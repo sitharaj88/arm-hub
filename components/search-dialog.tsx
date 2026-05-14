@@ -2,8 +2,14 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { Search, X, ArrowRight, FileText, Loader2, Command } from 'lucide-react';
 import { cn } from '@/lib/utils';
+
+// When the site is served from a non-root basePath (e.g. /arm-hub on
+// GitHub Pages), the search-index.json fetch URL needs the prefix.
+// `<Link>` and `router.push()` from next/navigation auto-prepend basePath,
+// so the search-result hrefs stay as plain "/docs/..." paths.
 
 type SearchEntry = {
   href: string;
@@ -236,7 +242,7 @@ export function SearchDialog() {
                 </div>
               )}
               {results.map((r, i) => (
-                <a
+                <Link
                   key={r.href}
                   href={r.href}
                   data-idx={i}
@@ -262,7 +268,7 @@ export function SearchDialog() {
                     </div>
                   </div>
                   <ArrowRight className={cn('h-3.5 w-3.5 shrink-0 self-center text-muted-foreground transition-transform', active === i && 'text-primary translate-x-0.5')} />
-                </a>
+                </Link>
               ))}
             </div>
           )}
