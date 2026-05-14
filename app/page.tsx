@@ -98,7 +98,7 @@ export default async function HomePage() {
 
             <dl className="mx-auto mt-14 grid max-w-2xl grid-cols-3 gap-3 sm:gap-4">
               {[
-                { v: '169', l: 'reference pages',    color: 'text-primary' },
+                { v: '191', l: 'reference pages',    color: 'text-primary' },
                 { v: '10',  l: 'deep sections',      color: 'text-accent' },
                 { v: '7',   l: 'interactive tools',  color: 'text-highlight' },
               ].map((s) => (

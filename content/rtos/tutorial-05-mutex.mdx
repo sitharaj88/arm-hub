@@ -1,0 +1,306 @@
+---
+title: Lesson 5 — Mutex and priority inheritance
+description: Why a mutex is not a binary semaphore. The Mars Pathfinder story. Recursive vs non-recursive. configMAX_SYSCALL_INTERRUPT_PRIORITY done correctly.
+order: 6
+updated: 2026-05-13
+tags: [rtos, tutorial, freertos, mutex, priority-inheritance, nvic, prigroup]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 5 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'When to use a mutex vs a semaphore, what priority inheritance does, how to set configMAX_SYSCALL_INTERRUPT_PRIORITY correctly on Cortex-M' },
+    { label: 'Code provided', value: '~140 lines (shared-SPI mutex example, priority-inversion demo)' },
+    { label: 'Time', value: '75–120 min' },
+    { label: 'Pre-reqs', value: 'Lesson 4, plus NVIC priority page' },
+    { label: 'Outcome', value: 'A mutex protecting a shared SPI bus across multiple tasks, with priority inheritance verified by trace' },
+  ]}
+/>
+
+A mutex is a primitive for *mutual exclusion* — making sure only one task at a time touches a shared resource. It looks superficially like a binary semaphore but is meaningfully different. The differences matter, they matter in production, and they were once expensive enough that NASA had to upload a hot fix to a spacecraft on Mars to make a mutex work the way you would expect a mutex to work. This lesson explains why.
+
+## Why a mutex is not a binary semaphore
+
+A binary semaphore has no concept of an *owner*. Any task can give it, any task can take it. It is a signal — "X happened" — not a lock.
+
+A mutex *does* have an owner. The task that takes the mutex is its owner; only the same task may give it back. The kernel tracks the owner because it needs to do two things you cannot do with a plain semaphore:
+
+1. **Priority inheritance.** If task L holds the mutex and higher-priority task H blocks waiting for it, the kernel temporarily raises L's priority to H's, so unrelated medium-priority task M cannot preempt L and starve H indirectly.
+2. **Recursive locking.** Optional: the same task can take the mutex multiple times; each take must be matched by a give. Without owner tracking, the kernel cannot tell "same task taking again" from "different task taking."
+
+If you use a binary semaphore for mutual exclusion, neither behaviour works. You can construct a *correctness bug* that looks like a *performance bug* and chase it for months. The fix is one keyword: create the synchronisation object with `xSemaphoreCreateMutex` instead of `xSemaphoreCreateBinary`.
+
+## The Mars Pathfinder story, in one paragraph
+
+July 1997, NASA's Pathfinder lander on Mars. Every couple of days the spacecraft watchdog tripped and the system reset itself, losing science data. The cause: an information-bus task at high priority blocked on a mutex held by a low-priority data-recording task; a medium-priority meteorological task — which had nothing to do with the mutex — kept running and preempted the data-recording task; the data-recording task could not release the mutex; the information-bus task starved; watchdog fired; reset. The fix uploaded by JPL: enable priority inheritance on the offending mutex. VxWorks had shipped inheritance as an opt-in feature; Pathfinder's team had left it off. The lesson is not just "enable inheritance" — it is "know what your RTOS does by default." The deep-dive lives at [priority inversion](/docs/rtos/priority-inversion/).
+
+FreeRTOS gets this right: `xSemaphoreCreateMutex` always enables priority inheritance. There is no off switch. You either use a mutex (correct) or a binary semaphore (subtly wrong).
+
+## A working mutex example: shared SPI bus
+
+Two tasks want to talk to two different SPI devices on the same bus — say a temperature sensor at CS0 and a flash chip at CS1. The bus is shared; only one device can be selected at a time.
+
+```c
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+
+static SemaphoreHandle_t spi_mtx;
+
+static void spi_transfer(uint8_t cs, const uint8_t *tx, uint8_t *rx, size_t n) {
+    /* Caller must hold spi_mtx */
+    gpio_cs_low(cs);
+    for (size_t i = 0; i < n; i++) {
+        SPI1->DR = tx[i];
+        while (!(SPI1->SR & SPI_SR_RXNE));
+        rx[i] = SPI1->DR;
+    }
+    gpio_cs_high(cs);
+}
+
+static int read_temperature(int16_t *out) {
+    uint8_t tx[3] = { 0xAA, 0, 0 };
+    uint8_t rx[3];
+    if (xSemaphoreTake(spi_mtx, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
+    spi_transfer(/* cs */ 0, tx, rx, 3);
+    xSemaphoreGive(spi_mtx);
+    *out = (rx[1] << 8) | rx[2];
+    return 0;
+}
+
+static int flash_read_page(uint32_t addr, uint8_t *buf) {
+    uint8_t cmd[4] = { 0x03, addr >> 16, addr >> 8, addr };
+    if (xSemaphoreTake(spi_mtx, pdMS_TO_TICKS(500)) != pdTRUE) return -1;
+    spi_transfer(/* cs */ 1, cmd, NULL, 4);
+    spi_transfer(/* cs */ 1, NULL, buf, 256);
+    xSemaphoreGive(spi_mtx);
+    return 0;
+}
+
+static void sensor_task(void *arg) {
+    (void)arg;
+    while (1) {
+        int16_t temp;
+        if (read_temperature(&temp) == 0) publish_temp(temp);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+static void log_task(void *arg) {
+    (void)arg;
+    while (1) {
+        uint8_t buf[256];
+        flash_read_page(get_next_addr(), buf);
+        process_log_page(buf);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+int main(void) {
+    spi_init();
+    spi_mtx = xSemaphoreCreateMutex();
+    configASSERT(spi_mtx != NULL);
+
+    xTaskCreate(sensor_task, "sensor", 256, NULL, 3, NULL);
+    xTaskCreate(log_task,    "log",    256, NULL, 2, NULL);
+    vTaskStartScheduler();
+    while (1) {}
+}
+```
+
+The mutex is created with `xSemaphoreCreateMutex`. Each function that touches the SPI peripheral takes the mutex first and gives it back at the end. While the sensor task holds the mutex, the log task blocks in `xSemaphoreTake(spi_mtx, ...)`. When the sensor task releases, the log task wakes and proceeds.
+
+If we had used `xSemaphoreCreateBinary` here, the *correctness* would still hold under normal load — only one task at a time talks to the SPI. But suppose a low-priority telemetry task also occasionally needs the bus. If `sensor_task` (priority 3) blocks on a mutex held by telemetry (priority 1), and `log_task` (priority 2) happens to wake up, you have priority inversion. With `xSemaphoreCreateMutex`, the kernel boosts telemetry to priority 3 while it holds the mutex; log_task cannot preempt. With `xSemaphoreCreateBinary`, telemetry stays at priority 1, log_task preempts and runs, and sensor_task is blocked indefinitely.
+
+## Recursive mutexes
+
+A recursive mutex can be taken multiple times by the same owner; each take must be matched by a give. Used when a function holding the mutex calls another function that also takes the same mutex — without recursion support, the second take would deadlock with itself.
+
+```c
+SemaphoreHandle_t rec_mtx = xSemaphoreCreateRecursiveMutex();
+xSemaphoreTakeRecursive(rec_mtx, portMAX_DELAY);
+xSemaphoreTakeRecursive(rec_mtx, portMAX_DELAY);   /* OK, same task */
+/* ... */
+xSemaphoreGiveRecursive(rec_mtx);
+xSemaphoreGiveRecursive(rec_mtx);
+```
+
+The kernel tracks a recursion count. Other tasks block on the first attempt and resume only when the count returns to zero.
+
+<Callout type="warn" title="Don't use recursive mutexes by default">
+A function that needs to take a mutex it already holds is usually a sign of a refactoring opportunity: split the function into a "with-lock-held" inner and a "with-lock-acquired" outer. Recursive mutexes hide ownership confusion. Use them when you must (e.g., calling back into a third-party library that takes a lock you also hold), not as the default.
+</Callout>
+
+## `configMAX_SYSCALL_INTERRUPT_PRIORITY` — the priority barrier
+
+This is the single most important — and most misunderstood — constant in `FreeRTOSConfig.h`. We saw it in lesson 2 without explaining. Now we explain.
+
+The Cortex-M NVIC supports up to 256 priority levels per IRQ, with smaller numerical values meaning *higher* urgency. FreeRTOS uses a priority barrier to divide ISRs into two groups:
+
+- **ISRs at numerically higher priority than the barrier** (= less urgent) — these may call FreeRTOS `*FromISR` APIs. The kernel disables them during its critical sections by setting `BASEPRI`.
+- **ISRs at numerically lower priority than the barrier** (= more urgent) — these may NOT call FreeRTOS APIs. They are completely invisible to the kernel; the kernel never disables them. They have minimum latency.
+
+```c
+/* In FreeRTOSConfig.h */
+#define configPRIO_BITS                                4
+#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY   5
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY \
+    (configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << (8 - configPRIO_BITS))
+```
+
+The `<< (8 - configPRIO_BITS)` is because the Cortex-M priority field is stored in the *upper* bits of the 8-bit register. With 4 priority bits implemented, the value `5` lands in the top nibble (`0x50`).
+
+The rule for application code:
+
+- **Any ISR that calls FreeRTOS APIs (e.g., `xQueueSendFromISR`, `xSemaphoreGiveFromISR`) must have an NVIC priority value >= `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY` (= 5).** Lower urgency.
+- **Any ISR that calls nothing FreeRTOS-related can have any priority** including 0–4. Use this for ultra-low-latency hardware ISRs (motor current loop, encoder pulses).
+
+```c
+NVIC_SetPriority(USART2_IRQn, 6);   /* OK to call FromISR APIs */
+NVIC_SetPriority(TIM1_IRQn,    2);  /* must NOT call FromISR APIs */
+```
+
+<Callout type="warn" title="The PRIGROUP trap">
+Cortex-M splits the 8-bit priority byte into preempt and sub-priority groups via the `SCB->AIRCR.PRIGROUP` field. FreeRTOS assumes PRIGROUP = 0 (all bits are preempt, no sub-priority). The CMSIS default is PRIGROUP = 3 on STM32 (4 preempt bits, 4 sub bits). The STM32 HAL sets PRIGROUP = 3 in `HAL_Init`. If you let the HAL run before FreeRTOS, your priorities are mixed-up. Always explicitly call `NVIC_SetPriorityGrouping(0)` after `HAL_Init` and before `vTaskStartScheduler`. See [NVIC priority](/docs/cortex-m/nvic-priority/) for the deeper story.
+</Callout>
+
+```c
+int main(void) {
+    HAL_Init();
+    NVIC_SetPriorityGrouping(0);   /* CRITICAL — undo HAL's group-3 setting */
+    SystemClock_Config();
+    /* ... rest of init ... */
+    vTaskStartScheduler();
+}
+```
+
+## Demonstrating priority inversion (and inheritance)
+
+Three tasks, all sharing a mutex:
+
+```c
+static SemaphoreHandle_t mtx;
+
+static void low_task(void *arg) {
+    (void)arg;
+    while (1) {
+        xSemaphoreTake(mtx, portMAX_DELAY);
+        p_set(5);
+        /* Hold the mutex for 100 ms doing 'work' */
+        for (volatile uint32_t i = 0; i < 10000000; i++) __NOP();
+        p_clr(5);
+        xSemaphoreGive(mtx);
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+static void med_task(void *arg) {
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(50));   /* offset start */
+    while (1) {
+        p_set(6);
+        for (volatile uint32_t i = 0; i < 20000000; i++) __NOP();   /* 200 ms */
+        p_clr(6);
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+static void high_task(void *arg) {
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(80));   /* let low_task grab the mutex first */
+    while (1) {
+        xSemaphoreTake(mtx, portMAX_DELAY);
+        p_set(7);
+        for (volatile uint32_t i = 0; i < 500000; i++) __NOP();    /* 5 ms */
+        p_clr(7);
+        xSemaphoreGive(mtx);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+int main(void) {
+    gpio_init();
+    mtx = xSemaphoreCreateMutex();
+    xTaskCreate(low_task,  "low",  128, NULL, 1, NULL);
+    xTaskCreate(med_task,  "med",  128, NULL, 2, NULL);
+    xTaskCreate(high_task, "high", 128, NULL, 3, NULL);
+    vTaskStartScheduler();
+    while (1) {}
+}
+```
+
+Look at PA5 (low), PA6 (med), PA7 (high) on a logic analyser. With `xSemaphoreCreateMutex`, you should see:
+
+- `low_task` starts at t=0, raises PA5, holds the mutex.
+- `med_task` starts at t=50 ms — but because `low_task` is currently holding the mutex and the kernel has boosted `low_task` to priority 3 (the moment `high_task` blocks on the mutex at t=80 ms), med cannot preempt low. PA6 stays low.
+- At t=80 ms, `high_task` wakes, tries to take the mutex, blocks. `low_task` is now boosted to priority 3.
+- `low_task` finishes its 100 ms of work at t=100, releases the mutex. PA5 goes low.
+- `high_task` immediately runs (5 ms of work), then blocks for 500 ms.
+- `med_task` now runs.
+
+Now change `xSemaphoreCreateMutex` to `xSemaphoreCreateBinary` and watch what happens: `med_task` happily preempts `low_task` between t=50 and t=80 (because there's no priority inheritance yet), but at t=80 when `high_task` wants the semaphore, low_task is still in the middle of its 100 ms. Worse: from t=80 to t=200+, `med_task` is at priority 2, low_task is at priority 1 with the binary semaphore held, and high_task is blocked at priority 3 waiting for low to release. Until med_task happens to finish its 200 ms (potentially extended by more med_task iterations), high_task waits — unbounded inversion. PA7 stays low for far longer than its 5 ms work would suggest.
+
+This is the Mars Pathfinder bug, reproduced on your bench in 30 minutes.
+
+## Common bugs with mutexes
+
+**Forgetting to give back.** A task takes the mutex, throws an exception or returns early on an error path, and never gives it back. Now no other task can ever take it. The kernel does *not* automatically release mutexes when the owning task is deleted or returns from its function — that is your responsibility. Use a goto-cleanup pattern or a wrapper function.
+
+```c
+int do_thing(void) {
+    int ret = -1;
+    if (xSemaphoreTake(mtx, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
+    if (precondition_failed()) goto out;
+    if (operation_failed())    goto out;
+    ret = 0;
+out:
+    xSemaphoreGive(mtx);
+    return ret;
+}
+```
+
+**Holding a mutex across a blocking call.** If you take a mutex and then call `vTaskDelay(pdMS_TO_TICKS(500))` or wait on a queue with a long timeout, you hold the mutex for half a second. Any task waiting for it gets blocked for half a second. The general rule: critical sections should be microseconds, not milliseconds. Never hold a mutex across a flash erase, a network call, a printf to UART, a queue wait, or any blocking I/O.
+
+**Taking mutexes in inconsistent order.** Two tasks each take two mutexes in opposite orders — classic deadlock. FreeRTOS priority inheritance does not prevent this. Discipline: every code path takes mutexes in the same order, document the order in a header.
+
+**Calling `xSemaphoreTake` (mutex) from an ISR.** ISRs cannot own mutexes (mutex ownership is a task concept). The kernel asserts. If an ISR needs to signal something to a task, use a binary semaphore or a task notification (lesson 7), not a mutex.
+
+## Exercises
+
+**Exercise 5.1**: In the SPI example, the `spi_transfer` function asserts the caller holds the mutex but does not check. Add a `configASSERT` that verifies it. (Hint: `xSemaphoreGetMutexHolder` returns the owning task handle.)
+
+**Exercise 5.2**: With priority inheritance, what is the worst-case time `high_task` could be blocked by `low_task`? Express it in terms of `low_task`'s critical-section length.
+
+**Exercise 5.3**: A task takes mutex A, then mutex B. A second task takes mutex B, then mutex A. Show how this deadlocks under priority inheritance. How do you fix it without changing the structure of the code?
+
+<Callout type="spec" title="Answer 5.1">
+```c
+configASSERT(xSemaphoreGetMutexHolder(spi_mtx) == xTaskGetCurrentTaskHandle());
+```
+Place at the top of `spi_transfer`. It will fire if any caller forgets to take the mutex first. Cheap to leave in production builds; expensive to omit and chase corruption later.
+</Callout>
+
+<Callout type="spec" title="Answer 5.2">
+Exactly the length of low_task's critical section — call it C. With priority inheritance, low is boosted to high's priority for the duration, so no medium-priority task can extend C. The blocking time for high_task is at most C, plus the time for the kernel to process the give and reschedule (sub-microsecond). This is what makes inheritance valuable: the blocking time is bounded by what the critical section actually does, not by whatever unrelated medium-priority work happens to want CPU.
+</Callout>
+
+<Callout type="spec" title="Answer 5.3">
+Sequence: T1 takes A, T2 takes B, T1 tries to take B (blocks, T2 inherits T1's priority on B), T2 tries to take A (blocks, T1 inherits T2's priority on A). Both blocked. Priority inheritance doesn't help — it only boosts holders, not waiters. Fix: enforce a global lock ordering. Always take A before B. Document the rule in a header comment near the mutex declarations: "If you need both A and B, take A first." This is a discipline rule, not a kernel mechanism — there is no automated check (deadlock detectors exist for real-time-validation tools, but not built into FreeRTOS).
+</Callout>
+
+## What you learned
+
+- A mutex has an owner; a binary semaphore does not. Mutexes provide priority inheritance, binary semaphores do not.
+- `xSemaphoreCreateMutex` always enables priority inheritance in FreeRTOS — no opt-in needed (unlike VxWorks circa 1997).
+- Recursive mutexes exist (`xSemaphoreCreateRecursiveMutex`) but are usually a smell.
+- `configMAX_SYSCALL_INTERRUPT_PRIORITY` is the barrier between FreeRTOS-aware ISRs (numerically higher value, less urgent) and FreeRTOS-invisible ISRs (numerically lower, more urgent). The latter have minimum latency but cannot call any FreeRTOS API.
+- After `HAL_Init`, call `NVIC_SetPriorityGrouping(0)` to keep PRIGROUP consistent with FreeRTOS's assumption.
+- The Mars Pathfinder bug is reproducible on your bench by swapping `xSemaphoreCreateMutex` for `xSemaphoreCreateBinary` in a three-task experiment.
+- Hold mutexes for microseconds, never milliseconds. Never hold across blocking I/O.
+
+## Up next
+
+| Previous | Next |
+|---|---|
+| [Lesson 4 — Semaphores](/docs/rtos/tutorial-04-semaphores/) | [Lesson 6 — Queues](/docs/rtos/tutorial-06-queues/) |

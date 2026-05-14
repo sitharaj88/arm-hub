@@ -1,0 +1,460 @@
+---
+title: Lesson 10 — Ring buffers and DMA-driven UART
+description: Lock-free SPSC ring buffer with power-of-two sizing. Circular DMA on USART2 RX, half-transfer and transfer-complete interrupts. The driver that ships in production firmware.
+order: 12
+updated: 2026-05-13
+tags: [programming, tutorial, c, embedded, dma, uart, ring-buffer]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 10 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'SPSC lock-free ring buffer, DMA1_Stream2 circular RX setup, half-transfer and transfer-complete interrupts, integrating with the lesson-9 parser FSM' },
+    { label: 'Code provided', value: 'About 200 lines — the ring buffer plus a DMA UART driver' },
+    { label: 'Time', value: '90 minutes' },
+    { label: 'Hardware', value: 'STM32F411 Nucleo with USART2 (PA2 TX / PA3 RX) wired to ST-Link VCP' },
+  ]}
+/>
+
+This is the capstone. We will build the UART driver that ships in real firmware: DMA-driven receive, lock-free ring buffer, half-transfer and transfer-complete interrupts. The CPU is involved only when there is work to do; bytes flow into memory while main is computing something else entirely.
+
+This is also the lesson that ties everything together. We use the volatile rules from lesson 3, the SysTick tick from lesson 6, the BSRR atomic writes from lesson 3, and the FSM parser from lesson 9.
+
+## Why DMA for UART
+
+A polled UART receive looks like:
+
+```c
+while (!(USART2->SR & USART_SR_RXNE)) { }
+uint8_t b = USART2->DR;
+```
+
+If main has anything else to do, that wait loop is dead time. At 115200 baud, a byte arrives every 87 µs — half a million CPU cycles on a 80 MHz part. You cannot poll for it; you have to interrupt.
+
+An interrupt-driven UART RX looks like the lesson-6 code:
+
+```c
+void USART2_IRQHandler(void) {
+    if (USART2->SR & USART_SR_RXNE) {
+        ring_push(USART2->DR);
+    }
+}
+```
+
+Better — but each byte triggers a ~12-cycle entry, ~10 cycles of work, ~12-cycle exit. At 115200 baud that is 0.4% of the CPU just servicing the UART. At higher rates (1 Mbaud, USB CDC at 12 Mbaud-effective), the IRQ overhead becomes substantial.
+
+DMA solves this. The DMA controller transfers UART bytes into memory autonomously. You only get an interrupt at meaningful boundaries: when the buffer is half full, when it is full, or when there is a transmission gap (idle line interrupt).
+
+The CPU cost of receiving 64 bytes drops from 64 × 34 cycles = 2176 cycles to about 30 cycles for one DMA interrupt — a 70x reduction.
+
+## Single-producer single-consumer ring buffer
+
+A ring buffer is a fixed-size circular array with two indices. One side writes (the producer); the other reads (the consumer). The buffer is full when writing one more would catch up to the read pointer; empty when the two indices are equal.
+
+The simplest form:
+
+```c
+typedef struct {
+    uint8_t       buf[SIZE];   /* SIZE must be a power of two */
+    volatile uint32_t head;    /* write index, modified by producer */
+    volatile uint32_t tail;    /* read index, modified by consumer */
+} ringbuf_t;
+
+#define MASK (SIZE - 1)
+```
+
+**Power-of-two size** matters. `(head + 1) & MASK` is one instruction; `(head + 1) % SIZE` is a division (4-10 cycles on Cortex-M4, more on M0). Always use sizes like 32, 64, 128, 256.
+
+```c
+bool ring_push(ringbuf_t *r, uint8_t b) {
+    uint32_t next = (r->head + 1) & MASK;
+    if (next == r->tail) return false;   /* full */
+    r->buf[r->head] = b;
+    r->head = next;                       /* publish AFTER writing the data */
+    return true;
+}
+
+bool ring_pop(ringbuf_t *r, uint8_t *out) {
+    if (r->head == r->tail) return false;  /* empty */
+    *out = r->buf[r->tail];
+    r->tail = (r->tail + 1) & MASK;
+    return true;
+}
+```
+
+The lock-freedom property: only the producer modifies `head`; only the consumer modifies `tail`. Both read both, but with strict ownership of the writes. On Cortex-M, 32-bit aligned reads and writes are atomic, so there is no torn-read problem.
+
+<Callout type="warn" title="Order matters: write data, THEN publish the index">
+In `ring_push`, the write to `r->buf[head]` must complete before `r->head` is updated. On Cortex-M3+ with the default memory ordering, plain stores are observed in program order from a single core. But if you add caches (M7) or multi-core (M3/M4 with SMP, M55), you need `__DMB()` between the data write and the index write. Most M3/M4 single-core code gets away without it. M7 and above: use `__DMB()` after the data write.
+</Callout>
+
+## A robust ring buffer
+
+```c
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#define RING_SIZE 128                  /* power of two */
+#define RING_MASK (RING_SIZE - 1)
+
+typedef struct {
+    uint8_t          buf[RING_SIZE];
+    volatile uint32_t head;
+    volatile uint32_t tail;
+} ringbuf_t;
+
+static inline bool ring_empty(const ringbuf_t *r) {
+    return r->head == r->tail;
+}
+
+static inline uint32_t ring_count(const ringbuf_t *r) {
+    return (r->head - r->tail) & RING_MASK;
+}
+
+static inline uint32_t ring_free(const ringbuf_t *r) {
+    return RING_SIZE - 1 - ring_count(r);   /* one slot wasted to distinguish empty/full */
+}
+
+bool ring_push(ringbuf_t *r, uint8_t b) {
+    uint32_t next = (r->head + 1) & RING_MASK;
+    if (next == r->tail) return false;
+    r->buf[r->head] = b;
+    __DMB();
+    r->head = next;
+    return true;
+}
+
+bool ring_pop(ringbuf_t *r, uint8_t *out) {
+    if (r->head == r->tail) return false;
+    *out = r->buf[r->tail];
+    __DMB();
+    r->tail = (r->tail + 1) & RING_MASK;
+    return true;
+}
+
+/* Bulk push: write up to n bytes, return number actually written */
+size_t ring_push_n(ringbuf_t *r, const uint8_t *src, size_t n) {
+    size_t avail = ring_free(r);
+    size_t to_copy = n < avail ? n : avail;
+    for (size_t i = 0; i < to_copy; i++) {
+        r->buf[(r->head + i) & RING_MASK] = src[i];
+    }
+    __DMB();
+    r->head = (r->head + to_copy) & RING_MASK;
+    return to_copy;
+}
+```
+
+Two design decisions:
+
+- **One slot wasted.** `RING_SIZE - 1` usable bytes; the extra slot lets us distinguish empty (`head == tail`) from full (`(head + 1) & MASK == tail`). The alternative is a separate "count" variable that needs atomic updates from both contexts — more complicated.
+- **Bulk push.** When you have many bytes to add at once (a DMA half-buffer copy, say), one bulk push beats N individual pushes.
+
+The `__DMB()` after the data write and before the index update is a data memory barrier — it tells the CPU and memory system that the data write must be visible before the index write becomes visible to other observers. On single-core Cortex-M3/M4 it compiles to nothing (or one cycle of `dmb sy`) but documents the invariant clearly.
+
+## DMA in 2 minutes
+
+The STM32F4 has two DMA controllers, each with 8 streams. Each stream connects to one peripheral request line (configurable to one of several "channels"). Once configured, the DMA controller:
+
+1. Waits for the peripheral to assert "I have a byte / I need a byte".
+2. Reads from the peripheral data register (or writes to it).
+3. Stores to (or loads from) memory.
+4. Updates its memory pointer and decrements the transfer count.
+5. Repeats until the count hits zero.
+
+For UART RX, we want **circular mode**: when the count hits zero, the DMA controller wraps back to the start of the buffer and continues. The transfer "never ends" — bytes keep flowing forever.
+
+Two interrupts matter:
+
+- **Half-transfer (HT)** — fires when half the buffer is filled.
+- **Transfer-complete (TC)** — fires when the buffer is full and DMA wraps.
+
+By processing data in the half we are *not* currently filling, we get clean double-buffering with no contention.
+
+<BlockDiagram
+  title="DMA-driven UART RX with double-buffering"
+  width={760}
+  height={260}
+  nodes={[
+    { id: 'usart', x: 30,  y: 100, w: 130, h: 70, kind: 'periph', label: 'USART2 RX', detail: 'DR register' },
+    { id: 'dma',   x: 220, y: 100, w: 130, h: 70, kind: 'accel', label: 'DMA1_Stream5', detail: 'circular, byte mode' },
+    { id: 'buf1',  x: 410, y: 30,  w: 230, h: 70, kind: 'memory', label: 'rx_dma_buf[0..63]', detail: 'first half — being filled' },
+    { id: 'buf2',  x: 410, y: 170, w: 230, h: 70, kind: 'memory', label: 'rx_dma_buf[64..127]', detail: 'second half — drained to ring' },
+  ]}
+  edges={[
+    { from: 'usart', to: 'dma',  label: 'RXNE → request', tone: 'primary' },
+    { from: 'dma',   to: 'buf1', label: 'fill', tone: 'accent' },
+    { from: 'buf2',  to: 'dma',  label: 'wrap', tone: 'muted' },
+  ]}
+  caption="Half-transfer IRQ fires when buf1 is full; main copies buf1 to the ring while DMA fills buf2. Transfer-complete IRQ fires when buf2 is full; main copies buf2 while DMA wraps to buf1."
+/>
+
+## Configuring DMA1 Stream 5 for USART2 RX
+
+On STM32F411, USART2_RX is mapped to DMA1 Stream 5 Channel 4. Reference: RM0383 table 27.
+
+```c
+#include <stdint.h>
+#include "stm32f4_minimal.h"   /* assume RCC, GPIO, USART, DMA, NVIC structs from CMSIS */
+
+#define DMA_BUF_SIZE 128
+
+static uint8_t  dma_rx_buf[DMA_BUF_SIZE];
+static ringbuf_t rx_ring;
+
+void uart_dma_init(void) {
+    /* 1. Enable clocks */
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN | RCC_AHB1ENR_DMA1EN;
+    RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+
+    /* 2. Configure PA2 (TX) and PA3 (RX) as AF7 */
+    GPIOA->MODER  = (GPIOA->MODER  & ~((3u << 4) | (3u << 6))) | ((2u << 4) | (2u << 6));
+    GPIOA->AFR[0] = (GPIOA->AFR[0] & ~((0xFu << 8) | (0xFu << 12))) | ((7u << 8) | (7u << 12));
+
+    /* 3. USART2: 115200 8N1, RX with DMA */
+    USART2->BRR = 16000000 / 115200;   /* 16 MHz HSI default; OVER8=0 */
+    USART2->CR3 = USART_CR3_DMAR;       /* enable DMA mode for receiver */
+    USART2->CR1 = USART_CR1_UE | USART_CR1_RE | USART_CR1_TE;
+
+    /* 4. Configure DMA1 Stream 5 for USART2_RX */
+    DMA1_Stream5->CR = 0;               /* disable while configuring */
+    while (DMA1_Stream5->CR & DMA_SxCR_EN) { }
+
+    DMA1_Stream5->PAR  = (uint32_t)&USART2->DR;
+    DMA1_Stream5->M0AR = (uint32_t)dma_rx_buf;
+    DMA1_Stream5->NDTR = DMA_BUF_SIZE;
+
+    DMA1_Stream5->CR = (4u << 25)                /* channel 4 */
+                     | (0u << 16)                /* priority low (default fine) */
+                     | (0u << 13)                /* MSIZE = byte */
+                     | (0u << 11)                /* PSIZE = byte */
+                     | DMA_SxCR_MINC             /* increment memory pointer */
+                     | DMA_SxCR_CIRC             /* circular mode */
+                     | DMA_SxCR_HTIE             /* half-transfer interrupt */
+                     | DMA_SxCR_TCIE             /* transfer-complete interrupt */
+                     | DMA_SxCR_TEIE             /* transfer-error interrupt */
+                     | DMA_SxCR_EN;              /* enable */
+
+    NVIC_SetPriority(DMA1_Stream5_IRQn, 6);
+    NVIC_EnableIRQ(DMA1_Stream5_IRQn);
+}
+```
+
+Key choices:
+
+- **Memory increment, peripheral fixed.** The DMA reads from `USART2->DR` (fixed address) and writes to successive memory locations.
+- **Byte sizes.** Both peripheral and memory transfers are 8-bit. UART data is a byte.
+- **Circular mode.** When NDTR hits zero, it auto-reloads and the memory pointer wraps to M0AR.
+- **HTIE + TCIE.** Two interrupts per full buffer fill — we process the just-filled half.
+- **TEIE.** Transfer error interrupt — fires on bus errors. Production code logs and recovers.
+
+## The DMA handler
+
+```c
+static volatile uint32_t last_pos;   /* last index we consumed from dma_rx_buf */
+
+static void dma_drain(uint32_t new_pos) {
+    /* Copy [last_pos, new_pos) into the ring */
+    if (new_pos > last_pos) {
+        ring_push_n(&rx_ring, &dma_rx_buf[last_pos], new_pos - last_pos);
+    } else if (new_pos < last_pos) {
+        ring_push_n(&rx_ring, &dma_rx_buf[last_pos], DMA_BUF_SIZE - last_pos);
+        ring_push_n(&rx_ring, &dma_rx_buf[0], new_pos);
+    }
+    /* if equal, nothing new (idle or full wrap caught next time) */
+    last_pos = new_pos;
+}
+
+void DMA1_Stream5_IRQHandler(void) {
+    uint32_t hisr = DMA1->HISR;
+
+    if (hisr & DMA_HISR_HTIF5) {
+        DMA1->HIFCR = DMA_HIFCR_CHTIF5;   /* ack */
+        dma_drain(DMA_BUF_SIZE / 2);
+    }
+
+    if (hisr & DMA_HISR_TCIF5) {
+        DMA1->HIFCR = DMA_HIFCR_CTCIF5;   /* ack */
+        dma_drain(DMA_BUF_SIZE);
+        last_pos = 0;
+    }
+
+    if (hisr & DMA_HISR_TEIF5) {
+        DMA1->HIFCR = DMA_HIFCR_CTEIF5;
+        /* error — reset stream */
+        DMA1_Stream5->CR &= ~DMA_SxCR_EN;
+        while (DMA1_Stream5->CR & DMA_SxCR_EN) { }
+        DMA1_Stream5->NDTR = DMA_BUF_SIZE;
+        last_pos = 0;
+        DMA1_Stream5->CR |= DMA_SxCR_EN;
+    }
+}
+```
+
+The handler:
+
+1. Reads the high interrupt status register `HISR` (Stream 5 is in the "high" half of DMA1).
+2. For half-transfer: copies the first half of the DMA buffer into the ring, advances `last_pos`.
+3. For transfer-complete: copies the second half, resets `last_pos` to 0 (DMA already wrapped).
+4. For transfer-error: resets the stream entirely.
+
+Acknowledging via `HIFCR` is mandatory — writing to the matching CHTIF/CTCIF bit clears the flag. Forgetting to ack causes the IRQ to re-fire endlessly.
+
+<Callout type="tip" title="Idle line interrupt for variable-length frames">
+For protocols where frames have variable length and end with a gap (Modbus RTU, line-based ASCII), enable USART2's idle line interrupt (`USART_CR1_IDLEIE`). The idle IRQ fires when the line is quiet for one byte time. In its handler, read `DMA1_Stream5->NDTR` to figure out where DMA currently is, and drain up to that point. This is the standard pattern for "receive a packet of unknown length".
+</Callout>
+
+## Main loop integration
+
+The main loop drains the ring buffer through the parser FSM from lesson 9:
+
+```c
+int main(void) {
+    /* clock config — skipped, default HSI 16 MHz */
+    systick_init_1ms(16000000);
+    gpio_mode(GPIOA, 5, GPIO_OUTPUT);
+    uart_dma_init();
+
+    while (1) {
+        uint8_t b;
+        while (ring_pop(&rx_ring, &b)) {
+            cmd_on_byte(b);   /* feed the FSM from lesson 9 */
+        }
+        /* other work — sleep, blink, etc. */
+    }
+}
+```
+
+The CPU is only active when there is something to do. Between bytes (87 µs at 115200 baud), main runs its other tasks. The DMA controller and the ring buffer absorb the latency.
+
+## TX with DMA (exercise)
+
+The TX side is symmetric but simpler — no half-buffer trick is needed because TX is request-driven from main. The pattern:
+
+1. Wait until previous DMA TX is done (check stream EN bit or a "tx_busy" flag).
+2. Copy the data into a TX buffer.
+3. Set NDTR to the length, M0AR to the buffer.
+4. Enable the stream and `USART_CR3_DMAT`.
+5. Get a transfer-complete interrupt; clear `tx_busy`.
+
+Below in exercise 10.2.
+
+## Cycle budget
+
+For 115200 baud with the configuration above:
+
+- Bytes per second: 11520
+- Half-buffer fills every 64/11520 = 5.5 ms.
+- HT interrupt: ~12 cycles entry + ~30 cycles handler + ~12 cycles exit = 54 cycles.
+- TC interrupt: same, ~54 cycles.
+- Total CPU cycles per second on UART: 2 IRQs per 5.5 ms × 54 cycles = ~19000 cycles/sec.
+
+At 80 MHz core, that is **0.024% of CPU**. Compared to per-byte RX IRQs at ~0.4%, a 16x reduction. At higher baud rates the difference is bigger.
+
+## Exercises
+
+**Exercise 10.1.** Add a `ring_pop_n` bulk pop that reads multiple bytes at once. When is bulk pop useful?
+
+<Callout type="spec" title="Answer">
+
+```c
+size_t ring_pop_n(ringbuf_t *r, uint8_t *dst, size_t n) {
+    size_t avail = ring_count(r);
+    size_t to_copy = n < avail ? n : avail;
+    for (size_t i = 0; i < to_copy; i++) {
+        dst[i] = r->buf[(r->tail + i) & RING_MASK];
+    }
+    __DMB();
+    r->tail = (r->tail + to_copy) & RING_MASK;
+    return to_copy;
+}
+```
+
+Useful when the consumer processes data in chunks — block compression, line-based parsing where you want to scan for `\n`, anything that benefits from contiguous access to many bytes. Saves the per-byte function-call overhead.
+</Callout>
+
+**Exercise 10.2.** Implement DMA-driven TX. The interface is `bool uart_send(const uint8_t *data, size_t n)` that copies into a TX buffer and kicks off DMA1 Stream 6 (USART2_TX). Return false if a previous transfer is still in progress.
+
+<Callout type="spec" title="Answer">
+
+```c
+static uint8_t  tx_buf[256];
+static volatile bool tx_busy;
+
+bool uart_send(const uint8_t *data, size_t n) {
+    if (tx_busy || n > sizeof(tx_buf)) return false;
+    memcpy(tx_buf, data, n);
+    tx_busy = true;
+
+    DMA1_Stream6->CR = 0;
+    while (DMA1_Stream6->CR & DMA_SxCR_EN) { }
+    DMA1_Stream6->PAR  = (uint32_t)&USART2->DR;
+    DMA1_Stream6->M0AR = (uint32_t)tx_buf;
+    DMA1_Stream6->NDTR = n;
+    DMA1_Stream6->CR = (4u << 25)        /* channel 4 */
+                     | DMA_SxCR_MINC
+                     | DMA_SxCR_DIR_0    /* memory-to-peripheral */
+                     | DMA_SxCR_TCIE
+                     | DMA_SxCR_EN;
+    USART2->CR3 |= USART_CR3_DMAT;
+    return true;
+}
+
+void DMA1_Stream6_IRQHandler(void) {
+    if (DMA1->HISR & DMA_HISR_TCIF6) {
+        DMA1->HIFCR = DMA_HIFCR_CTCIF6;
+        tx_busy = false;
+    }
+}
+```
+
+Production code adds a wait-loop and TX ring buffer so callers do not have to manage `tx_busy` themselves. The pattern is exactly symmetric to RX — different stream, opposite direction, no circular mode.
+</Callout>
+
+**Exercise 10.3.** What is the maximum baud rate the configuration above can sustain reliably? Hint: NDTR is 16-bit, and DMA has to finish a half before main can fall behind.
+
+<Callout type="spec" title="Answer">
+The DMA buffer is 128 bytes, so a half is 64 bytes. The HT interrupt has to drain those 64 bytes before the next 64 are filled (otherwise data is overwritten). At 115200 baud, that is 5.5 ms of headroom — plenty. At 1 Mbaud (100 kbytes/sec), a half fills in 640 µs — still fine for a small ring buffer copy. The real limit is the ring buffer size and how fast main consumes from it. With a 256-byte ring and a parser running at 80 MHz, 1 Mbaud is no problem. Above 2 Mbaud you would want a bigger DMA buffer to give main more time to react to bursts.
+</Callout>
+
+## What you learned
+
+- A single-producer single-consumer ring buffer is lock-free on Cortex-M when each context owns one index.
+- Power-of-two sizes make wrap arithmetic free; `__DMB` orders the data write before the index publish.
+- DMA + circular mode + half-transfer + transfer-complete is the production-grade UART RX pattern.
+- HT and TC interrupts double-buffer the work: drain one half while DMA fills the other.
+- The CPU cost of DMA-driven UART RX is independent of baud rate; per-byte IRQ cost is linear.
+- TX is symmetric but simpler — no half-buffer needed, just a kick-and-wait.
+
+## What you built across the tutorial
+
+Ten lessons in. Look at what you have now:
+
+- A bare-metal blink with vector table, startup, and linker script you wrote (lesson 2).
+- A clean GPIO driver header with proper volatile and atomic BSRR (lesson 3).
+- A 1 ms SysTick tick with `millis()` and `delay_ms()` (lesson 6).
+- Q15 fixed-point math and a PID controller that runs on any Cortex-M (lesson 8).
+- A command parser FSM with table-driven dispatch (lesson 9).
+- A DMA-driven UART driver with lock-free ring buffer (this lesson).
+
+About 1500 lines of code. Every line is yours. Every line is something you understand at the silicon level.
+
+This is the foundation for everything else. The HAL, FreeRTOS, USB stacks, even tinyAVR/ESP-IDF — they all sit on top of the patterns you just built. When the next firmware project needs a thing they do not provide, you know how to build it.
+
+## Where to go next
+
+- **Read the reference manual cover-to-cover.** Pick one peripheral — SPI, I2C, ADC — and write a bare-metal driver. The patterns are the same as UART.
+- **Bring up FreeRTOS or Zephyr** on the same board. With the FSM and ring-buffer skills, RTOS primitives map cleanly to what you already know.
+- **Profile something.** Hook up DWT->CYCCNT and measure a hot loop. Find where the cycles go.
+- **Build an OTA bootloader.** A/B flash, signature verification, in-application update. The [bootloaders page](/docs/programming/bootloaders/) is the next stop.
+- **Move to Cortex-M7 or M33.** Cache, MPU, TrustZone, FPU64. The lessons here all still apply; you add new ones for the architecture features.
+
+The single most important thing: keep typing the code. Knowledge in your fingers beats knowledge in your eyes.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 9 — State machines](/docs/programming/tutorial-09-state-machine/) | [Tutorial overview](/docs/programming/tutorial/) |

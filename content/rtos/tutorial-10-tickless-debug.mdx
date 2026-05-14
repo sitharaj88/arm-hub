@@ -1,0 +1,251 @@
+---
+title: Lesson 10 — Tickless idle and debugging
+description: Suppress SysTick during idle and save 100×–1000× power. Trace tools — SystemView, Tracealyzer, Ozone. Common bugs and how to find them. Where to go after FreeRTOS.
+order: 11
+updated: 2026-05-13
+tags: [rtos, tutorial, freertos, tickless, low-power, debug, tracing]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 10 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Tickless idle for battery devices. Trace tools that make RTOS bugs visible. The four most common FreeRTOS bugs and how to spot them. Next-RTOS options.' },
+    { label: 'Code provided', value: '~130 lines (tickless config + custom suppress-ticks hook, trace instrumentation)' },
+    { label: 'Time', value: '90–120 min' },
+    { label: 'Pre-reqs', value: 'Lessons 1–9' },
+    { label: 'Outcome', value: 'A FreeRTOS application that draws single-digit microamps when idle, plus the skill to diagnose RTOS bugs from a trace timeline' },
+  ]}
+/>
+
+We have covered the FreeRTOS API surface. This final lesson covers two things that turn a working RTOS application into a *good* RTOS application: getting the chip to actually sleep when nothing is happening, and seeing what is going on at runtime well enough to debug systematically. Plus a short tour of where to go next — Zephyr, ThreadX, RT-Thread, SAFERTOS — when FreeRTOS is no longer the right tool.
+
+## Tickless idle — let the chip sleep
+
+By default, FreeRTOS runs the SysTick interrupt at `configTICK_RATE_HZ` (1000 Hz typically). That means the CPU wakes up 1000 times per second to increment a counter, even if every task is blocked and there is nothing to do. On a battery-powered device this is catastrophic.
+
+Tickless idle changes the picture. When the idle task runs, it asks the kernel "how long until the next task should run?" and, if that interval is long enough, stops SysTick, sets a low-power timer to fire at the deadline, and issues `WFI` (Wait For Interrupt). The chip enters a deep sleep state; current consumption drops from milliamps to microamps. When the low-power timer fires (or any other wake source — RTC, external IRQ, USB), the chip wakes, restarts SysTick, and resumes scheduling.
+
+The power saving depends on what the chip can do in WFI:
+
+- Cortex-M4 in Sleep mode (default WFI): CPU clocked off, peripherals running. ~1–10 mA → ~0.5–2 mA.
+- Cortex-M4 in Stop mode (deeper sleep): SRAM retained, most peripherals off, low-power timer running. ~10 µA.
+- Cortex-M4 in Standby mode (deepest, but loses SRAM): RTC + a backup register, wakes by reset. ~2 µA.
+
+Tickless idle picks the right level based on the expected idle duration and what your `portSUPPRESS_TICKS_AND_SLEEP` hook is willing to do.
+
+## Enabling tickless idle
+
+```c
+/* FreeRTOSConfig.h */
+#define configUSE_TICKLESS_IDLE                  1
+#define configEXPECTED_IDLE_TIME_BEFORE_SLEEP    2   /* in ticks */
+```
+
+`configEXPECTED_IDLE_TIME_BEFORE_SLEEP` is the minimum idle interval (in ticks) before the kernel decides to enter tickless mode. If it's shorter, the kernel just spins in WFI without stopping SysTick (still saves some power but doesn't pay the wake-up overhead). Default of 2 ticks (2 ms with 1 kHz tick rate) is sensible.
+
+That's all you need for the default tickless behaviour. The port's built-in `portSUPPRESS_TICKS_AND_SLEEP` will:
+
+1. Compute the expected idle duration from the kernel's "next task to unblock" time.
+2. Reprogram SysTick with the corresponding reload value.
+3. Disable interrupts, then issue `__WFI()`.
+4. On wake, re-enable interrupts, read how much time SysTick actually counted (it might have been interrupted by something else first), update the tick count, and return.
+
+For Cortex-M4 sleep mode (the easiest, no peripheral state loss), the default is fine. For deeper sleep modes, you need a custom hook.
+
+## Custom suppress-ticks hook for Stop mode
+
+To go into STM32F4 Stop mode (~10 µA), SysTick is not running (it depends on the AHB clock which stops). You must use a separate low-power timer (LPTIM on F4 and later parts, or the RTC's wake-up timer).
+
+```c
+#define portSUPPRESS_TICKS_AND_SLEEP(idle_time) my_suppress_ticks_and_sleep(idle_time)
+
+void my_suppress_ticks_and_sleep(TickType_t expected_idle) {
+    /* expected_idle is in ticks (1 ms each at 1 kHz) */
+    if (expected_idle < 2) return;
+
+    /* Clamp to LPTIM range */
+    uint32_t lptim_ticks = ms_to_lptim(expected_idle);
+    if (lptim_ticks > LPTIM_MAX) {
+        lptim_ticks = LPTIM_MAX;
+        expected_idle = lptim_to_ticks(LPTIM_MAX);
+    }
+
+    /* Atomically check if anything is still pending */
+    __disable_irq();
+    if (eTaskConfirmSleepModeStatus() == eAbortSleep) {
+        __enable_irq();
+        return;
+    }
+
+    /* Arm the low-power timer for the deadline */
+    SysTick->CTRL &= ~SysTick_CTRL_ENABLE_Msk;
+    lptim_arm(lptim_ticks);
+
+    /* Configure deep sleep — Stop mode for STM32F4 */
+    SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
+    PWR->CR  |= PWR_CR_LPDS;   /* low-power voltage regulator */
+
+    __DSB();
+    __WFI();
+    __ISB();
+
+    SCB->SCR &= ~SCB_SCR_SLEEPDEEP_Msk;
+
+    /* Restart system clock — Stop mode reverted to HSI */
+    SystemClock_Config();
+
+    /* How much LPTIM time actually elapsed (may be less than requested if another IRQ woke us) */
+    uint32_t elapsed_lptim = lptim_read_elapsed();
+    TickType_t elapsed_ticks = lptim_to_ticks(elapsed_lptim);
+    if (elapsed_ticks > expected_idle) elapsed_ticks = expected_idle;
+
+    /* Tell FreeRTOS how many ticks went by */
+    vTaskStepTick(elapsed_ticks);
+
+    /* Resume SysTick */
+    SysTick->CTRL |= SysTick_CTRL_ENABLE_Msk;
+
+    __enable_irq();
+}
+```
+
+There is a lot going on. Read through carefully:
+
+- `eTaskConfirmSleepModeStatus()` is called *with interrupts disabled*. It checks one final time whether anything has happened since the kernel decided to sleep — a pending ISR, a task that became ready. If so, abort.
+- We disable SysTick, arm LPTIM with the expected duration, configure Stop mode, issue WFI.
+- After WFI, clock tree is in HSI (Stop mode dropped the PLL). Re-run `SystemClock_Config` to bring SYSCLK back.
+- `vTaskStepTick(elapsed_ticks)` advances the kernel tick counter by the duration we actually slept.
+
+Once this is wired up, your app idles at ~10 µA on an STM32F4. A battery device that was lasting two days now lasts two months.
+
+<Callout type="warn" title="Tickless idle has sharp edges">
+The hook above is simplified. Real production code has to handle: peripheral state loss in Stop mode (USB disconnects, I2C state machines reset), the wake latency from Stop (50–200 µs adds to ISR latency on every wake), debugger detach (the debugger sees the CPU "missing" during Stop and may give up). For battery products it is worth the effort. For mains-powered devices, leave tickless off and save the debugging time.
+</Callout>
+
+See [tickless idle](/docs/rtos/tickless/) for the longer treatment.
+
+## Debugging RTOS systems
+
+The biggest culture shift moving from bare-metal to RTOS is that print-based debugging stops working. With tasks switching every millisecond, a `printf` that took two milliseconds to send out the UART can hide all the timing you wanted to observe. You need *tracing* — recording every scheduling event to a buffer that can be displayed offline.
+
+### Segger SystemView
+
+Segger SystemView ([segger.com/products/development-tools/systemview](https://www.segger.com/products/development-tools/systemview/)) is the most accessible: free for non-commercial use, low overhead (~1 µs per event), works over the J-Link RTT transport which most ARM debuggers support. FreeRTOS ships SystemView integration in its repo; enable it by including `SEGGER_SYSVIEW_FreeRTOS.h` and compiling `SEGGER_SYSVIEW.c`.
+
+Once running, you see a per-task timeline: every task switch, every ISR entry/exit, every semaphore give/take, every queue send/receive. Times are in microseconds. You can zoom in, measure intervals, and instantly see priority inversions, blocked tasks, ISR latency outliers.
+
+### Percepio Tracealyzer
+
+Percepio Tracealyzer ([percepio.com/tracealyzer](https://percepio.com/tracealyzer/)) is the commercial competitor. More polished UI, deeper analysis (event chains, statistical task profiling, intertask dependency graphs). Free trial; license is a few hundred dollars per seat. The recorder library is also free and open source.
+
+In my experience, Tracealyzer is worth the money for anyone doing RTOS work full-time. SystemView is the right starting point.
+
+### Segger Ozone with FreeRTOS plugin
+
+Ozone ([segger.com/products/development-tools/ozone-j-link-debugger](https://www.segger.com/products/development-tools/ozone-j-link-debugger/)) is Segger's GUI debugger. With its FreeRTOS plugin, it can introspect TCBs, queue contents, and the ready/blocked task lists at any breakpoint. Combined with SystemView, you have both the timeline view and the at-this-moment state.
+
+### Interpreting a trace
+
+You're looking for these patterns:
+
+- **Task running unexpectedly long.** Should yield within microseconds; if it's holding the CPU for milliseconds it has a tight loop or is computing too much in a callback.
+- **Task blocked unexpectedly long.** Should wake on the next event; if not, the event source is broken or the priority is wrong.
+- **Priority inversion.** High-priority task in "blocked on mutex" state while a medium-priority task is running and a low-priority task is sitting in Ready waiting for medium to release CPU. Classic.
+- **ISR latency spikes.** Should be sub-microsecond on Cortex-M4 (5–20 cycles). Latency > 5 µs means another ISR or a critical section is running too long.
+- **Tick handler taking too long.** Should be ~50 cycles. > 1 µs means an unblocked task list is being walked too often.
+
+## The four most common FreeRTOS bugs
+
+Knowing the symptoms saves hours of debugging. From the field:
+
+**1. Priority inversion because you forgot the mutex.** Symptom: a high-priority task occasionally misses its deadline by a variable amount. The variability tracks medium-priority workload. Fix: replace `xSemaphoreCreateBinary` with `xSemaphoreCreateMutex` for any object used as a lock.
+
+**2. Stack overflow with a too-small `configMINIMAL_STACK_SIZE`.** Symptom: random crashes, fault on context switch, the stack-overflow hook fires intermittently for the idle task or another small task. Fix: increase `configMINIMAL_STACK_SIZE` to 128 (the F4 default), and increase any task that calls `printf`, vendor HAL functions, or anything else non-trivial.
+
+**3. ISR using a non-FromISR API.** Symptom: hang inside the kernel, or "vAssertCalled" with a confusing trace. With `configASSERT_DEFINED`, FreeRTOS catches this at the API entry. Without it, the kernel data structures are corrupted. Fix: every call inside an ISR must end in `FromISR`. The assert is on by default for development builds; leave it on.
+
+**4. Calling a blocking API in an ISR.** Symptom: deadlock or assertion. You called `xQueueSend(..., portMAX_DELAY)` in an ISR; the ISR cannot block, so the kernel asserts. Fix: use `xQueueSendFromISR` with no timeout. If the queue is full, the API returns failure — handle it.
+
+A fifth bug, less common but more painful:
+
+**5. Priority configuration wrong for `configMAX_SYSCALL_INTERRUPT_PRIORITY`.** Symptom: random scheduler corruption when a specific ISR fires under load. The ISR is at a higher urgency than the FreeRTOS barrier and calls a FreeRTOS API anyway. Fix: ensure every ISR that calls FreeRTOS has an NVIC priority >= `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY`. Also ensure PRIGROUP is 0 (no sub-priority bits) — call `NVIC_SetPriorityGrouping(0)` after `HAL_Init`.
+
+## Beyond FreeRTOS — where to go next
+
+If your project outgrows FreeRTOS or constraints push you elsewhere, the main options:
+
+**Zephyr** ([zephyrproject.org](https://www.zephyrproject.org/)). Linux Foundation project, Apache 2.0. Hugely capable: device tree, kconfig, hundreds of supported boards, integrated Bluetooth/802.15.4/Thread/Matter stacks, USB, networking. Build system is West (Python). Steep learning curve — it's more like a tiny Linux than a tiny RTOS. Worth the investment for products with significant integration (smartwatches, gateways, anything Matter-related). See [Zephyr reference](/docs/rtos/zephyr/).
+
+**ThreadX (Azure RTOS)** ([github.com/azure-rtos](https://github.com/azure-rtos)). Now Microsoft, MIT licensed since 2020. Clean APIs, FAA DO-178C certified versions available, very low memory footprint. The most "professional" RTOS in the sense of well-documented internals and predictable behaviour. Used in shipped products across automotive, industrial, medical. See [ThreadX](/docs/rtos/threadx/).
+
+**RT-Thread** ([rt-thread.io](https://www.rt-thread.io/)). Apache 2.0, originated in China, large global ecosystem. Strong networking and Wi-Fi support, broad MCU support, growing rapidly. Less mature documentation in English than Zephyr or ThreadX, but the kernel itself is solid. See [RT-Thread](/docs/rtos/rt-thread/).
+
+**SAFERTOS** ([highintegritysystems.com](https://www.highintegritysystems.com/safertos/)). The IEC 61508 SIL 3 certified version of FreeRTOS, by WITTENSTEIN high integrity systems. Paid, but the certification package saves months of safety-cert work. Use when you need 61508/26262/62304 compliance and want to keep the FreeRTOS programming model.
+
+**QNX** ([blackberry.com/qnx](https://blackberry.com/qnx)). Full microkernel RTOS, POSIX-compliant, used in automotive infotainment, medical, industrial. Different mental model — message-passing microkernel. Per-seat licensed; expensive but battle-tested.
+
+**Linux + PREEMPT_RT** for Cortex-A. When the workload outgrows a microcontroller entirely, real-time Linux on Cortex-A7/A53 is the answer. See [systems overview](/docs/systems/overview/).
+
+The migration path FreeRTOS → Zephyr → ThreadX is a real career progression. Each new RTOS adds capability but takes a quarter to learn properly. Plan accordingly.
+
+## Final checklist before shipping
+
+A pre-flight you should run for any RTOS product before release:
+
+- [ ] `configCHECK_FOR_STACK_OVERFLOW = 2` is on. Stack high-water marks are > 64 words for every task.
+- [ ] `configASSERT` is defined. Asserts run in development builds. Whether on in release is a project call.
+- [ ] All ISRs that call FreeRTOS APIs have NVIC priorities >= `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY`. Verified by grep'ing `NVIC_SetPriority` calls.
+- [ ] `NVIC_SetPriorityGrouping(0)` is called after `HAL_Init` and before `vTaskStartScheduler`.
+- [ ] Every mutex is created with `xSemaphoreCreateMutex` (not `xSemaphoreCreateBinary`).
+- [ ] Heap high-water mark under realistic load has at least 20% headroom.
+- [ ] No `vTaskDelay` or blocking API in any timer callback.
+- [ ] No `printf` or blocking I/O inside a critical section or under a held mutex.
+- [ ] Tracing has been captured at least once and reviewed for surprises.
+- [ ] If battery-powered: tickless idle is on and verified with a current probe.
+- [ ] Watchdog is configured and refreshed by a known-good task (not a timer callback).
+
+## Exercises
+
+**Exercise 10.1**: Your battery device idles at 5 mA (no tickless). After enabling tickless idle with Stop mode, you measure 25 µA when blocked, but the average over a minute is 1 mA. What's happening?
+
+**Exercise 10.2**: A SystemView trace shows the idle task running 92% of the time. Is this good, bad, or context-dependent? What do you check next?
+
+**Exercise 10.3**: You're shipping a product that needs IEC 62304 compliance (medical). Which RTOS choices are viable, and what about FreeRTOS makes it unsuitable as-is?
+
+<Callout type="spec" title="Answer 10.1">
+Something is waking the chip every few milliseconds, preventing extended sleep. Common culprits: a periodic task with too-short a period (e.g., 10 ms display refresh), a timer firing more often than needed, an unmasked peripheral interrupt (UART RX with no actual data), or `configEXPECTED_IDLE_TIME_BEFORE_SLEEP` too large so the kernel rarely commits to deep sleep. Use SystemView or current-vs-time logging to identify wake events. Once isolated, increase the offending task's period or move work to event-driven.
+</Callout>
+
+<Callout type="spec" title="Answer 10.2">
+Context-dependent. 92% idle on a battery device is great — your tasks finished and you're sleeping. 92% idle on a mains-powered control system means your tasks are barely doing anything and you have CPU headroom. Either way it tells you what the *real* workload is. Check: is any specific task taking longer than expected? Are deadlines being met? If everything is on time, 92% idle is a healthy system with margin.
+</Callout>
+
+<Callout type="spec" title="Answer 10.3">
+Viable: SAFERTOS (IEC 61508 SIL 3 certified, the parent standard 62304 maps to), ThreadX (DO-178C certification kits available, can be adapted), or QNX (medical-grade variants exist). FreeRTOS as-shipped is not viable because it has no safety certification — you'd have to do that work yourself, which for a small team is impractical. The decision is usually SAFERTOS (cheapest if you already know FreeRTOS) or ThreadX (cleaner APIs, broader certifications). Either is six-figure-cost territory in licensing/cert work; budget accordingly.
+</Callout>
+
+## What you learned
+
+- Tickless idle stops SysTick during idle and lets the chip deep-sleep. Power savings: 100×–1000× on battery devices. Custom `portSUPPRESS_TICKS_AND_SLEEP` hooks let you go below the default Sleep mode into Stop/Standby.
+- Tracing — SystemView (free for non-commercial), Tracealyzer (commercial), Ozone (Segger) — makes RTOS bugs visible. Without trace, debugging is guesswork.
+- The four most common FreeRTOS bugs are: priority inversion (mutex vs binary semaphore), stack overflow, ISR-non-ISR-API mixup, blocking API in ISR. All four are caught by the right configuration settings — leave them on.
+- Where to go next: Zephyr for integration-heavy products, ThreadX for clean APIs and Microsoft backing, RT-Thread for Chinese ecosystem, SAFERTOS for safety-cert, QNX for full microkernel.
+- Pre-flight checklist before shipping. Print it, follow it.
+
+## You're done
+
+Ten lessons, twelve to eighteen hours, one real FreeRTOS application from zero. You now have:
+
+- A working mental model for tasks, scheduling, IPC, ISR safety, memory, and power.
+- The judgment to decide when an RTOS is the right tool and when it isn't.
+- The skill to read and review production RTOS code, including code that other people wrote badly.
+- The vocabulary to evaluate other RTOSes — Zephyr, ThreadX, RT-Thread, SAFERTOS — without having to learn each from scratch.
+
+The FreeRTOS reference at [docs/rtos/freertos](/docs/rtos/freertos/) is your home from here. Build something real with it. Then come back and read about [Zephyr](/docs/rtos/zephyr/) or [ThreadX](/docs/rtos/threadx/) when the next project demands it.
+
+## Up next
+
+| Previous | Next |
+|---|---|
+| [Lesson 9 — Memory management](/docs/rtos/tutorial-09-memory/) | [Back to tutorial landing](/docs/rtos/tutorial/) |

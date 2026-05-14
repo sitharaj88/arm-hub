@@ -1,0 +1,272 @@
+---
+title: Lesson 4 — Synchronisation with semaphores
+description: Binary semaphore for ISR-to-task signalling. Counting semaphore for resource pools. portYIELD_FROM_ISR. The UART-RX-to-parser-task pattern that's in every product.
+order: 5
+updated: 2026-05-13
+tags: [rtos, tutorial, freertos, semaphore, isr, signalling]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 4 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Binary semaphores for ISR-to-task signalling, counting semaphores for resource pools, and the right way to give a semaphore from an interrupt handler' },
+    { label: 'Code provided', value: '~180 lines (UART-RX-to-parser-task and a DMA-channel resource pool)' },
+    { label: 'Time', value: '75–100 min' },
+    { label: 'Pre-reqs', value: 'Lessons 1–3, basic UART configuration on your board' },
+    { label: 'Outcome', value: 'Working ISR-to-task signalling and a generalisable mental model for "wake a worker when an event arrives"' },
+  ]}
+/>
+
+Until now the only thing our tasks have done is sleep on `vTaskDelay`. That works when activity is purely periodic, but most real systems are *event-driven*: a UART byte arrives, a button is pressed, a DMA transfer completes. The right way to handle these in an RTOS is to put a task to sleep, then wake it from the interrupt handler that detects the event. Semaphores are the simplest synchronisation primitive that does this.
+
+A semaphore in FreeRTOS is an integer counter with a "take" and "give" API. When you take and the counter is zero, you block until somebody gives. When you give, the counter goes up and any blocked taker wakes. We have two flavours.
+
+## Binary semaphores
+
+A binary semaphore has only two values: 0 (empty) or 1 (full). Created with `xSemaphoreCreateBinary`, it starts at 0. The pattern is:
+
+- Task: `xSemaphoreTake(sem, timeout)` — blocks if the semaphore is empty.
+- ISR: `xSemaphoreGiveFromISR(sem, &higher_priority_task_woken)` — fills the semaphore, possibly waking the blocked task.
+
+```c
+#include "FreeRTOS.h"
+#include "task.h"
+#include "semphr.h"
+
+static SemaphoreHandle_t uart_rx_sem;
+
+void USART2_IRQHandler(void) {
+    if (USART2->SR & USART_SR_RXNE) {
+        /* The byte will be read by the task; here we just signal */
+        BaseType_t hp_task_woken = pdFALSE;
+        xSemaphoreGiveFromISR(uart_rx_sem, &hp_task_woken);
+        portYIELD_FROM_ISR(hp_task_woken);
+    }
+}
+
+static void uart_rx_task(void *arg) {
+    (void)arg;
+    while (1) {
+        if (xSemaphoreTake(uart_rx_sem, portMAX_DELAY) == pdTRUE) {
+            uint8_t byte = USART2->DR;
+            process_rx_byte(byte);
+        }
+    }
+}
+
+int main(void) {
+    SystemClock_Config();
+    uart2_init(115200);
+    /* Enable RXNE interrupt at NVIC priority 6 (below FreeRTOS syscall priority of 5) */
+    USART2->CR1 |= USART_CR1_RXNEIE;
+    NVIC_SetPriority(USART2_IRQn, 6);
+    NVIC_EnableIRQ(USART2_IRQn);
+
+    uart_rx_sem = xSemaphoreCreateBinary();
+    configASSERT(uart_rx_sem != NULL);
+
+    xTaskCreate(uart_rx_task, "uart_rx", 256, NULL, 3, NULL);
+    vTaskStartScheduler();
+    while (1) {}
+}
+```
+
+Take this apart carefully — every line is doing real work.
+
+### `xSemaphoreCreateBinary`
+
+Allocates a `Queue_t` structure on the heap. A semaphore is internally a queue of zero-sized items with a max length of 1. The kernel uses one data structure for queues, mutexes, and semaphores; they differ only in initial state and a few flags. The cost is about 80 bytes for the queue struct.
+
+The semaphore starts at 0 — empty. `xSemaphoreTake` on a fresh binary semaphore will block. Some APIs (older versions) start at 1; this is no longer the default. Always check.
+
+### `xSemaphoreTake(sem, timeout)`
+
+Blocks the calling task. The timeout is in *ticks*; use `pdMS_TO_TICKS(ms)` or `portMAX_DELAY` for "forever". Returns `pdTRUE` if the semaphore was taken successfully, `pdFALSE` if the timeout expired.
+
+While the task is blocked, it consumes zero CPU. The scheduler removes it from the ready list and stores it on the semaphore's waiter list. When the semaphore is given, the highest-priority waiter is moved back to the ready list.
+
+### `xSemaphoreGiveFromISR(sem, &hp_task_woken)`
+
+Increments the semaphore. If a task is blocked on the semaphore, that task is moved from Blocked to Ready. If the unblocked task has a *higher priority* than the task that was running before the interrupt, the kernel sets `hp_task_woken = pdTRUE` to tell us "you should context-switch when the ISR returns."
+
+The `FromISR` suffix is important. Regular `xSemaphoreGive` would call `xTaskGenericNotify` which takes a kernel critical section the wrong way for an ISR — it would corrupt the scheduler's data structures. **Always use the `FromISR` variant inside an interrupt handler.** The kernel asserts this when `configASSERT_DEFINED` is on, so you will catch the mistake early.
+
+### `portYIELD_FROM_ISR(hp_task_woken)`
+
+If `hp_task_woken` is `pdTRUE`, this triggers a context switch when the ISR returns. The mechanism: it sets the PendSV exception pending. PendSV is the lowest-priority interrupt, so it does not run until all higher-priority ISRs finish (this is the tail-chaining behaviour we want). When PendSV finally runs, it saves the interrupted task's context and switches to the higher-priority task.
+
+If `hp_task_woken` is `pdFALSE`, the macro does nothing — the previously-running task resumes after the ISR.
+
+```
+[USART RX byte arrives]
+  -> USART2_IRQHandler runs (priority 6)
+  -> xSemaphoreGiveFromISR — sets hp_task_woken = pdTRUE because uart_rx_task (priority 3) > current task (e.g. blink task at priority 1)
+  -> portYIELD_FROM_ISR — pends PendSV
+  -> USART2_IRQHandler returns (HW restores stacked frame of blink_task)
+  -> PendSV immediately fires (tail-chain), saves blink_task context, restores uart_rx_task context
+  -> uart_rx_task wakes inside xSemaphoreTake and continues
+```
+
+Without `portYIELD_FROM_ISR`, the high-priority RX task would wait until the *next* SysTick before getting the CPU — adding up to one tick (1 ms by default) of latency. With it, the task gets the CPU within ~5 µs of the byte arriving.
+
+<Callout type="warn" title="The NVIC priority of your ISR matters">
+The USART2 interrupt above was set to NVIC priority 6. `configMAX_SYSCALL_INTERRUPT_PRIORITY` in `FreeRTOSConfig.h` is 5. That means the ISR is *below* the FreeRTOS API barrier — it is allowed to call `xSemaphoreGiveFromISR`. If you set it to priority 4 (higher urgency than the barrier), the FreeRTOS assertion fires: ISRs above the barrier cannot call FreeRTOS APIs because the kernel doesn't disable them during critical sections. Lesson 5 is dedicated to getting this exact relationship right.
+</Callout>
+
+## Why this is so much better than busy-wait
+
+Compare to bare-metal polling:
+
+```c
+while (!(USART2->SR & USART_SR_RXNE)) { /* spin */ }
+uint8_t byte = USART2->DR;
+```
+
+That spins 100% CPU until a byte arrives. With FreeRTOS + binary semaphore, the task sleeps consuming zero CPU until the ISR signals. Other tasks (control loop, display, network) keep running normally. When the byte arrives, the task is awake within microseconds. This is the central advantage of an RTOS over a bare-metal superloop for event-driven I/O.
+
+## Counting semaphores
+
+A counting semaphore behaves like a binary semaphore but the counter goes from 0 to N (instead of 0 to 1). Use it when you have a *pool* of identical resources — for example, three DMA channels — and tasks need to claim one before using it.
+
+```c
+#define DMA_CHANNEL_COUNT 3
+
+static SemaphoreHandle_t dma_pool;
+static dma_channel_t *channels[DMA_CHANNEL_COUNT];
+static SemaphoreHandle_t channel_mtx;  /* protects the channels[] array */
+
+void dma_init(void) {
+    dma_pool = xSemaphoreCreateCounting(DMA_CHANNEL_COUNT, DMA_CHANNEL_COUNT);
+    channel_mtx = xSemaphoreCreateMutex();
+    for (int i = 0; i < DMA_CHANNEL_COUNT; i++) channels[i] = &all_channels[i];
+}
+
+dma_channel_t *dma_acquire(TickType_t timeout) {
+    if (xSemaphoreTake(dma_pool, timeout) != pdTRUE) return NULL;
+    /* Pop a channel from the free list */
+    dma_channel_t *ch = NULL;
+    xSemaphoreTake(channel_mtx, portMAX_DELAY);
+    for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
+        if (channels[i] != NULL) {
+            ch = channels[i];
+            channels[i] = NULL;
+            break;
+        }
+    }
+    xSemaphoreGive(channel_mtx);
+    return ch;
+}
+
+void dma_release(dma_channel_t *ch) {
+    xSemaphoreTake(channel_mtx, portMAX_DELAY);
+    for (int i = 0; i < DMA_CHANNEL_COUNT; i++) {
+        if (channels[i] == NULL) {
+            channels[i] = ch;
+            break;
+        }
+    }
+    xSemaphoreGive(channel_mtx);
+    xSemaphoreGive(dma_pool);
+}
+```
+
+`xSemaphoreCreateCounting(max_count, initial_count)`. We set both to 3, meaning the pool starts full. Each `dma_acquire` decrements the count; if all three are out, the next caller blocks. Each `dma_release` increments the count and wakes one waiter.
+
+Notice we needed a mutex (`channel_mtx`) in addition to the semaphore — the counting semaphore tracks *how many* channels are free, but not *which*. The mutex protects the `channels[]` array while we add/remove from it. We will cover mutexes properly in lesson 5; the binary-semaphore-as-mutex shortcut above works for now but is wrong if priority inversion matters.
+
+## A real example: UART RX into a buffer
+
+Putting it together — a useful pattern that appears in every embedded product:
+
+```c
+#define UART_BUF_LEN 128
+
+static uint8_t       rx_buf[UART_BUF_LEN];
+static volatile int  rx_head;       /* ISR writes here */
+static int           rx_tail;       /* task reads here */
+static SemaphoreHandle_t rx_sem;
+
+void USART2_IRQHandler(void) {
+    if (USART2->SR & USART_SR_RXNE) {
+        uint8_t b = USART2->DR;
+        int next = (rx_head + 1) % UART_BUF_LEN;
+        if (next != rx_tail) {
+            rx_buf[rx_head] = b;
+            rx_head = next;
+        } /* else drop on overflow */
+        BaseType_t hp = pdFALSE;
+        xSemaphoreGiveFromISR(rx_sem, &hp);
+        portYIELD_FROM_ISR(hp);
+    }
+}
+
+static void rx_task(void *arg) {
+    (void)arg;
+    while (1) {
+        /* Wait for any RX activity */
+        xSemaphoreTake(rx_sem, portMAX_DELAY);
+        /* Drain everything the ISR has produced */
+        while (rx_tail != rx_head) {
+            uint8_t b = rx_buf[rx_tail];
+            rx_tail = (rx_tail + 1) % UART_BUF_LEN;
+            parse_byte(b);
+        }
+    }
+}
+```
+
+The ring buffer + semaphore split is the canonical pattern. The ISR is short and bounded: read one byte, write it to a ring buffer, give the semaphore. The task drains everything the ISR has produced, then sleeps again. The semaphore is a *signal*, not a counter — even if 10 bytes have arrived, one give wakes the task and the task drains all 10. Counting how many bytes the ISR has written would require a counting semaphore *and* a length variable; using a binary semaphore + ring buffer is simpler and equivalent.
+
+In lesson 6 we will replace this with a `Queue` (which copies items in/out automatically). In lesson 8 we will replace it with a `StreamBuffer` (lock-free, faster). Each is appropriate for a different scenario — but the semaphore version is the right baseline to understand first.
+
+<Callout type="tip" title="Bound your ISR's work">
+The single most important rule for ISR code is: do the minimum, then signal. Reading one byte is fine. Parsing a packet inside the ISR is not — you've turned an interrupt handler into a long critical section that blocks every other ISR and every higher-priority task. Move all the parsing into the task.
+</Callout>
+
+## Common bugs
+
+**Forgetting `portYIELD_FROM_ISR`.** The signal arrives, the task wakes, but the kernel does not context-switch until the next SysTick — adding up to one tick of latency. The bug is silent in slow applications; in tight ones it kills response time.
+
+**Calling the non-FromISR API in an ISR.** `xSemaphoreGive(sem)` from an ISR will assert (under `configASSERT_DEFINED`) because the API takes the wrong kind of critical section. Without the assert, behaviour is undefined — memory corruption, scheduler crash, the works.
+
+**Wrong NVIC priority on the source ISR.** The ISR's NVIC priority must be a numerically *higher* value than `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY` (which is 5 in our config) for the ISR to be allowed to call FreeRTOS APIs. Forgetting this is the source of most "FreeRTOS hard-faults inside a queue API call" bug reports.
+
+**Using a binary semaphore as a mutex.** Don't. Binary semaphores have no owner, no priority inheritance, no recursive behaviour. Lesson 5 covers why this matters and how mutexes fix it.
+
+**Buffer overrun in the ISR ring buffer.** The ring-buffer code above drops bytes silently on overflow. Decide explicitly what your policy is: drop, halt, light a warning LED, increment an error counter. Silent loss of data is a debugging nightmare.
+
+## Exercises
+
+**Exercise 4.1**: Modify the UART RX task to be a "command line" — it accumulates bytes until it sees `\n`, then calls `process_command(buffer, length)`. Where does the buffering happen — in the ISR or in the task? Why?
+
+**Exercise 4.2**: Replace the binary semaphore with a counting semaphore (max 128, initial 0). The ISR gives once per byte. The task takes once per byte. What's different? Which is better and why?
+
+**Exercise 4.3**: Suppose two ISRs (USART1 and USART2) both give the same binary semaphore, and one task waits on it. When the task wakes, how does it know which UART the byte came from?
+
+<Callout type="spec" title="Answer 4.1">
+In the task. The ISR's only job is "byte arrived, put it in the ring buffer, signal." The task drains bytes from the ring buffer and accumulates them into a line buffer; when it sees `\n` it calls `process_command`. Doing the buffering in the ISR would mean the ISR runs longer (every byte takes microseconds of comparison and copy), and would also need an awkward state machine for "still accumulating" vs "complete." Keep the ISR microseconds-short.
+</Callout>
+
+<Callout type="spec" title="Answer 4.2">
+With a counting semaphore, the task takes one byte per `xSemaphoreTake` call, so the loop becomes `while (xSemaphoreTake(sem, 0) == pdTRUE) parse_byte(...)`. It's slightly more code in the task and the semaphore's internal counter does the bookkeeping the ring buffer was doing. The downside: if the task falls behind by more than 127 bytes (the counting semaphore max), gives are dropped, and the counter no longer matches the actual byte count. The binary-semaphore + ring-buffer version is more robust because the ring buffer's overflow is explicit. Counting semaphores work for resource pools; for streaming bytes, prefer the binary-sem + ring-buffer (or stream buffer, lesson 8).
+</Callout>
+
+<Callout type="spec" title="Answer 4.3">
+It doesn't, with one semaphore. Either use two semaphores (one per UART) and two tasks, or use a single queue carrying `(source_uart, byte)` pairs — lesson 6. The semaphore is purely a signal "something happened"; the *what* must be carried in a separate data structure (ring buffer, queue, shared variable). This is why queues become the more common primitive for multi-source events.
+</Callout>
+
+## What you learned
+
+- Binary semaphore: 0 or 1, ISR-to-task signal. `xSemaphoreCreateBinary` starts it at 0.
+- Counting semaphore: 0 to N, useful for resource pools. `xSemaphoreCreateCounting(max, initial)`.
+- `xSemaphoreGiveFromISR` is the ISR-safe variant; the non-suffixed version will assert if called from interrupt context.
+- `portYIELD_FROM_ISR(hp_task_woken)` triggers an immediate context switch when the ISR returns, if a higher-priority task was unblocked.
+- The canonical pattern: ISR + ring buffer + binary semaphore + task. Keep the ISR short, do the parsing in the task.
+- Semaphores have no owner. They're for signalling, not mutual exclusion — that is the next lesson.
+
+## Up next
+
+| Previous | Next |
+|---|---|
+| [Lesson 3 — Tasks](/docs/rtos/tutorial-03-tasks/) | [Lesson 5 — Mutex and priority inheritance](/docs/rtos/tutorial-05-mutex/) |

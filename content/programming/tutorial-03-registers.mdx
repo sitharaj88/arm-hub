@@ -1,0 +1,312 @@
+---
+title: Lesson 3 — Reading hardware registers in C
+description: volatile, memory-mapped I/O, peripheral struct types, atomic single-bit writes via BSRR, and the read-modify-write hazards that bite every embedded engineer.
+order: 5
+updated: 2026-05-13
+tags: [programming, tutorial, c, embedded, registers, volatile, mmio]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 3 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'volatile semantics, peripheral struct types, BSRR for atomic single-bit writes, read-modify-write hazards in shared registers' },
+    { label: 'Code provided', value: 'About 90 lines — a clean GPIO driver header and demo' },
+    { label: 'Time', value: '60-90 minutes' },
+    { label: 'Hardware', value: 'STM32F411 Nucleo (PA5 LED), optional second LED or pushbutton' },
+  ]}
+/>
+
+In lesson 2 we accessed registers through bare `#define` cast pointers. That works, but it does not scale. A real driver needs typed register access, atomic operations where the hardware provides them, and a clear mental model of when a write to a peripheral register actually takes effect. This lesson turns the ad-hoc pointer pokes from lesson 2 into a reusable GPIO driver.
+
+## volatile, finally explained
+
+The single most important keyword in embedded C is `volatile`. Its semantics:
+
+> A `volatile` access in the source becomes exactly one load or store in the emitted machine code. The compiler will not reorder, merge, or elide volatile accesses to the same object.
+
+What that does **not** mean:
+
+- It is not atomic. `vol_reg |= 1` is still load-OR-store on Cortex-M4 — an interrupt between the load and the store can corrupt the result.
+- It is not a memory barrier. Volatile accesses to different objects can be reordered. To order volatile-A with respect to non-volatile-B you need `__DSB()` or compiler barriers (`__asm__ volatile("" ::: "memory")`).
+- It is not magic peripheral synchronisation. Some peripherals require `__DSB()` after a write before the side effect is observable on the bus.
+
+The classic bug, two pointers to the same address:
+
+```c
+uint32_t *const STATUS_A          = (uint32_t *)0x40000000;
+volatile uint32_t *const STATUS_B = (uint32_t *)0x40000000;
+
+while (*STATUS_A & 1) { }    /* may hang forever — read is hoisted out of the loop */
+while (*STATUS_B & 1) { }    /* re-reads every iteration */
+```
+
+GCC with `-O2` will compile the first loop to "load once into a register, then loop on the register". The hardware bit toggling never gets noticed.
+
+Rule of thumb: every pointer to a hardware register is `volatile`. Every variable shared with an ISR is `volatile`. Nothing else is volatile (it just kills optimisation).
+
+## The cast-pointer pattern
+
+The simplest way to access a register:
+
+```c
+#define GPIOA_ODR (*(volatile uint32_t *)0x40020014UL)
+
+GPIOA_ODR |= (1u << 5);
+```
+
+`(volatile uint32_t *)0x40020014UL` is "the address `0x40020014`, treated as a pointer to volatile 32-bit unsigned". The leading `*` dereferences it, so `GPIOA_ODR` is an lvalue you can read or write.
+
+The `UL` suffix prevents the literal from being treated as a signed 32-bit `int`, which would overflow on a 32-bit system in some shift contexts. Always use `UL` (or `u`) for address constants.
+
+## The struct-typed pattern
+
+Each peripheral has dozens of registers at consecutive addresses. Defining each one with its own `#define` is tedious and error-prone. The standard idiom:
+
+```c
+typedef struct {
+    volatile uint32_t MODER;     /* 0x00: mode register                  */
+    volatile uint32_t OTYPER;    /* 0x04: output type                    */
+    volatile uint32_t OSPEEDR;   /* 0x08: output speed                   */
+    volatile uint32_t PUPDR;     /* 0x0C: pull-up/down                   */
+    volatile uint32_t IDR;       /* 0x10: input data register            */
+    volatile uint32_t ODR;       /* 0x14: output data register           */
+    volatile uint32_t BSRR;      /* 0x18: bit set/reset register         */
+    volatile uint32_t LCKR;      /* 0x1C: lock register                  */
+    volatile uint32_t AFR[2];    /* 0x20-0x24: alternate function low/hi */
+} GPIO_TypeDef;
+
+#define GPIOA ((GPIO_TypeDef *)0x40020000UL)
+#define GPIOB ((GPIO_TypeDef *)0x40020400UL)
+#define GPIOC ((GPIO_TypeDef *)0x40020800UL)
+
+GPIOA->ODR |= (1u << 5);
+```
+
+Three things to notice.
+
+**First**, the struct layout exactly mirrors the peripheral's register map. The reference manual lists GPIOx_MODER at offset 0x00, GPIOx_OTYPER at offset 0x04, and so on; the struct fields are in the same order with the same widths. The compiler computes `GPIOA->ODR` as `*(volatile uint32_t *)(0x40020000 + 0x14)` — exactly what we want.
+
+**Second**, `volatile` lives on each field. You could put it on the typedef (`typedef volatile struct { uint32_t MODER; ... } GPIO_TypeDef;`) but the per-field form is clearer and matches the CMSIS convention.
+
+**Third**, every STM32 GPIO port has the same register layout, so one struct type plus three `#define`s gives you typed access to GPIOA, GPIOB, GPIOC. CMSIS uses this pattern for every peripheral.
+
+<Callout type="tip" title="CMSIS headers do this for you">
+The vendor's `stm32f4xx.h` defines `GPIO_TypeDef` and pointers to every GPIO port instance. After this tutorial you can just `#include "stm32f411xe.h"` and skip the struct definitions. We are writing them by hand here so you know exactly what the headers contain — when you read CMSIS source code, it should look completely familiar.
+</Callout>
+
+<RegisterMap
+  name="GPIOx_MODER"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:30', name: 'MODER15', access: 'RW', reset: '0x0', description: 'Pin 15 mode: 00 input, 01 output, 10 alternate function, 11 analog' },
+    { bits: '29:28', name: 'MODER14', access: 'RW', reset: '0x0', description: 'Pin 14 mode' },
+    { bits: '11:10', name: 'MODER5', access: 'RW', reset: '0x0', description: 'Pin 5 mode — this is the field we wrote in lesson 2' },
+    { bits: '1:0',   name: 'MODER0',  access: 'RW', reset: '0x0', description: 'Pin 0 mode' },
+  ]}
+  caption="GPIOx_MODER has 2 bits per pin. To change pin N you must clear bits [2N+1:2N] then write the new value — bare OR is not enough because old bits may be stuck high."
+/>
+
+## Multi-bit field writes
+
+When a register field is 2 or more bits wide, single-bit OR or AND is wrong. You must clear the field, then OR the new value:
+
+```c
+static inline void gpio_set_mode(GPIO_TypeDef *port, uint32_t pin, uint32_t mode) {
+    port->MODER = (port->MODER & ~(0x3u << (pin * 2))) | (mode << (pin * 2));
+}
+
+#define GPIO_MODE_INPUT  0x0
+#define GPIO_MODE_OUTPUT 0x1
+#define GPIO_MODE_AF     0x2
+#define GPIO_MODE_ANALOG 0x3
+```
+
+Each `MODER` field is 2 bits wide, so the mask is `0x3` shifted to position `pin * 2`. If you skip the clear step and only OR, then transitioning from analog (`0b11`) to output (`0b01`) leaves the high bit set, giving you alternate function (`0b11 & 0b01 → 0b11` after `|=`, oops — actually `0b11 | 0b01 = 0b11`, you stay in analog). The clear-then-OR pattern is the canonical idiom for any multi-bit register field.
+
+## BSRR — atomic single-bit set and reset
+
+The read-modify-write pattern from lesson 2 (`ODR |= bit`) has a race: load ODR, modify the bit, store back. If an interrupt fires between the load and the store and modifies a *different* bit of ODR, your store will overwrite the interrupt's change.
+
+ARM solved this by providing **BSRR** (Bit Set/Reset Register) on every GPIO port. The register is 32 bits:
+
+- Bits 0..15 (set bits) — writing 1 to bit N sets ODR bit N. Writing 0 has no effect.
+- Bits 16..31 (reset bits) — writing 1 to bit (N+16) clears ODR bit N. Writing 0 has no effect.
+
+So a write to BSRR is atomic: one store instruction, no read. The hardware ignores the bits you wrote 0 to, so you can set bit 5 with `GPIOA->BSRR = (1u << 5)` without disturbing any other bit.
+
+```c
+static inline void gpio_set(GPIO_TypeDef *port, uint32_t pin)   { port->BSRR = (1u << pin); }
+static inline void gpio_clear(GPIO_TypeDef *port, uint32_t pin) { port->BSRR = (1u << (pin + 16)); }
+static inline void gpio_write(GPIO_TypeDef *port, uint32_t pin, bool high) {
+    port->BSRR = high ? (1u << pin) : (1u << (pin + 16));
+}
+```
+
+No volatile-load. No read. Just a write. **This is the only correct way to set or clear a single GPIO bit from a context where another context might also write the same port.** If ISR1 sets PA5 via BSRR and ISR2 simultaneously sets PA6 via BSRR, both writes succeed and both bits become 1.
+
+For toggling, BSRR cannot help — toggle needs a read. Either accept the read-modify-write race (fine when only one context touches ODR) or use a separate "current state" variable plus BSRR.
+
+<Callout type="warn" title="If both set and reset bits are 1 simultaneously, set wins">
+On STM32 GPIOs, writing `(1<<5) | (1<<(5+16))` results in PA5 being set, not cleared. The set field has priority. Other vendors implement this differently — check your reference manual if you ever depend on the behaviour. Better: never write both at once.
+</Callout>
+
+## A clean GPIO driver
+
+Putting it together:
+
+```c
+/* gpio.h */
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+
+typedef struct {
+    volatile uint32_t MODER;
+    volatile uint32_t OTYPER;
+    volatile uint32_t OSPEEDR;
+    volatile uint32_t PUPDR;
+    volatile uint32_t IDR;
+    volatile uint32_t ODR;
+    volatile uint32_t BSRR;
+    volatile uint32_t LCKR;
+    volatile uint32_t AFR[2];
+} GPIO_TypeDef;
+
+#define GPIOA ((GPIO_TypeDef *)0x40020000UL)
+#define GPIOB ((GPIO_TypeDef *)0x40020400UL)
+#define GPIOC ((GPIO_TypeDef *)0x40020800UL)
+
+typedef enum { GPIO_INPUT, GPIO_OUTPUT, GPIO_AF, GPIO_ANALOG } gpio_mode_t;
+typedef enum { GPIO_NOPULL, GPIO_PULLUP, GPIO_PULLDOWN } gpio_pull_t;
+
+static inline void gpio_mode(GPIO_TypeDef *port, uint32_t pin, gpio_mode_t mode) {
+    port->MODER = (port->MODER & ~(0x3u << (pin * 2))) | ((uint32_t)mode << (pin * 2));
+}
+
+static inline void gpio_pull(GPIO_TypeDef *port, uint32_t pin, gpio_pull_t pull) {
+    port->PUPDR = (port->PUPDR & ~(0x3u << (pin * 2))) | ((uint32_t)pull << (pin * 2));
+}
+
+static inline void gpio_set(GPIO_TypeDef *port, uint32_t pin)   { port->BSRR = (1u << pin); }
+static inline void gpio_clear(GPIO_TypeDef *port, uint32_t pin) { port->BSRR = (1u << (pin + 16)); }
+static inline void gpio_write(GPIO_TypeDef *port, uint32_t pin, bool high) {
+    port->BSRR = high ? (1u << pin) : (1u << (pin + 16));
+}
+static inline bool gpio_read(GPIO_TypeDef *port, uint32_t pin) {
+    return (port->IDR & (1u << pin)) != 0;
+}
+static inline void gpio_toggle(GPIO_TypeDef *port, uint32_t pin) {
+    port->ODR ^= (1u << pin);   /* not atomic — caller's responsibility */
+}
+```
+
+```c
+/* main.c, using the driver */
+#include "gpio.h"
+
+#define RCC_AHB1ENR (*(volatile uint32_t *)0x40023830UL)
+
+static void delay(volatile uint32_t n) {
+    while (n--) { __asm__ volatile("nop"); }
+}
+
+int main(void) {
+    RCC_AHB1ENR |= (1u << 0);             /* enable GPIOA clock */
+    gpio_mode(GPIOA, 5, GPIO_OUTPUT);
+    gpio_mode(GPIOC, 13, GPIO_INPUT);     /* user button on F411 Nucleo */
+    gpio_pull(GPIOC, 13, GPIO_PULLUP);    /* idle high, pressed → low */
+
+    while (1) {
+        bool pressed = !gpio_read(GPIOC, 13);
+        gpio_write(GPIOA, 5, pressed);    /* LED follows button */
+        delay(1000);
+    }
+}
+```
+
+This is the same kind of driver layer that ships in production firmware — a thin set of inline functions that wrap the raw register accesses with clear names and types. No HAL needed, no per-pin "handle" struct, no overhead. The inlines compile to the same machine code as the raw register pokes.
+
+## Read-modify-write hazards on shared registers
+
+What if two pieces of code, in two different contexts, both want to set bits in the same register?
+
+```c
+/* Main code */
+GPIOA->MODER |= (1u << 10);    /* set PA5 to output */
+
+/* IRQ that fires between the load and the store */
+void TIM2_IRQHandler(void) {
+    GPIOA->MODER |= (1u << 12);    /* set PA6 to output */
+}
+```
+
+If the timer IRQ fires between the load of MODER and the store back in main, the IRQ's modification to bit 12 will be overwritten when main stores its (older) value of MODER.
+
+Three solutions, in order of preference:
+
+1. **Initialise once at boot, never modify from ISRs.** If MODER never changes after `main()`'s setup, there's nothing to race on.
+2. **Use a dedicated atomic-write register if the hardware provides one.** BSRR for ODR is one example. Some peripherals also have set/clear pairs (e.g., NVIC `ISER`/`ICER`).
+3. **Disable interrupts around the read-modify-write.** `__disable_irq()` ... `__enable_irq()` brackets the unsafe section. Cheap on Cortex-M (one instruction each) but stops all interrupts including high-priority ones.
+
+```c
+#include <cmsis_gcc.h>
+uint32_t pri = __get_PRIMASK();
+__disable_irq();
+GPIOA->MODER |= (1u << 10);
+__set_PRIMASK(pri);
+```
+
+The save-and-restore pattern allows the function to be called from contexts that already have interrupts disabled without re-enabling them.
+
+<Callout type="note" title="MODER and other config registers are usually safe">
+In practice you configure MODER, PUPDR, AFR once at startup before any ISRs are enabled. The race only matters for runtime modification of shared bitfield registers, which is rare for GPIO and common for clock-control registers like RCC_AHB1ENR.
+</Callout>
+
+## Exercises
+
+**Exercise 3.1.** Rewrite the lesson 2 blink program using the GPIO driver header. How many lines is `main()` now?
+
+<Callout type="spec" title="Answer">
+About 6 lines: enable clock, configure pin, then a loop that calls `gpio_toggle` and `delay`. Compare to the 15-line version from lesson 2. Cleaner, but identical machine code — the inline functions compile to the same loads and stores.
+</Callout>
+
+**Exercise 3.2.** Make `gpio_toggle` atomic without using `__disable_irq`. Hint: BSRR plus a software shadow of the pin state.
+
+<Callout type="spec" title="Answer">
+Keep a `static bool` per pin tracking its current state, and atomically flip via BSRR:
+
+```c
+static bool pin_state[16];
+static inline void gpio_toggle_atomic(GPIO_TypeDef *port, uint32_t pin) {
+    bool new_state = !pin_state[pin];
+    pin_state[pin] = new_state;
+    port->BSRR = new_state ? (1u << pin) : (1u << (pin + 16));
+}
+```
+
+There is still a race on `pin_state[pin]` itself if two contexts call this for the same pin. The honest answer: GPIO toggle from multiple contexts is rare; if you really need it, disable IRQs. Most real designs assign a pin to a single owning context.
+</Callout>
+
+**Exercise 3.3.** Disassemble `gpio_write` after compiling with `-O2`. How many instructions does it take?
+
+<Callout type="spec" title="Answer">
+Two: a conditional move to pick the BSRR value (`(1<<pin)` or `(1<<(pin+16))`) and a store to BSRR. With `pin` known at compile time, GCC folds the shift into an immediate and `gpio_write(GPIOA, 5, true)` becomes literally `movs r0, #32; str r0, [r1]`. This is why thin inline wrappers do not cost anything.
+</Callout>
+
+## What you learned
+
+- `volatile` keeps the compiler from caching or eliding memory-mapped accesses; it is *not* atomic and *not* a barrier.
+- Peripheral structs (one `volatile uint32_t` per register, in offset order) give you typed access with no overhead.
+- Multi-bit field writes need clear-then-OR; bare OR leaves stale bits set.
+- BSRR provides atomic single-bit set and clear without a read.
+- Read-modify-write on shared registers needs `__disable_irq()` brackets if more than one context can write.
+
+In lesson 4 we map the Cortex-M memory layout in detail — flash, SRAM, peripheral, system regions — and look at how the linker creates the `_etext`, `_sdata`, `_edata`, `_sbss`, `_ebss` symbols our startup code depends on.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 2 — Your first blink, no HAL](/docs/programming/tutorial-02-bare-metal/) | [Lesson 4 — Memory layout](/docs/programming/tutorial-04-memory-map/) |

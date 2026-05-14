@@ -1,0 +1,512 @@
+---
+title: Lesson 9 — State machines that survive
+description: Switch-case FSMs, function-pointer-table FSMs, hierarchical state machines. A real UART command parser that dispatches LED ON / LED OFF / BLINK 5.
+order: 11
+updated: 2026-05-13
+tags: [programming, tutorial, c, embedded, state-machine, fsm]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 9 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Switch-case FSM, function-pointer-table FSM, hierarchical FSMs, integrating an FSM with interrupts and a tick' },
+    { label: 'Code provided', value: 'About 150 lines — a full UART command parser FSM' },
+    { label: 'Time', value: '75-90 minutes' },
+    { label: 'Hardware', value: 'STM32F411 Nucleo with USART2 wired to the ST-Link virtual COM' },
+  ]}
+/>
+
+Most firmware is, structurally, a collection of state machines. The UART receiver is a state machine (idle, receiving header, receiving payload, receiving CRC). The button handler is a state machine (released, pressed, held, repeating). The motor controller is a state machine (off, accelerating, running, decelerating, fault). Recognising this and writing state machines explicitly — rather than letting them sprawl as nested booleans and counters — is the single biggest leap in code quality.
+
+This lesson covers three patterns, with a working UART command parser as the running example.
+
+## The pattern that fails: implicit state
+
+Bad firmware looks like this:
+
+```c
+bool receiving = false;
+bool got_header = false;
+int byte_count = 0;
+uint8_t buf[64];
+
+void on_byte(uint8_t b) {
+    if (!receiving && b == 0xA5) {
+        receiving = true;
+        got_header = true;
+        byte_count = 0;
+    } else if (receiving && got_header) {
+        buf[byte_count++] = b;
+        if (byte_count == 5) {
+            // ... process
+            receiving = false;
+            got_header = false;
+        }
+    }
+}
+```
+
+Four boolean and counter variables, mutual dependencies, no explicit notion of "what state are we in". When you need to add a "wait for ACK" phase, you add another bool. After three rounds of this the function is unreadable and bug-prone.
+
+## Pattern 1: switch-case FSM
+
+The canonical embedded state machine:
+
+```c
+typedef enum {
+    PARSE_IDLE,
+    PARSE_HEADER,
+    PARSE_LEN,
+    PARSE_DATA,
+    PARSE_CRC,
+} parse_state_t;
+
+static parse_state_t parse_state = PARSE_IDLE;
+static uint8_t parse_buf[64];
+static uint8_t parse_len;
+static uint8_t parse_idx;
+
+void parser_on_byte(uint8_t b) {
+    switch (parse_state) {
+    case PARSE_IDLE:
+        if (b == 0xA5) parse_state = PARSE_HEADER;
+        break;
+
+    case PARSE_HEADER:
+        parse_buf[0] = b;       /* command byte */
+        parse_state = PARSE_LEN;
+        break;
+
+    case PARSE_LEN:
+        parse_len = b;
+        if (parse_len > sizeof(parse_buf) - 2) {
+            parse_state = PARSE_IDLE;   /* invalid, restart */
+            break;
+        }
+        parse_idx = 0;
+        parse_state = parse_len ? PARSE_DATA : PARSE_CRC;
+        break;
+
+    case PARSE_DATA:
+        parse_buf[parse_idx + 1] = b;
+        parse_idx++;
+        if (parse_idx == parse_len) parse_state = PARSE_CRC;
+        break;
+
+    case PARSE_CRC:
+        if (b == crc8(parse_buf, parse_len + 1)) {
+            handle_packet(parse_buf, parse_len + 1);
+        }
+        parse_state = PARSE_IDLE;
+        break;
+    }
+}
+```
+
+Reads top-to-bottom in execution order. Every state's transitions are visible at a glance. Adding a new state is a single case plus a transition from somewhere else.
+
+Coding rules that keep switch-case FSMs healthy:
+
+1. **One enum, one variable.** `parse_state` is the only state container. All "secondary" data (`parse_buf`, `parse_len`, `parse_idx`) is *associated* with the current state but not part of it.
+2. **Every case ends with `break` or an explicit transition.** Fallthrough is a code smell here.
+3. **Default case logs and resets.** If you somehow get to an undefined state value (memory corruption, ESD strike), default returns to IDLE.
+4. **Log every transition during development.** A `printf("FSM: %s → %s\n", old, new);` line in a wrapper around `parse_state = ...;` is invaluable for debugging.
+
+<Callout type="tip" title="Make transitions a function">
+For non-trivial FSMs, write a single transition function:
+
+```c
+static void parse_transition(parse_state_t next) {
+    /* optional: log, validate, run on-exit actions */
+    parse_state = next;
+}
+```
+
+Now every transition is funnelled through one place. You can add logging, instrumentation, or invariant checks in one spot. Worth it for FSMs with more than five states.
+</Callout>
+
+## Pattern 2: function-pointer table
+
+For state machines where the per-state code is large, switch cases get unwieldy. Move each state to its own function and dispatch via a table:
+
+```c
+typedef parse_state_t (*state_handler_t)(uint8_t byte);
+
+static parse_state_t handle_idle(uint8_t b) {
+    return (b == 0xA5) ? PARSE_HEADER : PARSE_IDLE;
+}
+
+static parse_state_t handle_header(uint8_t b) {
+    parse_buf[0] = b;
+    return PARSE_LEN;
+}
+
+static parse_state_t handle_len(uint8_t b) {
+    if (b > sizeof(parse_buf) - 2) return PARSE_IDLE;
+    parse_len = b;
+    parse_idx = 0;
+    return parse_len ? PARSE_DATA : PARSE_CRC;
+}
+
+/* ... handle_data, handle_crc ... */
+
+static const state_handler_t state_table[] = {
+    [PARSE_IDLE]   = handle_idle,
+    [PARSE_HEADER] = handle_header,
+    [PARSE_LEN]    = handle_len,
+    [PARSE_DATA]   = handle_data,
+    [PARSE_CRC]    = handle_crc,
+};
+
+void parser_on_byte(uint8_t b) {
+    parse_state = state_table[parse_state](b);
+}
+```
+
+Three advantages:
+
+1. **Each state is a separately-testable unit.** You can unit-test `handle_len` without spinning up the whole FSM.
+2. **The dispatch is one indirect call.** Roughly the same speed as a switch with 8+ cases on Cortex-M.
+3. **The table can be const, living in flash.** No RAM cost beyond the state variable.
+
+The trade-off is that the *whole-system view* is in the table, not in the code. For a small FSM the switch form is easier to read; for a large FSM the table form scales better.
+
+C99 designated initialisers (`[PARSE_IDLE] = handle_idle`) are essential — they make the table self-documenting and resistant to enum reordering.
+
+## Pattern 3: hierarchical state machines
+
+Some systems have a state hierarchy: while in `RUNNING`, there are sub-states `RUNNING_NORMAL`, `RUNNING_OVERHEATING`, `RUNNING_THROTTLED`. While in `STOPPED`, there are sub-states `STOPPED_IDLE`, `STOPPED_FAULT`. Many events are handled at the parent level — `STOP_BUTTON_PRESSED` always transitions to `STOPPED` from any sub-state of `RUNNING`.
+
+The pattern:
+
+```c
+typedef enum {
+    /* Parent: STOPPED */
+    STOPPED_IDLE,
+    STOPPED_FAULT,
+    /* Parent: RUNNING */
+    RUNNING_NORMAL,
+    RUNNING_OVERHEATING,
+    RUNNING_THROTTLED,
+} state_t;
+
+static state_t state = STOPPED_IDLE;
+
+static bool is_running(state_t s) {
+    return s == RUNNING_NORMAL || s == RUNNING_OVERHEATING || s == RUNNING_THROTTLED;
+}
+
+void on_event(event_t e) {
+    /* Parent-level: handle events that apply to any sub-state */
+    if (e == EV_STOP_BUTTON) {
+        state = STOPPED_IDLE;
+        return;
+    }
+    if (e == EV_TEMP_CRITICAL && is_running(state)) {
+        state = RUNNING_OVERHEATING;
+        return;
+    }
+
+    /* Sub-state-level: switch on the leaf state */
+    switch (state) {
+    case STOPPED_IDLE:
+        if (e == EV_START_BUTTON) state = RUNNING_NORMAL;
+        break;
+    case RUNNING_NORMAL:
+        if (e == EV_TEMP_HIGH) state = RUNNING_THROTTLED;
+        break;
+    /* ... */
+    }
+}
+```
+
+Hierarchical state machines reduce duplication. Without the hierarchy, every running sub-state would need its own copy of "if STOP_BUTTON, go to STOPPED". With it, the rule is written once.
+
+For large hierarchies (audio codec firmware, USB stacks), formal HSM frameworks like QP/C or Miro Samek's QM tool are worth it. For most firmware, the manual two-level pattern above is enough.
+
+## A complete UART command parser
+
+Let us put it all together: a parser that reads ASCII commands like `LED ON\n`, `LED OFF\n`, `BLINK 5\n` from the UART and dispatches actions.
+
+```c
+#include <stdint.h>
+#include <string.h>
+#include "gpio.h"
+
+#define CMD_BUF_SIZE 32
+static char cmd_buf[CMD_BUF_SIZE];
+static size_t cmd_len;
+
+typedef enum {
+    CMD_IDLE,         /* waiting for first character */
+    CMD_COLLECTING,   /* collecting bytes until \n */
+    CMD_OVERFLOW,     /* line too long, drop until \n */
+} cmd_state_t;
+
+static cmd_state_t cmd_state = CMD_IDLE;
+
+/* Forward declaration */
+static void dispatch_command(const char *line);
+
+void cmd_on_byte(uint8_t b) {
+    switch (cmd_state) {
+    case CMD_IDLE:
+        if (b == '\n' || b == '\r') return;   /* ignore stray line endings */
+        cmd_len = 0;
+        cmd_buf[cmd_len++] = (char)b;
+        cmd_state = CMD_COLLECTING;
+        break;
+
+    case CMD_COLLECTING:
+        if (b == '\n' || b == '\r') {
+            cmd_buf[cmd_len] = '\0';
+            dispatch_command(cmd_buf);
+            cmd_state = CMD_IDLE;
+            return;
+        }
+        if (cmd_len >= CMD_BUF_SIZE - 1) {
+            cmd_state = CMD_OVERFLOW;
+            return;
+        }
+        cmd_buf[cmd_len++] = (char)b;
+        break;
+
+    case CMD_OVERFLOW:
+        if (b == '\n' || b == '\r') {
+            cmd_state = CMD_IDLE;
+        }
+        break;
+    }
+}
+
+/* Action handlers */
+static void cmd_led_on(const char *args)  { (void)args; gpio_set(GPIOA, 5); }
+static void cmd_led_off(const char *args) { (void)args; gpio_clear(GPIOA, 5); }
+static void cmd_blink(const char *args) {
+    int n = atoi(args);
+    if (n < 1 || n > 20) return;
+    for (int i = 0; i < n; i++) {
+        gpio_set(GPIOA, 5);
+        delay_ms(100);
+        gpio_clear(GPIOA, 5);
+        delay_ms(100);
+    }
+}
+static void cmd_help(const char *args) {
+    (void)args;
+    uart_write("Commands: LED ON, LED OFF, BLINK n, HELP\r\n");
+}
+
+/* Command dispatch table */
+typedef void (*cmd_handler_t)(const char *args);
+typedef struct {
+    const char    *name;
+    cmd_handler_t  handler;
+} cmd_entry_t;
+
+static const cmd_entry_t cmd_table[] = {
+    { "LED ON",  cmd_led_on  },
+    { "LED OFF", cmd_led_off },
+    { "BLINK",   cmd_blink   },
+    { "HELP",    cmd_help    },
+    { NULL,      NULL        },
+};
+
+static void dispatch_command(const char *line) {
+    for (const cmd_entry_t *e = cmd_table; e->name; e++) {
+        size_t n = strlen(e->name);
+        if (strncmp(line, e->name, n) == 0) {
+            const char *args = line + n;
+            while (*args == ' ') args++;   /* skip whitespace */
+            e->handler(args);
+            return;
+        }
+    }
+    uart_write("Unknown command\r\n");
+}
+```
+
+This is the architecture of a production CLI. Three explicit states, a dispatch table, separate per-command handlers. Adding a new command is a four-line patch: a function plus a table entry.
+
+<Callout type="warn" title="Why CMD_OVERFLOW is its own state">
+You could handle overflow inside CMD_COLLECTING with a "is_overflowing" flag. But then every iteration of the main parse loop has to check both `cmd_state` and `is_overflowing`. The explicit state CMD_OVERFLOW says "drop bytes until newline, then go back to idle" without any extra flag. Every behavioural mode deserves its own enum value.
+</Callout>
+
+## Connecting the FSM to interrupts and the tick
+
+Real systems have multiple FSMs running concurrently — the UART parser, a button debouncer, an LED animator. The clean pattern: each FSM gets one input function and runs in main loop time, *not* in the ISR.
+
+```c
+/* USART2 RX ISR — drops bytes into a ring buffer, nothing else */
+volatile uint8_t  rx_ring[64];
+volatile uint32_t rx_head, rx_tail;
+
+void USART2_IRQHandler(void) {
+    if (USART2->SR & USART_SR_RXNE) {
+        uint8_t b = USART2->DR;
+        uint32_t next = (rx_head + 1) & 63;   /* power-of-two size, mask is free */
+        if (next != rx_tail) {
+            rx_ring[rx_head] = b;
+            rx_head = next;
+        }
+        /* If full, byte is dropped — handler stays fast */
+    }
+}
+
+/* Main loop — drains the ring buffer through the FSM */
+int main(void) {
+    /* ... init ... */
+    while (1) {
+        while (rx_head != rx_tail) {
+            uint8_t b = rx_ring[rx_tail];
+            rx_tail = (rx_tail + 1) & 63;
+            cmd_on_byte(b);
+        }
+        /* other periodic work */
+    }
+}
+```
+
+The ISR is six lines and runs in a handful of cycles. The FSM lives in main, where it can take milliseconds to run a long command without blocking other interrupts.
+
+For periodic events (debouncing, animations), drive the FSM from a SysTick-derived tick:
+
+```c
+static uint32_t last_tick;
+
+while (1) {
+    /* RX byte handling */
+
+    if (millis() - last_tick >= 10) {   /* 10 ms tick */
+        last_tick += 10;
+        button_fsm_tick();
+        led_fsm_tick();
+    }
+}
+```
+
+The `+= 10` (rather than `= millis()`) means a slow main loop will not lose ticks — if you took 25 ms to process a byte, the next two ticks will fire immediately on consecutive iterations.
+
+## Debugging FSMs
+
+When an FSM misbehaves:
+
+1. **Log every transition.** A circular buffer of `(timestamp, from_state, to_state, trigger)` tuples is gold. Dump it on fault or via a debug command.
+2. **Make state visible in the debugger.** A `volatile parse_state_t parse_state` shows up directly in the watch window. Inspect every state variable at every breakpoint.
+3. **Add invariant checks.** If `CMD_COLLECTING` requires `cmd_len > 0`, write a `assert(cmd_len > 0)` at the top of that case. ASSERT macros mapped to `__BKPT(0)` are excellent — they stop the debugger exactly when the invariant fails.
+4. **Test transitions explicitly.** A unit test that drives `cmd_on_byte` with a fixed sequence of bytes and checks `cmd_state` at each step catches regressions early.
+
+<Callout type="tip" title="Visualise with StateDiagram blocks">
+For non-trivial FSMs, draw the state diagram. The act of drawing reveals impossible transitions and missing edges. Several of the bugs in my career were caught by drawing the FSM after writing it.
+</Callout>
+
+## Exercises
+
+**Exercise 9.1.** Add a `STATUS` command that prints uptime in seconds. You need access to the SysTick counter from lesson 6.
+
+<Callout type="spec" title="Answer">
+
+```c
+static void cmd_status(const char *args) {
+    (void)args;
+    char buf[32];
+    uint32_t uptime_sec = systick_ms / 1000;
+    int n = snprintf(buf, sizeof(buf), "Uptime: %lu s\r\n", (unsigned long)uptime_sec);
+    if (n > 0) uart_write_n(buf, (size_t)n);
+}
+```
+
+Plus a `{"STATUS", cmd_status}` entry in `cmd_table`. The casts to `unsigned long` keep `%lu` correct across platforms. On STM32F4 `uint32_t` is `unsigned int`, but `%lu` is portable to platforms where it is not.
+</Callout>
+
+**Exercise 9.2.** Convert the command parser to use the function-pointer-table FSM pattern. Each state becomes a function returning the next state.
+
+<Callout type="spec" title="Answer">
+
+```c
+typedef cmd_state_t (*cmd_state_fn_t)(uint8_t);
+
+static cmd_state_t s_idle(uint8_t b) {
+    if (b == '\n' || b == '\r') return CMD_IDLE;
+    cmd_len = 0;
+    cmd_buf[cmd_len++] = (char)b;
+    return CMD_COLLECTING;
+}
+
+static cmd_state_t s_collect(uint8_t b) {
+    if (b == '\n' || b == '\r') {
+        cmd_buf[cmd_len] = '\0';
+        dispatch_command(cmd_buf);
+        return CMD_IDLE;
+    }
+    if (cmd_len >= CMD_BUF_SIZE - 1) return CMD_OVERFLOW;
+    cmd_buf[cmd_len++] = (char)b;
+    return CMD_COLLECTING;
+}
+
+static cmd_state_t s_overflow(uint8_t b) {
+    return (b == '\n' || b == '\r') ? CMD_IDLE : CMD_OVERFLOW;
+}
+
+static const cmd_state_fn_t cmd_states[] = {
+    [CMD_IDLE]       = s_idle,
+    [CMD_COLLECTING] = s_collect,
+    [CMD_OVERFLOW]   = s_overflow,
+};
+
+void cmd_on_byte(uint8_t b) {
+    cmd_state = cmd_states[cmd_state](b);
+}
+```
+
+Same behaviour, separately-testable handlers, fits the pattern from earlier in this lesson.
+</Callout>
+
+**Exercise 9.3.** Add a hierarchical layer: an outer "AUTHENTICATED / UNAUTHENTICATED" mode. Most commands require authentication. Add `LOGIN <password>` and `LOGOUT` commands. Where in the FSM does the auth check live?
+
+<Callout type="spec" title="Answer">
+Auth is a parent-level state. The cleanest place to check is *in `dispatch_command`*, before walking the command table:
+
+```c
+static bool authenticated = false;
+
+static void dispatch_command(const char *line) {
+    /* Always allow LOGIN and HELP */
+    if (strncmp(line, "LOGIN ", 6) == 0) {
+        authenticated = strcmp(line + 6, "secret123") == 0;
+        uart_write(authenticated ? "OK\r\n" : "FAIL\r\n");
+        return;
+    }
+    if (strcmp(line, "LOGOUT") == 0) {
+        authenticated = false;
+        uart_write("Logged out\r\n");
+        return;
+    }
+    if (!authenticated) {
+        uart_write("Login required\r\n");
+        return;
+    }
+    /* Normal dispatch */
+    for (const cmd_entry_t *e = cmd_table; e->name; e++) { /* ... */ }
+}
+```
+
+The parser FSM stays the same (it just collects bytes). The hierarchy lives one level up. This separation — input parsing FSM at the bottom, business-logic FSM above — is the right factoring for nearly every protocol.
+</Callout>
+
+## What you learned
+
+- Implicit state (loose booleans) does not scale; explicit enums plus a single state variable do.
+- Switch-case FSM is the default; function-pointer-table FSM scales better with state count.
+- Hierarchical state machines reduce duplication when many events apply to multiple sub-states.
+- Drop bytes into a ring buffer in the ISR; drain through the FSM in main.
+- Log transitions during development; make state visible in the debugger.
+
+In lesson 10 we deepen the ring buffer and combine it with DMA — the production-grade pattern that lets the CPU sleep while data flows.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 8 — Fixed-point math](/docs/programming/tutorial-08-fixed-point/) | [Lesson 10 — Ring buffers and DMA-driven UART](/docs/programming/tutorial-10-ringbuffer-dma/) |

@@ -1,0 +1,385 @@
+---
+title: Lesson 7 — Bit manipulation patterns
+description: Set, clear, toggle. Multi-bit fields. Sign extension. __builtin_clz, __builtin_popcount, __builtin_ctz. __REV. Saturate-add DSP intrinsics on Cortex-M4F.
+order: 9
+updated: 2026-05-13
+tags: [programming, tutorial, c, embedded, bits, dsp]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 7 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Idiomatic bit manipulation, sign extension, GCC builtins for clz/popcount/ctz, endianness swap via __REV, saturating arithmetic via Cortex-M4F DSP intrinsics' },
+    { label: 'Code provided', value: 'About 100 lines of small focused examples' },
+    { label: 'Time', value: '60-75 minutes' },
+    { label: 'Hardware', value: 'STM32F411 Nucleo or any Cortex-M4 board' },
+  ]}
+/>
+
+Embedded code is dense with bit work. Every peripheral register has named bitfields. Every wire protocol packs flags into bytes. Every fast lookup needs popcount or log2. This lesson catalogues the patterns you will type a thousand times, plus the GCC builtins and Cortex-M4 DSP intrinsics that make them fast.
+
+## The four basic operations
+
+```c
+reg |=  (1u << n);   /* set bit n */
+reg &= ~(1u << n);   /* clear bit n */
+reg ^=  (1u << n);   /* toggle bit n */
+if (reg & (1u << n)) { ... }   /* test bit n */
+```
+
+A few details that matter:
+
+- **Always use `1u`** not `1`. The default `int` is signed; shifting `1 << 31` is undefined behaviour. `1u << 31 = 0x80000000` cleanly.
+- **For 64-bit values use `1ULL`** — same reason, scaled up.
+- **`&= ~` clears, not `|= ~`** — a common typo that silently sets every bit except the one you wanted to clear.
+- **`<<` has higher precedence than `|`**, so `1u << n | 1u << m` works as expected without parens. But add parens anyway, for the next reader.
+
+## Multi-bit field write
+
+Already covered in lesson 3, but worth restating:
+
+```c
+#define USART_BRR_DIV_Mantissa_Pos  4
+#define USART_BRR_DIV_Mantissa_Msk  (0xFFFu << USART_BRR_DIV_Mantissa_Pos)
+
+USART2->BRR = (USART2->BRR & ~USART_BRR_DIV_Mantissa_Msk)
+            | ((mantissa & 0xFFFu) << USART_BRR_DIV_Mantissa_Pos);
+```
+
+Clear the field, then OR the new value. The `& 0xFFFu` on the new value is defensive — if the caller passes a value bigger than the field can hold, we mask it to the field width rather than letting it leak into adjacent fields.
+
+CMSIS provides `_Pos` (position) and `_Msk` (mask) macros for every documented bitfield. Use them; they document the layout and survive silicon revisions.
+
+## Sign extension from N bits
+
+ADC results are usually unsigned 12-bit values. CAN ID lengths vary. Sometimes you have a value packed into fewer bits than `int` and you need its signed interpretation.
+
+For an N-bit two's-complement value packed in the low bits of a larger word:
+
+```c
+int32_t sign_extend(uint32_t x, unsigned n) {
+    uint32_t shift = 32 - n;
+    return (int32_t)(x << shift) >> shift;   /* arithmetic shift right */
+}
+```
+
+The trick: left-shift the value so its top bit is in bit 31, then right-shift as a signed `int32_t`, which is implementation-defined as arithmetic shift on GCC for ARM. The sign bit replicates.
+
+GCC also provides a builtin that compiles to a single `SBFX` (signed bitfield extract) instruction on Cortex-M3+:
+
+```c
+int32_t v = __builtin_sbfx(packed, position, width);   /* not standard; ARM-specific */
+```
+
+Most code uses the shift-shift idiom — it is portable and GCC optimises it to the same instruction.
+
+## Fast log2 with __builtin_clz
+
+`__builtin_clz(x)` returns the count of leading zero bits in `x`. On Cortex-M3+ it compiles to a single `CLZ` instruction (1 cycle).
+
+Uses:
+
+```c
+/* Integer log2 (floor) */
+static inline uint32_t ilog2(uint32_t x) {
+    return 31 - __builtin_clz(x);    /* undefined for x = 0 */
+}
+
+/* Next power of two >= x */
+static inline uint32_t next_pow2(uint32_t x) {
+    return x <= 1 ? 1 : 1u << (32 - __builtin_clz(x - 1));
+}
+
+/* Find highest set bit */
+static inline int highest_bit(uint32_t x) {
+    return x ? 31 - __builtin_clz(x) : -1;
+}
+```
+
+`__builtin_clz(0)` is undefined behaviour. Always guard.
+
+GCC also provides `__builtin_clzl` and `__builtin_clzll` for `long` and `long long`. On Cortex-M, `long` is 32-bit so `clzl` is identical; `clzll` operates on 64-bit and compiles to a small sequence using `CLZ`.
+
+## __builtin_popcount and __builtin_ctz
+
+`__builtin_popcount(x)` counts set bits. Useful for Hamming distance, weight computations, set-cardinality.
+
+On Cortex-M4 there is no native popcount instruction, so GCC emits a portable bit-counting sequence (8-12 instructions). On Cortex-M55 with Helium, there is a real instruction.
+
+`__builtin_ctz(x)` counts trailing zeros — finds the lowest set bit. Useful for iterating over bits in a bitmask:
+
+```c
+uint32_t mask = ...;
+while (mask) {
+    int bit = __builtin_ctz(mask);
+    do_something(bit);
+    mask &= mask - 1;     /* clear the lowest set bit */
+}
+```
+
+`mask & (mask - 1)` is the classic "clear lowest set bit" idiom. Combined with `__builtin_ctz`, you iterate set bits in O(popcount) time without scanning every bit position.
+
+<Callout type="tip" title="GCC builtins for everything bit-related">
+`__builtin_clz`, `__builtin_ctz`, `__builtin_popcount`, `__builtin_parity`, `__builtin_bswap16/32/64`. These map to single instructions on Cortex-M where available, and to optimal portable sequences elsewhere. Use them instead of hand-rolled loops.
+</Callout>
+
+## Endianness swap with __REV / __REV16
+
+ARM is little-endian by default. Network and many wire protocols (CAN, Modbus, Ethernet) are big-endian. Cortex-M provides single-instruction byte-reverse:
+
+```c
+#include <cmsis_gcc.h>
+
+uint32_t be = __REV(le);     /* swap 4 bytes */
+uint32_t be16 = __REV16(le); /* swap each halfword */
+int16_t  sbe = __REVSH(le);  /* swap low halfword, sign-extend */
+```
+
+Or with GCC builtins (portable):
+
+```c
+uint32_t be = __builtin_bswap32(le);
+uint16_t be = __builtin_bswap16(le);
+```
+
+Both compile to the `REV` / `REV16` instruction on Cortex-M3+. One cycle each.
+
+## Saturating arithmetic on Cortex-M4F
+
+Cortex-M4 has DSP extensions: saturating add and subtract, packed-byte arithmetic, multiply-and-accumulate. They are intrinsics in `cmsis_gcc.h`:
+
+```c
+#include <cmsis_gcc.h>
+
+int32_t a = INT32_MAX - 5;
+int32_t b = 10;
+int32_t s = __QADD(a, b);    /* saturating signed add — returns INT32_MAX */
+int32_t d = __QSUB(0, INT32_MIN);  /* saturating signed sub */
+
+uint8_t  pa[4] = { 250, 100, 200, 50 };
+uint8_t  pb[4] = {  20,  20,  20, 20 };
+uint32_t packed_a, packed_b;
+memcpy(&packed_a, pa, 4);
+memcpy(&packed_b, pb, 4);
+uint32_t result = __UQADD8(packed_a, packed_b);  /* parallel saturating add of 4 bytes */
+/* result bytes = {255, 120, 220, 70} */
+```
+
+Saturating ops are essential for audio (clipping rather than wrapping), control loops (preventing integrator wind-up), and signal processing. The packed forms do four operations in parallel — SIMD on a Cortex-M.
+
+Other useful M4 DSP intrinsics:
+
+- `__SMLAL(a, b, accum)` — signed multiply-accumulate (32 × 32 → 64-bit).
+- `__SSAT(x, n)` — saturate to a signed N-bit range.
+- `__USAT(x, n)` — saturate to an unsigned N-bit range. `__USAT(value, 12)` is exactly what you want when packing a 12-bit DAC sample with clipping.
+- `__SXTB16(x)` — sign-extend two bytes to two halfwords in one register.
+
+These map to single instructions. On Cortex-M0/M0+ they fall back to multi-instruction sequences (`-mcpu=cortex-m0` will still emit the intrinsics correctly, just slower).
+
+<Callout type="warn" title="DSP intrinsics need the right -mcpu">
+Compile with `-mcpu=cortex-m4` (or higher) and the intrinsics emit native instructions. Compile with `-mcpu=cortex-m3` and they emit software emulation — silently slower. Always check the disassembly when you depend on a DSP intrinsic for performance.
+</Callout>
+
+## Bit-set struct vs raw mask — when to use which
+
+C lets you declare bit-set structs:
+
+```c
+struct status {
+    uint32_t ready    : 1;
+    uint32_t error    : 1;
+    uint32_t mode     : 3;
+    uint32_t reserved : 27;
+};
+```
+
+These read prettily — `s.mode = 3; s.ready = 1;` — but they have problems:
+
+- **Layout is implementation-defined.** The C standard doesn't guarantee bit order, padding, or endianness. GCC for ARM does what you expect, but you cannot portably overlay a bitfield struct on a peripheral register or a wire format.
+- **Read-modify-write is not atomic.** Setting a single bit via `s.ready = 1` may compile to load-mask-or-store, which is the race we covered in lesson 3.
+- **Multi-field writes may be split.** Assigning two adjacent fields might be one store or two; the compiler decides.
+
+For peripheral registers and wire formats, **always use raw masks and explicit shifts**. CMSIS does this everywhere — `USART_CR1_RXNEIE` is `(1u << 5)`, not a bitfield member.
+
+For internal application state where you control all accesses, bitfields are fine and the syntax is clear.
+
+## Sign extension via SBFX (M4 instruction)
+
+GCC emits `SBFX` for `int32_t v = ((int32_t)(x << (32-n))) >> (32-n)` patterns. Verify with `-O2 -S` and grep for `sbfx`. Example:
+
+```c
+int32_t adc_signed_12bit(uint32_t raw) {
+    return (int32_t)(raw << 20) >> 20;   /* compiles to: sbfx rd, rs, #0, #12 */
+}
+```
+
+`SBFX rd, rs, #lsb, #width` extracts and sign-extends `width` bits starting at `lsb`. One cycle.
+
+## Bit reversal — useful for FFT
+
+```c
+uint32_t bit_reverse(uint32_t x) {
+    return __RBIT(x);   /* CMSIS intrinsic, single RBIT instruction on M3+ */
+}
+```
+
+`RBIT` reverses bit order of a 32-bit word in one cycle. Mainly used by FFT (bit-reversed addressing of the data array) and some CRC implementations.
+
+## Register packing example
+
+Pack three small values into one 32-bit word:
+
+```c
+typedef struct {
+    uint16_t voltage_mv;  /* 0..4095 (12 bits) */
+    uint16_t current_ma;  /* 0..1023 (10 bits) */
+    uint16_t temp_dc;     /* 0..255  (8 bits)  */
+} sensor_packed_t;
+
+uint32_t pack(sensor_packed_t s) {
+    return ((uint32_t)s.voltage_mv & 0x0FFF)         /* bits 11:0  */
+         | ((uint32_t)(s.current_ma & 0x03FF) << 12) /* bits 21:12 */
+         | ((uint32_t)(s.temp_dc    & 0x00FF) << 22); /* bits 29:22 */
+}
+
+sensor_packed_t unpack(uint32_t w) {
+    return (sensor_packed_t){
+        .voltage_mv = w         & 0x0FFF,
+        .current_ma = (w >> 12) & 0x03FF,
+        .temp_dc    = (w >> 22) & 0x00FF,
+    };
+}
+```
+
+12 + 10 + 8 = 30 bits, fits in 32 with room. Saves 50% over storing three `uint16_t` (which would be 6 bytes plus 2 bytes of padding to 4-byte align).
+
+## Packet parsing example
+
+A 5-byte fixed packet over UART:
+
+```
+byte 0:  header (0xA5)
+byte 1:  command (1 byte)
+bytes 2-3: 16-bit value, big-endian
+byte 4:  CRC8
+```
+
+```c
+typedef struct {
+    uint8_t  command;
+    uint16_t value;
+    uint8_t  crc;
+} packet_t;
+
+bool parse_packet(const uint8_t buf[5], packet_t *out) {
+    if (buf[0] != 0xA5) return false;
+    out->command = buf[1];
+    out->value   = ((uint16_t)buf[2] << 8) | buf[3];   /* manual BE assembly */
+    out->crc     = buf[4];
+    if (crc8(buf, 4) != out->crc) return false;
+    return true;
+}
+```
+
+The `(uint16_t)buf[2] << 8` cast is critical. Without it, `buf[2]` (a `uint8_t`) gets promoted to `int` before the shift, and `int << 8` produces an `int`. On a 16-bit platform that would overflow. On 32-bit ARM you get away with it, but the cast documents intent and is portable.
+
+For longer packets, `__builtin_bswap16` and `__builtin_bswap32` after a `memcpy` are cleaner:
+
+```c
+uint16_t be;
+memcpy(&be, &buf[2], 2);
+out->value = __builtin_bswap16(be);
+```
+
+`memcpy` handles unaligned access correctly; the compiler often inlines it to a single `LDRH` on Cortex-M3+.
+
+## Lookup tables
+
+Precomputed lookups beat live computation for many small problems — sine, gamma correction, CRC tables. The pattern:
+
+```c
+static const uint8_t crc8_table[256] = { /* precomputed in build script */ };
+
+uint8_t crc8(const uint8_t *data, size_t n) {
+    uint8_t crc = 0;
+    while (n--) {
+        crc = crc8_table[crc ^ *data++];
+    }
+    return crc;
+}
+```
+
+`static const` puts the table in `.rodata`, which the linker places in flash. Free if you have flash to spare; saves dozens of cycles per byte over polynomial computation.
+
+For sine: a 256-entry Q15 sine table is 512 bytes of flash and gives you one-cycle sine lookup. Combined with linear interpolation between two adjacent entries, accuracy beats most analog sensors.
+
+## Exercises
+
+**Exercise 7.1.** Write a function `bits_in_range(uint32_t x, int lo, int hi)` that returns the number of set bits in `x` between bit positions `lo` and `hi` inclusive. Use builtins.
+
+<Callout type="spec" title="Answer">
+
+```c
+unsigned bits_in_range(uint32_t x, int lo, int hi) {
+    int width = hi - lo + 1;
+    uint32_t mask = (width == 32) ? 0xFFFFFFFFu : ((1u << width) - 1);
+    return __builtin_popcount((x >> lo) & mask);
+}
+```
+
+The `width == 32` guard avoids undefined behaviour from `1u << 32`. The whole function compiles to about 5 instructions on Cortex-M4.
+</Callout>
+
+**Exercise 7.2.** Implement `saturate_audio_sample(int32_t x)` that clips to the signed 16-bit range. Try both with a manual `if` and with `__SSAT`. Compare the disassembly.
+
+<Callout type="spec" title="Answer">
+
+```c
+int16_t saturate_manual(int32_t x) {
+    if (x > 32767) return 32767;
+    if (x < -32768) return -32768;
+    return (int16_t)x;
+}
+
+int16_t saturate_intrinsic(int32_t x) {
+    return (int16_t)__SSAT(x, 16);   /* 'saturate to 16-bit signed' — one SSAT instruction */
+}
+```
+
+Manual: 5-6 instructions including the two branches. Intrinsic: one `SSAT` instruction, one cycle. For an audio loop running at 48 kHz on a Cortex-M4, saving 4 cycles per sample is 0.2% of the CPU — small individually, meaningful when you have many such optimisations.
+</Callout>
+
+**Exercise 7.3.** Without using `__builtin_bswap32`, write a 32-bit byte-swap. Then disassemble with `-O2` — does GCC recognise the pattern and emit `REV`?
+
+<Callout type="spec" title="Answer">
+
+```c
+uint32_t bswap(uint32_t x) {
+    return ((x >> 24) & 0x000000FFu)
+         | ((x >>  8) & 0x0000FF00u)
+         | ((x <<  8) & 0x00FF0000u)
+         | ((x << 24) & 0xFF000000u);
+}
+```
+
+Yes — modern GCC at `-O2` recognises this exact pattern and emits `rev r0, r0; bx lr`. You can confirm with `-S`. This is one of many "idiom recognition" patterns the compiler has. Sometimes the portable code is the fastest code.
+</Callout>
+
+## What you learned
+
+- Set/clear/toggle/test with `(1u << n)`. Always use `1u`, not `1`.
+- Multi-bit field write: clear with `& ~mask`, then OR new value.
+- Sign extension via paired shifts; GCC emits `SBFX`.
+- `__builtin_clz` / `__builtin_popcount` / `__builtin_ctz` are single-cycle on Cortex-M3+.
+- `__REV` / `__builtin_bswap32` for endian swap, one cycle each.
+- Cortex-M4 DSP intrinsics: `__QADD`, `__UQADD8`, `__SSAT`, `__USAT` for saturating ops.
+- Bitfield structs for internal state only; raw masks for hardware and wire formats.
+
+In lesson 8 we tackle math on parts without an FPU — Q15 and Q31 fixed-point, plus a real PID controller.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 6 — Interrupts and ISRs](/docs/programming/tutorial-06-interrupts/) | [Lesson 8 — Fixed-point math](/docs/programming/tutorial-08-fixed-point/) |

@@ -1,0 +1,327 @@
+---
+title: Lesson 6 — Queues for IPC
+description: Copy-by-value queues. Producer/consumer. ISR-safe sends. The pointer-vs-copy decision. UART RX parser written the proper way.
+order: 7
+updated: 2026-05-13
+tags: [rtos, tutorial, freertos, queue, ipc, producer-consumer]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 6 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Queues — copy-by-value IPC. Producer/consumer pattern. ISR-safe variants. When to send pointers versus values.' },
+    { label: 'Code provided', value: '~170 lines (UART command parser, event-bus pattern, large-payload via pointer)' },
+    { label: 'Time', value: '75–100 min' },
+    { label: 'Pre-reqs', value: 'Lessons 1–5; comfort with semaphores' },
+    { label: 'Outcome', value: 'A UART command parser with bounded latency, plus a generalisable event-bus pattern' },
+  ]}
+/>
+
+Queues are FreeRTOS's main inter-task communication primitive. A queue is a fixed-length FIFO of fixed-size items, with blocking send and blocking receive. The kernel allocates the storage at create time; items are *copied* in and out. If you have ever written a thread-safe ring buffer with `std::mutex` and a condition variable, this is the same thing — but smaller, simpler, and embedded-friendly.
+
+Semaphores from lesson 4 are good for *signalling* (something happened). Queues are good for *data transfer* (here is the something that happened). Most event-driven embedded designs use queues as the spine and reserve semaphores for cases where the signal carries no payload.
+
+## The basic API
+
+```c
+QueueHandle_t xQueueCreate(UBaseType_t length, UBaseType_t item_size);
+
+BaseType_t xQueueSend(QueueHandle_t q, const void *item, TickType_t timeout);
+BaseType_t xQueueReceive(QueueHandle_t q, void *item, TickType_t timeout);
+
+BaseType_t xQueueSendFromISR(QueueHandle_t q, const void *item, BaseType_t *hp_woken);
+```
+
+Three things to internalise immediately:
+
+- **Copy by value.** `xQueueSend` does `memcpy(internal_storage, item, item_size)`. `xQueueReceive` does `memcpy(item, internal_storage, item_size)`. Your local `item` variable on the sender side can go out of scope or be overwritten immediately after `xQueueSend` returns; the queue already has its own copy. This is the safest IPC primitive precisely *because* of this copy semantics.
+- **Storage is allocated at create time.** `xQueueCreate(10, sizeof(struct event))` allocates `10 * sizeof(struct event)` + a small queue header. No allocation per send. Predictable memory behaviour.
+- **Send blocks when full, receive blocks when empty.** With `portMAX_DELAY` the call blocks forever; with `0` it returns immediately whether successful or not; with a finite timeout it returns `pdFALSE` on timeout.
+
+## A producer/consumer skeleton
+
+```c
+struct event {
+    uint8_t  type;
+    uint32_t timestamp;
+    int16_t  value;
+};
+
+static QueueHandle_t event_q;
+
+static void producer_task(void *arg) {
+    (void)arg;
+    while (1) {
+        struct event ev = {
+            .type = EV_SENSOR_SAMPLE,
+            .timestamp = xTaskGetTickCount(),
+            .value = read_sensor(),
+        };
+        if (xQueueSend(event_q, &ev, pdMS_TO_TICKS(100)) != pdTRUE) {
+            /* Queue is full and the consumer is too slow */
+            error_log("event queue overrun");
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void consumer_task(void *arg) {
+    (void)arg;
+    while (1) {
+        struct event ev;
+        if (xQueueReceive(event_q, &ev, portMAX_DELAY) == pdTRUE) {
+            switch (ev.type) {
+                case EV_SENSOR_SAMPLE: handle_sensor(&ev); break;
+                case EV_BUTTON:        handle_button(&ev); break;
+                default:               break;
+            }
+        }
+    }
+}
+
+int main(void) {
+    event_q = xQueueCreate(16, sizeof(struct event));
+    configASSERT(event_q != NULL);
+    xTaskCreate(producer_task, "prod", 256, NULL, 2, NULL);
+    xTaskCreate(consumer_task, "cons", 512, NULL, 3, NULL);
+    vTaskStartScheduler();
+    while (1) {}
+}
+```
+
+The consumer is at a *higher priority* than the producer because the consumer's job is to drain as fast as possible. When `xQueueSend` puts an item in, the consumer (blocked in `xQueueReceive`) immediately becomes Ready and preempts the producer. The queue is rarely more than 1 deep in normal operation; the 16-deep storage is buffer against bursts (e.g., consumer briefly preempted by a higher-priority task).
+
+A common newbie mistake: making the producer higher priority than the consumer. The producer fills the queue, the consumer never gets the CPU, the queue overruns. **Drains should be at least as fast as fillers.**
+
+## ISR-safe send
+
+```c
+struct event ev_isr;
+
+void EXTI15_10_IRQHandler(void) {
+    if (EXTI->PR & EXTI_PR_PR13) {
+        EXTI->PR = EXTI_PR_PR13;   /* clear pending */
+        ev_isr.type = EV_BUTTON;
+        ev_isr.timestamp = xTaskGetTickCountFromISR();
+        ev_isr.value = 0;
+        BaseType_t hp = pdFALSE;
+        xQueueSendFromISR(event_q, &ev_isr, &hp);
+        portYIELD_FROM_ISR(hp);
+    }
+}
+```
+
+The pattern is identical to the semaphore case from lesson 4. Build the event on the ISR's stack (or in a static struct), call `xQueueSendFromISR`, yield if the consumer was unblocked. The NVIC priority of `EXTI15_10_IRQn` must be numerically >= `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY` for this to be legal — see lesson 5.
+
+If you call `xQueueSendFromISR` and the queue is *full*, it returns `pdFALSE` and the event is dropped. You cannot block from an ISR. Decide ahead of time how you handle full queues:
+
+- **Drop and increment an error counter.** Simplest. Works when occasional loss is acceptable (telemetry, debug logs).
+- **Drop the oldest item, insert the new.** Use `xQueueOverwriteFromISR` (works only for queues of length 1; for longer queues you would do `xQueueReceiveFromISR` then `xQueueSendFromISR`).
+- **Halt the system.** For safety-critical paths where loss is never acceptable. Increment a counter, fire a fault, reset.
+
+The right answer depends on the data. A button event is fine to drop on overflow (the next one is coming). A CAN frame in a vehicle network is not.
+
+## Sizing the queue
+
+Queue length × item size is RAM. Sizing it too generously wastes RAM; sizing it too tight causes overruns. The method that works:
+
+1. Compute the *worst-case burst* — how many items can arrive while the consumer is preempted by every higher-priority task running back-to-back.
+2. Add 25% margin.
+3. Run the system under realistic load and measure the high-water mark with `uxQueueMessagesWaiting`.
+
+```c
+UBaseType_t hwm = 0;
+static void monitor_task(void *arg) {
+    while (1) {
+        UBaseType_t n = uxQueueMessagesWaiting(event_q);
+        if (n > hwm) hwm = n;
+        printf("queue depth: %lu (hwm %lu)\r\n", (unsigned long)n, (unsigned long)hwm);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+```
+
+If hwm is ever within 1 of the queue length, you have a sizing problem.
+
+<Callout type="tip" title="Queue depth should breathe">
+A queue that's always empty is over-sized but not harmful. A queue that's always full is under-sized — the consumer is barely keeping up; any small delay will cause loss. A queue that breathes — typically empty, occasionally a few items, rarely close to full — is sized right.
+</Callout>
+
+## Multiple producers and consumers
+
+Multiple tasks can send to the same queue safely; the kernel serialises access internally. Same for multiple receivers — each `xQueueReceive` gets a different item.
+
+A common pattern: **event bus.** One queue, many producers, one consumer. Every subsystem in your firmware posts events to a single `event_q`; a dispatcher task pulls events and routes them to handlers. Centralises the concurrency story.
+
+```c
+enum event_type {
+    EV_SENSOR_SAMPLE,
+    EV_BUTTON,
+    EV_UART_LINE,
+    EV_TIMER_TICK,
+    EV_NETWORK_RX,
+    EV_TYPE_COUNT
+};
+
+typedef void (*event_handler_t)(const struct event *ev);
+static event_handler_t handlers[EV_TYPE_COUNT];
+
+static void dispatcher_task(void *arg) {
+    while (1) {
+        struct event ev;
+        xQueueReceive(event_q, &ev, portMAX_DELAY);
+        if (ev.type < EV_TYPE_COUNT && handlers[ev.type]) {
+            handlers[ev.type](&ev);
+        }
+    }
+}
+```
+
+Now every other task or ISR just sends events; the dispatcher decides what to do. This is the *actor model*, and it's a strong default for event-driven embedded designs.
+
+## When items are too big — send a pointer
+
+`xQueueCreate(10, sizeof(struct event))` works when items are small (say, < 64 bytes). If you have a 1500-byte network packet, copying 1500 bytes into a queue then 1500 bytes back out is wasteful. Send a pointer instead.
+
+```c
+struct packet {
+    size_t  length;
+    uint8_t payload[1500];
+};
+
+static QueueHandle_t pkt_q;   /* holds struct packet * */
+
+void rx_isr_done(struct packet *p) {
+    /* Called from DMA-complete ISR — p was allocated from a pool */
+    BaseType_t hp = pdFALSE;
+    xQueueSendFromISR(pkt_q, &p, &hp);   /* sending the pointer, not the packet */
+    portYIELD_FROM_ISR(hp);
+}
+
+static void rx_task(void *arg) {
+    while (1) {
+        struct packet *p;
+        xQueueReceive(pkt_q, &p, portMAX_DELAY);
+        process_packet(p);
+        packet_pool_free(p);   /* return to the pool */
+    }
+}
+
+int main(void) {
+    pkt_q = xQueueCreate(8, sizeof(struct packet *));   /* queue of pointers */
+    /* ... */
+}
+```
+
+The queue item size is now `sizeof(struct packet *)` = 4 bytes. Send and receive each copy 4 bytes instead of 1500. The packets themselves come from a pre-allocated pool — never `malloc` and free from a hot ISR.
+
+The trade-off: **ownership is more confusing.** With value semantics, the queue has its own copy and lifetimes are obvious. With pointer semantics, the receiver is responsible for freeing the packet (or returning to the pool). Document the rule clearly in code. Memory leaks via "forgot to free" are the second-most-common queue bug.
+
+## A real example: UART line parser
+
+Lesson 4 used a semaphore + ring buffer. Same job with a queue is cleaner:
+
+```c
+static QueueHandle_t uart_q;   /* queue of uint8_t */
+
+void USART2_IRQHandler(void) {
+    if (USART2->SR & USART_SR_RXNE) {
+        uint8_t b = USART2->DR;
+        BaseType_t hp = pdFALSE;
+        xQueueSendFromISR(uart_q, &b, &hp);
+        portYIELD_FROM_ISR(hp);
+    }
+}
+
+static void parser_task(void *arg) {
+    char line[128];
+    size_t pos = 0;
+    while (1) {
+        uint8_t b;
+        if (xQueueReceive(uart_q, &b, portMAX_DELAY) != pdTRUE) continue;
+        if (b == '\n' || pos == sizeof(line) - 1) {
+            line[pos] = 0;
+            process_line(line);
+            pos = 0;
+        } else if (b >= 0x20) {
+            line[pos++] = b;
+        }
+    }
+}
+
+int main(void) {
+    uart_q = xQueueCreate(256, sizeof(uint8_t));   /* 256 bytes of buffer */
+    xTaskCreate(parser_task, "parser", 512, NULL, 3, NULL);
+    /* ... uart init, NVIC setup ... */
+    vTaskStartScheduler();
+    while (1) {}
+}
+```
+
+The queue replaces both the ring buffer and the semaphore. The ISR is two lines plus the yield. The task pulls one byte at a time, accumulates a line, processes when complete. RAM cost: 256 bytes for the queue storage plus the queue header (~80 bytes).
+
+The downside vs. a stream buffer (lesson 8): the queue takes a critical section on every send and receive. For a 921 600 baud UART that's ~92 000 critical sections per second, ~10 µs each — about 1% of CPU. A stream buffer is lock-free and ~10× cheaper. For 115 200 baud, queues are fine.
+
+## Common bugs
+
+**Sender priority higher than receiver.** Queue fills up; receiver never runs. Make the receiver at least as high as the highest-priority sender.
+
+**Calling the non-ISR API from an ISR.** `xQueueSend` (no FromISR) in an interrupt handler. Asserts under `configASSERT_DEFINED`; corrupts the scheduler without it.
+
+**Wrong item size.** `xQueueCreate(10, sizeof(struct event*))` when you meant `sizeof(struct event)`. Send fails silently or the receiver gets garbage. Always be explicit about whether you're queueing values or pointers.
+
+**Passing pointers to stack-allocated data via queues.** If the sender does `struct event ev = {...}; xQueueSend(q, &ev, 0);` — that's fine, queue copies the value out of `ev`. But if the queue holds *pointers* and you do `struct event ev = {...}; struct event *p = &ev; xQueueSend(q, &p, 0);` — disaster. `ev` goes out of scope when the sender returns, the receiver dereferences a dangling pointer. Always use heap or pool allocation for queued pointers.
+
+**Forgetting `portYIELD_FROM_ISR`.** Same as semaphores. The high-priority receiver wakes but waits up to one tick for the next reschedule. Always yield from ISR queue sends.
+
+## Comparing queues, semaphores, and other primitives
+
+<CoreCompare
+  rows={[
+    { core: 'Binary semaphore', notes: 'Pure signal, zero payload. Use when you only need "X happened". ~80 bytes RAM.' },
+    { core: 'Counting semaphore', notes: 'Resource pool of N identical resources. Use for DMA channel allocation, ticket dispensing.' },
+    { core: 'Mutex', notes: 'Mutual exclusion with priority inheritance. Use for shared peripherals, shared data structures.' },
+    { core: 'Queue', notes: 'Data transfer with copy semantics. The default choice for event-driven IPC. ~80 bytes + length × item_size.' },
+    { core: 'Task notification (lesson 7)', notes: '32-bit per-task signal, lock-free, ~45× faster than a semaphore. Use for one-sender-one-receiver fast paths.' },
+    { core: 'Stream buffer (lesson 8)', notes: 'Lock-free byte stream, one-writer-one-reader. Use for high-rate UART RX.' },
+    { core: 'Event group (lesson 7)', notes: '32-bit bit-pattern, wait on AND/OR of bits. Use for "wait for multiple events" rendezvous.' },
+  ]}
+/>
+
+Queues are the most versatile and the most-used primitive. When in doubt, start with a queue and only switch to something faster when you've measured a problem.
+
+## Exercises
+
+**Exercise 6.1**: In the UART parser example, the queue holds individual bytes. Sizing: the parser task is at priority 3, plus an unrelated 10-ms control task is at priority 4. The 10-ms task occasionally takes 5 ms of CPU. At 921 600 baud, what minimum queue length avoids loss?
+
+**Exercise 6.2**: Convert the event-bus pattern to use pointers (each event posted is `malloc`'d). What new bugs become possible? Sketch a memory-pool design that avoids them.
+
+**Exercise 6.3**: Two tasks both send to the same queue, with `portMAX_DELAY`. The queue fills up. Both blocks. The consumer eventually receives one item. Which task's send unblocks first?
+
+<Callout type="spec" title="Answer 6.1">
+At 921 600 baud, one byte arrives every ~10 µs. In 5 ms (worst-case parser-task starvation while the higher-priority task runs), 500 bytes arrive. Round up with margin → 768 or 1024 entries. A 1024-byte queue costs ~1 KB of RAM. At this rate you should really use a stream buffer (lesson 8) — same 1 KB, but lock-free, ~10× cheaper CPU per byte.
+</Callout>
+
+<Callout type="spec" title="Answer 6.2">
+New bugs: forgotten-free (memory leak), double-free (free at sender and receiver), use-after-free (sender keeps reference), heap fragmentation from frequent malloc/free in a hot path. Memory-pool design: at boot, allocate an array of fixed-size event objects; maintain a free-list (a queue of pointers). To "alloc," take a pointer from the free-list queue; to "free," put it back. Bounded, no fragmentation, deterministic timing. FreeRTOS doesn't ship a pool API but it's ~30 lines of code on top of a queue.
+</Callout>
+
+<Callout type="spec" title="Answer 6.3">
+Whichever task has higher priority. If equal priority, FIFO — whichever entered the queue's "senders blocked" list first. The kernel maintains the waiter list sorted by priority then arrival order. Same rule applies to receivers when the queue is empty and multiple are blocked on `xQueueReceive`.
+</Callout>
+
+## What you learned
+
+- `xQueueCreate(length, item_size)` allocates storage at create time. Items are copied in and out.
+- The producer/consumer pattern is the default: consumer at higher priority, queue acts as a buffer for bursts.
+- `xQueueSendFromISR` + `portYIELD_FROM_ISR` is the ISR-safe send. Items must be copy-safe.
+- When items are large, queue *pointers* — but design the lifetime carefully, preferably with a memory pool.
+- Sender priority must be at most equal to receiver priority, otherwise the queue fills and overruns.
+- For one-sender-one-receiver byte streams, prefer a stream buffer (lesson 8) over a byte queue.
+
+## Up next
+
+| Previous | Next |
+|---|---|
+| [Lesson 5 — Mutex](/docs/rtos/tutorial-05-mutex/) | [Lesson 7 — Event groups & notifications](/docs/rtos/tutorial-07-events-notifications/) |

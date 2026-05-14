@@ -1,0 +1,306 @@
+---
+title: Lesson 1 — Toolchain setup
+description: Install arm-none-eabi-gcc, OpenOCD, and GDB. Wire up the ST-Link. Verify the toolchain with a one-line compile and decode every GCC flag.
+order: 3
+updated: 2026-05-13
+tags: [programming, tutorial, c, embedded, toolchain, gcc]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 1 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Installing the GNU Arm Embedded toolchain, OpenOCD, and GDB; verifying with a one-line compile; understanding every flag' },
+    { label: 'Code provided', value: 'About 10 lines of C plus shell commands' },
+    { label: 'Time', value: '45-60 minutes (mostly download/install)' },
+    { label: 'Hardware', value: 'STM32F411 Nucleo or any Cortex-M4 board with ST-Link or compatible SWD probe' },
+  ]}
+/>
+
+This first lesson is all setup. We will install three tools — the compiler, the flasher, and the debugger — and confirm each one works before we write a single byte of real firmware. Skipping this step is the single most common reason people abandon embedded tutorials. The cost of doing it right now is one evening; the cost of not doing it is every subsequent lesson failing in confusing ways.
+
+The three tools:
+
+1. **arm-none-eabi-gcc** — the cross-compiler. It runs on your laptop and emits Cortex-M machine code.
+2. **OpenOCD** (or `st-flash`) — talks to the SWD probe and writes your binary into the chip's flash.
+3. **arm-none-eabi-gdb** — connects to the debugger half of OpenOCD and lets you step, breakpoint, and inspect.
+
+All three are free. All three are available on Linux, macOS, and Windows.
+
+## Pick the board
+
+You want a Cortex-M4-based STM32 with an on-board SWD probe. In order of preference for this tutorial:
+
+- **NUCLEO-F411RE** (STM32F411, M4F, 100 MHz, 512 KB flash, 128 KB SRAM) — the cheapest sane choice. Around 15 USD. Ships with on-board ST-Link/V2-1 that also acts as a USB-to-UART bridge on USART2.
+- **STM32F4-DISCO** (STM32F407, M4F, 168 MHz) — slightly older, has MEMS sensors and audio codec on board, ST-Link/V2 built in.
+- **NUCLEO-G474RE** (STM32G474, M4F, 170 MHz) — modern peripherals, ST-Link/V3.
+- **NUCLEO-F446RE** (STM32F446, M4F, 180 MHz) — drop-in for F411 with more flash.
+
+If you already have any of these, use it. If not, get the F411 Nucleo. The lessons reference STM32F4xx register addresses; on a different family you will need to look up your chip's peripheral addresses in the reference manual, but the structure is identical.
+
+<Callout type="note" title="Boards I am explicitly not covering">
+This tutorial targets Cortex-M4 with on-board ST-Link because that is the most accessible path. It will work on Arduino-Nano-style boards only through an external SWD probe, which adds wiring and confusion. Skip those for now.
+</Callout>
+
+## Install the compiler
+
+### Linux (Debian/Ubuntu)
+
+```bash
+sudo apt update
+sudo apt install gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
+```
+
+Note: Ubuntu's packaged version sometimes lags. If you want the latest (12.x or 13.x), download from Arm's official site at `developer.arm.com/downloads/-/arm-gnu-toolchain-downloads` and add `bin/` to your `PATH`.
+
+### macOS
+
+```bash
+brew install --cask gcc-arm-embedded
+```
+
+If `brew` is missing, install it from `brew.sh` first. The cask drops the binaries in `/Applications/ArmGNUToolchain/<version>/arm-none-eabi/bin` and creates symlinks on `PATH`.
+
+### Windows
+
+Download the installer from `developer.arm.com/downloads/-/arm-gnu-toolchain-downloads`. Run it. Check the box that adds the toolchain to `PATH`. Reboot if PowerShell still cannot find the binaries.
+
+### Verify
+
+In any shell:
+
+```bash
+arm-none-eabi-gcc --version
+```
+
+Expected output (version may differ):
+
+```
+arm-none-eabi-gcc (Arm GNU Toolchain 13.2.Rel1) 13.2.1 20231009
+Copyright (C) 2023 Free Software Foundation, Inc.
+```
+
+If the shell says "command not found", your PATH is wrong. On Linux/macOS, `which arm-none-eabi-gcc` should print a path; if not, find where `apt`/`brew` put it and add that directory to your shell's PATH. Do not move on until `--version` prints.
+
+## Install OpenOCD
+
+OpenOCD is the open-source debug bridge. It talks to ST-Link, J-Link, CMSIS-DAP, and most other SWD probes.
+
+### Linux
+
+```bash
+sudo apt install openocd
+openocd --version
+```
+
+### macOS
+
+```bash
+brew install open-ocd
+openocd --version
+```
+
+### Windows
+
+Grab a build from `gnutoolchains.com/arm-eabi/openocd/` or use the OpenOCD that ships with VS Code Cortex-Debug. The xPack distribution at `xpack.github.io/openocd/` is also good.
+
+OpenOCD should print something like:
+
+```
+Open On-Chip Debugger 0.12.0
+```
+
+### st-flash alternative
+
+If you only want to write firmware (not debug), `stlink-tools` is a smaller install:
+
+```bash
+# Linux
+sudo apt install stlink-tools
+
+# macOS
+brew install stlink
+```
+
+It gives you `st-flash`, `st-info`, and `st-util`. We will use `st-flash` for quick programming in lesson 2.
+
+## Install GDB
+
+```bash
+# Linux
+sudo apt install gdb-multiarch
+
+# macOS
+brew install arm-none-eabi-gdb   # may also be bundled with the gcc cask
+```
+
+Verify:
+
+```bash
+arm-none-eabi-gdb --version
+```
+
+On some Linux distros the binary is `gdb-multiarch` rather than `arm-none-eabi-gdb`. Either works — for the multiarch version you pass `set architecture arm` once after launch.
+
+## Optional: VS Code Cortex-Debug
+
+Install VS Code. Install the **Cortex-Debug** extension by `marus25`. It wraps OpenOCD and GDB into a graphical debugger with peripheral register views. We will write everything from the command line in this tutorial, but for day-to-day work Cortex-Debug is excellent.
+
+```jsonc
+// .vscode/launch.json
+{
+  "version": "0.2.0",
+  "configurations": [{
+    "name": "Cortex Debug",
+    "type": "cortex-debug",
+    "request": "launch",
+    "servertype": "openocd",
+    "cwd": "${workspaceFolder}",
+    "executable": "build/blink.elf",
+    "device": "STM32F411RE",
+    "configFiles": ["interface/stlink.cfg", "target/stm32f4x.cfg"],
+    "svdFile": "${workspaceFolder}/STM32F411.svd"
+  }]
+}
+```
+
+The SVD file (System View Description) tells the IDE the layout of every peripheral register on the chip — grab it from `github.com/posborne/cmsis-svd-data/tree/main/data/STMicro`.
+
+## Wire up the board
+
+Take the Nucleo board out of its box. There are no jumpers to set — the on-board ST-Link is hardwired to the target STM32. Plug the USB cable into the **CN1 / STLK** port (the one nearest the small ST-Link MCU, not the user USB if your board has one). Three LEDs should light up:
+
+- **LD1** (red/green tricolour) — ST-Link status. Solid green means USB enumerated.
+- **LD3** (red) — 3.3 V power good.
+- **LD2** (green) — user LED, controlled by PA5 on the F411 Nucleo. This is the one we will blink.
+
+The OS should enumerate two interfaces: a mass-storage device (drag-and-drop programmer) and a virtual COM port (USART2 bridge on F411 Nucleo). On Linux, check `dmesg | tail` after plugging in — you should see `STM32 STLink` and `cdc_acm` lines.
+
+<Callout type="tip" title="The PA5 LED varies by board">
+On the F411 Nucleo the user LED is PA5. On the F407 Discovery board there are four user LEDs on PD12 (green), PD13 (orange), PD14 (red), PD15 (blue). Lesson 2 uses PA5; change the pin number if your board is different.
+</Callout>
+
+## A first compile
+
+We will write the simplest possible C program that the cross-compiler can chew on. Put this in `hello.c`:
+
+```c
+int square(int x) {
+    return x * x;
+}
+```
+
+That's it — no `main()`, no headers, nothing fancy. We just want to confirm the compiler can produce Cortex-M4 object code.
+
+Compile:
+
+```bash
+arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -nostdlib -c hello.c -o hello.o
+```
+
+If the command returns with no output, it worked. Inspect what we made:
+
+```bash
+arm-none-eabi-objdump -d hello.o
+```
+
+Expected output (Thumb assembly for the `square` function):
+
+```
+hello.o:     file format elf32-littlearm
+
+Disassembly of section .text:
+
+00000000 <square>:
+   0:   fb00 f000   mul.w   r0, r0, r0
+   4:   4770        bx      lr
+```
+
+Two instructions: multiply r0 by itself, return. That's Cortex-M4 Thumb-2.
+
+## Every flag decoded
+
+The command line had four flags. Each one matters.
+
+### `-mcpu=cortex-m4`
+
+Tells GCC which ARM core to target. This affects which instructions are available (Cortex-M4 has the Thumb-2 instruction set plus DSP extensions; Cortex-M0 has a much smaller subset). It also sets architecture-specific defaults for code generation.
+
+You can also use `-march=armv7e-m` to target the architecture rather than a specific core. `-mcpu` is more common and lets GCC tune for the specific microarchitecture.
+
+<Callout type="warn" title="Floating-point flags matter and we are not using them yet">
+We have **not** told GCC about the FPU. On Cortex-M4F you want `-mfpu=fpv4-sp-d16 -mfloat-abi=hard` to use the hardware FPU efficiently. Without those flags, float operations go through software emulation — slow and large. We will add them in lesson 8 when we start doing math.
+</Callout>
+
+### `-mthumb`
+
+Cortex-M only executes Thumb (16-bit and Thumb-2 32-bit) instructions, never the older 32-bit ARM instruction set. This flag is mandatory for every Cortex-M target. Without it, GCC may emit ARM instructions that the M4 cannot execute.
+
+### `-nostdlib`
+
+Do not link against the C standard library. We want this because:
+
+- We have no operating system to provide syscalls.
+- We have not provided startup code yet (next lesson).
+- We want to confirm the compiler can produce code, independent of newlib.
+
+In a real project you usually want newlib-nano (`-specs=nano.specs`) for `memcpy`, `memset`, and basic `printf`. We will add that in lesson 4.
+
+### `-c`
+
+Compile only — produce an object file (`.o`), do not link. Useful for testing the compiler without needing a complete program with `main()`.
+
+## A more realistic command
+
+For comparison, here is what a typical full-project link command will look like by lesson 5:
+
+```bash
+arm-none-eabi-gcc \
+    -mcpu=cortex-m4 -mthumb \
+    -mfpu=fpv4-sp-d16 -mfloat-abi=hard \
+    -Os -g3 -ffunction-sections -fdata-sections \
+    -Wall -Wextra -Wpedantic -Wshadow -Wundef \
+    -T linker.ld -nostartfiles \
+    -Wl,--gc-sections -Wl,-Map=build/blink.map \
+    src/startup.s src/main.c \
+    -o build/blink.elf
+```
+
+We will introduce these flags one by one as the lessons need them. For now, the four-flag command above is the minimum to confirm the toolchain is alive.
+
+The [GCC flags reference](/tools/gcc-flags/) explains every flag in this expanded line.
+
+## Exercises
+
+**Exercise 1.1.** Run `arm-none-eabi-gcc --print-multi-lib`. What do the entries tell you about the toolchain's pre-built C library variants?
+
+<Callout type="spec" title="Answer">
+Each line shows a library subdirectory and a set of flags that select it. For example, `thumb/v7e-m+fp/hard;@mthumb@march=armv7e-m+fp@mfloat-abi=hard` means there is a libc compiled specifically for Cortex-M4F with hard-float ABI. When you compile your project with matching flags, GCC links the right variant automatically. If your flags don't match any variant, you get the default (often soft-float) and your floating-point performance suffers silently. This is why getting the `-mcpu`, `-mfpu`, `-mfloat-abi` triple right matters.
+</Callout>
+
+**Exercise 1.2.** Add `-S` instead of `-c` to the compile command. What does GCC produce, and where do the multiply and `bx lr` come from?
+
+<Callout type="spec" title="Answer">
+`-S` stops after compilation but before assembly — you get a `.s` text file with the assembly source. Open `hello.s`. You'll see `mul r0, r0, r0` and `bx lr` literally written out, plus directives like `.thumb`, `.thumb_func`, and `.cpu cortex-m4`. The compiler picked the Cortex-M4 multiply form because of `-mcpu=cortex-m4`; the `bx lr` is the standard ARM return-from-function (branch to whatever address is in the link register).
+</Callout>
+
+**Exercise 1.3.** On your board, what is the user LED pin? Find it in the board's user manual (search for "UM1724" for F411 Nucleo, "UM1472" for F407 Disco). Write down the GPIO port and pin number — you will need it in lesson 2.
+
+<Callout type="spec" title="Answer">
+F411 Nucleo: PA5 (LD2, green). F407 Discovery: PD12 (green), PD13 (orange), PD14 (red), PD15 (blue). G474 Nucleo: PA5. Most Nucleo boards put the user LED on PA5 because it doubles as the SPI1 SCK pin — useful for visual feedback when SPI is active. If your board has multiple LEDs, pick any one and stick with it; lesson 2 will explain how to translate "PA5" into register writes.
+</Callout>
+
+## What you learned
+
+- Installed `arm-none-eabi-gcc`, OpenOCD, and GDB on your host OS.
+- Wired the board over USB and confirmed the ST-Link enumerates.
+- Compiled a one-line C file to Cortex-M4 Thumb-2 object code.
+- Decoded the four mandatory flags: `-mcpu`, `-mthumb`, `-nostdlib`, `-c`.
+
+In lesson 2 we will write a complete bare-metal program — `main.c`, startup assembly, linker script — and flash it to the chip. The LED will blink. Every line will be yours.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Tutorial overview](/docs/programming/tutorial/) | [Lesson 2 — Your first blink, no HAL](/docs/programming/tutorial-02-bare-metal/) |

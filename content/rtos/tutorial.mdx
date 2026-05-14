@@ -1,0 +1,124 @@
+---
+title: RTOS tutorial — FreeRTOS on Cortex-M from zero
+description: A hands-on 10-lesson tutorial. Why an RTOS, your first task, blocking primitives, queues, event groups, mutexes done right, tickless idle, debugging — all on real silicon.
+order: 1
+updated: 2026-05-13
+tags: [rtos, tutorial, freertos, cortex-m, hands-on]
+badge: tutorial
+---
+
+Most engineers learn an RTOS the wrong way. They read three blog posts, port the demo project, get a blinking LED, then graft a queue and a semaphore onto whatever code they happen to be writing. Three months later, they have a system that mostly works, occasionally locks up, and that nobody on the team really understands. The mental model never gelled because the tutorial skipped the parts that matter: why an RTOS at all, what `xTaskCreate` *actually* allocates, why the SysTick handler has to be the lowest-priority interrupt in the system, and what happens to a hardware ISR that calls `xQueueSend` instead of `xQueueSendFromISR`.
+
+This tutorial is the version I wish I had been handed in 2012. Ten lessons, built on real silicon, in linear order. By the end you will have written, debugged, traced, and reasoned about a small but complete FreeRTOS application running on a Cortex-M4 board you can buy for fifteen dollars. The mental model will transfer to Zephyr, ThreadX, RT-Thread, and any future RTOS you encounter, because the underlying ideas — pre-emption, priority, blocking, IPC, the Cortex-M port internals — are universal. Only the API names change.
+
+<SpecSheet
+  title="Tutorial at a glance"
+  specs={[
+    { label: 'Target RTOS', value: 'FreeRTOS Kernel v11.x (post-AWS-stewardship release)' },
+    { label: 'Target silicon', value: 'STM32F411 Nucleo-64 — anything Cortex-M4F works (nRF52, RP2040 M0+ with kernel rebuilt, MAX32660)' },
+    { label: 'Hardware required', value: 'Board, USB cable, ST-Link (built into Nucleo), one LED (built in), one button (built in), UART-to-USB bridge (built in)' },
+    { label: 'Toolchain', value: 'arm-none-eabi-gcc 13.x or later, make or CMake, OpenOCD or STM32CubeProgrammer' },
+    { label: 'Time investment', value: '12–18 hours total, 60–120 minutes per lesson' },
+    { label: 'Lessons', value: '10 lessons + this landing page' },
+    { label: 'Recommended pre-reads', value: 'C tutorial, NVIC priority, exception model, SysTick' },
+  ]}
+/>
+
+## Why this tutorial and not the FreeRTOS docs
+
+The official FreeRTOS documentation is reference material. It tells you what `xQueueCreate` does, not when to reach for a queue versus a stream buffer versus a task notification. It tells you what `configMAX_SYSCALL_INTERRUPT_PRIORITY` is, not what catastrophe befalls you when you set it wrong. Reference docs are organised by API surface; tutorials are organised by the order in which questions arise in your head as you build something. This is a tutorial. We will keep returning to the same six or seven core ideas — priority, blocking, context switch, ISR safety, memory layout, predictability, observability — and look at them from progressively more interesting angles.
+
+The other reason: the FreeRTOS demos compile, but they do not teach. Most of them assume you already know what a task is, what a tick is, and what an idle hook is for. We start much earlier.
+
+## Philosophy — one RTOS deeply
+
+You only need to learn one RTOS deeply. The vocabulary maps cleanly across the field:
+
+- FreeRTOS `xTaskCreate` is Zephyr `K_THREAD_DEFINE`, ThreadX `tx_thread_create`, RT-Thread `rt_thread_create`.
+- FreeRTOS `xQueueSend` is Zephyr `k_msgq_put`, ThreadX `tx_queue_send`, RT-Thread `rt_mq_send`.
+- FreeRTOS `xSemaphoreTake` is Zephyr `k_sem_take`, ThreadX `tx_semaphore_get`, RT-Thread `rt_sem_take`.
+- Priority inheritance, tickless idle, software timers, ISR-safe API variants — every modern RTOS has them. Only the spellings differ.
+
+We picked FreeRTOS because:
+
+- It is MIT-licensed, free to use commercially, and shipped on more Cortex-M designs than every other RTOS combined.
+- Its kernel is tiny (about 9000 lines of C) — you can read every line.
+- The port for ARM Cortex-M is a model of clarity. PendSV for context switch, SysTick for tick, SVC to bootstrap. We will dissect it in lesson 2.
+- Amazon's stewardship since 2017 has stabilised the release process without changing the API. Code from 2012 still compiles against the current kernel.
+
+If you finish this tutorial and then move to Zephyr because your employer requires it, you will spend a weekend learning the Kconfig + device-tree workflow and then feel right at home. The kernel concepts are the same.
+
+## Prerequisites
+
+You should know C — pointers, function pointers, structs, the difference between `static` and `extern`, basic preprocessor. If any of that feels shaky, work through the [C tutorial](/docs/programming/c-tutorial/) first; it is calibrated to set you up for embedded work.
+
+You should also be comfortable bringing up a bare-metal project on Cortex-M — that is, you can write a startup file, configure a clock tree, get a blinking LED working without an RTOS. If you cannot, our [Cortex-M lineup](/docs/cortex-m/lineup/) page and the [exception model](/docs/architecture/exception-model/) page give the background; lesson 2 will not re-derive any of that.
+
+Hardware: an [STM32F411 Nucleo-64](https://www.st.com/en/evaluation-tools/nucleo-f411re.html) is the reference. Any Cortex-M3, M4, M7, or M33 board works with minor adjustments. The Nucleo has its built-in ST-Link debugger, a UART-over-USB bridge mapped to USART2, an LED on PA5, and a button on PC13 — enough to do everything we need.
+
+## The ten lessons
+
+<CoreCompare
+  rows={[
+    { core: 'Lesson 1 — Why an RTOS', notes: 'Bare-metal superloop vs scheduled tasks. Hard vs soft real-time. The exact list of problems an RTOS solves and the exact list it does not.' },
+    { core: 'Lesson 2 — Hello FreeRTOS', notes: 'Get the kernel, build it, wire SysTick/PendSV/SVC, configure FreeRTOSConfig.h, write your first task, blink an LED.' },
+    { core: 'Lesson 3 — Tasks', notes: 'What xTaskCreate allocates. Stack sizing. Priority. The Ready/Running/Blocked/Suspended state machine. Observing pre-emption.' },
+    { core: 'Lesson 4 — Semaphores', notes: 'Binary semaphore for ISR-to-task signalling. Counting semaphore for resource pools. portYIELD_FROM_ISR.' },
+    { core: 'Lesson 5 — Mutex and priority inheritance', notes: 'Why mutex is not a binary semaphore. Mars Pathfinder. configMAX_SYSCALL_INTERRUPT_PRIORITY done correctly.' },
+    { core: 'Lesson 6 — Queues', notes: 'Producer/consumer. ISR-safe sends. Queue sizing. The pointer-vs-copy decision.' },
+    { core: 'Lesson 7 — Event groups and task notifications', notes: 'Wait on AND/OR bit patterns. The fast IPC: 45× faster than a semaphore.' },
+    { core: 'Lesson 8 — Stream buffers and software timers', notes: 'Lock-free byte stream for UART. The timer daemon task. configTIMER_TASK_PRIORITY pitfalls.' },
+    { core: 'Lesson 9 — Memory management', notes: 'heap_1 through heap_5. Stack overflow detection. Static allocation for safety builds.' },
+    { core: 'Lesson 10 — Tickless idle and debugging', notes: 'Suppress SysTick during idle, WFI, save 100×–1000× power. SystemView, Tracealyzer, Ozone. Where to go next.' },
+  ]}
+/>
+
+## How to use this tutorial
+
+Read each lesson cover-to-cover before touching code. The lessons are written to be understood in one sitting; the code is at the end. Then build the code yourself — copy it, do not paste it. Typing the call sequences is part of how the API gets into your fingers.
+
+Every lesson ends with two or three **Exercises**. They are not optional. The answers are in collapsed callouts at the end of each lesson, but resist looking until you have either solved the exercise on hardware or convinced yourself you know exactly why it works. Real embedded debugging is "stare at the symptom and form a hypothesis"; the exercises are calibrated to that.
+
+If something behaves unexpectedly on your board, do not move on. RTOS bugs are vastly easier to diagnose in a five-task system than in a twenty-task system. Fix it now.
+
+<Callout type="tip" title="Use a logic analyser if you can">
+A cheap USB logic analyser (Saleae clone, $10) plugged into two GPIOs you toggle from your tasks is the single most valuable debug tool for this tutorial. You will see context switches happen, you will see ISR latency, you will see priority inversion. Print-based debugging hides all of that.
+</Callout>
+
+<Callout type="warn" title="Do not start with an RTOS in your day job">
+If you are an embedded engineer reading this tutorial because your team is "considering an RTOS for the next project" — pause. Lesson 1 walks through the decision criteria honestly. RTOSes are a tool, not a virtue. Some of the best firmware ever shipped never had one.
+</Callout>
+
+## Conventions used throughout
+
+Code is in C unless otherwise stated. Shell commands assume bash on Linux or macOS; Windows users can use WSL or the equivalent native tooling. Snippets that need vendor HAL calls (clock init, GPIO setup) abstract them as `SystemClock_Config()` and `gpio_init()` — the focus is the FreeRTOS API, not the vendor's clock-tree wizard.
+
+Stack sizes are given in *words*, not bytes, because that is FreeRTOS's convention. `configMINIMAL_STACK_SIZE = 128` means 128 × 4 = 512 bytes on Cortex-M. We will repeat this every time it matters.
+
+Priority values follow FreeRTOS's "higher number is higher priority" convention. This is the opposite of NVIC priorities, which are "lower number is higher urgency." Lesson 5 explains why both conventions exist and how to keep them straight.
+
+## Cross-references
+
+This tutorial is self-contained but every lesson links out to deeper reference material on this site. The most useful background pages:
+
+- [FreeRTOS reference](/docs/rtos/freertos/) — API summary you can return to between lessons.
+- [The RTOS landscape](/docs/rtos/landscape/) — when you graduate to Zephyr, ThreadX, or RT-Thread.
+- [Priority inversion](/docs/rtos/priority-inversion/) — long-form on the Mars Pathfinder story; lesson 5 references this.
+- [IPC primitives](/docs/rtos/ipc/) — when to pick a queue versus a stream buffer versus a notification.
+- [Scheduling](/docs/rtos/scheduling/) — fixed-priority pre-emptive context, including rate-monotonic analysis.
+- [Tickless idle](/docs/rtos/tickless/) — lesson 10 builds on this.
+- [NVIC priority](/docs/cortex-m/nvic-priority/) — required reading before lesson 5.
+- [SysTick](/docs/cortex-m/systick/) — the heartbeat under FreeRTOS.
+- [Exception model](/docs/architecture/exception-model/) — PendSV, SVC, and how they cooperate with the scheduler.
+
+Tools that pair well with the lessons:
+
+- [NVIC priority simulator](/tools/nvic-simulator/) — visualise PRIGROUP splits.
+- [Interrupt latency calculator](/tools/interrupt-latency/) — model context-switch overhead.
+- [Stack frame visualiser](/tools/stack-frame/) — see exactly what gets pushed on a context switch.
+
+## Where to next
+
+If you are ready, open [Lesson 1 — Why an RTOS](/docs/rtos/tutorial-01-why-rtos/). It is the most boring lesson in the set — almost no code, just judgment. Read it anyway. Half the production RTOS bugs in the wild trace back to engineers who used an RTOS for a workload that did not actually need one, or who skipped an RTOS for one that did.
+
+If you already know whether you need an RTOS and just want the code, jump to [Lesson 2 — Hello FreeRTOS](/docs/rtos/tutorial-02-hello-freertos/). You can always come back to lesson 1 after your first hang.

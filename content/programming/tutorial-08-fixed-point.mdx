@@ -1,0 +1,336 @@
+---
+title: Lesson 8 — Fixed-point math without an FPU
+description: Q-format primer. Q15 and Q31 multiplication and overflow rules. CMSIS-DSP helpers. A complete Q15 PID controller. When floats are fine on Cortex-M4F.
+order: 10
+updated: 2026-05-13
+tags: [programming, tutorial, c, embedded, fixed-point, dsp, pid]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 8 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Q15/Q31 fixed-point representation, overflow-safe multiplication, CMSIS-DSP helpers, a complete Q15 PID controller, float vs fixed-point decision rules' },
+    { label: 'Code provided', value: 'About 130 lines — Q15 helpers and a PID' },
+    { label: 'Time', value: '75-90 minutes' },
+    { label: 'Hardware', value: 'STM32F411 Nucleo (M4F). Most of the math applies unchanged to M3, M0, M0+' },
+  ]}
+/>
+
+On Cortex-M0, Cortex-M0+, and Cortex-M3 there is no floating-point unit. `float a = 1.5f * 2.0f` becomes a call into newlib's software-float library — easily 50-200 cycles per operation, plus library code in flash. For real-time signal processing this is not acceptable.
+
+The solution is fixed-point arithmetic: represent fractional values as integers with an implicit binary point. All operations become plain integer math, fast on every core. The cost is constant care about overflow and scale.
+
+Even on Cortex-M4F (which our board has) fixed-point still wins in many cases — DMA stream postprocessing at the audio sample rate, integer-only RTOS code, ports that must run on multiple cores in the family.
+
+## Q-format primer
+
+A Qm.n number uses `m` bits for the integer part (including sign for signed) and `n` bits for the fraction. The total is `m + n` bits, plus a sign bit for signed Q-formats.
+
+Common formats:
+
+| Format | Bits | Range                         | Resolution     |
+|--------|------|-------------------------------|----------------|
+| Q15    | 16   | -1.0 to +0.999969...          | 2^-15 ~= 3.05e-5 |
+| Q1.15  | 16   | same as Q15 (one integer bit, 15 fraction) | 2^-15 |
+| Q31    | 32   | -1.0 to +0.999999999...       | 2^-31 ~= 4.66e-10 |
+| Q7.24  | 32   | -128.0 to +127.999...         | 2^-24          |
+| UQ16   | 16   | 0 to 65535/65536 ~= 0.9999    | 2^-16          |
+
+Q15 (signed 16-bit, all 15 bits fractional except the sign bit) is the workhorse for audio and control. Stored in `int16_t`, the integer value `0x7FFF` represents `+0.99996948...` and `0x8000` represents `-1.0`.
+
+## Conversion to and from float
+
+```c
+static inline int16_t to_q15(float x) {
+    if (x >= 1.0f) return INT16_MAX;
+    if (x < -1.0f) return INT16_MIN;
+    return (int16_t)(x * 32768.0f);   /* scale by 2^15 */
+}
+
+static inline float from_q15(int16_t x) {
+    return (float)x / 32768.0f;
+}
+```
+
+The clamp before conversion prevents overflow on values out of range. For Q31:
+
+```c
+static inline int32_t to_q31(float x) {
+    if (x >=  1.0f) return INT32_MAX;
+    if (x < -1.0f) return INT32_MIN;
+    return (int32_t)(x * 2147483648.0);   /* 2^31, double precision to avoid rounding */
+}
+```
+
+Note the literal `2147483648.0` — a double, because `2147483648` (as int) overflows `int32_t`. Use the double form to be safe across compilers.
+
+## Addition and subtraction
+
+```c
+int16_t a = to_q15(0.4f);   /* 0x3333 */
+int16_t b = to_q15(0.5f);   /* 0x4000 */
+int16_t c = a + b;          /* 0x7333 = +0.9 in Q15 — fine */
+
+int16_t d = a + a + a;      /* 0x9999 — overflow! becomes negative */
+```
+
+Q15 addition wraps around at +/-1.0. For saturating addition, use Cortex-M4 `__QADD16`:
+
+```c
+int16_t safe_add(int16_t a, int16_t b) {
+    return (int16_t)__QADD16((uint32_t)a, (uint32_t)b);
+}
+```
+
+On M3 and below, manual saturation:
+
+```c
+int16_t safe_add_portable(int16_t a, int16_t b) {
+    int32_t sum = (int32_t)a + (int32_t)b;
+    if (sum >  INT16_MAX) return INT16_MAX;
+    if (sum <  INT16_MIN) return INT16_MIN;
+    return (int16_t)sum;
+}
+```
+
+About 4 cycles. The Cortex-M3+ form using `__SSAT` is 2 cycles.
+
+## Multiplication — the dangerous part
+
+Q15 × Q15 gives Q30 (the fraction bits add). To get back to Q15 you shift right by 15:
+
+```c
+int16_t q15_mul(int16_t a, int16_t b) {
+    return (int16_t)(((int32_t)a * (int32_t)b) >> 15);
+}
+```
+
+Three things to notice:
+
+- **Cast to `int32_t` before multiplying.** Without the cast, `int * int` produces an `int` and Q15 × Q15 overflows for values close to +/-1.
+- **The intermediate is Q1.30.** You shift right 15 to get back to Q1.15 (Q15).
+- **The shift drops precision.** For multiplications that you accumulate (FIR filters, dot products), keep the intermediate as Q31 and shift once at the end.
+
+Example FIR filter inner loop, accumulating in Q31:
+
+```c
+int16_t fir_q15(const int16_t *taps, const int16_t *samples, size_t n) {
+    int64_t acc = 0;   /* 64-bit to be paranoid about overflow */
+    for (size_t i = 0; i < n; i++) {
+        acc += (int32_t)taps[i] * (int32_t)samples[i];
+    }
+    /* acc is in Q30 (each product is Q30, sum stays Q30 but grows) */
+    /* clamp to int32 range, then shift to Q15 */
+    if (acc > INT32_MAX) acc = INT32_MAX;
+    if (acc < INT32_MIN) acc = INT32_MIN;
+    return (int16_t)((int32_t)acc >> 15);
+}
+```
+
+Cortex-M4F has a single-cycle `SMLAL` (signed multiply-accumulate, 32x32 → 64-bit accumulator) that GCC emits for the inner loop with `-O2`. Verify with disassembly.
+
+## Pre-shifting to avoid overflow
+
+Multiplying two values each just under 1.0 in Q15 is fine: result is just under 1.0. But what about `q15_mul(to_q15(0.99), to_q15(0.99))`? The intermediate `0x7D70 * 0x7D70 = 0x3CFF2510` fits in int32. The right-shift gives `0x79FE`, which is `~0.953` in Q15 — correct.
+
+What if one operand is Q7.8 (range +/-128, 8 fraction bits) and the other is Q15? Product is Q22 (8 + 15 fraction bits). Direction of shift depends on what scale you want the result in.
+
+The general rule: track the scale of every operand and every result. Comments help; macros help more:
+
+```c
+typedef int16_t q15_t;
+typedef int32_t q31_t;
+typedef int32_t q7_8_t;  /* 7 integer bits, 8 fraction bits */
+
+q15_t scale_then_round(q31_t intermediate, unsigned downshift) {
+    q31_t rounded = intermediate + (1 << (downshift - 1));   /* round-half-up */
+    return (q15_t)(rounded >> downshift);
+}
+```
+
+Round-half-up via `+= half` before the shift fixes the bias from truncation. Some implementations prefer round-to-even ("banker's rounding") — it eliminates the bias entirely at the cost of one extra branch.
+
+<Callout type="warn" title="Signed right-shift is implementation-defined">
+The C standard says `int >> n` for negative values is implementation-defined. GCC's behaviour is arithmetic shift (sign-extending). Every compiler used in production embedded development does the same. Just be aware: if you ever port to a freestanding compiler that does logical right shift, your signed Q-math breaks.
+</Callout>
+
+## CMSIS-DSP helpers
+
+If you have CMSIS-DSP available (`arm_math.h`), it provides:
+
+- `arm_mult_q15(srcA, srcB, dst, blockSize)` — vectorised Q15 multiply.
+- `arm_dot_prod_q15(srcA, srcB, blockSize, result)` — dot product with 64-bit accumulator.
+- `arm_fir_q15`, `arm_iir_q15` — finite/infinite impulse response filters.
+- `arm_sin_q15`, `arm_cos_q15` — table-based trig in Q15.
+- `arm_fft_q15` — fast Fourier transform.
+
+These are hand-tuned for each core. On Cortex-M4F with DSP extensions they use `SMLAL`, `SMUAD` (dual-multiply-add), and packed 16-bit operations to process two samples per cycle. On Cortex-M0+ they fall back to plain integer.
+
+Including CMSIS-DSP costs ~5-50 KB of flash depending on which functions you use. For projects with a few dozen samples of DSP, hand-rolled fixed-point is smaller. For audio or motor control, use the library.
+
+## A complete Q15 PID controller
+
+```c
+#include <stdint.h>
+
+typedef struct {
+    /* Tuning gains in Q15 */
+    int16_t kp;
+    int16_t ki;
+    int16_t kd;
+
+    /* State */
+    int32_t integral;          /* Q31 to hold accumulated error */
+    int16_t prev_error;        /* Q15 */
+
+    /* Output limits */
+    int16_t out_min;           /* Q15 */
+    int16_t out_max;           /* Q15 */
+    int32_t integral_min;      /* Q31, for anti-windup */
+    int32_t integral_max;      /* Q31 */
+} pid_q15_t;
+
+void pid_init(pid_q15_t *p, int16_t kp, int16_t ki, int16_t kd,
+              int16_t out_min, int16_t out_max) {
+    p->kp = kp;
+    p->ki = ki;
+    p->kd = kd;
+    p->integral = 0;
+    p->prev_error = 0;
+    p->out_min = out_min;
+    p->out_max = out_max;
+    /* Choose integral limits scaled to output range */
+    p->integral_min = (int32_t)out_min << 15;
+    p->integral_max = (int32_t)out_max << 15;
+}
+
+int16_t pid_update(pid_q15_t *p, int16_t setpoint, int16_t measurement) {
+    /* Error in Q15. Saturating sub on M4. */
+    int32_t error = (int32_t)setpoint - (int32_t)measurement;
+    if (error >  INT16_MAX) error = INT16_MAX;
+    if (error < INT16_MIN) error = INT16_MIN;
+
+    /* P term: kp * error → Q30, shift down to Q15 */
+    int32_t p_term = ((int32_t)p->kp * error) >> 15;
+
+    /* I term: integrate error, then ki * integral */
+    p->integral += error;
+    if (p->integral > p->integral_max) p->integral = p->integral_max;
+    if (p->integral < p->integral_min) p->integral = p->integral_min;
+    int32_t i_term = ((int64_t)p->ki * p->integral) >> 30;
+
+    /* D term: kd * (error - prev_error) → Q30, shift to Q15 */
+    int32_t d_term = ((int32_t)p->kd * (error - p->prev_error)) >> 15;
+    p->prev_error = (int16_t)error;
+
+    /* Sum and clamp to output range */
+    int32_t out = p_term + i_term + d_term;
+    if (out > p->out_max) out = p->out_max;
+    if (out < p->out_min) out = p->out_min;
+    return (int16_t)out;
+}
+```
+
+Forty lines. Highlights:
+
+- The integral accumulator is Q31 so it can hold tens of thousands of accumulated Q15 errors without overflowing.
+- `kp * error` is `int16_t * int32_t`, but only after casting `p->kp` to `int32_t`. Important.
+- `ki * integral` is `Q15 * Q31`, giving Q46. We shift down 30 to get Q16, then truncate to Q15. The `int64_t` cast on `p->ki` prevents intermediate overflow.
+- Anti-windup limits the integral so it cannot grow past the output range. Without this, after a long disturbance the integral wind-up causes massive overshoot when the system returns.
+
+Cycles per update on Cortex-M4F: about 30. Same loop in floats with FPU: about 25. The fixed-point version runs on every Cortex-M including M0+.
+
+<Callout type="tip" title="Tuning a Q15 PID">
+Start with kp non-zero, ki and kd at zero. Increase kp until you see oscillation, then back off. Add ki to remove steady-state error. Add kd only if you need to damp fast transients — kd is noise-amplifying and the most fragile term in a quantised system. Plot the output and error during tuning; intuition is misleading when the dynamics are nonlinear.
+</Callout>
+
+## Float vs fixed-point — when to use which
+
+**Use fixed-point when:**
+
+- The target has no FPU (M0, M0+, M3).
+- The code must port to a no-FPU member of the same chip family.
+- You are processing samples at a rate where every cycle matters (e.g., 48 kHz audio).
+- You need bit-exact reproducibility across runs and across compilers (float NaN handling differs).
+
+**Use float (M4F or above) when:**
+
+- The target has an FPU and you are not in a tight DSP loop.
+- The math is sparse — a sensor reading every 10 ms.
+- The dynamic range required is large (sensor values from microvolts to volts).
+- The code will not run on no-FPU parts.
+
+The argument for float on M4F: the FPU does single-precision add, multiply, divide, sqrt in 1-14 cycles. A complete float PID is faster than a Q15 one when you do not need to share code with M3 siblings. The argument against: float code links a much larger newlib (formatting, etc.) and tempting `printf("%f", x)` calls pull in 4-10 KB of formatter.
+
+Mixed strategy: use float in the high-level control logic, fixed-point in the inner DSP loop. Profile both before committing.
+
+## What the FPU gives you on M4F
+
+Cortex-M4F has a single-precision FPU (FPv4-SP-D16). With the right compile flags:
+
+```bash
+arm-none-eabi-gcc -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard ...
+```
+
+- `float` operations compile to native VFP instructions (1-14 cycles each).
+- `double` still goes through software emulation. **Stick to `float`** unless you really need double precision.
+- Function arguments are passed in FPU registers (`s0`-`s15`), saving register pressure.
+- Lazy stacking: the FPU registers are saved to the exception frame only if the ISR uses them. Configure via `FPU->FPCCR` (default is on; do not change unless you have measured a need).
+
+<Callout type="warn" title="Without -mfloat-abi=hard, your floats are slow even with the FPU">
+The default ABI for arm-none-eabi-gcc is sometimes soft-float (passing floats in integer registers, even on M4F). With `-mfloat-abi=hard` floats are passed in FPU registers and operate at native speed. The wrong ABI is a common silent bug. Also link with the matching newlib variant (`-specs=nano.specs -mfloat-abi=hard`).
+</Callout>
+
+## Exercises
+
+**Exercise 8.1.** Convert `pid_update` to use floats. Compile both for Cortex-M4F with `-O2 -mfpu=fpv4-sp-d16 -mfloat-abi=hard`. Compare cycle counts using the DWT cycle counter (`DWT->CYCCNT`).
+
+<Callout type="spec" title="Answer">
+
+```c
+float pid_update_f(...) {
+    float error = setpoint - measurement;
+    float p = p->kp * error;
+    p->integral += error;
+    /* clamp integral */
+    float i = p->ki * p->integral;
+    float d = p->kd * (error - p->prev_error);
+    p->prev_error = error;
+    float out = p + i + d;
+    /* clamp out */
+    return out;
+}
+```
+
+Float version: ~25 cycles per update on M4F with `-O2`. Q15 version: ~30 cycles. Float wins on M4F for this size of code, but only by 17%. On Cortex-M3 (no FPU), the float version is ~250 cycles; Q15 stays at ~30. The big win for fixed-point is portability and worst-case bounds.
+</Callout>
+
+**Exercise 8.2.** Implement Q15 multiplication using `__SMUL` intrinsic (if available) versus the portable cast-and-shift. Verify they produce identical results across the full Q15 range. Hint: write a brute-force test in `main` that compares for all 65536^2 input pairs is too slow; sample at strategic points.
+
+<Callout type="spec" title="Answer">
+The portable form `((int32_t)a * (int32_t)b) >> 15` and the M4 `__SMULBB` (signed multiply, bottom half × bottom half) produce identical results for all valid Q15 inputs. The intrinsic compiles to one instruction; the portable form compiles to one instruction too (GCC pattern-matches). On Cortex-M0+, the portable form is one `MUL` plus one `ASR`, still optimal. Conclusion: write portable, verify GCC generates good code, only reach for intrinsics when GCC fails to recognise the pattern.
+</Callout>
+
+**Exercise 8.3.** What happens to your Q15 PID if the input signals are quantised to 8 bits but you scale them to Q15? Specifically, what is the smallest non-zero error?
+
+<Callout type="spec" title="Answer">
+8-bit signed input scaled to Q15 has steps of `2^15 / 2^7 = 256` in Q15 units. Any error smaller than 256 LSBs reads as zero. With kp = 0.5 (Q15 0x4000), a tiny error of 100 LSB cannot accumulate visibly — the P term is below the resolution of the output. This is **deadband from quantisation**. Solutions: use higher-resolution inputs (12-bit ADC mapped to Q15), or accept the deadband and design around it (most real systems have hysteresis anyway), or use Q31 arithmetic everywhere to keep more LSBs.
+</Callout>
+
+## What you learned
+
+- Q-format encodes fractions as integers with implicit scale. Q15 is the workhorse.
+- Q15 multiply: cast to int32, multiply, shift right 15. Track scale on every operation.
+- Pre-shift or use 64-bit accumulators to avoid intermediate overflow.
+- CMSIS-DSP provides hand-tuned Q15/Q31 helpers and is worth the flash cost for serious DSP.
+- A Q15 PID controller fits in ~30 cycles on M4F and ports unchanged to M0+.
+- On M4F with `-mfloat-abi=hard`, `float` math is competitive for sparse code; fixed-point still wins for tight DSP loops and portable code.
+
+In lesson 9 we build state machines — the structural pattern that holds most firmware together.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 7 — Bit manipulation patterns](/docs/programming/tutorial-07-bit-patterns/) | [Lesson 9 — State machines](/docs/programming/tutorial-09-state-machine/) |

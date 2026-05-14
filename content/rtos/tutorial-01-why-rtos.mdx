@@ -1,0 +1,233 @@
+---
+title: Lesson 1 — Why an RTOS, and when not
+description: Bare-metal superloop vs scheduled tasks. Hard vs soft real-time. The exact list of problems an RTOS solves — and the workloads where it costs more than it gives.
+order: 2
+updated: 2026-05-13
+tags: [rtos, tutorial, freertos, decision, bare-metal]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 1 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'When an RTOS is the right tool and when it is overhead masquerading as architecture' },
+    { label: 'Code provided', value: '~80 lines (one bare-metal superloop, one RTOS sketch for comparison)' },
+    { label: 'Time', value: '60–90 min' },
+    { label: 'Pre-reqs', value: 'Comfort with bare-metal Cortex-M, interrupt handlers, and timer-driven I/O' },
+    { label: 'Outcome', value: 'A defensible answer to the question "should this project use an RTOS?"' },
+  ]}
+/>
+
+Before we write a single line of FreeRTOS code, let's settle the question that should be settled at the start of every project: does this project actually want an RTOS? The honest answer is "sometimes." The dishonest answer — endemic in firmware shops that have just discovered FreeRTOS — is "always, because it is fashionable." This lesson sets the framework you will use for the rest of your career.
+
+## The superloop — what it is and why it still wins
+
+The simplest firmware architecture is a `while (1)` loop in `main` that walks through every job the system has, one after the other, forever. Interrupts handle the strict real-time parts; the loop handles the rest. Done correctly, this architecture is excellent. Predictable, debuggable, small. The Linux kernel was a superloop until 1995. The Apollo guidance computer was a superloop with a priority hint.
+
+```c
+int main(void) {
+    SystemClock_Config();
+    gpio_init();
+    uart_init();
+    adc_init();
+    timer_init();
+
+    while (1) {
+        if (button_pressed())   handle_button();
+        if (adc_sample_ready()) process_adc();
+        if (uart_rx_pending())  parse_command();
+        if (tick_elapsed(100))  blink_led();
+    }
+}
+```
+
+Each block runs to completion in microseconds; the loop revisits the top fast enough that no input is missed. The pattern handles a surprising variety of real products — bicycle computers, kitchen timers, simple sensor nodes, motor controllers — and it ships unproblematically on parts as small as a Cortex-M0+ with 4 KB of RAM.
+
+The hidden assumption is that **every job in the loop is short and bounded**. If `parse_command` ever takes 50 ms because it walks a long token tree, then `process_adc` is delayed by 50 ms and you have missed five ADC samples. The superloop's promise is "I will service every job in turn" — its failure mode is "I will service every job in turn, but slowly, when one of them misbehaves."
+
+## When the superloop starts to hurt
+
+Trouble begins when these things appear simultaneously in one project:
+
+- **Multiple periodic activities with different rates.** A control loop at 1 kHz, a UART parser servicing variable-length packets, a display refresh at 60 Hz, a sensor fusion job at 100 Hz. Coordinating four different periods inside one loop is doable but the timing analysis becomes painful and the code becomes a stew of state machines and timers.
+- **Blocking I/O that wants to coexist with a control loop.** A flash erase takes 50–100 ms. A network DNS lookup takes 200 ms. Without an RTOS, you must split each of these into a state machine driven from the loop, because you cannot afford to actually block the loop for 100 ms. State machines for inherently sequential code are tedious to write and maintain.
+- **Independent subsystems written by different engineers.** Each subsystem wants to think it owns the CPU and reason about time locally. With one superloop, every change anyone makes anywhere can affect the timing of every other subsystem.
+
+If two of those three apply, you start looking at an RTOS. If all three apply, you almost certainly want one.
+
+## Pre-emptive vs cooperative scheduling
+
+A scheduler is the piece of code that decides which task runs next. Two basic strategies:
+
+**Cooperative**: tasks run until they voluntarily yield (call `vTaskDelay`, block on a queue, etc.). The scheduler only switches at yield points. Predictable and cheap, but every task must be written to yield often. One unyielding task starves everything else.
+
+**Pre-emptive**: the scheduler can stop a running task at any time and switch to a higher-priority task. On Cortex-M, this is driven by the SysTick interrupt (every millisecond by default) and by ISR-induced rescheduling. The current task's CPU state is saved on its stack, the next task's state is restored, execution resumes.
+
+Pre-emptive is what FreeRTOS does by default (`configUSE_PREEMPTION = 1`). It is what virtually every modern RTOS does. Cooperative scheduling is a relic; the only time you turn pre-emption off in FreeRTOS is on ultra-tiny parts where you cannot afford the context-switch stack overhead.
+
+The cost of pre-emption is that shared data must be protected — a task can be interrupted at any instruction, including in the middle of updating a 64-bit counter. That is where mutexes, queues, and atomics enter the picture, and is the topic of lessons 4 through 7.
+
+## Hard vs soft real-time
+
+A real-time system is one where the *correctness* of the output depends on *when* it is produced, not just *what* it is. Two flavours:
+
+**Hard real-time**: missing a deadline is a system failure. An airbag firing 50 ms late is an airbag that did not fire. A motor controller missing its current-loop deadline by one cycle can destroy the motor. Hard real-time demands worst-case execution time analysis and provable timing — not "it usually meets the deadline."
+
+**Soft real-time**: missing a deadline degrades quality but does not break the system. A video frame dropped at 60 fps is a glitch the user might not notice; the next frame still arrives. A UART parser running 5 ms late produces a delayed response, not a wrong one.
+
+An RTOS does not magically give you hard real-time. It gives you the **mechanisms** — priority-based pre-emption, bounded primitives, predictable scheduling — that *enable* hard real-time if you do the analysis. A system with a 1 kHz hard deadline running on FreeRTOS is hard real-time only if you have measured the worst-case path and shown it fits in 1 ms with margin. Plenty of FreeRTOS systems are soft real-time and that is fine.
+
+<Callout type="warn" title="FreeRTOS is not certified for safety-critical hard real-time">
+The standard MIT-licensed FreeRTOS does not carry a safety certification. For safety-critical hard real-time (IEC 61508, ISO 26262, DO-178), use SAFERTOS (the IEC 61508 SIL 3 variant of FreeRTOS), ThreadX with the AzureRTOS certification packs, or QNX. Lesson 10 covers this in more depth.
+</Callout>
+
+## When you DO want an RTOS
+
+The pattern is consistent across two decades of real projects:
+
+- **Multiple periodic tasks at different rates** — for example, a 1 kHz control loop, a 100 Hz sensor fusion, and a 10 Hz UI update. Trying to schedule three rates inside one superloop is solvable but unpleasant; an RTOS makes each rate a task at its own priority and the scheduler does the work.
+- **Blocking I/O coexisting with control loops** — DNS lookups, flash erase, TLS handshakes, SD card writes. Each one is a multi-millisecond blocking call. Without an RTOS you write a state machine for each one. With an RTOS, each becomes a task that calls a blocking API and the scheduler runs your control loop in the meantime.
+- **Networking + UI + sensors in one product** — a smart thermostat. Five or six subsystems written by different people, each one needing its own piece of CPU time. An RTOS is the obvious choice.
+- **Anything with a TCP/IP stack** — lwIP, Mbed TLS, Wi-Fi drivers. They all assume tasks, mutexes, and queues. Porting them to bare-metal is possible but unwise.
+- **Code reuse across products** — your sensor driver should be the same driver in a smartwatch, a flight controller, and a thermostat. If it assumes the RTOS API (queues for incoming samples, a task for the driver's worker), it ports cleanly.
+
+## When you do NOT want an RTOS
+
+Equally consistent:
+
+- **Tight single-loop motor control at >50 kHz.** A 20 µs control loop has no slack for context-switch overhead. The control loop wants the whole CPU. Run it bare-metal in a timer ISR.
+- **Very small chips, < 8 KB RAM.** FreeRTOS itself needs about 6 KB minimum (kernel + heap + idle stack); leaving you very little for tasks. Use a superloop or a tiny event scheduler instead.
+- **Hard safety-critical without certification budget.** A medical infusion pump or an automotive ECU running uncertified FreeRTOS is a regulatory and ethical problem. Either pay for a certified RTOS or stick to bare-metal under the relevant safety standard.
+- **Single-purpose products with one job.** A garage door opener. A capacitive touch lamp. A USB-to-serial bridge. One concurrent activity, no blocking I/O of any consequence — the superloop is the right architecture forever.
+- **Hard determinism without engineering for it.** An RTOS introduces context-switch jitter (typically 1–5 µs on Cortex-M4). If your system cannot tolerate that jitter, do not paper over it with an RTOS; control the CPU yourself.
+
+## The cost-benefit table
+
+<CoreCompare
+  rows={[
+    { core: 'Cost — RAM', notes: 'Kernel + idle stack + per-task TCB and stack. Typical: 6–10 KB minimum, grows linearly with task count.' },
+    { core: 'Cost — flash', notes: 'FreeRTOS kernel: 6–15 KB depending on features enabled. Negligible on most parts.' },
+    { core: 'Cost — CPU overhead', notes: 'Context switch: ~80–200 cycles on Cortex-M4. Tick handler: ~50 cycles. Total typically < 1% at 1 ms tick.' },
+    { core: 'Cost — complexity', notes: 'Race conditions become possible. Priority inversion becomes possible. Stack overflows become harder to predict. Debugging needs trace tools.' },
+    { core: 'Benefit — productivity', notes: 'Each subsystem can be written linearly with blocking APIs. Code reuse across products. Standard primitives reduce custom synchronisation code.' },
+    { core: 'Benefit — composition', notes: 'Third-party stacks (TCP/IP, USB, filesystems) assume an RTOS. Porting them away is months of work.' },
+    { core: 'Benefit — observability', notes: 'Trace tools (SystemView, Tracealyzer) give per-task timelines. Bare-metal has nothing comparable without significant custom instrumentation.' },
+  ]}
+/>
+
+## Why FreeRTOS specifically
+
+If you have decided you want an RTOS, the choice for an introductory tutorial is straightforward:
+
+- **Free and MIT-licensed.** No royalties, no per-unit fees, no licence audit ever. Use it in commercial products without restriction.
+- **Ubiquitous on Cortex-M.** Every vendor's tooling has FreeRTOS templates. Every TCP/IP stack has been ported. Every chip you might use has a known-working configuration in the field.
+- **Simple kernel.** ~9000 lines of C, readable in an afternoon. You can grep your way through it when something misbehaves.
+- **ARM-friendly.** The Cortex-M port is the canonical one, maintained by ARM and the FreeRTOS team. It exploits PendSV and SVC the way the architecture intends.
+- **AWS stewardship.** Since 2017, Amazon owns the project. Releases are regular, security advisories are issued, the LTS branches are real. Project risk has gone down, not up.
+
+The alternatives are reasonable but more demanding. Zephyr has Kconfig + device tree and a much larger surface area; ThreadX has cleaner APIs but is now part of the Microsoft Azure umbrella; RT-Thread is huge in China and growing elsewhere. We will compare them all in lesson 10. For now: FreeRTOS, because it is the cleanest API and the smallest mental model.
+
+## A bare-metal sketch and an RTOS sketch, side by side
+
+The same job — read a button, debounce it, blink an LED at a rate that depends on the button — written both ways. Pseudocode-ish; lesson 2 has the real FreeRTOS version.
+
+Bare-metal superloop:
+
+```c
+int main(void) {
+    SystemClock_Config();
+    gpio_init();
+    uint32_t blink_period = 500;
+    uint32_t last_blink = 0;
+    uint32_t last_button = 0;
+    bool button_was = false;
+
+    while (1) {
+        uint32_t now = millis();
+
+        if (now - last_button > 20) {
+            bool pressed = read_button();
+            if (pressed && !button_was) {
+                blink_period = (blink_period == 500) ? 100 : 500;
+            }
+            button_was = pressed;
+            last_button = now;
+        }
+
+        if (now - last_blink >= blink_period) {
+            toggle_led();
+            last_blink = now;
+        }
+    }
+}
+```
+
+FreeRTOS:
+
+```c
+static volatile uint32_t blink_period = 500;
+
+void button_task(void *arg) {
+    bool was = false;
+    while (1) {
+        bool pressed = read_button();
+        if (pressed && !was) blink_period = (blink_period == 500) ? 100 : 500;
+        was = pressed;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+void blink_task(void *arg) {
+    while (1) {
+        toggle_led();
+        vTaskDelay(pdMS_TO_TICKS(blink_period));
+    }
+}
+
+int main(void) {
+    SystemClock_Config();
+    gpio_init();
+    xTaskCreate(button_task, "btn", 128, NULL, 2, NULL);
+    xTaskCreate(blink_task, "blink", 128, NULL, 1, NULL);
+    vTaskStartScheduler();
+    while (1) {}
+}
+```
+
+For this toy example, the bare-metal version is shorter and clearer. Now imagine adding: a UART command parser, a 1 kHz ADC sample loop, a 10 Hz sensor fusion task, an MQTT client. The bare-metal version becomes a tangle of state machines and the RTOS version stays linear — five tasks, each a small `while (1)` doing one thing.
+
+The break-even is somewhere around three concurrent activities. Below that, bare-metal wins on simplicity. Above it, the RTOS wins on maintainability.
+
+## Exercises
+
+**Exercise 1.1**: A motor controller runs a 20 kHz field-oriented control loop (50 µs period). It also needs to talk to a host over UART at 115200 baud and respond to a 100 Hz watchdog. Should this use an RTOS? Argue both sides briefly.
+
+**Exercise 1.2**: A simple temperature logger samples one sensor every second, writes to flash every minute, and reports over UART every five minutes. RTOS, or superloop? Why?
+
+**Exercise 1.3**: An ISR triggered by a UART RX byte runs in 3 µs. A FreeRTOS context switch on the same chip takes 2 µs. The system runs at 1 ms tick. What fraction of CPU time is RTOS overhead? Is that significant?
+
+<Callout type="spec" title="Answer 1.1">
+The 20 kHz control loop is the killer. 50 µs is too tight for FreeRTOS context-switch overhead (1–5 µs of jitter) to be invisible. The right architecture is: a hardware timer ISR runs the control loop bare-metal at the top NVIC priority; everything else (UART, watchdog, host comms) runs as a FreeRTOS task at a lower priority, with `configMAX_SYSCALL_INTERRUPT_PRIORITY` set so that the control-loop ISR is *above* the FreeRTOS API barrier (the kernel never sees that ISR, never delays it). This is the "RTOS for the slow stuff, ISR for the fast stuff" pattern — common in motor drives, see [m4](/docs/cortex-m/m4/).
+</Callout>
+
+<Callout type="spec" title="Answer 1.2">
+Superloop. Three jobs, all slow, none of them blocking I/O of any consequence. Total RAM usage is in the hundreds of bytes. An RTOS adds 6 KB of overhead, six new failure modes (priority, blocking, stack overflow, mutex misuse, ISR safety, heap fragmentation), and zero benefit. The bare-metal version is shorter, faster, and more reliable.
+</Callout>
+
+<Callout type="spec" title="Answer 1.3">
+At 1 ms tick rate, the tick handler runs 1000 times per second. Each tick takes ~50 cycles plus possibly a context switch. On a 100 MHz Cortex-M4 that's roughly 100 µs per second of pure tick overhead, plus context-switch cost — call it 0.1–0.3% total RTOS overhead. Negligible for almost any workload. If you find FreeRTOS adding measurable load, you either have a runaway tick hook or a thousand tasks; investigate before tuning.
+</Callout>
+
+## What you learned
+
+- The superloop is a legitimate architecture and often the right one. Three or fewer concurrent activities, simple I/O, single engineer: stay bare-metal.
+- An RTOS pays for itself when you have multiple periodic rates, blocking I/O alongside control loops, networking + UI + sensors, or third-party stacks that assume one.
+- Pre-emptive scheduling is the default mental model. Cooperative scheduling is a relic.
+- Hard real-time needs WCET analysis on top of an RTOS, not instead of one. FreeRTOS itself is not certified for safety-critical use.
+- FreeRTOS is the pragmatic starting point: MIT-licensed, tiny, ubiquitous, ARM-native.
+
+## Up next
+
+| Previous | Next |
+|---|---|
+| [Tutorial landing](/docs/rtos/tutorial/) | [Lesson 2 — Hello FreeRTOS](/docs/rtos/tutorial-02-hello-freertos/) |

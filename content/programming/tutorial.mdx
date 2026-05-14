@@ -1,0 +1,109 @@
+---
+title: C tutorial — bare-metal Cortex-M from zero
+description: A hands-on 10-lesson tutorial. Set up GCC, blink an LED without HAL, read registers, write a linker script, handle interrupts, decode CFSR/HFSR, build a DMA-driven UART driver — all from scratch.
+order: 2
+updated: 2026-05-13
+tags: [programming, tutorial, c, embedded, cortex-m]
+badge: tutorial
+---
+
+
+Most embedded C tutorials online start with `HAL_GPIO_TogglePin(...)`. You copy the call, the LED blinks, and you have learned nothing about the silicon underneath. Six months later when the HAL leaks abstractions — a peripheral half-initialised, a clock dependency you can't see, an interrupt firing at the wrong priority — you have no model to debug it with.
+
+This tutorial does the opposite. We start at the silicon and earn our way up. By lesson 2 you will have toggled an LED with a literal pointer to a memory-mapped register, a 16-line startup assembly file, and a linker script you wrote yourself. By lesson 10 you will have implemented a DMA-driven UART driver with a lock-free ring buffer and a circular DMA controller — the same kind of code that ships in production firmware.
+
+The philosophy is simple: **learn the silicon, then earn the right to use HAL**. After you have written a `volatile` register-banged driver, the HAL's wrapper around it is just a convenience. Before that, it is a black box that hides the bugs you cannot debug.
+
+## At a glance
+
+<SpecSheet
+  title="Tutorial — at a glance"
+  specs={[
+    { label: 'Target', value: 'Cortex-M4 (STM32F411 Nucleo, STM32F4-DISCO, or NUCLEO-G474)' },
+    { label: 'Hardware required', value: 'Cortex-M4 board with on-board ST-Link (or external SWD probe), USB cable, host PC' },
+    { label: 'Software', value: 'arm-none-eabi-gcc, OpenOCD or st-flash, arm-none-eabi-gdb, a text editor' },
+    { label: 'Time investment', value: 'Approximately 15-20 hours total — 60-90 minutes per lesson' },
+    { label: 'Prerequisites', value: 'Basic C: pointers, structs, bit operations. No prior embedded experience required' },
+    { label: 'You will write', value: 'About 1500 lines of C and 50 lines of linker / assembly' },
+    { label: 'Output', value: 'A working bare-metal codebase: blink, GPIO driver, SysTick, UART RX/TX with DMA, fault decoder' },
+  ]}
+/>
+
+## The board
+
+The lessons target the **STM32F411 Nucleo-64** (a Cortex-M4F at 100 MHz with 512 KB flash, 128 KB SRAM, on-board ST-Link/V2-1). It is the cheapest sane choice: a single USB cable carries power, programming, and a virtual COM port. Total cost around 15 USD.
+
+The code will run unchanged on:
+
+- **STM32F4-DISCO** (STM32F407, same Cortex-M4F core, MEMS sensors on board)
+- **NUCLEO-F446RE** (STM32F446, M4F at 180 MHz)
+- **NUCLEO-G474RE** (STM32G474, M4F at 170 MHz, modern peripherals)
+- Any other Cortex-M4 with an SWD probe — peripheral register addresses change, the rest does not.
+
+If you have an STM32F1 (M3, no FPU) or STM32L0 (M0+), most lessons still work — only lesson 8 (fixed-point) has a section that depends on M4F intrinsics, and lesson 6 references SysTick which is identical on every Cortex-M.
+
+## The 10 lessons
+
+<CoreCompare
+  rows={[
+    { core: 'Lesson 1 — Toolchain setup', notes: 'Install arm-none-eabi-gcc, OpenOCD, GDB. Verify with a one-line compile. Wire up the ST-Link.' },
+    { core: 'Lesson 2 — Your first blink, no HAL', notes: 'main.c, startup.s, linker.ld, build, flash. ~80 lines total. The LED blinks because you understand every line.' },
+    { core: 'Lesson 3 — Reading hardware registers in C', notes: 'volatile, memory-mapped I/O, peripheral struct types, BSRR for atomic single-bit ops, read-modify-write hazards.' },
+    { core: 'Lesson 4 — Memory layout', notes: 'Flash, SRAM, peripheral, system regions. _etext, _sdata, _edata, _sbss, _ebss. Startup-time .data copy and .bss zeroing.' },
+    { core: 'Lesson 5 — A minimum linker script', notes: 'MEMORY and SECTIONS blocks annotated line-by-line. AT-load. PROVIDE. Adding a bootloader region.' },
+    { core: 'Lesson 6 — Interrupts and ISRs', notes: 'Manual SysTick configuration, vector table dispatch, NVIC priority, critical sections via BASEPRI, UART RX interrupt.' },
+    { core: 'Lesson 7 — Bit manipulation patterns', notes: 'Set/clear/toggle, multi-bit fields, sign extension, __builtin_clz, __REV, saturate-add DSP intrinsics.' },
+    { core: 'Lesson 8 — Fixed-point math without an FPU', notes: 'Q15, Q31, Q1.15. Overflow rules. A complete Q15 PID controller. When to use float on M4F.' },
+    { core: 'Lesson 9 — State machines that survive', notes: 'switch-case, function-pointer-table, hierarchical FSMs. A real UART command parser dispatching LED ON / LED OFF / BLINK 5.' },
+    { core: 'Lesson 10 — Ring buffers and DMA UART', notes: 'SPSC lock-free ring buffer. DMA1_Stream2 circular RX. Half-transfer + transfer-complete IRQs. Production-grade UART driver.' },
+  ]}
+/>
+
+## How to use this tutorial
+
+Three rules. They sound boring; they are the difference between absorbing the material and forgetting it in a week.
+
+1. **Read in order.** Each lesson assumes the last one. Lesson 4 (memory layout) will not make sense without lesson 2 (the blink program whose memory layout we dissect). Lesson 10's ring buffer assumes the interrupt vocabulary from lesson 6.
+
+2. **Type the code. Do not copy-paste.** Typing is slow on purpose. The friction is where learning lives. When you mis-type a register name and the compiler complains, you have built a memory of that register name that you will never have from a clipboard. Every working firmware engineer I know has typed `GPIOA->ODR ^= (1<<5);` enough times that their fingers know it.
+
+3. **Do every exercise before reading the answer.** The answers are in `<Callout type="spec">` blocks at the end of each lesson. Read them only after you have written your own code and either made it work or got stuck. Getting stuck for 20 minutes and then reading the answer teaches more than reading the answer in the first place.
+
+<Callout type="tip" title="If you get stuck for more than 30 minutes">
+That is a debugging exercise. Walk through the disassembly. Read the reference manual section for the peripheral. Check the `.map` file to confirm your code is where you expect it. The act of finding the bug is most of the skill of embedded engineering, and the tutorial cannot teach it for you — only practice can.
+</Callout>
+
+## A note on HAL and CubeMX
+
+I am not anti-HAL. I have shipped firmware that used STM32Cube HAL extensively. The HAL is a perfectly reasonable abstraction once you understand what it abstracts. The problem is using it without that understanding, because the moment a real bug shows up — a stuck DMA stream, a missing baud rate, an EXTI line that won't fire — you cannot debug at the abstraction level. You have to drop down to registers anyway.
+
+After this tutorial you will be able to read the HAL source code and understand exactly what it is doing. You will also know when to bypass it (hot ISRs, custom protocols, code-size-constrained projects) and when to use it (one-off bring-up code, prototypes, anything where engineering time matters more than the last 5% of performance).
+
+## What you will have built
+
+By the end:
+
+- A bare-metal blink (lesson 2) that flashes the user LED, written entirely without vendor libraries.
+- A GPIO register-level driver (lessons 3, 5) with proper volatile semantics and atomic BSRR usage.
+- A SysTick-driven 1 ms tick (lesson 6) feeding both `main()` polling code and interrupt handlers.
+- A UART RX/TX driver (lessons 6, 9, 10) that handles back-pressure correctly and runs DMA in the background.
+- A Q15 PID controller (lesson 8) that runs in roughly 30 cycles per update on M4F.
+- A command parser (lesson 9) that dispatches text commands from the serial port to runtime actions.
+
+The total code is around 1500 lines. Every line is yours.
+
+## Cross-references
+
+- [Embedded C patterns](/docs/programming/embedded-c/) — the patterns this tutorial uses, in reference form.
+- [Startup & vector table](/docs/programming/startup/) — deeper dive on what we build in lesson 2.
+- [Linker scripts](/docs/programming/linker-scripts/) — reference companion to lesson 5.
+- [CMSIS](/docs/programming/cmsis/) — what to use *after* you have done it the hard way.
+- [NVIC overview](/docs/cortex-m/nvic/) — interrupt model behind lesson 6.
+- [Vector table](/docs/cortex-m/vector-table/) — the architectural reference.
+- [DMA peripheral](/docs/peripherals/dma/) — used in lesson 10.
+- [UART peripheral](/docs/peripherals/uart/) — used in lessons 6, 9, 10.
+- [Linker script builder tool](/tools/linker-script/) — generate a starting point for your chip.
+- [Fault decoder](/tools/fault-decoder/) — paired with lesson 6 hardware fault sidebars.
+- [GCC flags reference](/tools/gcc-flags/) — what every flag in our build command means.
+
+Start with [Lesson 1 — Toolchain setup](/docs/programming/tutorial-01-toolchain/).

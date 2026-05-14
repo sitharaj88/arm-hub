@@ -1,0 +1,393 @@
+---
+title: Lesson 2 — Hello FreeRTOS
+description: Pull the FreeRTOS kernel from GitHub, wire SysTick/PendSV/SVC, write FreeRTOSConfig.h, build, flash, and watch your first task blink an LED.
+order: 3
+updated: 2026-05-13
+tags: [rtos, tutorial, freertos, build, port, systick, pendsv]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 2 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'How to integrate the FreeRTOS kernel into a Cortex-M4 project from source — including the exception-handler wiring that nobody documents clearly' },
+    { label: 'Code provided', value: '~150 lines (FreeRTOSConfig.h, main.c, Makefile additions)' },
+    { label: 'Time', value: '90–120 min' },
+    { label: 'Pre-reqs', value: 'Lesson 1, plus a working bare-metal blink on your board' },
+    { label: 'Outcome', value: 'A FreeRTOS task on real silicon, blinking an LED every 500 ms' },
+  ]}
+/>
+
+The shortest path to a FreeRTOS port that actually teaches you something is to pull the kernel from source, drop the four files you need into your project, write a minimal `FreeRTOSConfig.h`, wire three exception handlers, and build. Most tutorials hide all of this behind a vendor IDE wizard that generates 200 files and obscures what is going on. We are going to do it by hand the first time. After that, the wizards make sense.
+
+## Get the kernel
+
+The kernel lives at [github.com/FreeRTOS/FreeRTOS-Kernel](https://github.com/FreeRTOS/FreeRTOS-Kernel). Do not clone the bigger `FreeRTOS/FreeRTOS` repo — that one bundles dozens of demo projects and is over a gigabyte. The kernel repo alone is ~5 MB and contains exactly what you need.
+
+```bash
+cd ~/projects
+git clone -b V11.1.0 --depth 1 https://github.com/FreeRTOS/FreeRTOS-Kernel.git
+```
+
+Pin a specific release tag. The kernel API is stable but the build glue (`portable/` directory layout) has churned over the years. Pin a tag, write the build against it, and update only deliberately.
+
+## Source layout
+
+The repository looks like this once cloned:
+
+```
+FreeRTOS-Kernel/
+├── include/                   # public headers
+│   ├── FreeRTOS.h
+│   ├── task.h
+│   ├── queue.h
+│   ├── semphr.h
+│   ├── event_groups.h
+│   ├── stream_buffer.h
+│   ├── timers.h
+│   └── ...
+├── portable/
+│   ├── GCC/
+│   │   ├── ARM_CM0/           # Cortex-M0 / M0+
+│   │   ├── ARM_CM3/           # Cortex-M3
+│   │   ├── ARM_CM4F/          # Cortex-M4 with FPU  ← us
+│   │   ├── ARM_CM7/           # Cortex-M7
+│   │   ├── ARM_CM33_NTZ/      # Cortex-M33 non-TrustZone
+│   │   └── ...
+│   ├── MemMang/
+│   │   ├── heap_1.c
+│   │   ├── heap_2.c
+│   │   ├── heap_3.c
+│   │   ├── heap_4.c           # ← us
+│   │   └── heap_5.c
+│   └── Common/
+├── tasks.c
+├── queue.c
+├── list.c
+├── timers.c
+├── event_groups.c
+├── stream_buffer.c
+└── croutine.c                 # legacy, ignore
+```
+
+The kernel itself is the six `.c` files at the top level. The `portable/` directory contains the architecture-specific port (context save/restore, SysTick handler, PendSV trampoline) and the heap implementation. You pick one port directory and one heap file.
+
+## The files we need for STM32F411 Nucleo
+
+The Nucleo F411 is Cortex-M4F at 100 MHz. So:
+
+```
+tasks.c
+queue.c
+list.c
+timers.c
+event_groups.c
+stream_buffer.c
+portable/GCC/ARM_CM4F/port.c
+portable/MemMang/heap_4.c
+```
+
+Include paths:
+
+```
+FreeRTOS-Kernel/include
+FreeRTOS-Kernel/portable/GCC/ARM_CM4F
+```
+
+Plus your own project directory, which needs to contain `FreeRTOSConfig.h`.
+
+## FreeRTOSConfig.h — the minimum that works
+
+Every FreeRTOS port needs a project-local `FreeRTOSConfig.h`. The kernel headers look it up via the standard include path. This is where you tell the kernel about your CPU clock, tick rate, heap size, priority count, and which features to compile in.
+
+Drop this into `src/FreeRTOSConfig.h`:
+
+```c
+#ifndef FREERTOS_CONFIG_H
+#define FREERTOS_CONFIG_H
+
+/* CPU / tick configuration */
+#define configUSE_PREEMPTION                    1
+#define configCPU_CLOCK_HZ                      ((unsigned long)100000000)
+#define configTICK_RATE_HZ                      ((TickType_t)1000)
+
+/* Task system */
+#define configMAX_PRIORITIES                    5
+#define configMINIMAL_STACK_SIZE                ((unsigned short)128)
+#define configMAX_TASK_NAME_LEN                 16
+#define configUSE_16_BIT_TICKS                  0
+#define configIDLE_SHOULD_YIELD                 1
+
+/* Hooks */
+#define configUSE_IDLE_HOOK                     0
+#define configUSE_TICK_HOOK                     0
+#define configCHECK_FOR_STACK_OVERFLOW          2
+#define configUSE_MALLOC_FAILED_HOOK            1
+
+/* Memory */
+#define configTOTAL_HEAP_SIZE                   ((size_t)(8 * 1024))
+#define configSUPPORT_DYNAMIC_ALLOCATION        1
+#define configSUPPORT_STATIC_ALLOCATION         0
+
+/* Software timers — disabled for now, lesson 8 enables them */
+#define configUSE_TIMERS                        0
+
+/* API features */
+#define INCLUDE_vTaskDelay                      1
+#define INCLUDE_vTaskDelayUntil                 1
+#define INCLUDE_vTaskSuspend                    1
+#define INCLUDE_xTaskGetSchedulerState          1
+#define INCLUDE_uxTaskGetStackHighWaterMark     1
+
+/* Cortex-M priority — see lesson 5 for the full story */
+#define configPRIO_BITS                         4
+#define configLIBRARY_LOWEST_INTERRUPT_PRIORITY        0xf
+#define configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY   5
+#define configKERNEL_INTERRUPT_PRIORITY                (configLIBRARY_LOWEST_INTERRUPT_PRIORITY << (8 - configPRIO_BITS))
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY           (configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY << (8 - configPRIO_BITS))
+
+/* Map FreeRTOS exception handlers to CMSIS names */
+#define vPortSVCHandler         SVC_Handler
+#define xPortPendSVHandler      PendSV_Handler
+#define xPortSysTickHandler     SysTick_Handler
+
+/* Assertions */
+#define configASSERT(x) if ((x) == 0) { taskDISABLE_INTERRUPTS(); for (;;); }
+
+#endif /* FREERTOS_CONFIG_H */
+```
+
+Take a moment to read every line. The values are not arbitrary.
+
+- `configCPU_CLOCK_HZ` — used by `vTaskDelay` and the port to calibrate SysTick. Set it to your actual SYSCLK. Wrong value here means all your delays are wrong.
+- `configTICK_RATE_HZ = 1000` — 1 ms tick. Higher tick rates give finer delay granularity but more CPU overhead.
+- `configMAX_PRIORITIES = 5` — five levels (0 through 4). Idle task uses 0. Most tutorials use 5 because anything more is wasted RAM (the scheduler ready-list is one list per priority).
+- `configMINIMAL_STACK_SIZE = 128` — 128 words = 512 bytes. The minimum stack for the idle task and the lowest sensible stack for any task you write. Lesson 3 explains how to size stacks properly.
+- `configTOTAL_HEAP_SIZE = 8 KB` — enough for a handful of tasks. The kernel will refuse `xTaskCreate` once this is exhausted.
+- `configCHECK_FOR_STACK_OVERFLOW = 2` — paint stacks with `0xA5` and verify on every context switch. Catches the most common newbie bug.
+- The last block — `configKERNEL_INTERRUPT_PRIORITY` and `configMAX_SYSCALL_INTERRUPT_PRIORITY` — is the priority story. Lesson 5 dissects it. For now, copy it verbatim.
+
+<Callout type="warn" title="The three handler-name lines are how the port hooks the vector table">
+`SVC_Handler`, `PendSV_Handler`, and `SysTick_Handler` are the CMSIS-standard names in your startup file. FreeRTOS's port code defines functions called `vPortSVCHandler`, `xPortPendSVHandler`, and `xPortSysTickHandler`. The `#define` lines in `FreeRTOSConfig.h` rename the kernel functions to match your vector table. Without these three lines, your vector table calls weak default handlers and FreeRTOS never runs.
+</Callout>
+
+## Wiring the exception handlers
+
+Open your startup file (`startup_stm32f411xe.s` for the Nucleo F411). Find the vector table — it should be near the top. Look for `SVC_Handler`, `PendSV_Handler`, `SysTick_Handler`. They should be declared `WEAK` and pointing at default infinite-loop stubs.
+
+The three `#define`s in `FreeRTOSConfig.h` above rename the kernel's functions. So when the linker sees a strong symbol `SVC_Handler` defined by `port.c`, it overrides the weak default in the startup file. Same for `PendSV_Handler` and `SysTick_Handler`. **You do nothing in the startup file** — the `#define` does the work.
+
+The trap to avoid: some HAL projects (STM32Cube generated, for example) provide non-weak implementations of `SysTick_Handler` in `stm32f4xx_it.c` that call `HAL_IncTick()`. Those will conflict with FreeRTOS. Open `stm32f4xx_it.c` and *delete* (or comment out) `SysTick_Handler`, `SVC_Handler`, and `PendSV_Handler`. FreeRTOS now owns them.
+
+If you need `HAL_IncTick()` to be called as well (some HAL code depends on it), call it from a FreeRTOS tick hook — enable `configUSE_TICK_HOOK = 1` and provide:
+
+```c
+void vApplicationTickHook(void) {
+    HAL_IncTick();
+}
+```
+
+## Build glue — Makefile
+
+Here is the Makefile fragment to add FreeRTOS to a typical Cortex-M GCC build:
+
+```makefile
+FREERTOS_DIR = third_party/FreeRTOS-Kernel
+FREERTOS_PORT = $(FREERTOS_DIR)/portable/GCC/ARM_CM4F
+
+CFLAGS += -I$(FREERTOS_DIR)/include
+CFLAGS += -I$(FREERTOS_PORT)
+CFLAGS += -Isrc
+
+FREERTOS_SRCS = \
+    $(FREERTOS_DIR)/tasks.c \
+    $(FREERTOS_DIR)/queue.c \
+    $(FREERTOS_DIR)/list.c \
+    $(FREERTOS_DIR)/timers.c \
+    $(FREERTOS_DIR)/event_groups.c \
+    $(FREERTOS_DIR)/stream_buffer.c \
+    $(FREERTOS_PORT)/port.c \
+    $(FREERTOS_DIR)/portable/MemMang/heap_4.c
+
+SRCS += $(FREERTOS_SRCS)
+```
+
+Then the rest of your Makefile compiles `$(SRCS)` to objects and links them. Total: eight new source files added to the build.
+
+The Cortex-M4F flags should be:
+
+```makefile
+CFLAGS += -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard -mthumb
+```
+
+The hard-float ABI matters: the FreeRTOS Cortex-M4F port pushes the FPU registers on context switch only if the task has used the FPU. If you build with `-mfloat-abi=soft` the port still works, but you lose the FPU benefit. Use hard-float.
+
+## main.c — your first task
+
+Create `src/main.c`:
+
+```c
+#include "stm32f4xx.h"      /* CMSIS device header */
+#include "FreeRTOS.h"
+#include "task.h"
+
+/* LED on PA5 (Nucleo green user LED) */
+static void gpio_init(void) {
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    GPIOA->MODER &= ~(3u << (5 * 2));
+    GPIOA->MODER |=  (1u << (5 * 2));   /* output */
+    GPIOA->OTYPER &= ~(1u << 5);         /* push-pull */
+}
+
+static inline void led_toggle(void) {
+    GPIOA->ODR ^= (1u << 5);
+}
+
+static void blink_task(void *arg) {
+    (void)arg;
+    while (1) {
+        led_toggle();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+int main(void) {
+    /* Assume SystemInit() in startup.s has set SYSCLK to 100 MHz */
+    gpio_init();
+
+    BaseType_t ok = xTaskCreate(
+        blink_task,         /* function */
+        "blink",            /* name */
+        128,                /* stack words (128*4 = 512 bytes) */
+        NULL,               /* arg */
+        1,                  /* priority */
+        NULL                /* task handle out */
+    );
+    configASSERT(ok == pdPASS);
+
+    vTaskStartScheduler();
+
+    /* Never reached unless heap exhausted */
+    while (1) {}
+}
+
+/* Hook called if a task overflows its stack — wired by configCHECK_FOR_STACK_OVERFLOW */
+void vApplicationStackOverflowHook(TaskHandle_t t, char *name) {
+    (void)t; (void)name;
+    __BKPT(0);
+    while (1) {}
+}
+
+/* Hook called if pvPortMalloc returns NULL */
+void vApplicationMallocFailedHook(void) {
+    __BKPT(0);
+    while (1) {}
+}
+```
+
+That is the whole program. Read it twice. The pattern is:
+
+1. Initialise hardware (`gpio_init`).
+2. Create one or more tasks (`xTaskCreate`).
+3. Start the scheduler (`vTaskStartScheduler`) — this never returns under normal operation.
+4. The task functions are `void task(void *arg)` and contain an infinite `while (1)` loop with at least one blocking call (`vTaskDelay` here). A task that returns from its function corrupts the scheduler.
+
+## Build and flash
+
+```bash
+make
+arm-none-eabi-size build/firmware.elf
+```
+
+Expected output is roughly:
+
+```
+   text    data     bss     dec     hex filename
+  14820     124   10240   25184    6260 build/firmware.elf
+```
+
+About 15 KB of code (kernel + your startup + HAL stubs), and ~10 KB of BSS (mostly the FreeRTOS heap and idle stack).
+
+Flash:
+
+```bash
+openocd -f board/st_nucleo_f4.cfg -c "program build/firmware.elf verify reset exit"
+```
+
+Or use STM32CubeProgrammer or `st-flash` depending on your setup. The LED should now blink at 1 Hz (500 ms on, 500 ms off).
+
+If it does *not* blink, one of these is wrong:
+
+<Callout type="warn" title="Common first-port failures">
+**Symptom: nothing happens, debugger shows the CPU in an infinite loop in `prvTaskExitError` or the SVC handler stub.** You forgot to delete the conflicting `SVC_Handler` / `PendSV_Handler` / `SysTick_Handler` from `stm32f4xx_it.c`. The linker silently picked the wrong (HAL or weak default) versions.
+
+**Symptom: LED toggles once then nothing.** Your `vTaskDelay` is waiting for tick that never comes. SysTick is not wired — see above.
+
+**Symptom: hard fault on `vTaskStartScheduler`.** `configCPU_CLOCK_HZ` is wrong and the SysTick reload value overflows. Or your stack size is too small. Or the FPU is on but the FPU lazy-stack bit is not set (it should be by default on Cortex-M4F).
+
+**Symptom: malloc failed hook fires.** `configTOTAL_HEAP_SIZE` is smaller than the sum of your task TCBs and stacks. Increase to 16 KB.
+</Callout>
+
+## Probe the SysTick / PendSV story
+
+Connect a logic analyser to PA5 (the LED pin). You should see a clean 1 Hz square wave with edges aligned to millisecond boundaries (because `pdMS_TO_TICKS(500)` evaluates to 500 ticks, and each tick is 1 ms). The edges have jitter of maybe a couple of microseconds — that is the context-switch cost.
+
+To convince yourself FreeRTOS is really running, toggle a second GPIO inside the task and a third one inside an idle hook. Enable `configUSE_IDLE_HOOK = 1` in `FreeRTOSConfig.h` and add:
+
+```c
+void vApplicationIdleHook(void) {
+    /* Runs whenever no other task is ready */
+    GPIOA->ODR ^= (1u << 6);   /* PA6 — toggles continuously when blink task is sleeping */
+}
+```
+
+You will see PA6 toggling at the maximum rate the CPU can do it — perhaps 50 MHz of toggle frequency — for ~500 ms, then nothing for ~10 µs while the blink task runs and toggles PA5. The discontinuity in PA6 corresponds to a context switch. This is your first observation of pre-emption in action.
+
+## What `vTaskStartScheduler` actually does
+
+Just enough to demystify it:
+
+1. Configures SysTick to interrupt at `configTICK_RATE_HZ`.
+2. Sets PendSV and SysTick to the lowest interrupt priority.
+3. Sets SVC to the highest interrupt priority (in the implementation-defined range).
+4. Creates the idle task (priority 0).
+5. Creates the timer task if `configUSE_TIMERS = 1` (we left it off).
+6. Issues an `SVC` instruction. The SVC handler picks the highest-priority ready task and `BX LR` into it.
+
+After that, the scheduler is autonomous. SysTick fires every millisecond and increments the tick count; if a task should now be unblocked (its delay expired), SysTick sets PendSV pending. PendSV runs at the tail of the SysTick handler (or when ISRs unblock tasks), saves the current task's context, picks the next task, restores its context.
+
+See [the FreeRTOS reference](/docs/rtos/freertos/), [SysTick](/docs/cortex-m/systick/), and [the exception model](/docs/architecture/exception-model/) for the deeper version.
+
+## Exercises
+
+**Exercise 2.1**: Add a second task at priority 2 that toggles PA6 every 100 ms. Build and run. Does the original PA5 blink still hit its 500 ms period exactly? Use a logic analyser if you have one.
+
+**Exercise 2.2**: Reduce `configMINIMAL_STACK_SIZE` from 128 to 32. Rebuild. What happens? Why?
+
+**Exercise 2.3**: Set `configTICK_RATE_HZ` to 100 instead of 1000. What changes about how the blink looks on a logic analyser? Is the 500 ms still 500 ms?
+
+<Callout type="spec" title="Answer 2.1">
+Yes, PA5 still hits 500 ms cleanly. The PA6 task is higher priority and pre-empts the blink task whenever its 100 ms delay expires, but since the work inside both tasks is microseconds (a single GPIO toggle), the effect on PA5's timing is negligible — the blink task wakes from `vTaskDelay`, the higher-priority task may run briefly, then the blink task gets the CPU. With a logic analyser you'll see PA5 edges slightly displaced (~few microseconds) from where they would be in a single-task system. That displacement is exactly the context-switch cost; it does not accumulate because `vTaskDelay(pdMS_TO_TICKS(500))` schedules wake-up at absolute tick boundaries.
+</Callout>
+
+<Callout type="spec" title="Answer 2.2">
+The idle task overflows its stack and the stack-overflow hook fires (CPU enters `__BKPT(0)`). 32 words = 128 bytes is below the minimum for an exception frame on Cortex-M4F (8 words basic + 18 words FPU = 26 words just for the frame, leaving no room for the actual idle code). This is exactly the bug `configCHECK_FOR_STACK_OVERFLOW = 2` is designed to catch — without it you would get silent memory corruption.
+</Callout>
+
+<Callout type="spec" title="Answer 2.3">
+`pdMS_TO_TICKS(500)` evaluates to `500 / (1000 / 100) = 50` ticks. With 100 Hz tick rate, each tick is 10 ms, so 50 ticks = 500 ms exactly. The blink period is unchanged. What changes is the *granularity*: any `vTaskDelay(pdMS_TO_TICKS(5))` now becomes `vTaskDelay(0)` — i.e., yields immediately. Lower tick rates save CPU but limit delay resolution to one tick. The default 1000 Hz is the sweet spot for most projects.
+</Callout>
+
+## What you learned
+
+- The FreeRTOS Cortex-M port needs three exception handlers wired: SVC (boot), PendSV (context switch), SysTick (tick). The `#define` block at the bottom of `FreeRTOSConfig.h` does the wiring.
+- Eight source files (six kernel + one port + one heap) is the whole kernel.
+- `xTaskCreate` allocates a TCB and a stack on the FreeRTOS heap, registers the task with the scheduler, and returns `pdPASS`. `vTaskStartScheduler` does not return.
+- Stack sizes are in *words*. `configMINIMAL_STACK_SIZE = 128` is 512 bytes — the absolute minimum on Cortex-M4F.
+- Common first-port failures are HAL collisions on the three exception handlers, wrong `configCPU_CLOCK_HZ`, and too-small heap.
+
+## Up next
+
+| Previous | Next |
+|---|---|
+| [Lesson 1 — Why an RTOS](/docs/rtos/tutorial-01-why-rtos/) | [Lesson 3 — Tasks](/docs/rtos/tutorial-03-tasks/) |

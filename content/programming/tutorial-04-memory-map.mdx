@@ -1,0 +1,280 @@
+---
+title: Lesson 4 — Memory layout
+description: Walk the Cortex-M memory map — flash, SRAM, peripherals, system region. Decode _etext, _sdata, _edata, _sbss, _ebss. Watch the startup-time .data copy.
+order: 6
+updated: 2026-05-13
+tags: [programming, tutorial, c, embedded, memory, linker]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 4 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'The Cortex-M unified memory map, what each region is for, how linker symbols mark section boundaries, and what the startup .data copy actually moves' },
+    { label: 'Code provided', value: 'About 70 lines — a program that introspects its own memory layout' },
+    { label: 'Time', value: '60 minutes' },
+    { label: 'Hardware', value: 'STM32F411 Nucleo or any Cortex-M4 board' },
+  ]}
+/>
+
+By now you have written a program that runs on bare silicon. The startup code copied `.data` and zeroed `.bss`, but those operations probably felt mechanical — you wrote the assembly without fully internalising what was moving where. This lesson fixes that. We will walk every region of the Cortex-M memory map, explain what lives there, and trace exactly what the startup code does to bridge "flash image at power-on" and "running C program with global variables".
+
+## The Cortex-M architectural memory map
+
+Every Cortex-M part shares the same 4 GB address space layout, defined by the architecture. Vendors customise *what* lives at each address, but the regions and their permissions are fixed.
+
+<MemoryMap
+  title="Cortex-M 4 GB address space"
+  regions={[
+    { start: '0x0000_0000', end: '0x1FFF_FFFF', name: 'Code',         note: 'Typically aliased to flash on reset. Executable, read-only.', tone: 'primary' },
+    { start: '0x2000_0000', end: '0x3FFF_FFFF', name: 'SRAM',         note: 'On-chip RAM. Executable on M3+, contains .data, .bss, stack, heap.', tone: 'accent' },
+    { start: '0x4000_0000', end: '0x5FFF_FFFF', name: 'Peripheral',   note: 'Memory-mapped peripherals (GPIO, USART, SPI, I2C, etc).', tone: 'warning' },
+    { start: '0x6000_0000', end: '0x9FFF_FFFF', name: 'External RAM', note: 'FMC/FSMC external SRAM/SDRAM if connected.', tone: 'muted' },
+    { start: '0xA000_0000', end: '0xDFFF_FFFF', name: 'External device', note: 'Memory-mapped external devices via FMC.', tone: 'muted' },
+    { start: '0xE000_0000', end: '0xE00F_FFFF', name: 'System',       note: 'NVIC, SCB, SysTick, FPU, MPU, DWT, ITM. Private to the core.', tone: 'destructive' },
+    { start: '0xE010_0000', end: '0xFFFF_FFFF', name: 'Vendor',       note: 'Implementation-defined; rarely used by application code.', tone: 'muted' },
+  ]}
+  caption="Same layout on every Cortex-M. Memory bands have predictable attributes (cacheable, executable, bufferable) set by the architecture; the MPU can refine them per region."
+/>
+
+The regions matter because the architecture pre-defines memory attributes for each:
+
+- **Code (0x0000-0x1FFF)** — normal memory, cacheable on parts with cache. Instruction fetches happen here. Most STM32s alias flash here on reset (`BOOT0=0`), so the first instruction the CPU fetches at `0x0000_0004` actually comes from flash at `0x0800_0004`.
+- **SRAM (0x2000-0x3FFF)** — normal memory, cacheable, executable. The architecture lets you fetch instructions from SRAM, which is how things like ITCM-resident ISRs and bootloaders updating their own flash work.
+- **Peripheral (0x4000-0x5FFF)** — device memory, never cacheable, never executable. Writes complete in order with respect to each other and have side effects.
+- **System (0xE000-0xE00F)** — strongly-ordered device memory. NVIC, SCB, SysTick, FPU control all live here. Reads and writes are not buffered.
+
+The MPU (if you configure it) can override these defaults per region, but the *default* attribute for each band matches what you almost always want.
+
+## STM32F411 specifics
+
+The architectural map says "code region from 0 to 0x2000_0000", but it does not say what is actually there. The vendor decides. On STM32F411:
+
+| Address range            | Contents                                                |
+|--------------------------|---------------------------------------------------------|
+| `0x0000_0000`-`0x0007_FFFF` | Aliased to flash, system memory, or SRAM (BOOT0/BOOT1 selects) |
+| `0x0800_0000`-`0x0807_FFFF` | Internal flash, 512 KB                                |
+| `0x1FFF_0000`-`0x1FFF_77FF` | System memory (vendor bootloader, factory-programmed) |
+| `0x1FFF_7800`-`0x1FFF_7A0F` | OTP area                                              |
+| `0x1FFF_C000`-`0x1FFF_C007` | Option bytes                                          |
+| `0x2000_0000`-`0x2001_FFFF` | SRAM, 128 KB                                          |
+| `0x4000_0000`-`0x4002_63FF` | APB1/APB2/AHB1 peripherals                            |
+| `0xE000_0000`-`0xE00F_FFFF` | Cortex-M4 system region                               |
+
+The reference manual (RM0383 section 2.3) lists every peripheral's base address. We have already used three: `RCC_BASE = 0x40023800`, `GPIOA_BASE = 0x40020000`, and our flash origin `0x08000000`.
+
+<Callout type="tip" title="The BOOT pins decide what is at address zero">
+At reset, BOOT0 = 0 aliases flash to address 0 — your firmware boots normally. BOOT0 = 1 with BOOT1 = 0 aliases the system bootloader (the factory ROM that listens on USART for firmware uploads). BOOT0 = 1 with BOOT1 = 1 aliases SRAM (for debugging code loaded directly to RAM). Most boards tie BOOT0 to a button or jumper; the F411 Nucleo has a jumper-selectable BOOT0 source. Important when you accidentally brick your firmware: hold BOOT0 high, reset, and you can re-flash via DFU.
+</Callout>
+
+## Linker symbols — the bridge between linker script and C
+
+The linker script generates symbols at every section boundary. These are not variables; they are addresses, treated by C as having type `void` (you reference them via `&symbol` or by declaring them as arrays).
+
+For our lesson 2 linker script, the symbols generated are:
+
+| Symbol      | Meaning                                          | Typical value     |
+|-------------|--------------------------------------------------|-------------------|
+| `_etext`    | End of `.text` and `.rodata` in flash            | `0x0800_00B4`     |
+| `_sidata`   | Load address of `.data` (in flash, = `_etext`)   | `0x0800_00B4`     |
+| `_sdata`    | Run-time start of `.data` (in SRAM)              | `0x2000_0000`     |
+| `_edata`    | Run-time end of `.data`                          | `0x2000_0014`     |
+| `_sbss`     | Start of `.bss` in SRAM (= `_edata`, usually)    | `0x2000_0014`     |
+| `_ebss`     | End of `.bss`                                    | `0x2000_0020`     |
+| `_estack`   | Top of SRAM, initial MSP                         | `0x2002_0000`     |
+
+(Exact values depend on your binary's size.)
+
+The startup code copies `[_sidata, _sidata + (_edata - _sdata))` from flash to `[_sdata, _edata)` in SRAM, then zeroes `[_sbss, _ebss)`. After that, every initialised global has its correct starting value, every uninitialised global is zero, and the program is in the state that the C standard requires before `main` runs.
+
+## A program that introspects its own layout
+
+The clearest way to make this concrete is to print the addresses from a running program. We will use `_write` over SWO (or a polling UART) — for now, just stash them and inspect via the debugger.
+
+```c
+#include <stdint.h>
+#include <stddef.h>
+
+/* Linker-provided symbols. The 'extern' makes the linker fill in the addresses. */
+extern uint32_t _etext;
+extern uint32_t _sidata;
+extern uint32_t _sdata;
+extern uint32_t _edata;
+extern uint32_t _sbss;
+extern uint32_t _ebss;
+extern uint32_t _estack;
+
+/* Some test data so .data, .bss, .rodata each have content */
+static const uint32_t flash_table[4] = { 0xDEAD, 0xBEEF, 0xCAFE, 0xBABE };  /* .rodata */
+static       uint32_t init_counter   = 0x42;                                /* .data   */
+static       uint32_t zero_counter;                                         /* .bss    */
+
+/* A volatile pointer the debugger can read */
+volatile struct {
+    uint32_t etext;
+    uint32_t sidata;
+    uint32_t sdata;
+    uint32_t edata;
+    uint32_t sbss;
+    uint32_t ebss;
+    uint32_t estack;
+    uint32_t flash_table_addr;
+    uint32_t init_counter_addr;
+    uint32_t zero_counter_addr;
+    uint32_t init_counter_value;
+    uint32_t zero_counter_value;
+} layout;
+
+int main(void) {
+    layout.etext              = (uint32_t)&_etext;
+    layout.sidata             = (uint32_t)&_sidata;
+    layout.sdata              = (uint32_t)&_sdata;
+    layout.edata              = (uint32_t)&_edata;
+    layout.sbss               = (uint32_t)&_sbss;
+    layout.ebss               = (uint32_t)&_ebss;
+    layout.estack             = (uint32_t)&_estack;
+    layout.flash_table_addr   = (uint32_t)flash_table;
+    layout.init_counter_addr  = (uint32_t)&init_counter;
+    layout.zero_counter_addr  = (uint32_t)&zero_counter;
+    layout.init_counter_value = init_counter;
+    layout.zero_counter_value = zero_counter;
+
+    while (1) { __asm__ volatile("nop"); }
+}
+```
+
+Build it, load it under GDB, set a breakpoint on the `while (1)`, and inspect:
+
+```bash
+arm-none-eabi-gdb build/blink.elf
+(gdb) target extended-remote :3333    # OpenOCD must be running
+(gdb) load
+(gdb) b 49                            # break at the while
+(gdb) c
+(gdb) print layout
+```
+
+Expected (approximate):
+
+```
+$1 = {
+  etext              = 0x80000b4,
+  sidata             = 0x80000b4,
+  sdata              = 0x20000000,
+  edata              = 0x20000014,
+  sbss               = 0x20000014,
+  ebss               = 0x20000020,
+  estack             = 0x20020000,
+  flash_table_addr   = 0x8000088,
+  init_counter_addr  = 0x20000010,
+  zero_counter_addr  = 0x2000001c,
+  init_counter_value = 0x42,
+  zero_counter_value = 0x0
+}
+```
+
+Look at the addresses. `flash_table` is a `static const`, so it lives in `.rodata` (which our linker put in `.text`) at `0x0800_0088` — in flash. `init_counter` (a `static` with an initialiser) is in `.data` at `0x2000_0010` — in SRAM. `zero_counter` is in `.bss` at `0x2000_001c`.
+
+The startup code copied `init_counter`'s initial value `0x42` from flash to SRAM before main ran. It also zeroed `zero_counter`. Both are visible in their final state.
+
+<Callout type="note" title="If your build optimises out the const table">
+With `-O2` and `-ffunction-sections -fdata-sections -Wl,--gc-sections`, the linker drops `flash_table` because nothing references its contents. Either reference it (e.g., add `layout.first = flash_table[0];`) or declare it with `__attribute__((used))` to force the linker to keep it.
+</Callout>
+
+## Inspecting symbols with arm-none-eabi-nm
+
+```bash
+arm-none-eabi-nm --numeric-sort build/blink.elf | head -30
+```
+
+Expected:
+
+```
+08000000 T __isr_vector
+08000000 t $t
+080000b4 T _etext
+080000b4 T _sidata
+...
+20000000 D _sdata
+20000010 d init_counter
+20000014 B _sbss
+20000014 D _edata
+2000001c B zero_counter
+20000020 B _ebss
+20020000 T _estack
+```
+
+The single-letter columns are symbol types: `T` for `.text` (code), `D` for `.data`, `B` for `.bss`, `R` for `.rodata`. The lowercase versions are the local (static) variants.
+
+Notice the addresses cluster:
+- `0x0800_0000` and up: code and read-only data in flash.
+- `0x2000_0000`-`0x2000_0014`: `.data` in SRAM.
+- `0x2000_0014`-`0x2000_0020`: `.bss` in SRAM.
+- `0x2002_0000`: top of SRAM (`_estack`).
+
+`_etext == _sidata` — that's the LMA trick from the linker script: `.data`'s load address is wherever the linker emits it in the flash image, which is right after `.text` ends.
+
+## The .data copy in slow motion
+
+```
+Flash:                    SRAM:
+0x0800_00B0: 0xDEAD       0x2000_0000: 0x????   (random at reset)
+0x0800_00B4: 0xBEEF       0x2000_0004: 0x????
+0x0800_00B8: 0xCAFE       0x2000_0008: 0x????
+0x0800_00BC: 0xBABE       0x2000_000C: 0x????
+0x0800_00C0: 0x42         0x2000_0010: 0x????   (init_counter dst)
+0x0800_00C4: ...
+
+After Reset_Handler runs:
+
+Flash:                    SRAM:
+0x0800_00C0: 0x42         0x2000_0010: 0x42     (init_counter)
+                          0x2000_0014: 0x00     (zero_counter, .bss start)
+                          0x2000_0018: 0x00
+                          0x2000_001C: 0x00     (zero_counter is here)
+```
+
+The flash image always has both copies. Power-on always wipes SRAM to indeterminate values (some chips reset to all-zeros, most do not — never rely on it). The startup code is the only thing standing between "SRAM full of garbage" and "globals in their expected state".
+
+## Cortex-M7 ITCM/DTCM aliasing
+
+On Cortex-M7 parts (STM32H7, NXP i.MX RT, MIMXRT10xx), the memory map gets richer. ITCM (Instruction Tightly-Coupled Memory) sits at `0x0000_0000` and DTCM at `0x2000_0000`. Both are dual-ported single-cycle SRAM accessible only by the core, not by DMA or other masters.
+
+For our M4 target this does not apply. But the same idea — placing hot code or buffers in a faster, smaller memory region — is one of the most common reasons to write a custom linker script. See the [Cortex-M7 memory page](/docs/cortex-m/m7/) for details.
+
+## Exercises
+
+**Exercise 4.1.** Add `arm-none-eabi-nm --size-sort` to your build's post-link step. Sort by size in reverse. Identify the three largest symbols. Are they where you expected?
+
+<Callout type="spec" title="Answer">
+`nm --size-sort --reverse-sort | head` shows the biggest contributors to binary size. For a minimal blink, expect `Reset_Handler` (50-100 bytes), `main` (50-100 bytes), and the vector table (64 bytes for the minimum 16 entries plus some weak handler stubs). Once you start using `printf`, newlib's float-format library will dwarf everything else — easily 6-10 KB. This is the single most useful diagnostic when chasing binary bloat.
+</Callout>
+
+**Exercise 4.2.** Change the linker script to move SRAM origin to `0x2000_1000` and shrink LENGTH to 124 K, leaving 4 K at the start unused. Rebuild and check `arm-none-eabi-nm` to confirm. What might you put in the first 4 K of SRAM?
+
+<Callout type="spec" title="Answer">
+Symbols shift by 0x1000. Common uses for a reserved SRAM block: a DMA buffer that survives across firmware updates, a no-init region preserved over warm reset (with `(NOLOAD)` and the right MPU config), a vector table copy for in-flash runtime patching (`SCB->VTOR = 0x20001000`), or simply nothing — leaving room for future growth. In bootloader designs, the first KB of SRAM often holds a "shared state" struct passed between bootloader and application.
+</Callout>
+
+**Exercise 4.3.** Add an uninitialised array `static uint32_t big_buf[1024];` to your program. Check `nm` — what section is it in, and what is the binary impact?
+
+<Callout type="spec" title="Answer">
+It lands in `.bss` (uninitialised globals are zero-initialised, which is what `.bss` provides). The `.bss` section grows by 4096 bytes in SRAM, but the **flash image grows by zero bytes** — there is nothing to store. This is the key reason to prefer `static int x;` over `static int x = 0;` for large buffers: both result in zero, but the latter forces an extra 4 KB in flash for the explicit initialiser. (Modern compilers may still optimise the latter to `.bss`, but only if you trust them and check.)
+</Callout>
+
+## What you learned
+
+- Cortex-M has a fixed 4 GB memory map: code, SRAM, peripheral, external, system regions.
+- Vendor reference manuals fill in what lives at each address on a specific chip.
+- The linker emits symbols `_etext`, `_sidata`, `_sdata`, `_edata`, `_sbss`, `_ebss`, `_estack` at section boundaries.
+- `.data` is loaded into flash but its run-time addresses are in SRAM; Reset_Handler copies it.
+- `.bss` is reserved in SRAM only; Reset_Handler zeroes it.
+- `nm --numeric-sort` shows the post-link memory map; `nm --size-sort` shows what is bloating your binary.
+
+In lesson 5 we annotate the linker script line-by-line so you understand every directive.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 3 — Reading hardware registers in C](/docs/programming/tutorial-03-registers/) | [Lesson 5 — A minimum linker script you understand](/docs/programming/tutorial-05-linker-script/) |

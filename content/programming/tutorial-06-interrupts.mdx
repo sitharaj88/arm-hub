@@ -1,0 +1,350 @@
+---
+title: Lesson 6 — Interrupts and ISRs
+description: Write a SysTick handler by hand. Configure the timer, define the handler, set NVIC priority, manage volatile shared state, and bracket critical sections with BASEPRI.
+order: 8
+updated: 2026-05-13
+tags: [programming, tutorial, c, embedded, interrupts, isr, systick, nvic]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 6 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'SysTick configuration without HAL, vector table dispatch, NVIC priority and PRIGROUP, volatile-shared-state discipline, critical sections via PRIMASK and BASEPRI' },
+    { label: 'Code provided', value: 'About 120 lines — a SysTick tick driver and a UART RX ISR' },
+    { label: 'Time', value: '75-90 minutes' },
+    { label: 'Hardware', value: 'STM32F411 Nucleo (PA5 LED, USART2 on PA2/PA3 for the RX exercise)' },
+  ]}
+/>
+
+Until now your main loop has been doing everything: blink with a busy-wait, poll for a button. Interrupts let the CPU do useful work in the background — service a UART byte while main is busy, count milliseconds while you compute, react to a button press without polling. Every real embedded system uses interrupts; this lesson is where you stop avoiding them.
+
+We will configure SysTick (the core's built-in millisecond timer) by hand, write the ISR, and use it to replace the lousy busy-wait `delay` from lesson 2. Then we add a UART RX interrupt as an exercise.
+
+## How the vector table dispatches
+
+Recall from lesson 2: the vector table at flash origin has entries 0 (MSP) and 1 (Reset_Handler), then a bunch of system exception handlers (NMI, HardFault, ..., SysTick at slot 15), then external IRQ handlers from slot 16 onward (the vendor-specific peripherals — USART2 is slot 38 on the F411).
+
+When an interrupt fires, the hardware does:
+
+1. Push 8 registers (xPSR, PC, LR, R12, R3, R2, R1, R0) onto the current stack. This is the "exception frame".
+2. Look up the vector at the corresponding slot in the vector table.
+3. Load PC with that address (masking off the low bit). Now the handler is running.
+4. On `BX LR` (or any branch to `0xFFFFFFFx` exception-return magic value), unwind the frame and return to where the main code was interrupted.
+
+Crucially: **steps 1 and 4 are done in hardware**. Your handler is just a normal C function — it does not need to save or restore registers. AAPCS calling convention plus hardware stacking handles everything.
+
+The latency from interrupt assertion to handler entry on Cortex-M4 is **12 cycles** (sometimes less with tail-chaining; see [interrupt latency](/tools/interrupt-latency/)).
+
+## Configuring SysTick by hand
+
+SysTick is part of the core, not a peripheral. Its four registers live in the system region at `0xE000_E010`:
+
+```c
+#define SYST_CSR    (*(volatile uint32_t *)0xE000E010UL)  /* Control and Status */
+#define SYST_RVR    (*(volatile uint32_t *)0xE000E014UL)  /* Reload Value */
+#define SYST_CVR    (*(volatile uint32_t *)0xE000E018UL)  /* Current Value */
+#define SYST_CALIB  (*(volatile uint32_t *)0xE000E01CUL)  /* Calibration */
+
+#define SYST_CSR_ENABLE      (1u << 0)
+#define SYST_CSR_TICKINT     (1u << 1)
+#define SYST_CSR_CLKSOURCE   (1u << 2)   /* 1 = core clock, 0 = external ref */
+```
+
+To get a 1 ms tick on a 16 MHz core (default HSI on STM32F4 at reset, before you bump up the PLL):
+
+```c
+void systick_init(uint32_t ticks_per_ms) {
+    SYST_RVR = ticks_per_ms - 1;       /* count down from this value */
+    SYST_CVR = 0;                       /* clear current value */
+    SYST_CSR = SYST_CSR_CLKSOURCE       /* use core clock */
+             | SYST_CSR_TICKINT         /* assert SysTick exception on underflow */
+             | SYST_CSR_ENABLE;
+}
+
+/* Call as systick_init(16000) for 1 ms tick at 16 MHz core */
+```
+
+The SysTick counter decrements every core clock; when it reaches zero it reloads from RVR and (if TICKINT is set) sets the SysTick pending bit. The NVIC sees the pending bit and dispatches the SysTick_Handler.
+
+<RegisterMap
+  name="SYST_CSR"
+  width={32}
+  reset="0x0000_0004"
+  fields={[
+    { bits: '31:17', name: '-', access: 'RO', reset: '0', description: 'Reserved.' },
+    { bits: '16',    name: 'COUNTFLAG', access: 'RO', reset: '0', description: 'Reads 1 if the timer counted to zero since this bit was last read. Clears on read.' },
+    { bits: '15:3',  name: '-', access: 'RO', reset: '0', description: 'Reserved.' },
+    { bits: '2',     name: 'CLKSOURCE', access: 'RW', reset: '1', description: '0 = external clock (chip-specific, often AHB/8). 1 = core clock.' },
+    { bits: '1',     name: 'TICKINT',   access: 'RW', reset: '0', description: '1 = assert the SysTick exception on underflow.' },
+    { bits: '0',     name: 'ENABLE',    access: 'RW', reset: '0', description: '1 = counter running.' },
+  ]}
+  caption="SysTick Control and Status Register. Setting all three of CLKSOURCE, TICKINT, ENABLE gives you a periodic interrupt at (RVR+1)/core_clock seconds."
+/>
+
+## The handler
+
+```c
+volatile uint32_t systick_ms;
+
+void SysTick_Handler(void) {
+    systick_ms++;
+}
+```
+
+Two lines. The function name `SysTick_Handler` matches the weak alias in startup.s — when the linker sees a real `SysTick_Handler`, it uses yours instead of the default infinite-loop stub.
+
+`volatile` on `systick_ms` is **mandatory** because main code will read it and the compiler must not cache the read in a register.
+
+## A delay that uses the tick
+
+```c
+static inline uint32_t millis(void) {
+    return systick_ms;
+}
+
+void delay_ms(uint32_t ms) {
+    uint32_t start = millis();
+    while ((millis() - start) < ms) { __asm__ volatile("nop"); }
+}
+```
+
+Two things to notice. First, this works even when the counter wraps around (32-bit wrap, every 49.7 days at 1 ms). The subtraction `millis() - start` gives the correct elapsed value due to two's complement arithmetic, as long as you do not need to delay longer than half the wrap period.
+
+Second, the read of `millis()` (which reads `systick_ms`) is a single 32-bit load. **On Cortex-M, 32-bit aligned loads and stores are atomic.** An interrupt cannot occur in the middle of one. So even though `systick_ms` is written by an ISR and read by main, no critical section is needed for the read.
+
+If you used a 64-bit counter, that would not be true — a 64-bit read is two 32-bit loads, and an ISR can fire between them. The fix is either a 32-bit counter (good for ~50 days), a critical section around the read, or careful retry-on-mismatch reads.
+
+<Callout type="warn" title="Two reads of the same volatile in one expression">
+`while ((millis() - start) < ms)` calls `millis()` once per iteration. That is intended — we want to re-read on every check. But beware expressions like `if (systick_ms == 0 && systick_ms < 10)` which reads `systick_ms` twice, and the value can change between the two reads. Snapshot to a local first: `uint32_t now = systick_ms; if (now == 0 && now < 10)`.
+</Callout>
+
+## NVIC priority
+
+SysTick is a system exception (slot 15), not an external IRQ, so it uses `SCB->SHPR3` (System Handler Priority Register 3) rather than `NVIC->IPR[n]`. CMSIS provides `NVIC_SetPriority` which accepts both system exception IDs (negative) and external IRQ numbers (non-negative):
+
+```c
+#define SCB_SHPR3   (*(volatile uint32_t *)0xE000ED20UL)
+
+/* SysTick priority is in SHPR3 bits 31:24 — left-justified, 4 implemented bits on F4 */
+SCB_SHPR3 = (SCB_SHPR3 & ~(0xFFu << 24)) | (0xF0u << 24);  /* lowest urgency */
+```
+
+With CMSIS:
+
+```c
+#include <cmsis_gcc.h>
+#include "core_cm4.h"
+
+NVIC_SetPriority(SysTick_IRQn, 15);   /* lowest urgency on a 4-bit-priority part */
+```
+
+Convention: SysTick at the lowest urgency (highest numeric value). It is just a timekeeper; nothing should delay a fast IRQ to service the tick.
+
+For external IRQs, e.g. USART2:
+
+```c
+NVIC_SetPriority(USART2_IRQn, 5);     /* mid-priority */
+NVIC_EnableIRQ(USART2_IRQn);
+```
+
+The full priority model — PRIGROUP, preempt vs sub, BASEPRI — is in the [NVIC priority page](/docs/cortex-m/nvic-priority/). For this tutorial we use the defaults (PRIGROUP=0, all 4 bits preempt, no sub-priority) and pick urgency values out of the 0-15 range.
+
+## Volatile shared between ISR and main
+
+The pattern that comes up constantly:
+
+```c
+volatile bool button_pressed;       /* set by EXTI ISR, read by main */
+volatile uint32_t rx_count;          /* incremented by UART ISR, read by main */
+volatile uint8_t rx_byte;            /* latest byte from UART ISR */
+```
+
+Three rules:
+
+1. **Every shared variable is `volatile`.** Without it, the compiler may cache the value in a register and never re-read.
+2. **Single-word aligned loads and stores are atomic on Cortex-M.** A 32-bit `volatile uint32_t` read or write completes in one cycle and cannot be interrupted.
+3. **Read-modify-write is NOT atomic.** `counter++` is load-add-store; an ISR between them can corrupt the result. Either disable IRQs around it, or use `<stdatomic.h>` on Cortex-M3+.
+
+## Critical sections
+
+The simplest critical section disables all interrupts:
+
+```c
+__disable_irq();
+do_unsafe_thing();
+__enable_irq();
+```
+
+`__disable_irq` is one instruction (`CPSID i`) that sets PRIMASK to 1, blocking every configurable-priority exception. NMI and HardFault still run. `__enable_irq` clears PRIMASK with `CPSIE i`.
+
+The save-and-restore pattern, for nesting:
+
+```c
+uint32_t pri = __get_PRIMASK();
+__disable_irq();
+do_unsafe_thing();
+__set_PRIMASK(pri);
+```
+
+This re-enables only if the caller had interrupts on. Safe to call from contexts that already have interrupts disabled.
+
+### BASEPRI — selective masking
+
+PRIMASK kills *all* IRQs, including the audio sample IRQ at priority 0. If you want to keep urgent IRQs alive while protecting against lower-priority ones, use BASEPRI:
+
+```c
+__set_BASEPRI(0x50);    /* block priorities >= 5 (numerically); priorities 0-4 still run */
+do_thing_safe_against_low_priority();
+__set_BASEPRI(0);       /* re-enable */
+```
+
+The value is left-shifted to match the priority byte encoding (see lesson 5 in [NVIC priority](/docs/cortex-m/nvic-priority/)). On a 4-bit-priority part, `__set_BASEPRI(0x50)` blocks IRQs at priority 5 and up.
+
+This is how FreeRTOS implements its critical sections — `configMAX_SYSCALL_INTERRUPT_PRIORITY` is the BASEPRI value, and IRQs more urgent than that may not call kernel APIs.
+
+<Callout type="tip" title="Keep critical sections short">
+Every cycle inside a critical section is a cycle added to your worst-case interrupt latency. Aim for under 100 cycles. If you need a long protected operation, copy data out, release the lock, then operate on the copy.
+</Callout>
+
+## Putting it together — a blink driven by SysTick
+
+```c
+#include <stdint.h>
+#include "gpio.h"   /* from lesson 3 */
+
+#define RCC_AHB1ENR (*(volatile uint32_t *)0x40023830UL)
+
+volatile uint32_t systick_ms;
+
+void SysTick_Handler(void) {
+    systick_ms++;
+}
+
+static void systick_init_1ms(uint32_t core_hz) {
+    *(volatile uint32_t *)0xE000E014UL = (core_hz / 1000) - 1;   /* RVR */
+    *(volatile uint32_t *)0xE000E018UL = 0;                       /* CVR */
+    *(volatile uint32_t *)0xE000E010UL = (1u << 2)                /* CLKSOURCE = core */
+                                       | (1u << 1)                /* TICKINT */
+                                       | (1u << 0);               /* ENABLE */
+}
+
+static void delay_ms(uint32_t ms) {
+    uint32_t start = systick_ms;
+    while ((systick_ms - start) < ms) { __asm__ volatile("nop"); }
+}
+
+int main(void) {
+    RCC_AHB1ENR |= (1u << 0);
+    gpio_mode(GPIOA, 5, GPIO_OUTPUT);
+
+    systick_init_1ms(16000000);   /* 16 MHz HSI default */
+
+    while (1) {
+        gpio_set(GPIOA, 5);
+        delay_ms(500);
+        gpio_clear(GPIOA, 5);
+        delay_ms(500);
+    }
+}
+```
+
+Now the LED blinks at exactly 1 Hz, regardless of compiler optimisation, regardless of where main is in its execution — because the time is being tracked by an independent counter incremented every millisecond by a precise hardware timer.
+
+## UART RX interrupt — full example
+
+The same pattern applies to peripheral IRQs. To receive UART bytes asynchronously:
+
+```c
+#define USART2_BASE 0x40004400UL
+#define USART2_SR   (*(volatile uint32_t *)(USART2_BASE + 0x00))
+#define USART2_DR   (*(volatile uint32_t *)(USART2_BASE + 0x04))
+#define USART2_CR1  (*(volatile uint32_t *)(USART2_BASE + 0x0C))
+
+#define USART_SR_RXNE   (1u << 5)
+#define USART_CR1_RXNEIE (1u << 5)
+
+#define RX_BUF_SIZE 64
+volatile uint8_t  rx_buf[RX_BUF_SIZE];
+volatile uint32_t rx_head;   /* written by ISR */
+volatile uint32_t rx_tail;   /* written by main */
+
+void USART2_IRQHandler(void) {
+    if (USART2_SR & USART_SR_RXNE) {
+        uint8_t byte = (uint8_t)USART2_DR;   /* reading DR clears RXNE */
+        uint32_t next = (rx_head + 1) % RX_BUF_SIZE;
+        if (next != rx_tail) {               /* drop on overflow */
+            rx_buf[rx_head] = byte;
+            rx_head = next;
+        }
+    }
+}
+
+void uart2_init(void) {
+    /* GPIO + USART clock setup elided — see lesson 9 for the full version */
+    USART2_CR1 |= USART_CR1_RXNEIE;
+    NVIC_SetPriority(USART2_IRQn, 6);
+    NVIC_EnableIRQ(USART2_IRQn);
+}
+
+bool uart2_getchar(uint8_t *out) {
+    if (rx_head == rx_tail) return false;    /* empty */
+    *out = rx_buf[rx_tail];
+    rx_tail = (rx_tail + 1) % RX_BUF_SIZE;
+    return true;
+}
+```
+
+The ring buffer is single-producer (ISR writes head), single-consumer (main writes tail), 32-bit aligned indices. Both contexts read both indices but each writes only one — that is the key property that makes the ring buffer lock-free on Cortex-M. We will polish this pattern in lesson 10.
+
+## Exercises
+
+**Exercise 6.1.** Write a `delay_us` function using SysTick's current-value register (without changing the reload value). Hint: SYST_CVR gives you the current count; with a 16 MHz clock and 16000 RVR, each count is 62.5 ns.
+
+<Callout type="spec" title="Answer">
+
+```c
+void delay_us(uint32_t us) {
+    uint32_t ticks_per_us = 16;   /* 16 MHz / 1 MHz */
+    uint32_t start = SYST_CVR;
+    uint32_t needed = us * ticks_per_us;
+    /* SysTick counts down; handle wraparound at RVR */
+    while (1) {
+        uint32_t now = SYST_CVR;
+        uint32_t elapsed = (start >= now) ? (start - now) : (start + (16000 - now));
+        if (elapsed >= needed) break;
+    }
+}
+```
+
+This is approximate and works only for delays under one SysTick period (1 ms in our setup). For longer delays use SysTick interrupts plus a sub-millisecond residue. Many real designs prefer a dedicated TIM peripheral configured for 1 MHz with a free-running counter — easier to read directly.
+</Callout>
+
+**Exercise 6.2.** What happens if `SysTick_Handler` runs for longer than 1 ms? Walk through the sequence.
+
+<Callout type="spec" title="Answer">
+SysTick keeps counting and pending again before the previous handler returns. On Cortex-M the NVIC sets the SysTick pending bit, but cannot dispatch the handler because it is already active. When the handler returns, the NVIC immediately re-dispatches via tail-chain. Net effect: the handler runs back-to-back with no main-loop time in between. `systick_ms++` still counts correctly, but main starves. Solution: keep handlers short — under ~5% of the tick period is a healthy rule.
+</Callout>
+
+**Exercise 6.3.** In the UART RX example, what bug shows up if you remove `volatile` from `rx_head`?
+
+<Callout type="spec" title="Answer">
+Main's `uart2_getchar` does `if (rx_head == rx_tail) return false;` then `rx_buf[rx_tail]`. Without volatile, the compiler may cache `rx_head` in a register at function entry — so even if the ISR updates `rx_head` mid-function, main does not see it. On `-O2`, you can get a stuck "empty" reading even when bytes are arriving. Volatile is what forces re-read from memory on every access.
+</Callout>
+
+## What you learned
+
+- The vector table maps each exception number to a handler address; hardware stacks 8 registers on entry.
+- SysTick is configured by writing four MMIO words; the handler is a normal C function named `SysTick_Handler`.
+- `volatile` is mandatory on every variable shared between ISR and main.
+- 32-bit aligned reads and writes are atomic on Cortex-M; read-modify-write is not.
+- `__disable_irq`/`__enable_irq` for blunt critical sections, BASEPRI for selective masking.
+- NVIC priorities: SysTick at the lowest urgency, fast peripheral IRQs at the highest.
+
+In lesson 7 we go deep on bit manipulation — the patterns you will use every day for register packing, packet parsing, and fast lookup tables.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 5 — A minimum linker script](/docs/programming/tutorial-05-linker-script/) | [Lesson 7 — Bit manipulation patterns](/docs/programming/tutorial-07-bit-patterns/) |

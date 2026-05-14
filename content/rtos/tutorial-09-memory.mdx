@@ -1,0 +1,378 @@
+---
+title: Lesson 9 — Memory management, heap and stack
+description: heap_1 through heap_5 — what each one does and when to pick which. Stack overflow detection. Static allocation for safety-cert builds.
+order: 10
+updated: 2026-05-13
+tags: [rtos, tutorial, freertos, heap, stack, memory, static-allocation]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 9 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Which FreeRTOS heap implementation to pick. How stack overflow detection works. How to switch to fully-static allocation for safety builds.' },
+    { label: 'Code provided', value: '~140 lines (heap monitoring, static task example, overflow-hook implementation)' },
+    { label: 'Time', value: '60–90 min' },
+    { label: 'Pre-reqs', value: 'Lessons 1–8' },
+    { label: 'Outcome', value: 'A clear rule for choosing between the five heap implementations, plus a fully-static FreeRTOS configuration that doesn\'t call malloc once' },
+  ]}
+/>
+
+FreeRTOS allocates kernel objects (TCBs, stacks, queues, semaphores, mutexes, timers, event groups, stream buffers) from its own heap by default. The heap is a fixed-size array (`configTOTAL_HEAP_SIZE`) and FreeRTOS provides five different allocator implementations. Which one is right for your project is a real engineering decision; the documentation calls them by number and most engineers pick the first one they read about. This lesson explains all five and tells you which to use when.
+
+For safety-critical systems where any heap is unacceptable, the second half of the lesson covers the fully-static allocation path: every object's storage is statically declared at compile time, no `pvPortMalloc` ever runs.
+
+## The five heap implementations
+
+```
+FreeRTOS-Kernel/portable/MemMang/
+├── heap_1.c    Allocate-only (no free)
+├── heap_2.c    First-fit, no coalescence
+├── heap_3.c    Wraps stdlib malloc/free
+├── heap_4.c    First-fit, with coalescence  ← default choice
+└── heap_5.c    Like heap_4 across multiple regions
+```
+
+Pick exactly one — drop one of these C files into your build. They all implement the same `pvPortMalloc` / `vPortFree` interface; the kernel and your code don't care which.
+
+### heap_1 — allocate only, no free
+
+The simplest possible allocator. A single contiguous `configTOTAL_HEAP_SIZE`-byte buffer. `pvPortMalloc` bumps a pointer; there is no `vPortFree`. Once allocated, always allocated.
+
+**Use when**: your firmware allocates all its kernel objects at boot (tasks, queues, semaphores) and never frees anything. This is more common than you'd think — many embedded systems are completely static after `vTaskStartScheduler`.
+
+**Don't use when**: you need to delete tasks, recreate queues, or do any runtime allocation.
+
+**Cost**: ~600 bytes of code. Deterministic timing. No fragmentation by construction.
+
+### heap_2 — best-fit, no coalescence
+
+Maintains a free-list. `pvPortMalloc` finds the smallest free block that fits and uses it (or splits it). `vPortFree` puts the block back on the free-list but **does not coalesce** with adjacent free blocks.
+
+**Use when**: heap_2 ships in legacy projects. New projects should use heap_4 instead.
+
+**Don't use when**: you alloc/free frequently with varying sizes. Fragmentation eats the heap.
+
+**Cost**: ~1.4 KB of code. Fragmentation-prone.
+
+### heap_3 — wraps the C library
+
+`pvPortMalloc` is `malloc`; `vPortFree` is `free`. Whatever your newlib/picolibc/glibc provides is what you get. The `configTOTAL_HEAP_SIZE` is ignored (the libc heap is sized elsewhere — typically by `_sbrk` and the linker).
+
+**Use when**: you already have a libc heap configured (often newlib-nano with reentrant malloc) and you want one heap instead of two. Useful for projects that mix C++ `new`, libc `malloc`, and FreeRTOS objects.
+
+**Don't use when**: libc `malloc` is not thread-safe in your environment and you can't fix it. Or when you want explicit control of when allocation happens.
+
+**Cost**: ~50 bytes of glue code. Performance depends on the libc.
+
+### heap_4 — first-fit with coalescence
+
+The general-purpose default. Maintains a free-list, coalesces adjacent free blocks on free, so fragmentation behaves reasonably.
+
+**Use when**: you don't have a specific reason to pick another. Default for new projects.
+
+**Don't use when**: you need bounded worst-case alloc time (heap_4 walks the free-list; the worst-case is proportional to free-list length, which depends on alloc/free history).
+
+**Cost**: ~2 KB of code. Good general-purpose behaviour. The default in almost every FreeRTOS-using product.
+
+### heap_5 — heap_4 across multiple regions
+
+Same algorithm as heap_4 but accepts multiple non-contiguous memory regions. Useful when you have two SRAM banks (e.g., STM32F4's SRAM + CCM RAM) and want one heap that uses both.
+
+**Use when**: your part has multiple SRAM regions and you want them unified into one heap.
+
+**Don't use when**: you have one contiguous SRAM region (heap_4 is simpler).
+
+**Cost**: ~2.2 KB of code. Initialisation requires a `vPortDefineHeapRegions` call with the region table at boot — before `vTaskStartScheduler`.
+
+```c
+static uint8_t sram_region[64 * 1024]  __attribute__((section(".sram")));
+static uint8_t ccm_region[16 * 1024]   __attribute__((section(".ccmram")));
+
+static const HeapRegion_t regions[] = {
+    { sram_region, sizeof(sram_region) },
+    { ccm_region,  sizeof(ccm_region)  },
+    { NULL,        0                   }
+};
+
+int main(void) {
+    vPortDefineHeapRegions(regions);
+    /* ... rest of init, then xTaskCreate, then vTaskStartScheduler ... */
+}
+```
+
+## Picking a heap — the decision tree
+
+1. **All kernel objects created at boot, never deleted?** → heap_1.
+2. **Need to mix with libc malloc / C++ new?** → heap_3.
+3. **Multiple non-contiguous SRAM regions?** → heap_5.
+4. **None of the above?** → heap_4. (Most projects.)
+
+`heap_2` is here for historical reasons; never pick it for a new project.
+
+## Monitoring the heap
+
+Three functions to watch the heap at runtime:
+
+```c
+size_t xPortGetFreeHeapSize(void);          /* bytes currently free */
+size_t xPortGetMinimumEverFreeHeapSize(void);   /* low-water mark */
+```
+
+The minimum-ever value is the most useful. It tells you how close you came to exhaustion under realistic workload. Print it from a low-priority monitor task every few seconds and watch it during stress tests.
+
+```c
+static void heap_monitor_task(void *arg) {
+    while (1) {
+        printf("heap free: %u, min: %u\r\n",
+               (unsigned)xPortGetFreeHeapSize(),
+               (unsigned)xPortGetMinimumEverFreeHeapSize());
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+```
+
+If `min_ever` is within 200 bytes of zero, you have a memory pressure problem. If it's monotonically decreasing over hours, you have a leak.
+
+A useful hook: `vApplicationMallocFailedHook` fires when `pvPortMalloc` returns `NULL`. Catch this immediately:
+
+```c
+void vApplicationMallocFailedHook(void) {
+    __BKPT(0);
+    /* In production: log + reset */
+    while (1) {}
+}
+```
+
+Enable in `FreeRTOSConfig.h`:
+
+```c
+#define configUSE_MALLOC_FAILED_HOOK    1
+```
+
+## Stack overflow detection
+
+Stacks are allocated from the heap (via `pvPortMalloc` inside `xTaskCreate`), one per task. The Cortex-M MPU can detect stack overflow in hardware, but most non-MPU configs rely on software checking via `configCHECK_FOR_STACK_OVERFLOW`.
+
+```c
+#define configCHECK_FOR_STACK_OVERFLOW    2   /* recommended */
+```
+
+The two methods:
+
+**Method 1**: on every context switch, the kernel compares the outgoing task's stack pointer against its stored stack limit. If SP is past the bottom of the stack, overflow detected.
+
+**Method 2**: in addition to method 1, the kernel fills each new stack with `0xA5A5A5A5` at task creation. On context switch, it checks that the bottom 16 words still hold `0xA5A5A5A5`. If any have been overwritten, overflow detected.
+
+Method 2 catches overflows that briefly touched the bottom of the stack and then came back. Method 1 misses those. Always use method 2 during development.
+
+When overflow is detected, the kernel calls:
+
+```c
+void vApplicationStackOverflowHook(TaskHandle_t task, char *task_name) {
+    /* task and task_name identify the offending task */
+    __BKPT(0);
+    /* In production: log task_name, save context, reset */
+    while (1) {}
+}
+```
+
+The cost of method 2 is ~30 cycles per context switch — negligible. Leave it on in production unless you've measured a problem.
+
+### Reading the high-water mark
+
+We saw this in lesson 3 but it's worth repeating:
+
+```c
+UBaseType_t uxTaskGetStackHighWaterMark(TaskHandle_t task);
+```
+
+Returns the number of *words* of stack that have never been used. If it returns 24, you have 96 bytes of headroom. Print this from a monitor task to size stacks correctly.
+
+```c
+TaskStatus_t tasks[16];
+UBaseType_t n = uxTaskGetSystemState(tasks, 16, NULL);
+for (UBaseType_t i = 0; i < n; i++) {
+    printf("%-12s prio=%lu state=%d stack_free=%lu\r\n",
+           tasks[i].pcTaskName,
+           (unsigned long)tasks[i].uxCurrentPriority,
+           (int)tasks[i].eCurrentState,
+           (unsigned long)tasks[i].usStackHighWaterMark);
+}
+```
+
+A high-water mark of 20–50 words is normal. Less than 16 is danger. More than 200 means you can shrink the stack.
+
+## Static allocation — banning the heap entirely
+
+Some projects ban dynamic allocation outright. Safety standards (IEC 61508 SIL 3, ISO 26262, DO-178C) often require it. Even outside safety, static allocation eliminates a whole class of bugs: no malloc failures, no fragmentation, no heap monitoring needed, memory layout fully predictable at compile time.
+
+FreeRTOS supports this via the `*Static` variant of every create function.
+
+```c
+#define configSUPPORT_STATIC_ALLOCATION    1
+#define configSUPPORT_DYNAMIC_ALLOCATION   0   /* enforce static-only */
+```
+
+With `configSUPPORT_DYNAMIC_ALLOCATION = 0`, the linker errors if any code calls `xTaskCreate` (which uses the heap). You must use `xTaskCreateStatic`:
+
+```c
+static StaticTask_t blink_tcb;
+static StackType_t  blink_stack[256];
+
+TaskHandle_t h = xTaskCreateStatic(
+    blink_task,         /* function */
+    "blink",            /* name */
+    256,                /* stack depth in words */
+    NULL,               /* arg */
+    1,                  /* priority */
+    blink_stack,        /* caller-provided stack */
+    &blink_tcb          /* caller-provided TCB */
+);
+```
+
+The two new arguments are the storage. They must outlive the task, so almost always file-scope or global static. The function returns a handle (same as the dynamic version) on success.
+
+Every other create function has an equivalent: `xQueueCreateStatic`, `xSemaphoreCreateBinaryStatic`, `xSemaphoreCreateMutexStatic`, `xSemaphoreCreateCountingStatic`, `xTimerCreateStatic`, `xEventGroupCreateStatic`, `xStreamBufferCreateStatic`.
+
+### Idle and timer task static storage
+
+With static-only allocation, even the kernel's own idle and timer tasks need static storage. The kernel asks for it via two hooks you must implement:
+
+```c
+void vApplicationGetIdleTaskMemory(StaticTask_t **tcb_out,
+                                    StackType_t **stack_out,
+                                    uint32_t *stack_size_out) {
+    static StaticTask_t idle_tcb;
+    static StackType_t  idle_stack[configMINIMAL_STACK_SIZE];
+    *tcb_out = &idle_tcb;
+    *stack_out = idle_stack;
+    *stack_size_out = configMINIMAL_STACK_SIZE;
+}
+
+void vApplicationGetTimerTaskMemory(StaticTask_t **tcb_out,
+                                     StackType_t **stack_out,
+                                     uint32_t *stack_size_out) {
+    static StaticTask_t timer_tcb;
+    static StackType_t  timer_stack[configTIMER_TASK_STACK_DEPTH];
+    *tcb_out = &timer_tcb;
+    *stack_out = timer_stack;
+    *stack_size_out = configTIMER_TASK_STACK_DEPTH;
+}
+```
+
+These two functions are mandatory if `configSUPPORT_STATIC_ALLOCATION = 1`. Without them the link fails.
+
+### A fully static skeleton
+
+```c
+/* FreeRTOSConfig.h */
+#define configSUPPORT_STATIC_ALLOCATION    1
+#define configSUPPORT_DYNAMIC_ALLOCATION   0
+#define configUSE_TIMERS                   1
+#define configTIMER_TASK_STACK_DEPTH       configMINIMAL_STACK_SIZE
+
+/* main.c */
+static StaticTask_t  worker_tcb;
+static StackType_t   worker_stack[256];
+static StaticQueue_t event_q_struct;
+static uint8_t       event_q_storage[16 * sizeof(struct event)];
+static QueueHandle_t event_q;
+
+int main(void) {
+    SystemClock_Config();
+    gpio_init();
+
+    event_q = xQueueCreateStatic(
+        16,                         /* length */
+        sizeof(struct event),       /* item size */
+        event_q_storage,            /* storage */
+        &event_q_struct             /* queue struct */
+    );
+
+    xTaskCreateStatic(
+        worker_task, "worker", 256, NULL, 1,
+        worker_stack, &worker_tcb
+    );
+
+    vTaskStartScheduler();
+    while (1) {}
+}
+```
+
+Now build. If you have not also removed dynamic allocation from your code, the link will fail with `pvPortMalloc` undefined — because `MemMang/heap_*.c` is no longer in the build. That is the safety guarantee: no heap means no heap.
+
+<Callout type="tip" title="Mixed static + dynamic is allowed">
+You can also set both `configSUPPORT_STATIC_ALLOCATION = 1` and `configSUPPORT_DYNAMIC_ALLOCATION = 1`. Then both kinds of API work. Some projects use this transitionally: declare critical tasks statically, leave less critical ones on the heap. For safety builds, eventually drop dynamic.
+</Callout>
+
+## When static allocation matters
+
+- **Functional safety.** IEC 61508 (industrial), ISO 26262 (automotive), DO-178C (avionics), IEC 62304 (medical). These standards require deterministic memory usage. SAFERTOS (the IEC 61508 SIL 3 version of FreeRTOS) requires static allocation.
+- **Critical reliability.** Pacemakers, infusion pumps, satellite firmware. You cannot afford an `OOM` at month six of a five-year mission.
+- **MISRA-C compliance.** MISRA-C 2012 Rule 21.3 forbids `malloc`. Static allocation lets you keep FreeRTOS in a MISRA-clean codebase.
+
+For typical commercial firmware (IoT, consumer, industrial automation without safety claims), dynamic allocation is fine and significantly more ergonomic.
+
+## RAM accounting on a typical Cortex-M4
+
+For a small system: 5 tasks, 3 queues, 2 semaphores, 2 timers, 1 event group:
+
+| Object | Count | Per-object | Subtotal |
+|---|---|---|---|
+| TCBs | 7 (5 + idle + timer) | ~92 B | 644 B |
+| Stacks | 7 | ~512 B avg | 3 584 B |
+| Queues | 3 | ~80 B + length×item_size | 80 + 16×8 = 208 B each ≈ 624 B |
+| Semaphores | 2 | ~80 B | 160 B |
+| Timers | 2 | ~50 B | 100 B |
+| Event group | 1 | ~32 B | 32 B |
+| Kernel ready-lists, etc. | — | — | ~200 B |
+| **Total** | | | ~5.3 KB |
+
+That's `configTOTAL_HEAP_SIZE = 8192` with comfortable margin. For a much bigger system (TCP/IP stack, file system, USB), budget 32 KB.
+
+## Common bugs
+
+**Heap exhausted at boot.** `xTaskCreate` returns failure. Fix: increase `configTOTAL_HEAP_SIZE` or use static allocation for some objects.
+
+**Heap exhausted at runtime.** Usually a leak: allocations without matching frees. Print `xPortGetFreeHeapSize` periodically and watch for monotonic decline. If you delete tasks dynamically, ensure you also free associated objects.
+
+**Stack overflow not detected.** `configCHECK_FOR_STACK_OVERFLOW = 0` or `1`. Set to `2` and define `vApplicationStackOverflowHook`.
+
+**FreeRTOS objects from a function-local variable.** `StaticTask_t tcb` on the stack and `xTaskCreateStatic(..., &tcb)`. When the function returns, the stack frame is gone but the kernel still thinks `tcb` is valid. Always use static or file-scope storage for static-allocation arguments.
+
+**Forgotten `vApplicationGetIdleTaskMemory` / `vApplicationGetTimerTaskMemory`.** Link errors at the static-only step. The error message is helpful — read it.
+
+## Exercises
+
+**Exercise 9.1**: Your project uses heap_4 with `configTOTAL_HEAP_SIZE = 16384`. After 24 hours of running, `xPortGetMinimumEverFreeHeapSize` reports 4096. Should you be worried? What else do you need to know?
+
+**Exercise 9.2**: A task has high-water mark 4 (16 bytes of free stack). What are the consequences of leaving this in production? Of fixing it?
+
+**Exercise 9.3**: You're converting a project to fully-static allocation. The project uses `xQueueCreate(10, sizeof(struct evt))` in five different files. What's the minimum set of changes?
+
+<Callout type="spec" title="Answer 9.1">
+You need to know whether 4096 is the *low* water mark or the *current* free. The function name is `MinimumEverFree` — it's the low-water mark, the worst seen so far. 4 KB headroom is fine if it's stable. The bigger question: is it monotonic? Print the value every minute and check whether it's bouncing or trending down. Monotonic decline = leak. Bouncing = sized adequately.
+</Callout>
+
+<Callout type="spec" title="Answer 9.2">
+Leaving it: 16 bytes is *one function call* of margin (frame pointer + locals + return address). Any unusual call path or interrupt frame will overflow. Probability of overflow in production is high. Fix: increase the task stack by enough to bring HWM to at least 64 words (256 bytes). Cost is RAM — usually trivial compared to the cost of debugging a corrupted-by-overflow bug later.
+</Callout>
+
+<Callout type="spec" title="Answer 9.3">
+For each of the five queues, declare `StaticQueue_t q_struct` and `uint8_t q_storage[10 * sizeof(struct evt)]` at file scope (or as fields of an init-time struct). Replace `xQueueCreate(10, sizeof(struct evt))` with `xQueueCreateStatic(10, sizeof(struct evt), q_storage, &q_struct)`. Also implement `vApplicationGetIdleTaskMemory` and `vApplicationGetTimerTaskMemory` (one-time, in `main.c`). Set `configSUPPORT_STATIC_ALLOCATION = 1`. Optionally set `configSUPPORT_DYNAMIC_ALLOCATION = 0` to enforce — but only after you've migrated *every* allocation in the project, including any in third-party stacks.
+</Callout>
+
+## What you learned
+
+- Five heap implementations: heap_1 (alloc only), heap_2 (legacy), heap_3 (libc wrapper), heap_4 (default), heap_5 (multi-region). For new projects, pick heap_4 unless you have a specific reason.
+- `xPortGetMinimumEverFreeHeapSize` and `vApplicationMallocFailedHook` together catch most heap problems.
+- `configCHECK_FOR_STACK_OVERFLOW = 2` is cheap and catches the most common newbie bug. Leave it on.
+- `uxTaskGetStackHighWaterMark` (per task) tells you how much stack each task actually used.
+- Static allocation is a hard requirement for many safety-critical projects. `xTaskCreateStatic` and friends accept caller-provided storage; setting `configSUPPORT_DYNAMIC_ALLOCATION = 0` enforces no-heap at link time.
+
+## Up next
+
+| Previous | Next |
+|---|---|
+| [Lesson 8 — Streams & timers](/docs/rtos/tutorial-08-streams-timers/) | [Lesson 10 — Tickless idle & debugging](/docs/rtos/tutorial-10-tickless-debug/) |

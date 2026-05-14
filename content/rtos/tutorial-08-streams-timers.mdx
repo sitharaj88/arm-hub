@@ -1,0 +1,322 @@
+---
+title: Lesson 8 — Stream buffers and software timers
+description: Lock-free byte streams for UART RX. Software timers and the timer daemon task. configTIMER_TASK_PRIORITY pitfalls. The blink-once abstraction.
+order: 9
+updated: 2026-05-13
+tags: [rtos, tutorial, freertos, stream-buffer, timer, daemon]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 8 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Stream buffers (lock-free, single-writer/single-reader byte streams) and software timers (one-shot or periodic callbacks via the timer service task)' },
+    { label: 'Code provided', value: '~180 lines (UART RX via stream buffer at 921600 baud, a "blink once" timer abstraction)' },
+    { label: 'Time', value: '75–100 min' },
+    { label: 'Pre-reqs', value: 'Lessons 1–7' },
+    { label: 'Outcome', value: 'A UART RX path that handles 921 600 baud without overrun, and a non-blocking "fire-and-forget" timer pattern' },
+  ]}
+/>
+
+Two FreeRTOS features that don't fit cleanly into the semaphore/queue/notification taxonomy, but solve real problems elegantly: **stream buffers** for high-rate byte streams (UART, USB CDC, any continuous data source) and **software timers** for "do this in N milliseconds" callbacks without standing up a whole task.
+
+## Stream buffers
+
+A stream buffer is a lock-free, single-producer, single-consumer FIFO of bytes. The kernel allocates a contiguous buffer at create time; the producer and consumer each have their own head pointer and they advance independently with atomic operations. No critical sections in the fast path.
+
+The key constraint: **exactly one producer and exactly one consumer.** If you have two ISRs writing to the same stream buffer, or two tasks reading from it, behaviour is undefined. For multi-producer or multi-consumer use a queue.
+
+```c
+#include "FreeRTOS.h"
+#include "stream_buffer.h"
+
+StreamBufferHandle_t xStreamBufferCreate(size_t buffer_size, size_t trigger_level);
+
+size_t xStreamBufferSend(StreamBufferHandle_t sb, const void *data,
+                          size_t data_len, TickType_t timeout);
+size_t xStreamBufferReceive(StreamBufferHandle_t sb, void *data,
+                             size_t max_len, TickType_t timeout);
+
+size_t xStreamBufferSendFromISR(StreamBufferHandle_t sb, const void *data,
+                                 size_t data_len, BaseType_t *hp_woken);
+```
+
+The **trigger level** is the threshold of bytes that must be in the buffer before a blocked `xStreamBufferReceive` is woken. If trigger level is 1, the receiver wakes on the first byte. If it's 16, the receiver waits for at least 16 bytes (or its timeout). This is the classic UART FIFO threshold — wake on bursts, not on each byte.
+
+```c
+sb = xStreamBufferCreate(1024, 1);   /* 1 KB buffer, wake on every byte */
+sb = xStreamBufferCreate(1024, 16);  /* 1 KB buffer, wake on at least 16 bytes */
+```
+
+## UART RX at high baud rate
+
+Lesson 6's queue version handled 115 200 baud comfortably. Stream buffers shine at higher rates.
+
+```c
+static StreamBufferHandle_t uart_sb;
+
+void USART2_IRQHandler(void) {
+    if (USART2->SR & USART_SR_RXNE) {
+        uint8_t b = USART2->DR;
+        BaseType_t hp = pdFALSE;
+        xStreamBufferSendFromISR(uart_sb, &b, 1, &hp);
+        portYIELD_FROM_ISR(hp);
+    }
+}
+
+static void parser_task(void *arg) {
+    char buf[64];
+    while (1) {
+        size_t got = xStreamBufferReceive(uart_sb, buf, sizeof(buf), portMAX_DELAY);
+        parse_chunk(buf, got);
+    }
+}
+
+int main(void) {
+    /* 2 KB buffer, wake on 32+ bytes (let bursts accumulate to reduce wake-ups) */
+    uart_sb = xStreamBufferCreate(2048, 32);
+    /* ... uart init at 921 600 ... */
+    xTaskCreate(parser_task, "parser", 512, NULL, 3, NULL);
+    vTaskStartScheduler();
+    while (1) {}
+}
+```
+
+At 921 600 baud (~92 000 bytes/s), with trigger level 32, the parser task wakes ~3 000 times per second instead of 92 000 times. Each wake processes a chunk. The ISR itself stays at ~1 µs per byte (just a register read + a stream buffer write). Total CPU: well under 5% on a 100 MHz Cortex-M4.
+
+A queue-of-bytes equivalent at 921 600 baud would spend ~10% of CPU on critical sections alone. Stream buffer is the right primitive at this rate.
+
+<Callout type="tip" title="Trigger level vs latency trade-off">
+Higher trigger level = fewer wake-ups but more latency before the task sees the first byte. For interactive terminal use, set it to 1 (wake on every byte) so a single keystroke is responsive. For streaming data (sensor logs, file transfer), 16–64 is reasonable. For DMA-fed data, the trigger level doesn't matter much because the DMA-complete ISR puts a whole transfer in at once.
+</Callout>
+
+## Message buffers — variable-length records
+
+A message buffer is the stream buffer's sibling. Same single-producer/single-consumer model, but each send is a discrete *message* with a length prefix. Receives return one complete message at a time.
+
+```c
+#include "message_buffer.h"
+
+MessageBufferHandle_t xMessageBufferCreate(size_t buffer_size);
+size_t xMessageBufferSend(MessageBufferHandle_t mb, const void *data, size_t len, TickType_t timeout);
+size_t xMessageBufferReceive(MessageBufferHandle_t mb, void *out, size_t out_max, TickType_t timeout);
+```
+
+Useful when you have variable-length records (parsed lines, CAN frames, sensor readings of different types). Faster than a queue of pointers, with the bounded-storage discipline built in. Each message has 4 bytes of overhead (the length prefix).
+
+## Software timers
+
+A software timer is a kernel object that fires a callback after a specified delay, optionally repeating. It's a way to schedule "do this in 500 ms" without dedicating a whole task to it.
+
+```c
+#include "timers.h"
+
+TimerHandle_t xTimerCreate(
+    const char *name,
+    TickType_t period,         /* in ticks */
+    BaseType_t auto_reload,    /* pdTRUE = periodic, pdFALSE = one-shot */
+    void *id,
+    TimerCallbackFunction_t cb
+);
+
+BaseType_t xTimerStart(TimerHandle_t t, TickType_t timeout);
+BaseType_t xTimerStop(TimerHandle_t t, TickType_t timeout);
+BaseType_t xTimerReset(TimerHandle_t t, TickType_t timeout);
+BaseType_t xTimerChangePeriod(TimerHandle_t t, TickType_t period, TickType_t timeout);
+```
+
+Enable in `FreeRTOSConfig.h`:
+
+```c
+#define configUSE_TIMERS                 1
+#define configTIMER_TASK_PRIORITY        (configMAX_PRIORITIES - 1)
+#define configTIMER_QUEUE_LENGTH         10
+#define configTIMER_TASK_STACK_DEPTH     configMINIMAL_STACK_SIZE
+```
+
+Three new things to understand:
+
+- `configUSE_TIMERS = 1` enables the timer service task and the timers API.
+- `configTIMER_TASK_PRIORITY` is the priority of the timer service task. All timer callbacks run in this task's context.
+- `configTIMER_QUEUE_LENGTH` is the depth of the internal command queue. `xTimerStart`, `xTimerStop`, etc. don't manipulate the timer directly — they post a command to the queue, which the timer task processes.
+
+## The "blink once" pattern
+
+A useful abstraction: turn an LED on, automatically turn it off N milliseconds later, without writing a task or polling.
+
+```c
+#define LED_ON_DURATION_MS 5000
+
+static TimerHandle_t led_off_timer;
+
+static void led_off_cb(TimerHandle_t t) {
+    (void)t;
+    GPIOA->BSRR = (1u << (5 + 16));   /* PA5 = 0 */
+}
+
+void blink_once(void) {
+    GPIOA->BSRR = (1u << 5);          /* PA5 = 1 */
+    xTimerStart(led_off_timer, 0);    /* fire once after period */
+}
+
+int main(void) {
+    led_off_timer = xTimerCreate(
+        "led_off",
+        pdMS_TO_TICKS(LED_ON_DURATION_MS),
+        pdFALSE,             /* one-shot */
+        NULL,
+        led_off_cb
+    );
+    /* ... */
+    xTaskCreate(/* some task that calls blink_once() on events */ ...);
+    vTaskStartScheduler();
+}
+```
+
+Any task can now call `blink_once()` and get a 5-second LED pulse. No task dedicated to LED management, no state variable tracking when the LED was turned on. The timer service task handles the callback.
+
+This generalises: anywhere you have "do X after N ms" — debounce a button, retry a network operation, timeout a state — a software timer is the cleanest implementation.
+
+## Periodic timers vs periodic tasks
+
+A periodic task with `vTaskDelayUntil` and a periodic timer both fire at a regular interval. When should you use which?
+
+**Periodic timer** wins when:
+- The work is short (microseconds).
+- You don't need to call blocking APIs (the timer callback should not block long).
+- You want to share one stack (the timer service task's) across many periodic activities.
+- Adding the activity dynamically (start/stop based on state) is natural.
+
+**Periodic task** wins when:
+- The work is long (milliseconds) or unpredictable.
+- The work blocks on I/O (queues, semaphores, vTaskDelay within the activity).
+- You need predictable scheduling latency at a specific priority.
+- The activity needs a private state machine with stack-allocated locals.
+
+A rule of thumb: if the work fits in ~50 µs and doesn't block, use a timer. Otherwise use a task.
+
+<Callout type="warn" title="Timer callbacks share one stack and one priority">
+All timer callbacks run in the timer service task. If one callback takes 50 ms, every other timer that should fire during that time is delayed. Long or blocking work in a callback breaks every other timer. Keep callbacks short. If you need long work, have the callback signal a task to do it.
+</Callout>
+
+## `configTIMER_TASK_PRIORITY` — pick carefully
+
+This is the priority of the timer service task. Two failure modes:
+
+**Too low.** Timer callbacks are delayed because higher-priority tasks are running. If the timer is a watchdog refresh or a control-loop coordinator, this is a bug.
+
+**Too high.** The timer task preempts your real work for trivial callbacks. The "blink-once" timer above will preempt your control loop to toggle a GPIO.
+
+Best practice: set `configTIMER_TASK_PRIORITY` slightly *higher* than the tasks that depend on its callbacks running on time, but *lower* than the truly time-critical tasks. For a typical 5-priority scheme, the timer task at priority 4 (one below the top) is reasonable.
+
+The timer service task also has its own stack (`configTIMER_TASK_STACK_DEPTH`). If any of your callbacks call `printf`, walk a tree, or otherwise use stack — size this generously. 512 words (2 KB) is a reasonable default for callbacks that do real work.
+
+## Timer commands are queued
+
+When you call `xTimerStart`, the API does *not* start the timer directly. It puts a "start" command on the timer service task's queue (`configTIMER_QUEUE_LENGTH` deep). The timer task pulls the command from its queue and acts on it. This means:
+
+- **The actual start time is when the timer task next runs**, not when you called `xTimerStart`. If the timer task is starving (low priority + busy higher-priority work), your timer doesn't start.
+- **The command queue can fill up.** If you call `xTimerStart` faster than the timer task can drain commands, calls return `pdFALSE`. Increase `configTIMER_QUEUE_LENGTH` or call less frequently.
+
+Stick with the default queue length (10) unless you have lots of dynamic timer operations.
+
+<Callout type="note" title="xTimerStartFromISR exists too">
+There are FromISR variants — `xTimerStartFromISR`, `xTimerStopFromISR`, etc. They post commands the same way; the only difference is they call `xQueueSendFromISR` internally. Use them when you need to start/stop a timer from an interrupt handler.
+</Callout>
+
+## A combined example: serial command timeout
+
+The user types a command. If they don't press Enter within 5 seconds, abandon the partial command.
+
+```c
+#define LINE_TIMEOUT_MS 5000
+#define LINE_MAX        128
+
+static char         line[LINE_MAX];
+static size_t       line_pos;
+static TimerHandle_t line_timeout_timer;
+
+static void line_timeout_cb(TimerHandle_t t) {
+    (void)t;
+    printf("\r\ntimeout — discarding partial line\r\n");
+    line_pos = 0;
+}
+
+void on_uart_byte(uint8_t b) {
+    if (b == '\n') {
+        xTimerStop(line_timeout_timer, 0);
+        line[line_pos] = 0;
+        process_command(line);
+        line_pos = 0;
+    } else if (b >= 0x20 && line_pos < LINE_MAX - 1) {
+        if (line_pos == 0) {
+            xTimerStart(line_timeout_timer, 0);
+        } else {
+            xTimerReset(line_timeout_timer, 0);   /* restart count from now */
+        }
+        line[line_pos++] = b;
+    }
+}
+
+int main(void) {
+    line_timeout_timer = xTimerCreate(
+        "line_to",
+        pdMS_TO_TICKS(LINE_TIMEOUT_MS),
+        pdFALSE,
+        NULL,
+        line_timeout_cb
+    );
+    /* ... */
+}
+```
+
+The timer is started on the first character, reset on every subsequent character (the 5-second countdown restarts), stopped on Enter. If the user types `H`, `i` and then walks away, 5 seconds later `line_timeout_cb` clears the buffer. No dedicated timeout task; no extra state machine.
+
+This pattern — a timer that gets `xTimerReset` on activity and fires on inactivity — is the standard "watchdog" or "inactivity timer" idiom.
+
+## Common bugs
+
+**Forgetting `configUSE_TIMERS = 1`.** Timer APIs link successfully (they're weak symbols) but do nothing at runtime. Symptom: callbacks never fire.
+
+**Timer service task starving.** Timer priority too low + busy higher-priority tasks. Symptom: timers fire late or irregularly. Fix: raise `configTIMER_TASK_PRIORITY`.
+
+**Long work in a callback.** All other timers stall. Fix: callback should just signal a task (notification, queue post).
+
+**Calling a non-ISR API from a callback that runs in the timer task.** Callbacks run in *task* context, not ISR context. So `xQueueSend` (not FromISR) is correct there. This trips people up — they see "callback" and think "ISR."
+
+**Forgetting to start the timer.** `xTimerCreate` does not start. You must call `xTimerStart` separately.
+
+## Exercises
+
+**Exercise 8.1**: A UART at 1 Mbaud produces ~100 000 bytes per second. With a stream buffer trigger level of 64, how often does the parser task wake? What about with trigger level 1?
+
+**Exercise 8.2**: You have 10 different one-shot timeouts in your application, each in a different state machine. Should you create 10 timers or use one timer and a state machine? Pro/con each.
+
+**Exercise 8.3**: A callback in a periodic timer (period 100 ms) calls `vTaskDelay(pdMS_TO_TICKS(200))`. What goes wrong?
+
+<Callout type="spec" title="Answer 8.1">
+With trigger level 64: 100 000 / 64 ≈ 1 560 wakes per second. With trigger level 1: 100 000 wakes per second. Each wake costs roughly 1 µs of context-switch overhead, so trigger level 1 is 100 ms/s = 10% of CPU just on wake-ups; trigger level 64 is 1.6 ms/s = 0.16%. The latency difference is up to 64 byte-times — at 1 Mbaud, ~640 µs. Acceptable for most stream protocols; not for interactive terminals.
+</Callout>
+
+<Callout type="spec" title="Answer 8.2">
+10 timers is usually cleaner. Each timer has a clear single purpose, can be started/stopped independently, and has its own callback. The cost is ~80 bytes per timer (TimerHandle structure). The "one timer + state machine" approach saves RAM but you reimplement the multiplex logic that the kernel already does. Use one timer only when you have hundreds of timeouts (e.g., per-connection timeouts in a TCP stack) — the standard pattern there is a sorted-list of expiry times and one timer for "next expiry."
+</Callout>
+
+<Callout type="spec" title="Answer 8.3">
+The timer task is blocked in `vTaskDelay`. Every other timer scheduled in the next 200 ms is delayed by 100–200 ms. The command queue may overflow if other tasks issue `xTimerStart` etc. during that window. Fix: timer callbacks must not block. If you need to wait 200 ms, have the callback signal a task that does the delay.
+</Callout>
+
+## What you learned
+
+- Stream buffers: lock-free, single-producer/single-consumer byte FIFO. Use for high-rate UART/USB/sensor streams. Trigger level controls wake-up granularity.
+- Message buffers: same model as stream buffers but with variable-length record framing.
+- Software timers: callbacks that fire after a delay (one-shot or periodic). The callback runs in the timer service task.
+- `configTIMER_TASK_PRIORITY` controls when callbacks run relative to your other tasks. Higher = lower latency, more preemption.
+- All timer API calls (`xTimerStart`, etc.) are queued commands — they execute when the timer task next runs.
+- Keep callbacks short. If work is long, have the callback signal a task.
+
+## Up next
+
+| Previous | Next |
+|---|---|
+| [Lesson 7 — Events & notifications](/docs/rtos/tutorial-07-events-notifications/) | [Lesson 9 — Memory management](/docs/rtos/tutorial-09-memory/) |

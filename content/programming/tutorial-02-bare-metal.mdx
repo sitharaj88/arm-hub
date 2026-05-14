@@ -1,0 +1,329 @@
+---
+title: Lesson 2 — Your first blink, no HAL
+description: Write main.c, startup.s, and linker.ld from scratch. Build, flash, watch the LED blink. Every line is yours — about 80 lines total.
+order: 4
+updated: 2026-05-13
+tags: [programming, tutorial, c, embedded, bare-metal, blink]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 2 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Bare-metal program structure: vector table, Reset_Handler, linker placement, GPIO register writes, flashing the chip' },
+    { label: 'Code provided', value: 'About 80 lines total — 40 C, 20 assembly, 25 linker' },
+    { label: 'Time', value: '60-90 minutes' },
+    { label: 'Hardware', value: 'STM32F411 Nucleo (PA5 LED). Adapt the pin number for other boards' },
+  ]}
+/>
+
+This is the lesson where it all comes together. We will build a complete firmware image — no HAL, no SDK, no vendor library — that blinks the user LED. The point is not that we cannot use libraries; the point is that you should understand every single line that runs on the chip before main even starts. After this lesson, the words "vector table", "reset handler", and "linker script" are no longer mysterious.
+
+Three files in one directory:
+
+- `main.c` — your application.
+- `startup.s` — the assembly that runs first, sets up the stack, and jumps to your C code.
+- `linker.ld` — tells the linker where in memory each piece goes.
+
+We will write them in that order, then build, then flash.
+
+## The mental model
+
+When the STM32 powers on (or wakes from reset), the Cortex-M core does exactly two things before running your code:
+
+1. Reads the 32-bit word at address `0x0800_0000` and loads it into the Main Stack Pointer (MSP).
+2. Reads the 32-bit word at address `0x0800_0004`, masks off the bottom bit, and branches to that address.
+
+That is it. Those two words live at the start of flash because the chip is configured to alias flash to `0x0000_0000` on reset (the `BOOT0` pin selects this). The first word is the initial top-of-stack; the second is the address of `Reset_Handler`, the first function that runs.
+
+After that, we are responsible for everything: copying initialised data from flash to RAM, zeroing `.bss`, calling `main()`, and providing default exception handlers for everything in the vector table.
+
+## main.c
+
+```c
+#include <stdint.h>
+
+/* STM32F4 peripheral base addresses (from RM0383 section 2.3) */
+#define RCC_BASE   0x40023800UL
+#define GPIOA_BASE 0x40020000UL
+
+/* RCC AHB1 enable register — bit 0 enables GPIOA clock */
+#define RCC_AHB1ENR (*(volatile uint32_t *)(RCC_BASE + 0x30))
+
+/* GPIOA registers */
+#define GPIOA_MODER (*(volatile uint32_t *)(GPIOA_BASE + 0x00))
+#define GPIOA_ODR   (*(volatile uint32_t *)(GPIOA_BASE + 0x14))
+
+#define LED_PIN 5  /* PA5 on F411 Nucleo */
+
+static void delay(volatile uint32_t n) {
+    while (n--) { __asm__ volatile("nop"); }
+}
+
+int main(void) {
+    /* 1. Enable the clock to GPIOA */
+    RCC_AHB1ENR |= (1u << 0);
+
+    /* 2. Set PA5 to output mode (MODER bits 11:10 = 01) */
+    GPIOA_MODER &= ~(3u << (LED_PIN * 2));   /* clear bits 11:10 */
+    GPIOA_MODER |=  (1u << (LED_PIN * 2));   /* set bit 10 */
+
+    /* 3. Blink forever */
+    while (1) {
+        GPIOA_ODR ^= (1u << LED_PIN);
+        delay(200000);
+    }
+}
+```
+
+Forty lines. Read them slowly.
+
+**Lines 4-13** define the addresses we will poke. They come from the STM32F411 reference manual (RM0383). RCC is the Reset and Clock Controller; we have to enable the clock to a peripheral before its registers respond to writes. GPIOA is one of the GPIO ports; its registers live at `0x4002_0000`.
+
+**Lines 15-16** define `delay`. It is a busy loop with `nop` to keep the optimiser from deleting it. The `volatile` on the parameter ensures the count is actually decremented in memory. This is a terrible delay primitive — we will fix it with SysTick in lesson 6.
+
+**Lines 19-25** are the real work. Enable the GPIOA clock by setting bit 0 of `AHB1ENR`. Then configure PA5 as an output: the MODER register has 2 bits per pin, and `01` means general-purpose output. Clear the existing 2 bits, set the low bit.
+
+**Lines 27-30** toggle the output bit and delay. Forever.
+
+<Callout type="tip" title="Why volatile? Why the read-modify-write?">
+Without `volatile`, the compiler is allowed to assume `GPIOA_ODR` does not change between reads, and would hoist the `^=` out of the loop. The LED would be set once and never toggle again. The read-modify-write pattern (`|=`, `&= ~`, `^=`) is fine here because no interrupt will touch ODR while main is running. Once we add ISRs in lesson 6, we will switch to BSRR for atomic single-bit writes.
+</Callout>
+
+## startup.s
+
+The smallest possible startup file: a vector table with the mandatory entries, a Reset_Handler that copies `.data`, zeroes `.bss`, then calls main, and weak fault handlers that just spin.
+
+```armasm
+    .syntax unified
+    .cpu cortex-m4
+    .thumb
+
+    .section .isr_vector, "a", %progbits
+    .word   _estack             /* 0x00: Initial MSP                 */
+    .word   Reset_Handler       /* 0x04: Reset                       */
+    .word   Default_Handler     /* 0x08: NMI                         */
+    .word   Default_Handler     /* 0x0C: HardFault                   */
+    .word   Default_Handler     /* 0x10: MemManage                   */
+    .word   Default_Handler     /* 0x14: BusFault                    */
+    .word   Default_Handler     /* 0x18: UsageFault                  */
+    .word   0, 0, 0, 0          /* 0x1C - 0x28: reserved             */
+    .word   Default_Handler     /* 0x2C: SVCall                      */
+    .word   Default_Handler     /* 0x30: DebugMon                    */
+    .word   0                   /* 0x34: reserved                    */
+    .word   Default_Handler     /* 0x38: PendSV                      */
+    .word   Default_Handler     /* 0x3C: SysTick                     */
+
+    .section .text
+    .thumb_func
+    .global Reset_Handler
+Reset_Handler:
+    /* Copy .data from flash (_sidata) to RAM (_sdata.._edata) */
+    ldr   r0, =_sdata
+    ldr   r1, =_edata
+    ldr   r2, =_sidata
+1:  cmp   r0, r1
+    bge   2f
+    ldr   r3, [r2], #4
+    str   r3, [r0], #4
+    b     1b
+
+    /* Zero .bss (_sbss.._ebss) */
+2:  ldr   r0, =_sbss
+    ldr   r1, =_ebss
+3:  cmp   r0, r1
+    bge   4f
+    movs  r3, #0
+    str   r3, [r0], #4
+    b     3b
+
+4:  bl    main
+hang: b   hang
+
+    .thumb_func
+    .global Default_Handler
+Default_Handler:
+    b     .
+```
+
+The `.isr_vector` section is what the linker script will place at the very start of flash. Every `.word` writes a 32-bit value into the table at compile time. The first word is the address of `_estack` (a symbol defined by the linker as the top of SRAM), the second is the address of `Reset_Handler`, and everything else points to `Default_Handler` — an infinite loop.
+
+`.thumb_func` before a label tells the assembler to set the low bit of the function pointer. Cortex-M code is always Thumb, and the convention is that the low bit of any function pointer is 1. The CPU strips that bit when branching but uses it as a sanity check (a 0 means "you tried to branch into ARM mode" which on Cortex-M raises a fault).
+
+<Callout type="warn" title="The relocation loop is the same logic as the C version">
+The two loops in Reset_Handler do exactly what the C `Reset_Handler` from the [startup page](/docs/programming/startup/) does — they are just expressed in pure assembly so we do not need any C runtime yet. After this lesson you can rewrite Reset_Handler in C as a single `__attribute__((noreturn))` function; both forms ship in real firmware.
+</Callout>
+
+## linker.ld
+
+```ld
+ENTRY(Reset_Handler)
+
+MEMORY
+{
+  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 512K
+  SRAM  (rwx): ORIGIN = 0x20000000, LENGTH = 128K
+}
+
+_estack = ORIGIN(SRAM) + LENGTH(SRAM);
+
+SECTIONS
+{
+  .isr_vector : {
+    KEEP(*(.isr_vector))
+  } > FLASH
+
+  .text : {
+    *(.text*)
+    *(.rodata*)
+    . = ALIGN(4);
+    _etext = .;
+  } > FLASH
+
+  .data : {
+    _sdata = .;
+    *(.data*)
+    . = ALIGN(4);
+    _edata = .;
+  } > SRAM AT > FLASH
+
+  _sidata = LOADADDR(.data);
+
+  .bss : {
+    _sbss = .;
+    *(.bss*)
+    *(COMMON)
+    . = ALIGN(4);
+    _ebss = .;
+  } > SRAM
+}
+```
+
+Twenty-five lines. The `MEMORY` block declares two regions matching the F411's flash and SRAM. The `_estack` assignment puts the initial stack pointer at the very top of SRAM (the stack grows downward).
+
+Each section in `SECTIONS` does one thing:
+
+- `.isr_vector` — the vector table from startup.s, pinned at the start of flash.
+- `.text` — code and read-only data, in flash.
+- `.data` — initialised globals: virtual addresses in SRAM, but the bytes live in flash (`AT > FLASH`). Reset_Handler copies them.
+- `.bss` — zero-initialised globals, only space reserved in SRAM. Reset_Handler clears them.
+
+`_sidata`, `_sdata`, `_edata`, `_sbss`, `_ebss` are the symbols Reset_Handler references. The linker emits them at the addresses they are assigned. Lesson 5 dissects this script line-by-line.
+
+## Build
+
+Create a `build/` directory and run:
+
+```bash
+arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb \
+    -nostdlib -T linker.ld \
+    startup.s main.c \
+    -Wl,-Map=build/blink.map \
+    -o build/blink.elf
+```
+
+If you get no output, the build succeeded. Inspect:
+
+```bash
+arm-none-eabi-size build/blink.elf
+```
+
+Expected (roughly):
+
+```
+   text    data     bss     dec     hex filename
+    140       0       0     140      8c build/blink.elf
+```
+
+Convert ELF to raw binary for flashing:
+
+```bash
+arm-none-eabi-objcopy -O binary build/blink.elf build/blink.bin
+```
+
+The `.bin` is what gets written to flash starting at `0x08000000`.
+
+## Flash and run
+
+With your Nucleo plugged in:
+
+```bash
+st-flash write build/blink.bin 0x08000000
+```
+
+Expected:
+
+```
+st-flash 1.7.0
+...
+2026-05-13T14:33:21 INFO common.c: Loading device parameters....
+2026-05-13T14:33:21 INFO common.c: Device connected is: F411RE
+...
+2026-05-13T14:33:22 INFO common.c: Starting verification of write complete
+2026-05-13T14:33:22 INFO common.c: Flash written and verified! jolly good!
+```
+
+The LD2 LED should now be blinking at roughly 2-3 Hz. **You just built a firmware image from scratch and flashed it onto silicon.**
+
+If using OpenOCD instead:
+
+```bash
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg \
+    -c "program build/blink.elf verify reset exit"
+```
+
+<Callout type="warn" title="If the LED is not blinking">
+First check: does `st-flash read /tmp/test.bin 0x08000000 256` produce the bytes you just wrote? If yes, the flash is programmed; the bug is in code. If no, the chip is not enumerating — re-seat USB, check for "STM32 STLink" in `dmesg` or Device Manager. Next: try `st-flash --reset write build/blink.bin 0x08000000` so the chip resets after programming. If still nothing, your `LED_PIN` may be wrong for your board — check the schematic.
+</Callout>
+
+## What just happened
+
+When you ran `st-flash write`, the bytes of `blink.bin` got written into flash starting at `0x0800_0000`. The first four bytes are the value of `_estack` (around `0x2002_0000`, the top of 128 KB SRAM). The next four are the address of `Reset_Handler`.
+
+When the chip reset:
+
+1. Cortex-M4 hardware reads `*(uint32_t*)0x08000000` → loads MSP with `_estack`.
+2. Reads `*(uint32_t*)0x08000004` → branches to `Reset_Handler` with the low bit set (Thumb).
+3. `Reset_Handler` copies `.data` from flash to SRAM (zero bytes in our case — no initialised globals).
+4. Zeroes `.bss` (also zero bytes).
+5. Calls `main`.
+6. `main` enables GPIOA clock, configures PA5 as output, loops toggling ODR with a delay.
+
+Every step is something you wrote. There is no SDK, no HAL, no startup file you did not author. This is the foundation we will build on for the next eight lessons.
+
+## Exercises
+
+**Exercise 2.1.** Modify the program to blink twice as fast. Two ways to do it — find both.
+
+<Callout type="spec" title="Answer">
+Easy: halve the delay constant, `delay(100000)`. Better: notice that one period of the LED cycles through "on" and "off" — the LED is "on" for one delay and "off" for one delay, so the visible blink rate is half the toggle rate. Halving the delay doubles toggle rate, which doubles visible blink rate. The second way: use BSRR to set/clear separately and only toggle once per period — that changes the duty cycle but not the rate. We will use BSRR properly in lesson 3.
+</Callout>
+
+**Exercise 2.2.** Add a second LED if your board has one (F407 Disco has four). Blink them out of phase — when one is on, the other is off.
+
+<Callout type="spec" title="Answer">
+On F407 Disco the LEDs are on PD12-15, so you need to enable GPIOD's clock (`RCC_AHB1ENR |= 1<<3`), configure both pins as outputs in `GPIOD_MODER`, and toggle both bits each loop iteration. To make them out of phase, set the initial ODR so one bit is high and the other low (`GPIOD_ODR = (1u << 12)`), then XOR both bits each cycle: `GPIOD_ODR ^= (1u << 12) | (1u << 13);`. They will toggle in lockstep but always have opposite values.
+</Callout>
+
+**Exercise 2.3.** Run `arm-none-eabi-objdump -d build/blink.elf` and find your `main` function. How many instructions are in the toggle loop?
+
+<Callout type="spec" title="Answer">
+Roughly five: a load of `GPIOA_ODR`, an `eor` (XOR) with the bit mask, a store back, a call to `delay`, and a branch back to the top. The exact count depends on optimisation level (try adding `-Os`) and whether GCC inlines `delay`. Compare to what you would get with `HAL_GPIO_TogglePin` — easily 20-30 instructions deep including a function-pointer dispatch. The simplicity is the point of bare metal.
+</Callout>
+
+## What you learned
+
+- The minimum-viable bare-metal project is three files: `main.c`, `startup.s`, `linker.ld`.
+- The vector table starts at flash origin; its first two words are MSP and Reset_Handler.
+- Reset_Handler copies `.data`, zeroes `.bss`, and calls `main`.
+- The linker script's `MEMORY` and `SECTIONS` blocks place each section in flash or SRAM.
+- GPIO writes need the peripheral clock enabled first, then a pin mode, then an output bit.
+- `volatile` keeps the compiler from caching peripheral-register reads in registers.
+
+In lesson 3 we dissect register access in detail — `volatile`, struct-typed peripheral views, BSRR for atomic operations.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 1 — Toolchain setup](/docs/programming/tutorial-01-toolchain/) | [Lesson 3 — Reading hardware registers in C](/docs/programming/tutorial-03-registers/) |

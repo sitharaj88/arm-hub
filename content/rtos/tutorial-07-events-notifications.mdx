@@ -1,0 +1,331 @@
+---
+title: Lesson 7 — Event groups and task notifications
+description: Wait on AND/OR bit patterns for "all subsystems ready" rendezvous. Task notifications — the FreeRTOS fast IPC, ~45× faster than a semaphore.
+order: 8
+updated: 2026-05-13
+tags: [rtos, tutorial, freertos, event-group, notification, ipc]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 7 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Event groups for "wait for multiple events" rendezvous. Task notifications for ultra-fast single-task signalling.' },
+    { label: 'Code provided', value: '~160 lines (system-ready rendezvous + ISR-to-task notification fast path)' },
+    { label: 'Time', value: '60–90 min' },
+    { label: 'Pre-reqs', value: 'Lessons 1–6' },
+    { label: 'Outcome', value: 'A multi-subsystem startup rendezvous and an ISR-to-task fast path measurably faster than a semaphore' },
+  ]}
+/>
+
+So far we have two ways for tasks to wait for something: block on a semaphore (one signal) or block on a queue (data transfer). Both are good general tools. This lesson covers two more specialised tools that solve specific problems much better than the general ones.
+
+**Event groups** let a task wait for a *combination* of independent events — "wait until the Wi-Fi is connected AND the time is synced AND the sensors are calibrated." Without event groups you would invent some ad-hoc state machine with three flags and a mutex.
+
+**Task notifications** are FreeRTOS's fast IPC. Each task has a 32-bit notification value built into its TCB; another task or an ISR can set it without any heap allocation, queue, or critical section. For one-sender-one-receiver paths, notifications are roughly an order of magnitude faster than a semaphore.
+
+## Event groups
+
+An event group is a 24-bit bitmask (32 bits on most ports, but only the bottom 24 are user-usable — the top 8 are reserved). You set bits, clear bits, and wait for combinations of bits.
+
+```c
+#include "event_groups.h"
+
+EventGroupHandle_t xEventGroupCreate(void);
+
+EventBits_t xEventGroupSetBits(EventGroupHandle_t eg, const EventBits_t bits);
+EventBits_t xEventGroupClearBits(EventGroupHandle_t eg, const EventBits_t bits);
+EventBits_t xEventGroupWaitBits(
+    EventGroupHandle_t eg,
+    const EventBits_t  bits_to_wait,
+    BaseType_t         clear_on_exit,
+    BaseType_t         wait_for_all,    /* pdTRUE = AND, pdFALSE = OR */
+    TickType_t         timeout
+);
+```
+
+The signature reveals the design. You name the bits you care about as a mask. You pick AND (all bits must be set) or OR (any bit). You optionally clear them on exit (so the next caller starts fresh).
+
+## System-ready rendezvous
+
+The canonical example: at boot, your firmware has multiple subsystems initialising in parallel. The main application loop should not start until all of them are ready.
+
+```c
+#define BIT_WIFI_CONNECTED    (1 << 0)
+#define BIT_TIME_SYNCED       (1 << 1)
+#define BIT_SENSORS_READY     (1 << 2)
+#define BIT_DISPLAY_READY     (1 << 3)
+#define BIT_ALL_READY         (BIT_WIFI_CONNECTED | BIT_TIME_SYNCED \
+                             | BIT_SENSORS_READY  | BIT_DISPLAY_READY)
+
+static EventGroupHandle_t startup_eg;
+
+static void wifi_task(void *arg) {
+    wifi_init();
+    connect_to_ap();   /* may take 5–30 s */
+    xEventGroupSetBits(startup_eg, BIT_WIFI_CONNECTED);
+    /* ... ongoing wifi work ... */
+}
+
+static void time_task(void *arg) {
+    /* Wait for wifi first */
+    xEventGroupWaitBits(startup_eg, BIT_WIFI_CONNECTED, pdFALSE, pdTRUE, portMAX_DELAY);
+    sntp_sync();      /* may take a few seconds */
+    xEventGroupSetBits(startup_eg, BIT_TIME_SYNCED);
+}
+
+static void sensor_task(void *arg) {
+    sensor_init();
+    sensor_calibrate();
+    xEventGroupSetBits(startup_eg, BIT_SENSORS_READY);
+    /* ... ongoing sensor work ... */
+}
+
+static void display_task(void *arg) {
+    display_init();
+    xEventGroupSetBits(startup_eg, BIT_DISPLAY_READY);
+    /* ... ongoing UI work ... */
+}
+
+static void main_task(void *arg) {
+    /* Wait for all four subsystems */
+    EventBits_t got = xEventGroupWaitBits(
+        startup_eg,
+        BIT_ALL_READY,
+        pdFALSE,               /* don't clear */
+        pdTRUE,                /* AND — all bits must be set */
+        pdMS_TO_TICKS(60000)   /* 60 s overall timeout */
+    );
+
+    if ((got & BIT_ALL_READY) != BIT_ALL_READY) {
+        /* Some subsystem didn't come up — report which */
+        log_startup_failure(got);
+        system_reset();
+    }
+
+    /* Everyone is ready. Start the main application loop. */
+    run_application();
+}
+
+int main(void) {
+    startup_eg = xEventGroupCreate();
+    xTaskCreate(wifi_task,    "wifi",    1024, NULL, 2, NULL);
+    xTaskCreate(time_task,    "time",    512,  NULL, 2, NULL);
+    xTaskCreate(sensor_task,  "sensor",  512,  NULL, 3, NULL);
+    xTaskCreate(display_task, "display", 512,  NULL, 3, NULL);
+    xTaskCreate(main_task,    "main",    1024, NULL, 1, NULL);
+    vTaskStartScheduler();
+    while (1) {}
+}
+```
+
+Read what `main_task` is doing. It blocks in `xEventGroupWaitBits` waiting for all four bits, with a 60-second timeout. The four subsystem tasks set their bits when ready. When all four are set, `main_task` wakes and proceeds. If the 60 seconds expire with some bits unset, `got` tells you exactly which subsystems failed, and you can log it before resetting.
+
+This is much cleaner than the alternatives. With four binary semaphores, you would need four `xSemaphoreTake` calls in series, and you could not have a global timeout that applies to the whole rendezvous. With four flags + a mutex, you would have to invent a condition-variable equivalent.
+
+## OR semantics
+
+`wait_for_all = pdFALSE` waits for *any* of the named bits. Useful for "wake up if anything interesting happens":
+
+```c
+#define BIT_USER_INPUT    (1 << 0)
+#define BIT_NETWORK_RX    (1 << 1)
+#define BIT_TIMER_TICK    (1 << 2)
+#define BIT_ANY_EVENT     (BIT_USER_INPUT | BIT_NETWORK_RX | BIT_TIMER_TICK)
+
+EventBits_t bits = xEventGroupWaitBits(
+    main_eg,
+    BIT_ANY_EVENT,
+    pdTRUE,             /* clear on exit — fresh start next iteration */
+    pdFALSE,            /* OR — any bit wakes us */
+    portMAX_DELAY
+);
+if (bits & BIT_USER_INPUT) handle_input();
+if (bits & BIT_NETWORK_RX) handle_network();
+if (bits & BIT_TIMER_TICK) handle_tick();
+```
+
+This is the classic "event loop" pattern. Each "event source" sets its bit; the main task wakes, processes whatever bits are set, clears them, and waits again.
+
+<Callout type="warn" title="Event groups are not for high-rate signalling">
+Each `xEventGroupSetBits` is roughly as expensive as `xSemaphoreGive` plus a bit more (because the kernel has to scan the waiter list for combinatorial matches). Don't use event groups for a 100 kHz signal source. They are for rendezvous, not data flow.
+</Callout>
+
+## ISR variants
+
+`xEventGroupSetBitsFromISR` exists but is asymmetric: instead of doing the work synchronously, it defers the set operation to the *timer service task* via a queued command. This is because the operation may unblock multiple tasks and has too much work for an ISR.
+
+```c
+void EXTI15_10_IRQHandler(void) {
+    if (EXTI->PR & EXTI_PR_PR13) {
+        EXTI->PR = EXTI_PR_PR13;
+        BaseType_t hp = pdFALSE;
+        xEventGroupSetBitsFromISR(main_eg, BIT_USER_INPUT, &hp);
+        portYIELD_FROM_ISR(hp);
+    }
+}
+```
+
+The catch: this requires `configUSE_TIMERS = 1` and the timer task to be running. If you are not already using timers, enabling them costs ~500 bytes of RAM. For ISR-to-task signalling without that overhead, use a task notification (next section) instead.
+
+## Task notifications — the fast IPC
+
+Every FreeRTOS task has a built-in 32-bit notification value in its TCB. Another task or an ISR can set it; the owning task can wait on it. No separate object, no heap allocation, no critical section in the fast path.
+
+Performance: a notification take/give pair on Cortex-M4 is roughly 600 cycles. A semaphore take/give pair is roughly 25 000 cycles. That is ~45× faster.
+
+### Two API styles
+
+There are two equivalent styles. The "raw" style with `xTaskNotify` and `xTaskNotifyWait`, and the "semaphore-mimicking" style with `xTaskNotifyGive` and `ulTaskNotifyTake`. Pick one; we will use the semaphore-mimicking style because it is simpler and fits 90% of cases.
+
+```c
+#include "FreeRTOS.h"
+#include "task.h"
+
+static TaskHandle_t rx_task_handle;
+
+void USART2_IRQHandler(void) {
+    if (USART2->SR & USART_SR_RXNE) {
+        /* read byte into a ring buffer (omitted) */
+        BaseType_t hp = pdFALSE;
+        vTaskNotifyGiveFromISR(rx_task_handle, &hp);
+        portYIELD_FROM_ISR(hp);
+    }
+}
+
+static void rx_task(void *arg) {
+    while (1) {
+        uint32_t pending = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        /* pending == number of times notify-give was called since last take */
+        drain_rx_buffer();
+    }
+}
+
+int main(void) {
+    xTaskCreate(rx_task, "rx", 256, NULL, 3, &rx_task_handle);
+    /* ... uart init, NVIC ... */
+    vTaskStartScheduler();
+    while (1) {}
+}
+```
+
+`vTaskNotifyGiveFromISR(handle, &hp)` increments the target task's notification value by 1. `ulTaskNotifyTake(pdTRUE, timeout)` reads the value and (because we passed `pdTRUE` for "clear on exit") resets it to 0, then returns. If the value was 0 when called, the task blocks until a notify-give arrives.
+
+This is the binary-semaphore pattern but ~45× faster and with no separate object. The TCB carries the notification field whether you use it or not (configurable via `configUSE_TASK_NOTIFICATIONS`), so there is zero RAM cost per use.
+
+### When notifications win
+
+- **ISR-to-single-task signal.** The canonical fast path. Lower latency than a semaphore.
+- **Single-task counter.** Multiple notify-gives accumulate; the take returns the count. Like a counting semaphore, smaller and faster.
+- **32-bit value passing.** `xTaskNotify(handle, value, action)` can carry a 32-bit value — useful for "here's a pointer" or "here's an error code."
+
+### When notifications lose
+
+- **More than one receiver.** Notifications are addressed to a specific task handle. If you have a pool of workers, use a queue.
+- **Need to wait on multiple events.** Notifications give you one notify-value. For "wait for any of N events," use an event group.
+- **From multiple sender contexts that need ordering.** Notifications are last-writer-wins for the "set value" mode; for "increment," they accumulate, but you cannot distinguish which sender did which increment.
+
+## The raw API for completeness
+
+```c
+BaseType_t xTaskNotify(TaskHandle_t target, uint32_t value, eNotifyAction action);
+BaseType_t xTaskNotifyWait(uint32_t clear_on_entry, uint32_t clear_on_exit,
+                            uint32_t *value_out, TickType_t timeout);
+```
+
+`eNotifyAction` choices:
+
+- `eNoAction` — just unblock the task, don't touch value.
+- `eSetBits` — OR the new value into the existing.
+- `eIncrement` — what `vTaskNotifyGive` does.
+- `eSetValueWithOverwrite` — replace value.
+- `eSetValueWithoutOverwrite` — replace only if the receiver has consumed the previous value.
+
+The "set bits" variant lets you treat the notification value like a tiny event group for one task. A producer says "the network is ready" via `xTaskNotify(net_task, BIT_NET_READY, eSetBits)`; the network task waits with `xTaskNotifyWait(0, 0xffffffff, &bits, ...)` and checks `bits & BIT_NET_READY`. Free event-group equivalent for single-task waits, with no separate object.
+
+## Comparison table
+
+<CoreCompare
+  rows={[
+    { core: 'Binary semaphore', notes: 'ISR-to-any-task signal. ~25 000 cycles per take/give pair. Separate object. Standard pattern.' },
+    { core: 'Task notification (give/take)', notes: 'ISR-to-specific-task signal. ~600 cycles per pair. Lives in the TCB, no separate object. Use when there\'s exactly one receiver and you want lowest latency.' },
+    { core: 'Counting semaphore', notes: 'Resource pool. Notification (increment style) is equivalent and faster — but only one consumer.' },
+    { core: 'Queue (1-byte items)', notes: 'Data transfer with copy. ~15 000 cycles. Use when payload matters.' },
+    { core: 'Event group', notes: 'Wait on AND/OR of multiple bits. ~5 000 cycles per set + match-scan. Use for rendezvous, not streaming.' },
+    { core: 'Stream buffer (lesson 8)', notes: 'Lock-free byte stream. ~1 500 cycles per put. Use for high-rate one-writer-one-reader.' },
+  ]}
+/>
+
+A useful rule: **for ISR-to-task signalling where there is one consumer, use a task notification by default.** For any other shape (multiple consumers, data payload, rendezvous), the more general primitives are correct.
+
+## Real example: replace lesson 4's semaphore with a notification
+
+```c
+static TaskHandle_t uart_task_h;
+
+void USART2_IRQHandler(void) {
+    if (USART2->SR & USART_SR_RXNE) {
+        /* put byte in ring buffer (omitted) */
+        BaseType_t hp = pdFALSE;
+        vTaskNotifyGiveFromISR(uart_task_h, &hp);
+        portYIELD_FROM_ISR(hp);
+    }
+}
+
+static void uart_task(void *arg) {
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        drain_ring_buffer();
+    }
+}
+```
+
+Functionally identical to lesson 4's semaphore version. Removes ~80 bytes (no semaphore object). Speeds up the ISR-to-task path. The trade-off: you must know the task handle at ISR registration time — but you usually do.
+
+## Combining event groups with notifications
+
+A pattern I've used in shipping firmware: notifications for the high-rate per-source signals, an event group for the periodic rendezvous. The main task notifications carry single events; the event group is used once per boot to wait for "all four critical subsystems initialised."
+
+## Common bugs
+
+**Forgetting to set the task handle in `xTaskCreate`.** If you create the task with `NULL` as the handle pointer, you can't notify it later. Pass `&task_h` and store it globally if needed.
+
+**Calling `vTaskNotifyGiveFromISR` on a non-existent task.** If the receiving task hasn't been created yet, you've corrupted memory. Order matters: create the receiver before you enable the ISR.
+
+**Treating notifications as a multi-consumer primitive.** Two tasks can't both wait on the same notification — each task has its own notification value. If you find yourself wanting this, use a queue.
+
+**Mixing the `give/take` style with the `xTaskNotify/xTaskNotifyWait` style.** They share the same TCB field but interpret it differently. Pick one style per task and stay with it.
+
+## Exercises
+
+**Exercise 7.1**: A device has three sensors. The main task should run every 100 ms but only after *all three* sensors have produced a new sample. Each sensor task produces samples at slightly different rates (95–105 ms). Design with an event group.
+
+**Exercise 7.2**: Why does `xEventGroupSetBitsFromISR` defer to the timer task instead of doing the work synchronously like `xSemaphoreGiveFromISR`?
+
+**Exercise 7.3**: A high-rate ADC ISR fires at 10 kHz. Each sample should wake a processing task. Compare CPU overhead of three implementations: (a) binary semaphore, (b) task notification, (c) stream buffer of 16-bit samples.
+
+<Callout type="spec" title="Answer 7.1">
+Create an event group with three bits (one per sensor). Each sensor task sets its bit when a new sample is ready. The main task does `xEventGroupWaitBits(eg, ALL_THREE, pdTRUE, pdTRUE, ...)` — wait for AND, clear on exit. It runs as soon as all three bits are set, then the cycle restarts. If a sensor lags, the main task waits for it. If you need to know which sensor was last, also send the sample value via a queue or shared structure.
+</Callout>
+
+<Callout type="spec" title="Answer 7.2">
+Setting bits can unblock *multiple* waiters with different bit combinations — the kernel has to scan the entire waiter list for each one and decide which match. That scan is too long for an ISR (could be tens of microseconds). Deferring to the timer task keeps the ISR short, at the cost of slightly higher latency (the timer task runs at its configured priority, not immediately). For ISR-to-single-task signalling, task notifications are the better tool.
+</Callout>
+
+<Callout type="spec" title="Answer 7.3">
+At 10 kHz, the per-sample overhead is the whole story. (a) Semaphore: 25 000 cycles × 10 000 Hz = 250 Mcycles/s. On a 100 MHz CPU that's 2.5× over capacity — won't work. (b) Notification: 600 × 10 000 = 6 Mcycles/s = 6%. Doable. (c) Stream buffer: ~1 500 × 10 000 = 15 Mcycles/s = 15%. Also doable, and (c) can buffer multiple samples per task wake-up, which is even more efficient at very high rates. For 10 kHz, notification is the sweet spot. For 100 kHz or higher, prefer the stream buffer; for 1 MHz, prefer DMA + a low-rate "buffer-full" interrupt.
+</Callout>
+
+## What you learned
+
+- Event groups: 24-bit bitmask, wait for AND/OR combinations of bits. Best for boot rendezvous and main-loop "wait on any of N events."
+- `xEventGroupSetBitsFromISR` defers to the timer task; for ISR-to-task fast paths, use notifications.
+- Task notifications: 32-bit value in every TCB, no separate object, ~45× faster than a semaphore for ISR-to-single-task signalling.
+- Two API styles: give/take (binary-semaphore-equivalent) and notify/notify-wait (32-bit value + actions). Pick one style per task.
+- Notifications lose when there is more than one receiver or you need to combine multiple events — use queues and event groups respectively.
+
+## Up next
+
+| Previous | Next |
+|---|---|
+| [Lesson 6 — Queues](/docs/rtos/tutorial-06-queues/) | [Lesson 8 — Stream buffers & timers](/docs/rtos/tutorial-08-streams-timers/) |

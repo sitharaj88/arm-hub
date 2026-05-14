@@ -1,0 +1,299 @@
+---
+title: Lesson 3 — Tasks, what they are
+description: What xTaskCreate actually allocates. Stack sizing with the high-water mark. Priority. Ready/Running/Blocked/Suspended. Observing pre-emption on real silicon.
+order: 4
+updated: 2026-05-13
+tags: [rtos, tutorial, freertos, tasks, stack, priority, preemption]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 3 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'The internals of a FreeRTOS task — TCB, stack, priority, state machine. How to size stacks. How to observe pre-emption.' },
+    { label: 'Code provided', value: '~140 lines (three-task demo with stack monitoring and GPIO probes)' },
+    { label: 'Time', value: '60–90 min' },
+    { label: 'Pre-reqs', value: 'Lesson 2 — FreeRTOS building and blinking' },
+    { label: 'Outcome', value: 'Three tasks at three priorities, observable pre-emption on a logic analyser, and live stack-usage telemetry over UART' },
+  ]}
+/>
+
+A FreeRTOS task is an executable C function plus a small block of bookkeeping the kernel needs to schedule it. The function has the signature `void task(void *params)` and runs forever in a `while (1)` loop. The bookkeeping — a Task Control Block (TCB) and a stack — is what `xTaskCreate` allocates. This lesson opens up that allocation, walks through stack sizing in a way that actually works, and gives you a small multi-task demo where you can *see* pre-emption with a logic analyser or even just an LED.
+
+## What `xTaskCreate` actually allocates
+
+The signature:
+
+```c
+BaseType_t xTaskCreate(
+    TaskFunction_t  pxTaskCode,        /* the function */
+    const char *    pcName,            /* human-readable name, for debugging */
+    uint16_t        usStackDepth,      /* stack in WORDS (not bytes) */
+    void *          pvParameters,      /* opaque argument passed to the function */
+    UBaseType_t     uxPriority,        /* 0..configMAX_PRIORITIES-1 */
+    TaskHandle_t *  pxCreatedTask      /* output handle */
+);
+```
+
+When you call this:
+
+1. **TCB allocation**. The kernel calls `pvPortMalloc(sizeof(TCB_t))`. On Cortex-M4 with default config that is about 92 bytes. The TCB holds: the task's priority (current and base), the stack pointer, the list nodes that link the TCB into ready/blocked/delayed lists, the notification value, the mutex-held list (for priority inheritance), the task name, and a few pointers.
+
+2. **Stack allocation**. The kernel calls `pvPortMalloc(usStackDepth * sizeof(StackType_t))`. `StackType_t` is `uint32_t` on Cortex-M, so `usStackDepth = 128` means 512 bytes. If `configCHECK_FOR_STACK_OVERFLOW = 2`, every byte is initialised to `0xA5`.
+
+3. **Initial stack frame**. The kernel builds a fake exception frame on the task's stack — as if the task had been pre-empted just before its first instruction. The frame has the task function as the saved PC, `pvParameters` in R0, an `xPSR` with the Thumb bit set, etc. When the scheduler eventually picks this task and "restores" its context, the CPU resumes "execution" at the task function's first instruction with `pvParameters` already in R0. This is the central trick of the Cortex-M port.
+
+4. **Insertion into the ready list**. The TCB is placed at the tail of `pxReadyTasksLists[uxPriority]`.
+
+5. **Reschedule**. If the new task's priority is higher than the currently-running task and the scheduler is started, a context switch is requested (PendSV is set pending).
+
+Total RAM cost per task: about `92 + usStackDepth * 4` bytes. A task with a 256-word stack costs about 1.1 KB.
+
+## Sizing stacks properly
+
+This is the single most common source of trouble in new FreeRTOS projects. Stacks that are too small cause silent memory corruption (without overflow checking) or hard faults / scheduler asserts (with overflow checking). Stacks that are too large waste RAM.
+
+The method that works:
+
+1. Start with a generous stack — 512 words (2 KB) — for any task that does non-trivial work, 128 for a simple blink task.
+2. Build, run, exercise the task through realistic code paths including its worst-case branches (largest packet parsed, deepest call graph).
+3. Read the *high-water mark* — the minimum number of free stack words ever seen — via `uxTaskGetStackHighWaterMark`.
+4. Reduce the stack to (high-water mark + safety margin). I use 25% margin for development, 50% for production.
+
+```c
+void monitor_task(void *arg) {
+    (void)arg;
+    while (1) {
+        TaskStatus_t status[8];
+        UBaseType_t n = uxTaskGetSystemState(status, 8, NULL);
+        for (UBaseType_t i = 0; i < n; i++) {
+            printf("task %-10s prio=%lu stack_free=%lu\r\n",
+                   status[i].pcTaskName,
+                   (unsigned long)status[i].uxCurrentPriority,
+                   (unsigned long)status[i].usStackHighWaterMark);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+```
+
+The `usStackHighWaterMark` field is the number of *words* that have never been used. If it reports `12` you have 48 bytes of headroom — alarming. If it reports `200` your stack is 800 bytes too big and you can shrink it.
+
+<Callout type="warn" title="Recursive functions ruin stack sizing">
+Stack high-water mark is measured against the worst case you have actually run. If your task calls `printf("%d", x)` only when there is a USB error, and you never reproduced a USB error in test, the high-water mark misses the `printf` path. Either exercise the worst case explicitly, or be very generous with stack on tasks that call vendor HAL code (HAL paths are often dozens of frames deep).
+</Callout>
+
+## Anatomy of a task function
+
+```c
+void my_task(void *arg) {
+    my_args_t *params = (my_args_t *)arg;   /* opaque arg cast back */
+
+    /* One-time setup */
+    setup_local_state(params);
+
+    /* Forever loop — every FreeRTOS task is shaped like this */
+    while (1) {
+        do_one_unit_of_work();
+
+        /* MUST block — yield to the scheduler */
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    /* NEVER reached — but if it ever is, we must call vTaskDelete(NULL).
+       Returning from a task function corrupts the scheduler — the LR points
+       at prvTaskExitError which traps. */
+}
+```
+
+Three structural points:
+
+- **The forever loop is mandatory.** A task that returns from its function falls off the end of `prvTaskExitError`, which calls `configASSERT(0)`. If asserts are off, undefined behaviour. If you genuinely want a task to run once and exit, do `vTaskDelete(NULL)` at the end.
+- **There must be a blocking call inside the loop.** A task that never blocks (no `vTaskDelay`, no queue receive, no semaphore take) is a tight loop that starves every same-priority or lower-priority task forever. The only acceptable non-blocking task is the idle task itself.
+- **`pvParameters` is your only input.** If you need to pass multiple arguments to a task, pack them into a struct and pass a pointer. The struct must outlive the task (commonly: static or heap-allocated and never freed).
+
+## Priority — higher number wins
+
+`configMAX_PRIORITIES = 5` gives you priorities 0, 1, 2, 3, 4. Higher is more urgent. The idle task uses 0. So your first user task at priority 1 is one above idle; priority 4 is the top.
+
+The scheduler rule is straightforward: at every scheduling decision point (tick interrupt, task voluntarily blocks, ISR unblocks a task, task changes its own priority), the highest-priority *ready* task runs. If multiple tasks tie at the highest priority, they round-robin every tick.
+
+```c
+xTaskCreate(critical_task, "crit", 256, NULL, 4, NULL);   /* highest user priority */
+xTaskCreate(ui_task,       "ui",   256, NULL, 2, NULL);
+xTaskCreate(blink_task,    "blink", 128, NULL, 1, NULL);  /* lowest user priority */
+/* idle task at priority 0 is implicit */
+```
+
+Pre-emption follows naturally: while `blink_task` is running, if `critical_task` becomes ready (e.g., an ISR gives a semaphore it was blocked on), the scheduler immediately stops `blink_task` and runs `critical_task`. When `critical_task` blocks again, `blink_task` resumes from where it was interrupted.
+
+<Callout type="note" title="FreeRTOS priorities and NVIC priorities are inversely ordered">
+FreeRTOS: 0 is lowest, configMAX_PRIORITIES-1 is highest. NVIC: 0 is highest, 0xff is lowest. Both conventions exist for historical reasons. Lesson 5 explains how the two interact through `configMAX_SYSCALL_INTERRUPT_PRIORITY`.
+</Callout>
+
+### How many priorities should I use?
+
+In practice, five to seven is the right answer for most projects. Each priority level costs you a list head (a few bytes), so going crazy is cheap, but the analysis burden grows. A scheme that works:
+
+- **0**: idle (kernel)
+- **1**: background / housekeeping (telemetry, monitoring)
+- **2**: UI / non-critical I/O (display, button handling)
+- **3**: normal / network (UART, lwIP)
+- **4**: timer service task (`configTIMER_TASK_PRIORITY` — see lesson 8)
+- **5**: critical control / hard real-time
+- **6**: emergency / safety responses
+
+If you find yourself wanting priority 12, you have probably not thought through the design. Each priority should mean something semantically distinct.
+
+## Task states — the four states
+
+<StateDiagram title="FreeRTOS task state machine" width={720} height={340} states={[
+  { id: 'ready',   label: 'Ready', x: 40,  y: 140, w: 150, h: 60, tone: 'accent' },
+  { id: 'running', label: 'Running', x: 280, y: 140, w: 150, h: 60, tone: 'success' },
+  { id: 'blocked', label: 'Blocked', x: 530, y: 30,  w: 150, h: 60, tone: 'warning' },
+  { id: 'susp',    label: 'Suspended', x: 530, y: 250, w: 150, h: 60, tone: 'muted' },
+]} transitions={[
+  { from: 'ready', to: 'running', label: 'scheduler picks' },
+  { from: 'running', to: 'ready', label: 'preempted / yield' },
+  { from: 'running', to: 'blocked', label: 'vTaskDelay / queue / sem' },
+  { from: 'blocked', to: 'ready', label: 'event / timeout' },
+  { from: 'running', to: 'susp', label: 'vTaskSuspend' },
+  { from: 'susp', to: 'ready', label: 'vTaskResume', curve: 40 },
+]} caption="Every task is in exactly one of these four states at every instant. PendSV walks the ready lists and picks the highest-priority Ready task." />
+
+- **Ready** — the task can run right now but a higher-priority or same-priority task is running. The scheduler will pick this task when its turn comes.
+- **Running** — currently has the CPU. Exactly one task is in this state at any time (on a single-core CPU).
+- **Blocked** — waiting for an event (timeout, semaphore, queue item, notification). Not eligible to run until the event arrives or the timeout expires.
+- **Suspended** — explicitly removed from scheduling via `vTaskSuspend`. Stays out until `vTaskResume`. Different from blocked: a blocked task wakes on an event; a suspended task wakes only on explicit resume.
+
+`vTaskDelay(pdMS_TO_TICKS(500))` moves the calling task from Running to Blocked, sets a timeout 500 ticks in the future, and triggers a context switch. After 500 ticks the kernel moves the task from Blocked back to Ready; the scheduler will pick it up when no higher-priority task is ready.
+
+See [the FreeRTOS reference](/docs/rtos/freertos/) for the deeper version of the state diagram.
+
+## A three-task demo
+
+We want to see pre-emption in action. Three tasks, three priorities, three GPIOs:
+
+```c
+#include "stm32f4xx.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
+static inline void p_set(uint32_t pin)   { GPIOA->BSRR = (1u << pin); }
+static inline void p_clr(uint32_t pin)   { GPIOA->BSRR = (1u << (pin + 16)); }
+
+static void gpio_init(void) {
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+    /* PA5, PA6, PA7 as outputs */
+    GPIOA->MODER &= ~((3u << (5*2)) | (3u << (6*2)) | (3u << (7*2)));
+    GPIOA->MODER |=  ((1u << (5*2)) | (1u << (6*2)) | (1u << (7*2)));
+}
+
+/* High-priority — fires every 100 ms, "computes" for 5 ms */
+static void high_task(void *arg) {
+    (void)arg;
+    TickType_t last = xTaskGetTickCount();
+    while (1) {
+        p_set(7);
+        /* Busy-wait for ~5 ms to simulate work */
+        for (volatile uint32_t i = 0; i < 500000; i++) { __NOP(); }
+        p_clr(7);
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(100));
+    }
+}
+
+/* Medium-priority — fires every 50 ms, "computes" for 20 ms */
+static void med_task(void *arg) {
+    (void)arg;
+    TickType_t last = xTaskGetTickCount();
+    while (1) {
+        p_set(6);
+        for (volatile uint32_t i = 0; i < 2000000; i++) { __NOP(); }
+        p_clr(6);
+        vTaskDelayUntil(&last, pdMS_TO_TICKS(50));
+    }
+}
+
+/* Low-priority — runs continuously, toggling */
+static void low_task(void *arg) {
+    (void)arg;
+    while (1) {
+        p_set(5);
+        for (volatile uint32_t i = 0; i < 100000; i++) { __NOP(); }
+        p_clr(5);
+        for (volatile uint32_t i = 0; i < 100000; i++) { __NOP(); }
+    }
+}
+
+int main(void) {
+    gpio_init();
+    xTaskCreate(low_task,  "low",  128, NULL, 1, NULL);
+    xTaskCreate(med_task,  "med",  128, NULL, 2, NULL);
+    xTaskCreate(high_task, "high", 128, NULL, 3, NULL);
+    vTaskStartScheduler();
+    while (1) {}
+}
+```
+
+Build, flash, attach the logic analyser to PA5, PA6, PA7. What you should see:
+
+- PA5 (low) toggles continuously, but **goes silent** whenever PA6 or PA7 is high. Low-priority task is pre-empted whenever a higher-priority task is running.
+- PA6 (medium) toggles every 50 ms, with a 20 ms high period. While it is high, PA5 is quiet.
+- PA7 (high) toggles every 100 ms, with a 5 ms high period. While it is high, both PA5 and PA6 are quiet — PA7 even pre-empts PA6.
+
+This is fixed-priority pre-emptive scheduling in one picture. The low-priority task only runs when nothing else needs the CPU. Higher priority always wins.
+
+<Callout type="tip" title="vTaskDelayUntil vs vTaskDelay">
+`vTaskDelay(N)` blocks for N ticks from *now*. If the task did 5 ms of work first, the effective period is 105 ms — drift accumulates. `vTaskDelayUntil(&last, N)` blocks until the next multiple of N ticks from the reference time — the period is exactly N ticks, no drift. Always use `vTaskDelayUntil` for periodic tasks that need accurate timing.
+</Callout>
+
+## Equal priorities round-robin
+
+If two tasks are at the same priority and both are ready, FreeRTOS round-robins them at the tick rate (`configTICK_RATE_HZ` Hz, so every 1 ms by default). Useful when you have multiple equally-important workers — say, two TCP connection handlers. Set them both to the same priority and they share the CPU.
+
+The round-robin slice is fixed at one tick. If you want longer slices, raise `configTICK_RATE_HZ` would *shorten* them, lowering it would lengthen them — but lowering hurts delay granularity. In practice the default is right.
+
+## A note on stack overflow detection
+
+`configCHECK_FOR_STACK_OVERFLOW = 2` does two things:
+
+1. On `xTaskCreate`, fill the stack with `0xA5A5A5A5`.
+2. On every context switch, check that the bottom 16 words of the outgoing task's stack still read `0xA5A5A5A5`. If any have been overwritten, call `vApplicationStackOverflowHook` with the offending task handle and name.
+
+Method 2 catches a stack that *touched* the guard region — useful even when the overflow happened a while ago. Method 1 only checks the final SP value against the bounds, which can miss overflows that briefly dipped into the guard region during a deep call but then returned.
+
+Always use method 2 during development. In production, method 2 has tiny CPU cost (~30 cycles per context switch), so unless your context-switch rate is extreme you can leave it on.
+
+## Exercises
+
+**Exercise 3.1**: In the three-task demo above, what is the minimum CPU utilisation of the system? What does the low-priority task do?
+
+**Exercise 3.2**: Add a fourth task at priority 1 (same as `low_task`) that toggles PA8 continuously, the same shape as `low_task`. What pattern do you expect on PA5 and PA8? Verify with a logic analyser.
+
+**Exercise 3.3**: Suppose the medium task's busy-wait loop takes 60 ms instead of 20 ms. What happens to its `vTaskDelayUntil(&last, pdMS_TO_TICKS(50))`? Does the system behave gracefully?
+
+<Callout type="spec" title="Answer 3.1">
+The high task uses 5 ms per 100 ms = 5%. The medium task uses 20 ms per 50 ms = 40%. Together 45%. The low task fills the remaining 55%. The idle task gets the CPU only when low task is in its tiny inter-toggle delay, so idle usage is very small. Total system load: effectively 100% (the low task busy-waits the leftover). If you want any real idle time, the low task should call `vTaskDelay` instead of busy-waiting.
+</Callout>
+
+<Callout type="spec" title="Answer 3.2">
+PA5 and PA8 round-robin every 1 ms. With the logic analyser zoomed in, you'll see PA5 toggling for ~1 ms, then silent for ~1 ms while PA8 toggles, alternating. They each get half the available low-priority CPU time. Higher-priority tasks (med, high) still pre-empt both.
+</Callout>
+
+<Callout type="spec" title="Answer 3.3">
+`vTaskDelayUntil` was asked to wake at `last + 50`, but it's now beyond that — the task should already have woken at `last + 50` but it's still inside its 60 ms busy-wait. FreeRTOS handles this gracefully: the next call to `vTaskDelayUntil` returns immediately (no blocking) and `last` is advanced by 50. The task is now running back-to-back without any idle time, which means the *medium* task has effectively become a tight loop at priority 2 — starving the low task entirely. This is a real pathology: if your periodic task's worst-case execution time ever exceeds its period, you have lost the rate-monotonic guarantee. See [scheduling](/docs/rtos/scheduling/) for the analysis.
+</Callout>
+
+## What you learned
+
+- A task is a function + a TCB + a stack. `xTaskCreate` allocates both blocks on the FreeRTOS heap and seeds the stack with a fake exception frame.
+- Stack sizes are in *words* (4 bytes each on Cortex-M). Size them by setting generously, measuring with `uxTaskGetStackHighWaterMark`, then adding 25–50% margin.
+- Priorities run 0 (idle) to `configMAX_PRIORITIES - 1`. Higher number = more urgent. Equal priorities round-robin at the tick rate.
+- Tasks are always in one of four states: Ready, Running, Blocked, Suspended. Pre-emption moves a Running task to Ready when something more urgent becomes Ready.
+- `vTaskDelayUntil` is for periodic tasks; `vTaskDelay` is for "wait at least N ticks". They are not interchangeable.
+
+## Up next
+
+| Previous | Next |
+|---|---|
+| [Lesson 2 — Hello FreeRTOS](/docs/rtos/tutorial-02-hello-freertos/) | [Lesson 4 — Semaphores](/docs/rtos/tutorial-04-semaphores/) |

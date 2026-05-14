@@ -1,0 +1,387 @@
+---
+title: Lesson 5 — A minimum linker script you understand
+description: Annotate the linker.ld from lesson 2 line-by-line. MEMORY, SECTIONS, AT-load, PROVIDE, ENTRY. Add a bootloader region. Reserve heap and stack.
+order: 7
+updated: 2026-05-13
+tags: [programming, tutorial, c, embedded, linker, ld]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 5 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Line-by-line linker script anatomy, AT-load, PROVIDE, ENTRY, adding regions, bumping RAM, reserving a bootloader area' },
+    { label: 'Code provided', value: 'About 90 lines of linker script, three progressively-richer versions' },
+    { label: 'Time', value: '60-75 minutes' },
+    { label: 'Hardware', value: 'STM32F411 Nucleo or any Cortex-M4 board' },
+  ]}
+/>
+
+The linker script in lesson 2 was 25 lines and looked like magic. This lesson dispels the magic. We annotate every directive, then progressively extend the script to handle real-world cases: chips with more RAM, a reserved bootloader area at the top of flash, named regions for ITCM/DTCM, and proper stack/heap reservation.
+
+By the end you will read any vendor linker script the same way you read C — line by line, knowing what each construct does and why it is there.
+
+## The lesson-2 script, annotated
+
+```ld
+ENTRY(Reset_Handler)
+```
+
+`ENTRY` sets the program's entry symbol. The resulting ELF file's header records this address. **It is not what the chip jumps to on reset** — the chip always jumps to whatever address is in word 1 of the vector table. ENTRY matters when you load via a debugger or when another tool inspects "where does this program start". GDB's `run` command uses it. `arm-none-eabi-objdump --start-address=ENTRY` uses it. Setting it to `Reset_Handler` matches what the hardware will actually do; setting it wrong does not crash anything but confuses your debugger.
+
+```ld
+MEMORY
+{
+  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 512K
+  SRAM  (rwx): ORIGIN = 0x20000000, LENGTH = 128K
+}
+```
+
+`MEMORY` declares the physical regions the linker is allowed to place things in. Each entry has three parts:
+
+- **Name** (`FLASH`, `SRAM`) — referenced below with `> NAME`.
+- **Attribute string** in parens. The letters are `r` (readable), `w` (writable), `x` (executable). They do not affect placement; the linker just warns if a section's attributes do not match (e.g., placing executable code in a region marked `rw`).
+- **`ORIGIN`** and **`LENGTH`** — the physical address range.
+
+512 K of flash and 128 K of SRAM matches the STM32F411RE. For a different chip you change the LENGTH (and sometimes ORIGIN — STM32L4 puts SRAM at `0x1000_0000` for the first 32 K). The reference manual tells you the actual numbers; the linker has no idea what chip you have.
+
+```ld
+_estack = ORIGIN(SRAM) + LENGTH(SRAM);
+```
+
+This computes the top-of-SRAM address (`0x2000_0000 + 0x00020000 = 0x2002_0000`) and assigns it to a linker symbol. The vector table at `0x0800_0000` references `_estack`; the hardware loads MSP with this value at reset.
+
+The stack grows down from this address. Anything in SRAM below the stack top can be overwritten as the stack grows.
+
+```ld
+SECTIONS
+{
+```
+
+The `SECTIONS` block tells the linker how to assemble output sections from input sections and where to place each output section. Each block inside is one output section.
+
+```ld
+  .isr_vector : {
+    KEEP(*(.isr_vector))
+  } > FLASH
+```
+
+`.isr_vector` is the first output section, placed first in `FLASH` (because the regions inside SECTIONS are emitted in order). The input is "every `.isr_vector` input section from every input object file" — that is what the wildcard `*(.isr_vector)` means.
+
+`KEEP(...)` is critical. Without it, GCC's `--gc-sections` would discard the vector table because nothing in your C code calls into it from a tracked path. The Cortex-M boot ROM "calls" it by hardware, which the linker cannot see. `KEEP` is the override: "do not garbage-collect this even if it looks unreferenced".
+
+```ld
+  .text : {
+    *(.text*)
+    *(.rodata*)
+    . = ALIGN(4);
+    _etext = .;
+  } > FLASH
+```
+
+The `.text` output section collects every input `.text` section (your code) and every `.rodata` section (read-only data — `const` arrays, string literals). The `*` wildcards match any input section name *starting with* `.text` — which catches `.text.main`, `.text.delay`, etc., when you compile with `-ffunction-sections` (each function gets its own subsection so `--gc-sections` can discard unused ones).
+
+`. = ALIGN(4);` is a fence: advance the location counter to a 4-byte boundary. Necessary so that `_etext` is aligned and the following `.data` AT-load starts on a word boundary.
+
+`_etext = .;` defines a symbol at the current location counter. `.` is special — it is "the current address as the linker assembles output". So `_etext` ends up at the address right after the last byte of `.rodata`.
+
+```ld
+  .data : {
+    _sdata = .;
+    *(.data*)
+    . = ALIGN(4);
+    _edata = .;
+  } > SRAM AT > FLASH
+
+  _sidata = LOADADDR(.data);
+```
+
+This is the AT-load section. `> SRAM` sets the **virtual memory address** (VMA): the addresses your code uses to reference these symbols. `AT > FLASH` sets the **load memory address** (LMA): where the bytes actually live in the binary image.
+
+So `init_counter` (a global initialised to `0x42`) has its address `0x2000_0010` in your code (VMA), but the byte `0x42` is stored at `0x0800_00B4` in flash (LMA). The startup code copies from LMA to VMA.
+
+`LOADADDR(.data)` returns the LMA of `.data` — exactly where the flash bytes start. `_sidata = LOADADDR(.data)` gives Reset_Handler the source pointer for the copy loop.
+
+```ld
+  .bss : {
+    _sbss = .;
+    *(.bss*)
+    *(COMMON)
+    . = ALIGN(4);
+    _ebss = .;
+  } > SRAM
+```
+
+`.bss` is reserved space in SRAM, not loaded from flash. The linker tracks its size but emits no bytes in the binary for it. `*(COMMON)` catches the legacy "common block" symbols (uninitialised globals declared without `extern` in multiple translation units — older C trick, mostly obsolete with modern `-fno-common`).
+
+`_sbss` and `_ebss` mark the range Reset_Handler will zero.
+
+```ld
+}
+```
+
+End of SECTIONS. After this, the linker has assigned every input section to an output section, placed each output section in flash or SRAM, and resolved all the symbol values.
+
+That is the entire 25-line script. Every line has a purpose.
+
+## Symbol vs section vs region
+
+These three concepts trip up beginners. Be precise:
+
+- **Symbol** — a name with an address. `Reset_Handler`, `_estack`, `main`, `init_counter`. Defined either in code or by the linker script.
+- **Section** — a named blob of bytes (or reserved space). `.text`, `.data`, `.bss`, `.isr_vector`. Each input object has many; the linker combines them into output sections.
+- **Region** — a physical memory range. `FLASH`, `SRAM`. Declared in MEMORY, referenced in SECTIONS via `> REGION`.
+
+Sections live in regions. Symbols live at addresses. Code references symbols by name; the linker resolves names to addresses at link time.
+
+## Bumping RAM for a bigger chip
+
+Moving from STM32F411 (128 K SRAM) to STM32F407 (192 K SRAM, including 64 K of CCM at `0x1000_0000`):
+
+```ld
+MEMORY
+{
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 1024K   /* F407 has 1 MB flash */
+  CCM   (rw)  : ORIGIN = 0x10000000, LENGTH = 64K     /* tightly-coupled, no DMA */
+  SRAM  (rwx) : ORIGIN = 0x20000000, LENGTH = 128K    /* main SRAM */
+}
+```
+
+CCM (Core-Coupled Memory) is a separate SRAM bank that the CPU can access at single-cycle latency but DMA cannot reach. Useful for hot loop variables and stacks; useless for DMA buffers. To place a variable there:
+
+```c
+__attribute__((section(".ccmram")))
+static uint32_t hot_var;
+```
+
+And add a section in the script:
+
+```ld
+  .ccmram (NOLOAD) : {
+    *(.ccmram*)
+    . = ALIGN(4);
+  } > CCM
+```
+
+`(NOLOAD)` says "this section reserves space but is not loaded from anywhere" — appropriate for uninitialised data. If you want CCM data to have initial values, mark it `> CCM AT > FLASH` and add another startup-time copy loop.
+
+## Reserving the top of flash for a bootloader
+
+A/B firmware update designs reserve a chunk of flash for the bootloader (which never changes) and use the rest for the application. The bootloader at flash origin, application after:
+
+```ld
+MEMORY
+{
+  BOOT  (rx)  : ORIGIN = 0x08000000, LENGTH = 16K
+  APP   (rx)  : ORIGIN = 0x08004000, LENGTH = 512K - 16K
+  SRAM  (rwx) : ORIGIN = 0x20000000, LENGTH = 128K
+}
+```
+
+Then the bootloader's linker script uses `> BOOT` for its `.isr_vector` and `.text`; the application's linker script uses `> APP`. The bootloader jumps to the application's reset vector at `0x0800_4004` after validating the image.
+
+The application's vector table is no longer at `0x0800_0000`. You must set `SCB->VTOR = 0x08004000` early in the application's Reset_Handler so the NVIC dispatches interrupts to the application's handlers, not the bootloader's.
+
+<Callout type="warn" title="VTOR alignment requirement">
+The Cortex-M architecture requires the vector table base to be aligned to the larger of 32 entries or a power-of-2 covering the table size. For an application with the full 16 system entries plus, say, 82 external IRQs (STM32F411 count), the table is 98 × 4 = 392 bytes, rounded up to the next power of 2 → 512 bytes alignment. So your APP origin must be a multiple of 512. `0x08004000` (16 K) trivially satisfies this. `0x08004100` would not.
+</Callout>
+
+## Proper stack and heap reservation
+
+The script so far implicitly puts the stack at the top of SRAM and assumes it never collides with `.bss`. For safety, reserve explicit blocks:
+
+```ld
+_min_stack_size = 0x1000;   /* 4 K */
+_min_heap_size  = 0x0800;   /* 2 K, set to 0 if not using malloc */
+
+SECTIONS {
+  /* ... .isr_vector, .text, .data, .bss as before ... */
+
+  ._user_heap_stack (NOLOAD) : {
+    . = ALIGN(8);
+    PROVIDE(end = .);           /* newlib expects 'end' for _sbrk */
+    PROVIDE(_end = .);
+    . = . + _min_heap_size;
+    . = . + _min_stack_size;
+    . = ALIGN(8);
+  } > SRAM
+
+  /* If we run past the SRAM end, link fails */
+  . = ASSERT((_estack >= .), "Stack/heap overflows SRAM")
+}
+```
+
+`PROVIDE(name = ...)` defines a symbol only if it is not already defined elsewhere. Newlib's `_sbrk` reads `end` (or `_end`) as the start of the heap. Providing it from the linker script lets newlib's malloc work without you writing any extra code (and gives the user a chance to override it).
+
+`ASSERT` fails the link with a custom message if the condition is false. The ASSERT above triggers if `.bss` plus the heap+stack reservation would overflow SRAM — you find this at link time, not at run time.
+
+## A more complete linker script
+
+Putting it all together:
+
+```ld
+ENTRY(Reset_Handler)
+
+MEMORY
+{
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
+  SRAM  (rwx) : ORIGIN = 0x20000000, LENGTH = 128K
+}
+
+_estack = ORIGIN(SRAM) + LENGTH(SRAM);
+_min_stack_size = 0x1000;
+_min_heap_size  = 0x0800;
+
+SECTIONS
+{
+  .isr_vector : {
+    . = ALIGN(4);
+    KEEP(*(.isr_vector))
+    . = ALIGN(4);
+  } > FLASH
+
+  .text : {
+    . = ALIGN(4);
+    *(.text*)
+    *(.rodata*)
+    *(.glue_7)        /* ARM/Thumb interworking glue, harmless if empty */
+    *(.glue_7t)
+    . = ALIGN(4);
+    _etext = .;
+  } > FLASH
+
+  /* C++ constructors and destructors */
+  .preinit_array : {
+    PROVIDE_HIDDEN(__preinit_array_start = .);
+    KEEP(*(.preinit_array*))
+    PROVIDE_HIDDEN(__preinit_array_end = .);
+  } > FLASH
+
+  .init_array : {
+    PROVIDE_HIDDEN(__init_array_start = .);
+    KEEP(*(SORT(.init_array.*)))
+    KEEP(*(.init_array*))
+    PROVIDE_HIDDEN(__init_array_end = .);
+  } > FLASH
+
+  .fini_array : {
+    PROVIDE_HIDDEN(__fini_array_start = .);
+    KEEP(*(SORT(.fini_array.*)))
+    KEEP(*(.fini_array*))
+    PROVIDE_HIDDEN(__fini_array_end = .);
+  } > FLASH
+
+  _sidata = LOADADDR(.data);
+
+  .data : {
+    . = ALIGN(4);
+    _sdata = .;
+    *(.data*)
+    . = ALIGN(4);
+    _edata = .;
+  } > SRAM AT > FLASH
+
+  .bss : {
+    . = ALIGN(4);
+    _sbss = .;
+    __bss_start__ = _sbss;
+    *(.bss*)
+    *(COMMON)
+    . = ALIGN(4);
+    _ebss = .;
+    __bss_end__ = _ebss;
+  } > SRAM
+
+  ._user_heap_stack (NOLOAD) : {
+    . = ALIGN(8);
+    PROVIDE(end = .);
+    PROVIDE(_end = .);
+    . = . + _min_heap_size;
+    . = . + _min_stack_size;
+    . = ALIGN(8);
+  } > SRAM
+
+  /DISCARD/ : { *(.ARM.exidx*) *(.ARM.extab*) }   /* ditch exception unwinding */
+}
+```
+
+About 60 lines. This handles:
+
+- C++ static constructors via `.init_array` (called by `__libc_init_array`).
+- Explicit heap and stack reservation with link-time overflow check.
+- `PROVIDE_HIDDEN` symbols for newlib internals.
+- Discarding ARM exception unwinding tables (saves a few hundred bytes; you do not need them on bare metal).
+
+It is still small enough to read in one sitting and big enough for real production firmware.
+
+<Callout type="tip" title="Use the linker script builder tool">
+The [linker script builder](/tools/linker-script/) generates a starting script for any STM32 family, including the correct flash and SRAM sizes, optional ITCM/DTCM, and pre-configured bootloader regions. Start there for a new project, then customise.
+</Callout>
+
+## Common mistakes
+
+**Forgetting `KEEP` on the vector table** — `--gc-sections` discards it because nothing in C code references it. Result: chip resets and immediately HardFaults because the vector table reads as zeros.
+
+**Wrong alignment** — `_estack` not on an 8-byte boundary. The Cortex-M architecture requires double-word stack alignment when entering exceptions; missing it causes UsageFault or silent corruption when the FPU lazy-stacks. `ALIGN(8)` everywhere is cheap insurance.
+
+**Mismatched AT-load** — `.data` placed in SRAM without `AT > FLASH`. The flash image has no copy, so after Reset_Handler the SRAM is whatever it was at power-on. Symptoms: initialised globals come up with random values.
+
+**Stack/heap collision in .bss** — without an explicit ASSERT, a big global array can push `.bss` past where the stack will grow into it. Hard to debug because the symptom is "random crashes when the call stack gets deep". Use `ASSERT(_estack - _ebss > 0x800, "less than 2K free SRAM");`.
+
+## Exercises
+
+**Exercise 5.1.** Modify your blink linker script to reserve 32 K at the top of flash for a future bootloader. Application origin moves to `0x08000000` and length shrinks. Then set `SCB->VTOR = 0x08000000` in Reset_Handler (it is the default; this is just to practice the pattern). Build and confirm via `arm-none-eabi-objdump -h` that section addresses changed.
+
+<Callout type="spec" title="Answer">
+Change MEMORY: `FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 480K`, then add `BOOT (rx) : ORIGIN = 0x08078000, LENGTH = 32K`. The application's `.isr_vector` stays at `0x0800_0000` (unchanged). To put the bootloader at the *top* of flash (instead of the conventional bottom), application code is at the bottom and bootloader at top — non-standard but workable for in-application updaters. Most real designs put the bootloader at the bottom and the application above it; the principle is the same.
+</Callout>
+
+**Exercise 5.2.** Add a region for "battery-backed RAM" — a 4 K block at the top of SRAM that the application's `Reset_Handler` should *not* zero. Declare a `(NOLOAD)` section for it and place a struct there.
+
+<Callout type="spec" title="Answer">
+
+```ld
+SRAM    (rwx) : ORIGIN = 0x20000000, LENGTH = 124K
+BKP_RAM (rwx) : ORIGIN = 0x2001F000, LENGTH = 4K
+```
+
+Plus:
+
+```ld
+.backup (NOLOAD) : {
+  KEEP(*(.backup*))
+} > BKP_RAM
+```
+
+And in C:
+
+```c
+__attribute__((section(".backup")))
+volatile uint32_t reset_count;
+```
+
+The startup code's `.bss` zero loop runs from `_sbss` to `_ebss`, which does not include the BKP_RAM region — so the value persists across warm reset. For cold reset (power cycle), SRAM contents are undefined; you typically check a magic word and zero the struct if the magic does not match.
+</Callout>
+
+**Exercise 5.3.** Run `arm-none-eabi-ld --verbose` (no input files) to dump the default linker script. Find the `.text` block. What sections is it composed of by default?
+
+<Callout type="spec" title="Answer">
+The default `.text` collects roughly `*(.text.unlikely .text.*_unlikely .text.unlikely.*)` (cold sections, placed last for better instruction cache behaviour), then `*(.text.exit .text.exit.*)` (atexit handlers), then `*(.text.startup .text.startup.*)` (constructors and start-up code), then `*(.text .stub .text.* .gnu.linkonce.t.*)` (the bulk of your code). The ordering puts hot code first. For embedded targets we typically replace the default script entirely with our own simpler one, but knowing the default exists is useful when debugging "where did this symbol end up".
+</Callout>
+
+## What you learned
+
+- `ENTRY`, `MEMORY`, `SECTIONS`, `KEEP`, `ALIGN`, `LOADADDR`, `PROVIDE`, `ASSERT` — every directive has a job.
+- AT-load: `.data` has VMA in SRAM and LMA in flash; Reset_Handler bridges them.
+- The location counter `.` is your editing cursor; `_etext = .` defines a symbol at the current address.
+- Adding regions for ITCM, DTCM, CCM, BKP_RAM, or a bootloader area is a matter of MEMORY plus a `(NOLOAD)` section.
+- Explicit `ASSERT`s catch stack/heap overflow at link time.
+- The default GCC linker script exists but you almost never want it for embedded.
+
+In lesson 6 we wire up SysTick by hand, write a real ISR, and learn how the vector table actually dispatches.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 4 — Memory layout](/docs/programming/tutorial-04-memory-map/) | [Lesson 6 — Interrupts and ISRs](/docs/programming/tutorial-06-interrupts/) |
