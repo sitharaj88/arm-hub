@@ -11,7 +11,7 @@
 [![MDX](https://img.shields.io/badge/MDX-content-1B1F24?logo=mdx)](https://mdxjs.com)
 [![License: MIT + CC BY 4.0](https://img.shields.io/badge/license-MIT%20%2B%20CC%20BY%204.0-blue.svg)](#license)
 
-[**Live site**](https://armhub.dev) · [Docs](https://armhub.dev/docs/architecture/isa-family) · [Tools](https://armhub.dev/tools) · [Cheatsheets](https://armhub.dev/cheatsheets) · [Glossary](https://armhub.dev/glossary)
+[**Live site**](https://sitharaj88.github.io/arm-hub/) · [Docs](https://sitharaj88.github.io/arm-hub/docs/architecture/isa-family) · [Tools](https://sitharaj88.github.io/arm-hub/tools) · [Cheatsheets](https://sitharaj88.github.io/arm-hub/cheatsheets) · [Glossary](https://sitharaj88.github.io/arm-hub/glossary)
 
 </div>
 
@@ -48,13 +48,13 @@ Browser-only, no server. Paste real values, get real answers.
 
 | Tool | What it does |
 |------|--------------|
-| [HardFault decoder](https://armhub.dev/tools/fault-decoder) | Paste CFSR / HFSR / UFSR / BFSR hex — get the bits set, what each means, and likely root cause |
-| [Stack-frame visualizer](https://armhub.dev/tools/stack-frame) | Decode the 8 (or 25 with FPU) words an exception pushes — see R0–R3, R12, LR, PC, xPSR labelled |
-| [Find my MCU](https://armhub.dev/tools/find-mcu) | Filter by core, RAM, flash, wireless, vendor, certifications — surfaces realistic STM32 / nRF / RP / NXP / SiLabs picks |
-| [GCC flag explainer](https://armhub.dev/tools/gcc-flags) | Paste an `arm-none-eabi-gcc` command — every flag decoded with what it does, when you need it, where to read more |
-| [NVIC priority simulator](https://armhub.dev/tools/nvic-simulator) | Configure `PRIGROUP` + `__NVIC_PRIO_BITS`, add IRQs — see how the priority byte splits into preempt + sub, with a pairwise preemption matrix |
-| [Interrupt-latency calculator](https://armhub.dev/tools/interrupt-latency) | Pick core, clock, stack / vector region, FPU mode — get cycle-by-cycle exception entry breakdown plus tail-chain and late-arrival numbers |
-| [Linker script builder](https://armhub.dev/tools/linker-script) | Configure FLASH / SRAM / ITCM / DTCM regions, stack, heap, vector placement — generates a complete `linker.ld` with `.isr_vector`, `.data` LMA→VMA copy, and C++ ctor arrays |
+| [HardFault decoder](https://sitharaj88.github.io/arm-hub/tools/fault-decoder) | Paste CFSR / HFSR / UFSR / BFSR hex — get the bits set, what each means, and likely root cause |
+| [Stack-frame visualizer](https://sitharaj88.github.io/arm-hub/tools/stack-frame) | Decode the 8 (or 25 with FPU) words an exception pushes — see R0–R3, R12, LR, PC, xPSR labelled |
+| [Find my MCU](https://sitharaj88.github.io/arm-hub/tools/find-mcu) | Filter by core, RAM, flash, wireless, vendor, certifications — surfaces realistic STM32 / nRF / RP / NXP / SiLabs picks |
+| [GCC flag explainer](https://sitharaj88.github.io/arm-hub/tools/gcc-flags) | Paste an `arm-none-eabi-gcc` command — every flag decoded with what it does, when you need it, where to read more |
+| [NVIC priority simulator](https://sitharaj88.github.io/arm-hub/tools/nvic-simulator) | Configure `PRIGROUP` + `__NVIC_PRIO_BITS`, add IRQs — see how the priority byte splits into preempt + sub, with a pairwise preemption matrix |
+| [Interrupt-latency calculator](https://sitharaj88.github.io/arm-hub/tools/interrupt-latency) | Pick core, clock, stack / vector region, FPU mode — get cycle-by-cycle exception entry breakdown plus tail-chain and late-arrival numbers |
+| [Linker script builder](https://sitharaj88.github.io/arm-hub/tools/linker-script) | Configure FLASH / SRAM / ITCM / DTCM regions, stack, heap, vector placement — generates a complete `linker.ld` with `.isr_vector`, `.data` LMA→VMA copy, and C++ ctor arrays |
 
 ---
 
@@ -101,8 +101,8 @@ Custom palette: `--primary` (violet 252°), `--accent` (cyan 198°), `--highligh
 ## Local development
 
 ```bash
-git clone https://github.com/sitharaj88/armhub.git
-cd armhub
+git clone https://github.com/sitharaj88/arm-hub.git
+cd arm-hub
 npm install
 npm run dev          # http://localhost:3000
 ```
@@ -173,23 +173,31 @@ npm run build        # outputs static site to out/
 
 `next build` runs with `output: 'export'`. Every page is statically pre-rendered — no Node server required to serve the site. The output (`out/`) can be hosted on any static host (GitHub Pages, Vercel, Cloudflare Pages, Netlify, S3 + CloudFront, …).
 
-armhub.dev itself ships on **GitHub Pages** via `.github/workflows/deploy.yml`:
+### Live deployment — GitHub Pages
 
-1. Install deps with `npm ci`
-2. Run `npm run build` (Next.js → static export)
-3. Upload `out/` as a Pages artifact
+The site ships to **GitHub Pages** at:
 
-For a custom domain:
+> **[https://sitharaj88.github.io/arm-hub/](https://sitharaj88.github.io/arm-hub/)**
 
-1. Repo Settings → Pages → set custom domain
-2. Add `CNAME` file in `public/` containing your domain
-3. Point DNS at GitHub Pages
+The workflow is **manual-only** (`workflow_dispatch`). To publish:
+
+1. Push your changes to `main` (no auto-deploy happens — that's intentional).
+2. Go to **Actions** tab on GitHub → **"Deploy to GitHub Pages"** → **"Run workflow"**.
+3. The workflow builds with `NEXT_PUBLIC_BASE_PATH=/arm-hub`, runs `next build`, drops a `.nojekyll` marker, and uploads `out/` as a Pages artifact.
+
+First-time setup only: enable Pages once at **Repo Settings → Pages → Source: "GitHub Actions"**.
+
+### basePath configuration
+
+Because the site is served under a repo path (`/arm-hub/`) rather than the domain root, [`next.config.ts`](./next.config.ts) reads `NEXT_PUBLIC_BASE_PATH` to prefix every internal route and static asset. The workflow sets it to `/arm-hub`; locally it's unset so dev server runs at `/`.
+
+If you ever wire a custom domain (so the site lives at `https://example.com/`), remove the `NEXT_PUBLIC_BASE_PATH` line from the workflow — no other code changes needed.
 
 ---
 
 ## Contributing
 
-See [`/contributing`](https://armhub.dev/contributing) on the site. Short version:
+See [`/contributing`](https://sitharaj88.github.io/arm-hub/contributing) on the site. Short version:
 
 1. Create a new MDX file under `content/<section>/<slug>.mdx`
 2. Add frontmatter: `title`, `description` (130-180 char), `order`, `updated` (YYYY-MM-DD), optional `badge` (e.g. `"v8-M"`, `"Helium"`, `"security"`, `"new"`)
