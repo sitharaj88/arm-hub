@@ -194,7 +194,7 @@ export const sections: NavSection[] = [
   {
     title: 'Vendors',
     key: 'vendors',
-    intro: 'STM32, NXP, Nordic, RP2040, Renesas, TI, Microchip, Silicon Labs, Infineon.',
+    intro: 'STM32, NXP, Nordic, RP2040, Renesas, TI, Microchip, Silicon Labs, Infineon — plus GigaDevice, Artery, Nuvoton, Ambiq, Maxim/ADI, NVIDIA Jetson, MediaTek, and Rockchip.',
     links: [
       { title: 'STM32 (ST) — overview', href: '/docs/vendors/stm32' },
       { title: 'STM32 F / G / H mainstream', href: '/docs/vendors/stm32-mainstream' },
@@ -213,6 +213,40 @@ export const sections: NavSection[] = [
       { title: 'Silicon Labs EFM32 / EFR32', href: '/docs/vendors/silabs' },
       { title: 'Infineon XMC / PSoC', href: '/docs/vendors/infineon' },
       { title: 'Infineon AURIX', href: '/docs/vendors/aurix' },
+      // ─── GigaDevice (China) ──────────────────────────────────────────────
+      { title: 'GigaDevice GD32 — overview', href: '/docs/vendors/gigadevice' },
+      { title: 'GD32F mainstream (M3/M4)', href: '/docs/vendors/gigadevice-gd32f' },
+      { title: 'GD32L low-power (M23)', href: '/docs/vendors/gigadevice-gd32l' },
+      { title: 'GD32W wireless (M33)', href: '/docs/vendors/gigadevice-gd32w' },
+      // ─── Artery (China) ──────────────────────────────────────────────────
+      { title: 'Artery AT32 — overview', href: '/docs/vendors/artery' },
+      { title: 'AT32F4 mainstream (M4)', href: '/docs/vendors/artery-at32f4' },
+      { title: 'AT32M motor / power', href: '/docs/vendors/artery-at32m' },
+      // ─── Nuvoton (Taiwan) ────────────────────────────────────────────────
+      { title: 'Nuvoton NuMicro — overview', href: '/docs/vendors/nuvoton' },
+      { title: 'NuMicro M0 entry-level', href: '/docs/vendors/nuvoton-m0' },
+      { title: 'NuMicro M4 mainstream', href: '/docs/vendors/nuvoton-m4' },
+      { title: 'NuMicro M23 secure', href: '/docs/vendors/nuvoton-m23' },
+      // ─── Ambiq (USA, ultra-low-power) ────────────────────────────────────
+      { title: 'Ambiq Apollo — overview', href: '/docs/vendors/ambiq' },
+      { title: 'Apollo4 sub-µA M4F', href: '/docs/vendors/ambiq-apollo4' },
+      { title: 'Apollo510 / Apollo5 (Helium M55)', href: '/docs/vendors/ambiq-apollo5', badge: 'Helium' },
+      // ─── Maxim / Analog Devices ──────────────────────────────────────────
+      { title: 'Maxim / ADI MAX32 — overview', href: '/docs/vendors/maxim' },
+      { title: 'MAX32 general-purpose M4', href: '/docs/vendors/maxim-max32' },
+      { title: 'MAX78000 ML accelerator', href: '/docs/vendors/maxim-max78000', badge: 'AI' },
+      // ─── NVIDIA Jetson (Cortex-A edge AI) ────────────────────────────────
+      { title: 'NVIDIA Jetson — overview', href: '/docs/vendors/nvidia-jetson' },
+      { title: 'Jetson Orin Nano / NX', href: '/docs/vendors/nvidia-jetson-orin-nano' },
+      { title: 'Jetson AGX Orin / Thor', href: '/docs/vendors/nvidia-jetson-agx' },
+      // ─── MediaTek (Cortex-A IoT + Wi-Fi) ─────────────────────────────────
+      { title: 'MediaTek — overview', href: '/docs/vendors/mediatek' },
+      { title: 'MediaTek Genio (IoT A-series)', href: '/docs/vendors/mediatek-genio' },
+      { title: 'MediaTek Filogic Wi-Fi router', href: '/docs/vendors/mediatek-filogic' },
+      // ─── Rockchip (Cortex-A SBC) ─────────────────────────────────────────
+      { title: 'Rockchip — overview', href: '/docs/vendors/rockchip' },
+      { title: 'Rockchip RK3566 / RK3568', href: '/docs/vendors/rockchip-rk3568' },
+      { title: 'Rockchip RK3588 / RK3582', href: '/docs/vendors/rockchip-rk3588' },
     ],
   },
 ];

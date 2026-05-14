@@ -1,0 +1,134 @@
+---
+title: Jetson AGX Orin and Thor
+description: NVIDIA's top-tier Jetson modules. AGX Orin with 12 Cortex-A78AE cores and 275 TOPS, AGX Thor with Neoverse-derived A720AE and Blackwell GPU at 2000 TOPS for humanoid robotics and autonomous driving development.
+order: 32
+updated: 2026-05-13
+tags: [vendors, nvidia, jetson, agx-orin, agx-thor, cortex-a78ae, a720ae, blackwell, robotics]
+---
+
+The AGX-class Jetson modules are NVIDIA's full-power edge platform, with no compute compromises imposed by power or memory — intended for autonomous vehicles, surgical robotics, humanoid robotics, and deployments where the question is the maximum useful compute on the platform. AGX Orin (2022, currently the volume part) ships in 32 GB and 64 GB variants with 12 Cortex-A78AE cores, a 2048-core Ampere GPU, two DLAs, 15 to 60 W. AGX Thor (announced 2024, ramping 2025 and 2026) replaces it with 14 Neoverse-derived A720AE cores, Blackwell GPU with the Transformer Engine, 130 W — the largest Jetson NVIDIA has shipped.
+
+This page covers the AGX-class modules, the migration path across Xavier, Orin, Thor, and how the Isaac robotics stack uses them.
+
+<SpecSheet
+  title="Jetson AGX Orin and AGX Thor at a glance"
+  specs={[
+    { label: 'Vendor', value: 'NVIDIA Corporation' },
+    { label: 'AGX Orin released', value: 'March 2022' },
+    { label: 'AGX Thor announced', value: 'March 2024 (GTC); production ramp 2025 to 2026' },
+    { label: 'AGX Orin module', value: '12x Cortex-A78AE at 2.2 GHz + Ampere GPU 2048 cores + 64 tensor cores + 2x DLA' },
+    { label: 'AGX Orin INT8 TOPS', value: '200 (32 GB module) or 275 (64 GB module)' },
+    { label: 'AGX Thor module', value: '14x Cortex-A720AE at 2.6 GHz + Blackwell GPU + Transformer Engine' },
+    { label: 'AGX Thor peak', value: '1 PFLOPS FP4, 2000 TOPS INT8, 128 GB LPDDR5X' },
+    { label: 'Form factor', value: 'AGX module, 100 x 87 mm, dense connector with PCIe Gen4 x16, multiple 10G Ethernet, multiple displays' },
+    { label: 'Software', value: 'JetPack 6 for AGX Orin; JetPack 7 (in development) for AGX Thor' },
+    { label: 'External links', value: 'developer.nvidia.com/embedded/jetson-agx-orin, developer.nvidia.com/embedded/jetson-thor' },
+  ]}
+/>
+
+## AGX Orin — the production workhorse
+
+AGX Orin 64 GB is the most capable widely-available Jetson module. The CPU complex is 12 Cortex-A78AE cores in three clusters of four, sharing L2 and connected to a coherent fabric. Max clock 2.2 GHz under the 60 W MAXN profile. The GPU is 2048 Ampere cores in 16 SMs with 64 third-generation tensor cores, 5.3 TFLOPS FP32 / 170 TOPS INT8 on the GPU alone. Two NVDLA v2 accelerators add 105 TOPS INT8, for the headline 275 TOPS.
+
+The AGX form factor is 100 x 87 mm with a dense connector exposing PCIe Gen4 x16, multiple 10G Ethernet, USB 3.2 Gen2, multiple HDMI/DP, 16 MIPI-CSI lanes, dual CAN-FD, and the full low-speed peripheral set. The interface count drives the form factor; the SODIMM cannot deliver the same compute density.
+
+| Workload                                       | AGX Orin 32 GB | AGX Orin 64 GB | Notes                              |
+|------------------------------------------------|----------------|----------------|------------------------------------|
+| YOLOv8m, 1080p, INT8                            | 280 fps        | 320 fps        | TensorRT, single class             |
+| 8x parallel YOLOv8n at 1080p                    | 30 fps each    | 30 fps each    | DLA-offloaded streams              |
+| Whisper-large, real-time                        | 1.5x rt        | 2.0x rt        | Includes pre-processing            |
+| LLaMA-7B-INT4 inference                         | 28 tok/s       | 35 tok/s       | Quantised via TensorRT-LLM         |
+| ORB-SLAM3, dual stereo                          | yes            | yes            | 60 fps each, room to spare         |
+| Multi-camera VSLAM + planning (8 cameras)       | tight          | yes            | Memory bandwidth limited on 32 GB  |
+
+The 64 GB variant unlocks workloads the 32 GB cannot: 7B-parameter LLM inference in INT4, multi-camera autonomy with 8+ streams, multi-modal LIDAR-radar-camera fusion.
+
+## AGX Thor — the next jump
+
+AGX Thor responds to demand from humanoid robotics, advanced autonomy, and on-device generative AI. The CPU moves from Cortex-A78AE to a 14-core configuration of NVIDIA's Neoverse-derived A720AE — a server-class core with automotive-enhanced safety overlaid. Target clock 2.6 GHz. Significantly higher per-core throughput, which matters for the Linux-side stack (planning, control, ROS 2) that does not benefit from GPU acceleration.
+
+The GPU is Blackwell, the architecture NVIDIA shipped in 2024 on B100/B200 and in 2025 on RTX 50-series. Blackwell on Thor includes the Transformer Engine — fixed-function acceleration for attention and feed-forward primitives, supporting FP4 and FP8. The headline 1 PFLOPS FP4 / 2000 TOPS INT8 is an order of magnitude above AGX Orin. The 128 GB LPDDR5X accommodates substantially larger models — demonstrations target on-device 70B-parameter LLM inference, putting datacenter workloads into a 130 W edge module.
+
+| Trait                  | AGX Xavier (2018)        | AGX Orin (2022)           | AGX Thor (2024 to 2025)        |
+|------------------------|--------------------------|---------------------------|---------------------------------|
+| CPU                    | 8x Carmel A75-class      | 12x Cortex-A78AE          | 14x Cortex-A720AE (Neoverse)    |
+| CPU clock              | 2.26 GHz                 | 2.2 GHz                   | 2.6 GHz                         |
+| GPU architecture       | Volta                    | Ampere                    | Blackwell + Transformer Engine  |
+| GPU cores              | 512                      | 2048                      | Larger (NVIDIA has not detailed)|
+| DLA                    | 2x NVDLA v1              | 2x NVDLA v2               | Integrated into GPU             |
+| Peak INT8 TOPS         | 32                       | 275                       | 2000                            |
+| Memory                 | 32 GB LPDDR4x at 137 GB/s| 64 GB LPDDR5 at 204 GB/s  | 128 GB LPDDR5X at 273 GB/s      |
+| Power envelope         | 10 to 30 W               | 15 to 60 W                | up to 130 W                     |
+| Software at launch     | JetPack 4                | JetPack 5 then 6          | JetPack 7                       |
+
+## Use cases — what AGX-class actually deploys into
+
+The AGX Orin's customer base in 2024 to 2026 splits across four broad categories.
+
+**Autonomous mobile robots.** Multi-camera AGVs, warehouse AMRs, last-mile delivery. Typical configuration: 4 to 8 cameras into a YOLO-class detector on the GPU, SLAM (ORB-SLAM, Isaac VSLAM) on CPU plus GPU, planner on CPU. Compute budget 30 to 60 W.
+
+**Video analytics at the edge.** 30+ 1080p streams, NVDEC decode, batched TensorRT inference, results to MQTT or local storage. Smart-city, retail, perimeter security. DLAs handle some inference, GPU the rest.
+
+**Medical imaging and surgical robotics.** Imaging carts (intraoperative ultrasound, MRI, endoscopy), surgical-robot consoles, diagnostic systems. The compute, latency, and certifiable A78AE safety-island combination dominates. Several surgical-robot platforms use AGX-class.
+
+**AV development platforms.** Not production AV (that uses DRIVE Orin / DRIVE Thor) but development and fleet-testing vehicles running the Hyperion sensor stack with cameras, radars, LIDAR plus the perception, prediction, planning stack.
+
+## Software stack — Isaac, ROS 2, Omniverse
+
+NVIDIA's robotics software is branded Isaac:
+
+- **Isaac ROS** — NVIDIA-accelerated ROS 2 packages providing GPU implementations of visual odometry, stereo depth, SLAM, detection, navigation. Drop-in replacements for the CPU-only equivalents.
+- **Isaac Sim** — robotics simulator on Omniverse for training and validating perception and policy models. Synthetic data, domain randomisation, physics.
+- **Isaac Manipulator / Perceptor** — higher-level packages combining primitives into manipulation and perception pipelines.
+- **GR00T** — NVIDIA's foundation model for humanoid robotics, running on Jetson Thor and fine-tuned in Omniverse.
+
+Isaac is opt-in. Many deployments use Jetson with upstream ROS 2 and pull in NVIDIA-accelerated packages selectively.
+
+```bash
+# Switch AGX Orin 64 GB to the 60 W maximum mode
+sudo nvpmodel -m 0
+
+# Lock clocks to the maximum
+sudo jetson_clocks
+
+# Verify clocks and power draw under load
+sudo tegrastats --interval 1000
+```
+
+`nvpmodel` on AGX Orin defines 9 modes (mode 0 through 8 on the 64 GB module, covering 15W / 30W / 50W / MAXN). A battery-powered AMR might run mode 4 (30 W) nominally and switch to mode 0 (60 W MAXN) for dense compute around obstacle avoidance.
+
+<Callout type="tip">
+For a fleet of identically configured AGX Orin robots, define the `nvpmodel` mode and lock `jetson_clocks` at boot via a systemd unit. The default DVFS governors are tuned for general-purpose workloads, not for the consistent latency profile that robotics applications expect. A fixed power-mode plus locked clocks gives reproducible benchmark numbers and predictable thermal behaviour.
+</Callout>
+
+## Thermal design
+
+AGX Orin 64 GB at 60 W requires active cooling. NVIDIA's reference carrier uses a fan-cooled heatsink to roughly 50 C ambient. Industrial deployments in warmer ambients or fanless enclosures run at 30 or 40 W modes for passive cooling.
+
+AGX Thor at 130 W is well beyond passive cooling. Production designs use vapour chambers or liquid cooling. The thermal-budget conversation is closer to a server design than a typical embedded system.
+
+<Callout type="warn">
+The AGX Orin and AGX Thor module connectors are not pin-compatible with each other and are not pin-compatible with the Orin Nano / NX SODIMM. Migrating a product across these tiers requires a new carrier-board design. Plan the connector choice carefully at the start of a programme — switching tiers mid-development is a multi-month setback.
+</Callout>
+
+## Migration path Xavier to Orin to Thor
+
+| Phase                                | Practical work                                                                |
+|--------------------------------------|--------------------------------------------------------------------------------|
+| AGX Xavier to AGX Orin               | Carrier-board redesign; JetPack 4 to 5 transition; TensorRT engine recompile; minor CUDA kernel changes if low-level Volta-specific intrinsics were used. |
+| AGX Orin to AGX Thor (early adopters)| Carrier-board redesign; JetPack 6 to 7 transition; recompile to Blackwell; assess whether Transformer Engine is beneficial for the workload; CUDA kernel changes for FP4 / FP8 paths if needed. |
+| Software API churn                   | Most user-space code unchanged; kernel modules and low-level drivers re-validate; ROS 2 nodes re-validate; TensorRT plugins must be rebuilt. |
+
+The migration is not as painless as NVIDIA's marketing suggests, but materially better than equivalent migration between competing platforms. CUDA kernel-level code is the most stable layer; the carrier hardware is the least.
+
+## Cross-references
+
+- [NVIDIA Jetson landing page](/docs/vendors/nvidia-jetson) — family overview.
+- [Jetson Orin Nano and NX](/docs/vendors/nvidia-jetson-orin-nano) — the cost-conscious siblings.
+- [Cortex-A78AE](/docs/cortex-a/a78ae) — the application core in AGX Orin.
+- [Neoverse](/docs/cortex-a/neoverse) — the server-class ARM line from which A720AE derives.
+- [Edge AI system design](/docs/systems/edge-ai) — broader architectural context.
+- NVIDIA AGX Orin developer site: developer.nvidia.com/embedded/jetson-agx-orin.
+- NVIDIA Jetson Thor announcement: developer.nvidia.com/embedded/jetson-thor.
+- Isaac ROS documentation: nvidia-isaac-ros.github.io.
+- Isaac Sim documentation: docs.omniverse.nvidia.com/isaacsim.

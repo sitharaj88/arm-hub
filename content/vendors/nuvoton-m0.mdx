@@ -1,0 +1,145 @@
+---
+title: Nuvoton NuMicro M0
+description: NuMicro Cortex-M0 entry families — NUC100, NUC200, NANO100 ultra-low-power, M031/M032 modern entry, and the LD-ROM/APROM dual-flash boot architecture that defines them.
+order: 21
+updated: 2026-05-13
+tags: [vendors, nuvoton, numicro, m0, m0plus, entry]
+---
+
+The NuMicro M0 lineup is Nuvoton's entry-level Cortex-M family — the parts you reach for when you need 32-bit performance, a real USB device, and a peripheral set that would have required a Cortex-M3 a decade ago, but the BOM target is in the single-digit-dollar range. The portfolio splits into four broad strands: the original NUC100/NUC200 (the first NuMicro parts ever shipped, 2009-era silicon still in production for legacy designs), the NANO100 ultra-low-power line built on Cortex-M0+, the M031/M032 modern cost-optimised line, and the tiny M0510/M0518/M0519 parts that come in 8-pin SOP and 20-pin TSSOP packages for consumer-remote-control and small-appliance work.
+
+<SpecSheet
+  title="NuMicro M0 at a glance"
+  specs={[
+    { label: 'Vendor', value: 'Nuvoton Technology' },
+    { label: 'Founded', value: '2008 (NuMicro M0 introduced 2009)' },
+    { label: 'HQ', value: 'Hsinchu, Taiwan' },
+    { label: 'Flagship part', value: 'M032LG6AE (Cortex-M0, 72 MHz, 256 KB flash, 32 KB SRAM, USB 2.0 FS device)' },
+    { label: 'Key fact', value: 'All NuMicro parts ship with separate APROM + LD-ROM flash banks; LD-ROM holds an immutable user bootloader' },
+    { label: 'SDK', value: 'NuTool (pin / clock configurator) + StdDriver BSP, sources on github.com/OpenNuvoton' },
+    { label: 'Links', value: 'nuvoton.com/products/microcontrollers/arm-cortex-m0-mcus' },
+  ]}
+/>
+
+## The four sub-families
+
+| Sub-family | Core | Max clock | Flash | SRAM | Defining feature |
+|------------|------|-----------|-------|------|------------------|
+| **NUC100 / NUC200** | Cortex-M0 | 50 MHz | up to 128 KB | up to 16 KB | First NuMicro, full peripheral set, USB device, CAN |
+| **NANO100 / NANO103** | Cortex-M0+ | 42 MHz | up to 128 KB | up to 16 KB | Ultra-low-power, 1.8-3.6 V, SCNV, LCD driver |
+| **M031 / M032** | Cortex-M0 | 72 MHz | up to 512 KB | up to 96 KB | Modern entry, USB 2.0 FS, EBI, ADC 12-bit, 1.8-5.5 V |
+| **M0510 / M0518 / M0519** | Cortex-M0 | 50 MHz | 16-64 KB | 4-8 KB | Tiny packages, 8-48 pin, cost-optimised |
+
+The NUC and NANO lines are the older parts, kept alive for designs that locked their BOM years ago. New designs should target M031/M032 — same silicon process generation as competing modern entry-class parts, wider supply voltage, more flash per dollar, and a peripheral set that has aged well.
+
+## NUC100 / NUC200 — the original
+
+The NUC100 launched in 2009 as Nuvoton's first 32-bit MCU, replacing their 8051-based W7x and W7x lines for customers who needed more performance. Internally these parts feel very much like a Cortex-M0 reimplementation of a feature-rich 8051: lots of small peripherals (twelve general-purpose timers, four UARTs, three SPIs, two I²Cs, eight-channel 12-bit ADC, eight-channel PWM, analog comparator, USB 2.0 full-speed device, CAN 2.0B on the NUC140 variant), packaged in 48 / 64 / 100-pin LQFP. The 50 MHz clock comes from an internal 22.1184 MHz RC oscillator with PLL multiplication — the unusual base frequency (22.1184 = 4 × 4 × 1.3824 MHz) is chosen so the divided UART baud rates land exactly on standard rates with no fractional error.
+
+NUC100 is still in production but is not a part to design in for new work — power consumption is high (around 30 mA at 50 MHz, no Stop modes worth speaking of), and the 0.18 µm flash macro shows its age.
+
+## NANO100 — the low-power answer
+
+NANO100 sits at the other end of the entry-level range. It is Nuvoton's first Cortex-M0+ part, fabricated on a lower-leakage 0.18 µm ULP variant, with an architecture lifted in part from the NUC100 but reworked for sub-µA standby. The headline numbers:
+
+| Mode | Conditions | Typical current |
+|------|------------|-----------------|
+| Run | 42 MHz, all peripherals on | 8 mA |
+| Run | 4 MHz, MCU + RTC only | 600 µA |
+| Idle | CPU clock gated, RTC + LCD on | 50 µA |
+| Power-down | Deep sleep, RTC on | **2.5 µA** |
+| Power-down | Deep sleep, no RTC | 1.5 µA |
+| Standby | LXT off, retention RAM only | 700 nA |
+
+NANO100 also integrates a segment LCD driver (8 commons × 36 segments) — uncommon at this tier and the reason the part shows up in glucose meters, calorie counters, small instrumentation. The peripheral set otherwise matches NUC100 plus an SC (smart card) interface, which makes NANO103 a fit for low-cost payment terminals and SIM card readers.
+
+## M031 / M032 — the modern mainstream entry
+
+The current first-choice family. Process: TSMC 0.11 µm embedded-flash. Clock: 72 MHz (compared to the 48 / 64 MHz competitors in this tier). Supply: 1.8 to 5.5 V, which is genuinely unusual — most modern parts top out at 3.6 V and require a level shifter for 5 V sensor interfaces. Flash: up to 512 KB. SRAM: up to 96 KB.
+
+Peripheral set on the high-end M032LG6AE:
+
+- Eight UARTs (including one Smart Card / IrDA capable), four SPIs, three I²Cs, two I²S.
+- USB 2.0 full-speed device (12 Mbps).
+- Two CAN 2.0B controllers.
+- 16-channel 12-bit ADC at 1 MSPS, two analog comparators.
+- Eight 16-bit PWM channels with complementary outputs and dead-time for half-bridge motor drive.
+- EBI (external bus interface) for off-chip SRAM or FPGA glue.
+- 1.5 KB OTP for key storage (one-time-programmable).
+- Crypto: hardware AES-128/192/256, SHA-256, TRNG.
+- Touch key controller (16 channels) — capacitive sensing without external components.
+
+Packages: WLCSP-25, QFN-33, LQFP-48, LQFP-64, LQFP-128.
+
+## M0510 / M0518 / M0519 — the tiny ones
+
+For 8-pin SOP and 20-pin TSSOP slots — IR-remote controllers, small motor drives, USB dongles, toys. M0518 in SOP-8 is the smallest 32-bit MCU Nuvoton ships, and the price (under USD 0.40 in volume) makes it competitive against PIC16 and STM8S. The peripheral set is correspondingly trimmed — one UART, one SPI, one I²C, four-channel ADC, two timers — but the same Cortex-M0 ISA means you can move existing NuMicro code down to it with minimal porting.
+
+## Comparison against direct competitors
+
+| Part | Core | Max MHz | Flash | SRAM | Special | Approx unit price (10k) |
+|------|------|---------|-------|------|---------|--------------------------|
+| Nuvoton M032LG6AE | M0 | 72 | 512 KB | 96 KB | USB, EBI, 1.8-5.5 V, touch | USD 1.40 |
+| ST STM32G030F6 | M0+ | 64 | 32 KB | 8 KB | mainstream entry | USD 0.55 |
+| ST STM32G0B1RE | M0+ | 64 | 512 KB | 144 KB | USB, FDCAN, USB-PD | USD 2.10 |
+| GigaDevice GD32E230 | M23 | 72 | 64 KB | 8 KB | cheap M23 (no TZ enabled) | USD 0.40 |
+| TI MSPM0L1306 | M0+ | 32 | 64 KB | 4 KB | low-power, 5.5 V tolerant | USD 0.65 |
+
+Nuvoton's value proposition at this tier is not absolute lowest price (GD32 and MSPM0 win there for very simple parts) but the combination of generous flash + USB + 5 V operation on a single die — useful for any USB peripheral that lives on a 5 V bus rail and wants to skip the LDO.
+
+## The LD-ROM / APROM dual-flash boot
+
+The defining architectural feature of every NuMicro M0 part — and the reason firmware engineers either love or trip over Nuvoton — is the dual-flash boot scheme. On-chip flash is physically split into two banks:
+
+- **APROM** (Application ROM) — the main flash region, where the application image lives.
+- **LD-ROM** (Loader ROM) — a smaller separate flash bank (typically 4 KB on M031, 16 KB on M0xx high-end), independently erasable, independently lockable.
+
+A configuration bit (`CONFIG0.CBS`, Chip Boot Select) chooses which bank the CPU executes from after reset. The IAP library — a small ROM-resident driver — lets running firmware flip the bit and trigger a CPU reset. The pattern this enables: ship a bulletproof bootloader in LD-ROM that performs signature verification, supports UART/USB DFU, and falls back to recovery mode; the bootloader then jumps to APROM for the application. Application updates rewrite APROM only — the bootloader cannot be corrupted, regardless of how bad the new firmware is.
+
+```c
+/* Example: jump from LD-ROM bootloader into APROM application.
+ * Run from LD-ROM after image verification has passed. */
+
+#include "NuMicro.h"
+
+void boot_into_aprom(void)
+{
+    SYS_UnlockReg();                       /* unlock protected registers */
+
+    FMC_Open();                            /* enable flash controller    */
+    FMC_ENABLE_AP_UPDATE();
+
+    /* Select APROM as next boot source. CBS = 00 means boot from APROM
+     * with IAP, 01 = APROM without IAP, 10 = LD-ROM with IAP, 11 = LD-ROM
+     * without IAP. We want APROM with IAP so the new app can still flip
+     * back to LD-ROM for OTA later. */
+    FMC_SetBootSource(FMC_APROM);
+
+    FMC_Close();
+    SYS_LockReg();
+
+    /* Chip reset — comes back up in APROM. */
+    NVIC_SystemReset();
+}
+```
+
+The mirror image of this — APROM application code that wants to jump back into LD-ROM to enter DFU mode on a button press — is a single call to `FMC_SetBootSource(FMC_LDROM)` followed by `NVIC_SystemReset()`. No vector-table relocation, no manual stack pointer copy, no `SCB->VTOR` dance — the boot ROM handles all of that based on the CBS bit.
+
+<Callout type="tip" title="Use the IAP function library, not direct flash writes">
+NuMicro flash has page-erase and word-program primitives accessible directly through the FMC registers, but Nuvoton's BSP wraps them in an IAP library (`FMC_Erase`, `FMC_Write`, `FMC_Read`) that handles the unlock sequence, wait states, and brown-out checks. Always go through the library — direct register writes work but skip the integrity checks, and a brown-out during a direct write can corrupt the flash configuration bytes.
+</Callout>
+
+## Where to use M0
+
+Use NuMicro M0 for: USB peripherals on 5 V buses, low-end industrial I/O (Modbus over RS-485, simple PID loops), capacitive touch panels, small motor controllers (washing-machine pumps, fan drives), consumer remotes, USB-CDC dongles. Avoid it for: battery-powered sensors that need stop-mode currents below 1 µA (use NANO100 or move to STM32L0), and for any design that needs TrustZone (use the M23 family — see [NuMicro M23](/docs/vendors/nuvoton-m23)).
+
+## Cross-references
+
+- [NuMicro landing page](/docs/vendors/nuvoton)
+- [NuMicro M23 secure](/docs/vendors/nuvoton-m23)
+- [NuMicro M4 mainstream](/docs/vendors/nuvoton-m4)
+- [Cortex-M0 / M0+](/docs/cortex-m/m0-m0plus)
+- [STM32 low-power L and U](/docs/vendors/stm32-lowpower) — direct comparison for battery-powered designs
+- [NuMicro M031 product page](https://www.nuvoton.com/products/microcontrollers/arm-cortex-m0-mcus/m031-series/) (external)
+- [NuMicro M0 BSP on GitHub](https://github.com/OpenNuvoton/M031BSP) (external)
+- [NuMicro NANO100 datasheet](https://www.nuvoton.com/products/microcontrollers/arm-cortex-m0-mcus/nano100-series/) (external)

@@ -1,0 +1,227 @@
+---
+title: Ambiq Apollo4
+description: Apollo4 family — Cortex-M4F at 192 MHz, 2 MB flash, MIPI-DSI display, 2D GPU, BLE 5.1 on Plus variants, sub-microamp deep sleep. The silicon behind the modern AMOLED smartwatch.
+order: 25
+updated: 2026-05-13
+tags: [vendors, ambiq, apollo, apollo4, m4f, wearable, low-power]
+---
+
+Apollo4 is the part that took Ambiq from a niche-vendor of micropower MCUs to the dominant silicon in the premium smartwatch tier. Launched in 2021, it brought together the SPOT sub-threshold core technology Ambiq had been refining for a decade, a 192 MHz Cortex-M4F, 2 MB of flash, up to 2.75 MB of SRAM, and — critically for the AMOLED smartwatch wave — an on-chip MIPI-DSI controller, an AMOLED display driver, and a small 2D GPU. For the first time you could build a colour-AMOLED-displayed wearable on a single MCU without offloading the display refresh path to an external GRAM driver, and the battery life numbers still worked.
+
+<SpecSheet
+  title="Apollo4 at a glance"
+  specs={[
+    { label: 'Vendor', value: 'Ambiq Micro' },
+    { label: 'Founded', value: 'Apollo4 sampled Q1 2020, in production 2021; Apollo4 Plus 2022; Apollo4 Blue Plus 2022; Apollo4 Lite 2023' },
+    { label: 'HQ', value: 'Austin, Texas' },
+    { label: 'Flagship part', value: 'Apollo4 Blue Plus (Cortex-M4F 192 MHz, 2 MB flash, 2.75 MB SRAM, MIPI-DSI, 2D GPU, BLE 5.1)' },
+    { label: 'Key fact', value: 'Active current 4 µA/MHz at 96 MHz turbo mode; deep-sleep 1.7 µA with RTC; below 600 nA in true off mode with retention' },
+    { label: 'SDK', value: 'AmbiqSuite SDK with NemaGFX 2D graphics library, FreeRTOS port, Cordio BLE stack on Blue Plus variants' },
+    { label: 'Links', value: 'ambiq.com/apollo4' },
+  ]}
+/>
+
+## The four variants
+
+| Variant | Flash | SRAM | Display | Radio | Position |
+|---------|-------|------|---------|-------|----------|
+| **Apollo4** | 2 MB | 1 MB | MIPI-DSI | None | Original 2021 release, MCU-only |
+| **Apollo4 Plus** | 2 MB | 2.75 MB | MIPI-DSI + AMOLED driver | None | Display-heavy designs |
+| **Apollo4 Blue Plus** | 2 MB | 2.75 MB | MIPI-DSI + AMOLED driver | BLE 5.1 | Connected smartwatches |
+| **Apollo4 Lite** | 1 MB | 1 MB | none | None | Cost-optimised, headless designs |
+
+The Plus variants are the workhorse for premium smartwatches; Blue Plus adds the BLE radio for connected smartwatches that don't need an external Nordic / Silicon Labs companion. Lite is for sensor-only designs that don't drive a display — fitness trackers without colour screens, optical heart-rate patches, glucose monitors.
+
+## Power consumption in detail
+
+The numbers that drive the design wins:
+
+| Mode | Conditions | Typical current |
+|------|------------|-----------------|
+| Run | 192 MHz from MRAM, full peripherals | 5.6 mA |
+| Run | 96 MHz turbo, MCU + DSP active | 380 µA (4 µA/MHz) |
+| Run | 48 MHz LP mode, MCU only | 180 µA |
+| Sleep | CPU clock gated, peripherals running | 60 µA |
+| Deep sleep | All SRAM retained, RTC running, BLE radio off | 1.7 µA |
+| Deep sleep | SRAM partial retention (64 KB), RTC running | 1.1 µA |
+| Off | Only RTC + 32-byte tamper RAM, full cold boot on wake | 600 nA |
+
+Compare these against an equivalent STM32U5 (which is one of the lowest-power conventional CMOS parts you can buy): Apollo4 wins by roughly 3-4× in active mode at the same clock, and is competitive but no longer dominant in deep sleep. The active-mode advantage is what drives the design-wins in always-on display use cases, where the MCU has to run continuously rendering frame updates rather than sleeping for seconds at a time.
+
+## What the display path enables
+
+Apollo4 Plus integrates three blocks that together let it drive a modern AMOLED smartwatch panel:
+
+- **MIPI-DSI controller** — 1 or 2 lanes, up to 500 Mbps per lane. Drives most 1.x-inch AMOLED panels at QVGA to qHD resolutions.
+- **Display dispatch controller (DC)** — frame composition engine. Reads from a frame buffer in SRAM, composites multiple layers (UI background, watch face, animated complication overlays), feeds the DSI controller.
+- **NemaGFX 2D GPU** (licensed from Think Silicon) — texture blit, antialiased line and arc drawing, alpha blending, transformation matrices, vector fonts. Hardware-accelerates Lottie-style animations and gradient backgrounds at frame rates that scalar M4F software rendering cannot reach.
+
+A representative scenario: rendering a watch face with a moving second hand at 60 fps on a 390 × 390 AMOLED panel. The 2D GPU composites the background (cached as a static texture), the hour and minute hand sprites (rotated by NemaGFX's transform engine), the second hand, the date complication, and a heart-rate complication, into a frame buffer in SRAM. The DC reads that frame buffer and pushes it out over MIPI-DSI. The Cortex-M4F is asleep during the rendering — only waking to update the heart rate complication once a second. Average current for this workload measured on the Apollo4 Plus EVB is approximately 2.1 mA — about half what an equivalent STM32U585 design with an external display controller burns.
+
+## BLE radio on Apollo4 Blue Plus
+
+The Blue Plus variants integrate a Bluetooth 5.1 controller alongside the M4F core. The controller has its own dedicated processing block (not the M4F), with the host stack running on the M4F via the Cordio / PacketCraft BLE host (now an open-source Arm offering). Supported features:
+
+- BLE 5.1 LE 2M PHY, LE Coded PHY (long range), advertising extensions.
+- AoA / AoD direction finding (M4F handles IQ sample processing).
+- LE Power Control.
+- LE Isochronous Channels (foundational for LE Audio — not full LE Audio profile compliance on Apollo4, that lands on Apollo510).
+- Concurrent advertising and scanning.
+
+Active TX at 0 dBm: roughly 4.5 mA radio + 2 mA M4F running host stack. RX: 4 mA + 2 mA. Idle advertising at 1-second interval: under 30 µA average.
+
+## The AmbiqSuite SDK structure
+
+For Apollo4 the SDK ships as a single zip with this layout:
+
+```
+AmbiqSuite_R4.x.y/
+  boards/
+    apollo4_evb/         # Ambiq's dev board
+    apollo4_blue_plus/   # BLE-enabled dev board
+  CMSIS/                 # Arm CMSIS-Core, CMSIS-DSP
+  devices/
+    am_devices_*.c       # External-component drivers (BMI270 IMU, etc.)
+  mcu/
+    apollo4/
+      hal/               # am_hal_gpio.c, am_hal_iom.c, am_hal_uart.c, etc.
+      regs/              # am_reg.h register definitions
+  third_party/
+    FreeRTOS/
+    NemaGFX/             # 2D GPU driver
+    cordio/              # BLE host stack
+    mbedTLS/
+    tinyusb/
+  utils/
+    am_devices_button.c, am_devices_led.c
+  examples/
+    apollo4/
+      hello_world/
+      hello_world_uart/
+      ipc/
+      ble_freertos_amota/  # BLE OTA reference
+      graphics_demo/        # NemaGFX walkthrough
+```
+
+Project files for Keil, IAR, Segger Embedded Studio, and GCC + Makefile are checked in. There is no graphical configurator; pin and clock setup live in `am_bsp_pins.c` per board, and you edit them directly.
+
+## Code example — RTC + LP timer wake-up
+
+The defining battery-life pattern on Apollo4: sleep deeply with the RTC and an LP timer running, wake periodically for a sensor read, sleep again. Here is the canonical version using the Ambiq HAL.
+
+```c
+/* Apollo4 — RTC wake-up every 1 second from deep sleep.
+ * Average current target: under 5 µA total. */
+
+#include "am_mcu_apollo.h"
+#include "am_bsp.h"
+#include "am_util.h"
+
+static void rtc_init(void)
+{
+    /* Enable the XT (32.768 kHz crystal) oscillator. */
+    am_hal_mcuctrl_control(AM_HAL_MCUCTRL_CONTROL_XTAL_START, 0);
+
+    /* Select XT as the RTC clock source. */
+    am_hal_rtc_osc_select(AM_HAL_RTC_OSC_XT);
+    am_hal_rtc_osc_enable();
+
+    /* Configure alarm to fire every 1.0 s. Use REPEAT_EVERYSECOND. */
+    am_hal_rtc_alarm_interval_set(AM_HAL_RTC_ALM_RPT_SEC);
+
+    /* Set a starting time so the alarm has a reference. */
+    am_hal_rtc_time_t now = {
+        .ui32Hour    = 0,
+        .ui32Minute  = 0,
+        .ui32Second  = 0,
+        .ui32Hundredths = 0,
+    };
+    am_hal_rtc_time_set(&now);
+
+    /* Enable the alarm interrupt. */
+    am_hal_rtc_int_enable(AM_HAL_RTC_INT_ALM);
+    NVIC_SetPriority(RTC_IRQn, 4);
+    NVIC_EnableIRQ(RTC_IRQn);
+}
+
+void am_rtc_isr(void)
+{
+    am_hal_rtc_int_clear(AM_HAL_RTC_INT_ALM);
+    /* Application wake hook — set a flag for main loop. */
+    extern volatile bool g_wake_flag;
+    g_wake_flag = true;
+}
+
+int main(void)
+{
+    /* Configure system clock, voltage regulators, cache. */
+    am_hal_clkgen_control(AM_HAL_CLKGEN_CONTROL_SYSCLK_MAX, 0);
+    am_hal_cachectrl_config(&am_hal_cachectrl_defaults);
+    am_hal_cachectrl_enable();
+
+    /* Power down peripherals we will not use. SRAM banks beyond the working
+     * set are gated off via the powerctrl block — this is where most of the
+     * standby µA saving comes from. */
+    am_hal_pwrctrl_periph_disable(AM_HAL_PWRCTRL_PERIPH_ADC);
+    am_hal_pwrctrl_periph_disable(AM_HAL_PWRCTRL_PERIPH_MSPI0);
+    am_hal_pwrctrl_periph_disable(AM_HAL_PWRCTRL_PERIPH_MSPI1);
+    am_hal_pwrctrl_memory_enable(AM_HAL_PWRCTRL_MEM_SRAM_64K_DTCM);
+
+    rtc_init();
+
+    extern volatile bool g_wake_flag;
+    g_wake_flag = false;
+
+    while (1) {
+        /* Sleep until the next RTC alarm. AM_HAL_SYSCTRL_SLEEP_DEEP enters
+         * the lowest power state that still retains SRAM and the RTC. */
+        am_hal_sysctrl_sleep(AM_HAL_SYSCTRL_SLEEP_DEEP);
+
+        if (g_wake_flag) {
+            g_wake_flag = false;
+            /* Do the periodic work — read a sensor, push a sample to a
+             * queue, update the display if anything changed. Then loop
+             * back to sleep. */
+            do_periodic_work();
+        }
+    }
+}
+```
+
+The `am_hal_sysctrl_sleep(AM_HAL_SYSCTRL_SLEEP_DEEP)` call is the entire low-power story. Internally the HAL drops the core supply to the sub-threshold setpoint, gates off everything not marked for retention, and parks the CPU in WFI. The wake takes approximately 30 µs to be back in the application loop, dominated by PLL re-lock and the voltage regulator ramp.
+
+<Callout type="tip" title="Disable unused SRAM banks for the standby win">
+Apollo4 Plus has 2.75 MB of SRAM organised as multiple banks, each independently power-gated. Leaving all banks on in deep sleep adds approximately 200 nA per 256 KB bank. The `am_hal_pwrctrl_memory_enable()` call selects which banks survive sleep. For a typical wearable working set of 512 KB, gate off the upper 2 MB and save 1-2 µA standby current. The trade-off is a longer cold-init when the application starts after a full reset.
+</Callout>
+
+## Battery life math for a smartwatch
+
+A representative premium smartwatch workload on Apollo4 Blue Plus:
+
+| Activity | Duration / hour | Current | Charge / hour |
+|----------|------------------|---------|----------------|
+| Deep sleep with RTC, AOD off | 3000 s | 1.7 µA | 5.1 µAs |
+| Always-on display rendering at 1 Hz | 600 s | 2.1 mA | 1.26 mAs |
+| Heart-rate sample (every 5 s, 50 ms PPG burst) | 36 s total | 8 mA | 288 µAs |
+| BLE advertising, 1 s interval | 0.15 s | 4.5 mA | 0.7 mAs |
+| BLE connection event, 200 ms interval | 90 s total | 4.5 mA | 405 µAs |
+| User wrist-flick wake → bright UI, 5× per hour at 4 s each | 20 s | 12 mA | 240 µAs |
+| Per-hour total | | | **2.21 mAs** |
+
+Average current: 2.21 mAs / 3600 s ≈ 614 µA. On a 300 mAh battery that gives 300 / 0.614 ≈ 488 hours = approximately 20 days of battery life with always-on display. Drop AOD and the dominant 1.26 mAs term goes away — battery life jumps to roughly 60 days. Real-world numbers from shipping product (Garmin Forerunner 165, Fenix 7 in battery-saver mode) align with this math, modulo extra current draw for GPS that this calculation ignores.
+
+The same workload on a conventional 22 nm STM32U585 would average roughly 1.5 to 1.8 mA, giving 7-8 days battery on the same cell — close to the gap that explains why premium watch OEMs pay the Ambiq premium.
+
+<Callout type="warn" title="MRAM is not 'just like SRAM' for power purposes">
+Apollo510 introduced MRAM, but Apollo4 still uses conventional embedded flash. Flash reads on Apollo4 cost roughly 40 nA per active read at 96 MHz — small but it adds up if you run code from flash continuously rather than executing from cached / RAM-resident regions. The AmbiqSuite linker scripts pull the hottest code (RTOS scheduler, ISR vectors, the NemaGFX inner loops) into TCM SRAM by default. If you write custom assembly for an inner DSP loop, place it in TCM explicitly via the `__attribute__((section(".text.itcm")))` annotation.
+</Callout>
+
+## Cross-references
+
+- [Ambiq landing page](/docs/vendors/ambiq)
+- [Apollo5 family — M55 with Helium + NPU](/docs/vendors/ambiq-apollo5)
+- [Cortex-M4](/docs/cortex-m/m4)
+- [STM32 low-power L and U](/docs/vendors/stm32-lowpower) — direct comparison for non-wearable battery designs
+- [Apollo4 product page and datasheets](https://ambiq.com/apollo4/) (external)
+- [AmbiqSuite SDK download portal](https://ambiq.com/ambiqsuite-sdk/) (external)
+- [AmbiqMicro FreeRTOS BSP examples on GitHub](https://github.com/AmbiqMicro) (external)

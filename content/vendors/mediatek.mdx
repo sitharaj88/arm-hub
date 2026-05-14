@@ -1,0 +1,104 @@
+---
+title: MediaTek — Genio, Filogic, Dimensity
+description: MediaTek is the world's second-largest fabless silicon vendor. Genio for IoT and edge AI, Filogic for Wi-Fi routers, Dimensity for smartphones, all on TSMC.
+order: 18
+updated: 2026-05-13
+tags: [vendors, mediatek, genio, filogic, dimensity, cortex-a, iot]
+---
+
+MediaTek (Hsinchu, Taiwan, founded 1997) is the world's second-largest fabless semiconductor company by revenue, behind only Qualcomm. The company spent the 2000s as a quietly dominant supplier of DVD and TV chipsets, climbed into smartphones in the 2010s with the Helio line, and has since fragmented into a portfolio of brand-defined product lines that share a common engineering base on TSMC's leading-edge process nodes. For an embedded or systems engineer outside of phone development, MediaTek is most relevant through three product families: Genio for IoT and edge AI, Filogic for Wi-Fi routers and access points, and the Dimensity series whose silicon trickles into automotive, tablets, and reference designs.
+
+<SpecSheet
+  title="MediaTek at a glance"
+  specs={[
+    { label: 'Founded', value: '1997, Hsinchu, Taiwan' },
+    { label: 'Position', value: 'Number two fabless silicon vendor worldwide by revenue; largest by smartphone SoC unit volume' },
+    { label: 'Fabrication', value: 'TSMC exclusively — 4 nm, 6 nm, 7 nm, 12 nm, 22 nm nodes depending on product line' },
+    { label: 'Flagship IoT part', value: 'Genio 1200 — 4× Cortex-A78 + 4× Cortex-A55 + 5 TOPS APU, 6 nm' },
+    { label: 'Flagship router part', value: 'Filogic 880 — Wi-Fi 7, 2× A73 + 2× A53, 36 Gbps aggregate, MLO, 6 GHz' },
+    { label: 'Flagship smartphone part', value: 'Dimensity 9400 — Cortex-X925 + A725 cluster, Immortalis-G925 GPU, 3 nm' },
+    { label: 'IoT SDK', value: 'Genio SDK — Yocto-based BSP with Linux and Android variants, NeuroPilot for ML' },
+    { label: 'Router SDK', value: 'OpenWrt-based reference plus closed enterprise SDK with WED acceleration' },
+    { label: 'Documentation', value: 'mediatek.com product pages, mediatek-labs GitHub, vendor BSP releases per-SoC' },
+  ]}
+/>
+
+## Where MediaTek sits in the market
+
+The high-level competitive picture is simple. Qualcomm dominates premium smartphones in North America and ships the Snapdragon X compute platforms; Apple owns the top of its own walled garden; MediaTek owns the global mid-tier smartphone market and the volume end of Android. Outside phones the picture changes. In Wi-Fi routers MediaTek competes head-on with Qualcomm Atheros and Broadcom, and on Wi-Fi 7 the Filogic line has been first to market with credible silicon for both consumer and enterprise OEMs. In IoT and edge AI MediaTek competes with Rockchip, NXP i.MX, and the lower end of NVIDIA Jetson — different positioning depending on the price point. The shared trait across all lines is that MediaTek tapes out on TSMC at competitive nodes and is willing to engage smaller OEMs that Qualcomm will not return a call on.
+
+## The product line map
+
+| Line | Target market | CPU class | Typical node | Notes |
+|------|---------------|-----------|--------------|-------|
+| Dimensity | Premium and mid Android smartphones | Cortex-X4/X925 + A720/A725 + A520 | 3-4 nm | Replaces Helio for premium tier; flagship is Dimensity 9400 |
+| Helio | Entry and mid smartphones, tablets | Cortex-A78, A75, A55, A53 | 6-12 nm | Long-tail product line for low-cost handsets |
+| Genio | IoT, HMI, edge AI, signage | Cortex-A35, A53, A55, A78 | 6-22 nm | Direct competitor to Rockchip RK35xx and Jetson Nano |
+| Filogic | Wi-Fi routers and access points | Cortex-A53, A73 | 12-22 nm | OpenWrt-friendly, dominates Wi-Fi 7 consumer launches |
+| Pumpkin | Industrial gateway, edge IoT | Cortex-A35, A53 | 22-28 nm | Regional product line, less visible outside Asia |
+| Kompanio | Chromebooks, ARM laptops | Cortex-A78, A715, A520 | 6 nm | Dimensity silicon repackaged for ChromeOS OEMs |
+
+The lines share engineering — a Filogic Wi-Fi MAC and a Genio SoC running the same Cortex-A55 cluster come from adjacent teams using the same physical IP catalog. What changes is the radio block, the NPU, the package, and crucially the software stack that ships around it.
+
+## Genio for IoT and edge AI
+
+Genio replaces what MediaTek previously called the i-series (i300, i500, i700) and is now the official IoT branding. The lineup runs from the Genio 350, a low-cost Cortex-A35 quad targeting battery-powered HMI panels, up to the Genio 1200 which puts a Cortex-A78 quad and Cortex-A55 quad together with a 5 TOPS NPU and Wi-Fi 6 in a single package. The middle of the stack — Genio 510 and Genio 700 — has become the most interesting product for engineers replacing a Jetson Nano or Rockchip RK3568 reference design, because they bring a real APU and Mali-G57 GPU at a price point that undercuts NVIDIA significantly.
+
+The Genio software story is Yocto-based. MediaTek publishes a vendor BSP layer that pulls in their kernel fork, GPU userspace, NeuroPilot ML runtime, and a board-support layer for the reference platform (typically an I-Pi or ADLINK form-factor SoM). Mainline Linux support is partial and varies per SoC — for production, the vendor BSP is the practical path. See [Genio details](/docs/vendors/mediatek-genio) for the per-SKU breakdown, NeuroPilot deployment, and comparison with Rockchip RK3568 and Jetson Orin Nano.
+
+## Filogic for Wi-Fi access points
+
+Filogic is the rebranding of MediaTek's Wi-Fi SoC line. The flagship Filogic 880 was the first commercially shipping Wi-Fi 7 SoC for consumer routers and sits inside the ASUS RT-BE96U, TP-Link Archer BE800, and Xiaomi BE6500. Two Cortex-A73 application cores and two Cortex-A53 service cores share the die with a Wi-Fi 7 MAC supporting Multi-Link Operation, 4K-QAM, and the 6 GHz band, plus a hardware packet engine ("WED" — Wireless Ethernet Dispatch) that offloads NAT and bridging so the CPU sees only flow setup, not per-packet work.
+
+The Filogic line is unusually OEM-friendly. MediaTek ships both an enterprise-grade SDK (closed, with the proprietary WiFi-7 features fully exposed) and a community OpenWrt port. The Banana Pi BPI-R4 and several GL.iNet products ship with OpenWrt out of the box on Filogic silicon, which makes it the natural choice for the hackable consumer router segment. See [Filogic details](/docs/vendors/mediatek-filogic) for the SDK split, real product list, and comparison with Qualcomm IPQ807x and Broadcom BCM4908.
+
+## Dimensity for smartphones — and the edge cases
+
+Dimensity is MediaTek's smartphone flagship line. Most embedded engineers will never touch a Dimensity directly, but the platform is worth understanding for two reasons. First, Dimensity silicon often appears in non-phone products via Kompanio (Chromebooks), in automotive infotainment (the Dimensity Auto family), and in tablets. Second, MediaTek's CPU IP licensing on the Dimensity line — Cortex-X4 / Cortex-X925, the latest Cortex-A720 / A725, and Immortalis-G925 GPUs — is the upstream of what eventually lands in Genio in two-to-three year cycles. The Genio 1200 ships the Cortex-A78 cluster that was the premium Dimensity 1200's cluster two generations ago.
+
+The Dimensity 9400, current as of 2026, is built on TSMC N3E with a Cortex-X925 prime core, three Cortex-X4 performance cores, four Cortex-A725 efficiency cores, and Immortalis-G925 MC12 GPU. The APU (NPU) hits 60 TOPS for on-device generative AI workloads. For embedded engineers the practical takeaway is that Dimensity silicon defines the upper bound of what MediaTek will eventually rebrand into Genio.
+
+## Software stack across the lines
+
+| Line | Primary OS | Build system | ML runtime | Mainline kernel |
+|------|-----------|--------------|------------|-----------------|
+| Genio | Linux, Android | Yocto vendor BSP | NeuroPilot, TFLite, ARM NN | Partial; vendor 5.15 kernel typical |
+| Filogic | OpenWrt, vendor Linux | OpenWrt + vendor SDK | None (control plane only) | Filogic 830 supported; 880 catching up |
+| Dimensity | Android | Vendor BSP | NeuroPilot APU SDK | Vendor only |
+| Kompanio | ChromeOS, Linux | Google ChromeOS BSP | NeuroPilot, TFLite | Mainline via ChromeOS |
+
+NeuroPilot is MediaTek's unifying ML deployment framework. It exposes a TFLite-compatible runtime that targets either the APU (NPU) on Genio and Dimensity, or falls back to GPU and CPU. The APU compiler ("MDLA") is closed-source and quantises models to INT8 or INT16 — for many edge inference jobs the conversion is clean, but custom layers will land on CPU.
+
+<Callout type="warn" title="Mainline kernel support varies sharply by line">
+Filogic 830 and Genio 350/510 have decent upstream Linux support by kernel 6.6 and beyond. Filogic 880 and Genio 1200 are still vendor-BSP-only as of mid-2026 for several peripherals, particularly the Wi-Fi 7 MAC and the APU. If your roadmap requires mainline kernel, validate per-peripheral before committing.
+</Callout>
+
+## Sourcing and longevity
+
+MediaTek does not publish formal longevity guarantees in the way TI or Renesas do for their industrial lines. Genio parts ship with a typical 7-year availability commitment communicated through the FAE channel; Filogic and Dimensity are shorter (3-5 years typical) because the consumer router and phone markets churn faster. For long-life industrial designs, validate the specific SoC's lifecycle status before committing to a multi-year BOM.
+
+```bash
+# Pull the Genio BSP and build the reference image
+git clone https://gitlab.com/mediatek/aiot/bsp/manifest.git
+cd manifest
+repo init -u https://gitlab.com/mediatek/aiot/bsp/manifest.git -b kirkstone
+repo sync -j8
+source poky/oe-init-build-env build
+MACHINE=genio-510-evk bitbake rity-demo-image
+```
+
+<Callout type="note" title="Vendor BSP is the practical path">
+The Yocto BSP includes the closed-source GPU userspace, the APU compiler, and the Wi-Fi calibration data. Without the BSP, mainline Linux will boot to a serial console on most Genio and Filogic parts but you will not get the GPU, the NPU, or the radio working at full performance. Treat the BSP as a required dependency for production builds and budget time to track its kernel rebase cadence.
+</Callout>
+
+## Cross-references
+
+- [MediaTek Genio](/docs/vendors/mediatek-genio) — IoT and edge AI breakdown.
+- [MediaTek Filogic](/docs/vendors/mediatek-filogic) — Wi-Fi 6 and Wi-Fi 7 router SoCs.
+- [Wi-Fi router (Wi-Fi 6)](/docs/systems/wifi-router) — system view that uses Filogic silicon.
+- [Rockchip](/docs/vendors/rockchip) — closest Genio competitor.
+- [TI Sitara](/docs/vendors/ti-sitara) — industrial alternative for HMI and edge.
+- [mediatek.com](https://www.mediatek.com/) (external) — product index.
+- [MediaTek Genio product page](https://www.mediatek.com/products/iot) (external).
+- [MediaTek Filogic product page](https://www.mediatek.com/products/broadband-wifi) (external).
+- [mediatek-labs on GitHub](https://github.com/MediaTek-Labs) (external) — public SDK pieces and reference code.

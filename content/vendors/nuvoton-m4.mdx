@@ -1,0 +1,160 @@
+---
+title: Nuvoton NuMicro M4
+description: NuMicro Cortex-M4F mainstream — M451, NUC472, M480 (192 MHz with HS USB, Ethernet, CAN-FD, crypto), M487 industrial, M032 entry. Where it competes with STM32F4 and GD32F4.
+order: 22
+updated: 2026-05-13
+tags: [vendors, nuvoton, numicro, m4, m4f, cortex-m4]
+---
+
+The NuMicro M4 family is where Nuvoton makes its strongest pitch against STM32F4 — Cortex-M4F at 72 to 200 MHz, with peripheral mixes targeting industrial gateways, HMI panels, printer controllers, motor drives, and the kind of mid-range embedded work that has been Cortex-M4F's bread and butter for the last decade. Inside Greater China the M480 in particular has displaced STM32F4 in many local OEM designs, helped by aggressive pricing through Avnet Taiwan and Sertek, a peripheral mix that includes high-speed USB and dual CAN-FD on the same die, and the same long-lifecycle commitment Nuvoton offers across the rest of its catalogue.
+
+<SpecSheet
+  title="NuMicro M4 at a glance"
+  specs={[
+    { label: 'Vendor', value: 'Nuvoton Technology' },
+    { label: 'Founded', value: 'NuMicro M4 introduced 2014 (M451), M480 in 2017, M460 in 2021' },
+    { label: 'HQ', value: 'Hsinchu, Taiwan' },
+    { label: 'Flagship part', value: 'M487JIDAE (Cortex-M4F, 192 MHz, 512 KB flash, 160 KB SRAM, dual Ethernet, CAN-FD, AES, ECC RAM)' },
+    { label: 'Key fact', value: 'M480 was the first single-chip MCU with on-chip USB 2.0 high-speed PHY in this price tier (no external ULPI required)' },
+    { label: 'SDK', value: 'NuTool + StdDriver BSP + FreeRTOS port + lwIP + USB host/device libraries' },
+    { label: 'Links', value: 'nuvoton.com/products/microcontrollers/arm-cortex-m4-mcus' },
+  ]}
+/>
+
+## The family map
+
+| Sub-family | Max clock | Flash | SRAM | Defining peripherals |
+|------------|-----------|-------|------|----------------------|
+| **M032 (M4F entry)** | 72 MHz | up to 512 KB | up to 96 KB | USB FS, EBI, 1.8-5.5 V supply |
+| **M451 / M453** | 72 MHz | up to 256 KB | up to 32 KB | USB FS, CAN, segment LCD, EBI |
+| **NUC472 / NUC442** | 84 MHz | up to 512 KB | up to 64 KB | EBI, two CAN 2.0B, audio codec, EMAC (NUC472) |
+| **M45xD / M45xG** | 72 MHz | 64-256 KB | 32 KB | Touch, motor PWM, audio specialty variants |
+| **M480** | 192 MHz | up to 1 MB | up to 160 KB | USB 2.0 HS (on-chip PHY), 10/100 EMAC, CAN-FD, AES, SHA, RSA, ECC, TRNG |
+| **M487** | 192 MHz | up to 1 MB | up to 160 KB | Industrial-grade M480 + ECC RAM, dual CAN-FD, dual UART for RS-485 redundancy |
+| **M460** | 200 MHz | up to 1 MB | up to 512 KB | Dual 10/100 EMAC for ring topology, IEEE 1588 PTP, 4× CAN-FD |
+
+The progression matches the rest of the industry: an entry tier in the 70 MHz range (M032, M451), a mid-range around 84 MHz (NUC472), and a high-end pushing 192 to 200 MHz (M480, M487, M460). Where Nuvoton differs from STM32 is that the M032 entry M4F shares packages and pinout with the M0 entry parts in the same family — pin-compatible upgrade path from Cortex-M0 to Cortex-M4F without redoing the PCB.
+
+## M032 — entry-tier M4F
+
+M032 sits in an unusual position: Nuvoton sells it as both an M0 part (with Cortex-M0 core configured) and an M4F part (with Cortex-M4F core configured) on the same package. The internal hardware is M4F; the M0 variants disable the FPU and DSP extensions in OTP for marketing segmentation. For new designs at this tier just buy the M4F SKUs — they are pin-compatible with the M0 ones, sometimes cheaper because volume is concentrated there, and the FPU is useful for any signal processing.
+
+Peripheral set on M032KE3AE (a representative 128-pin LQFP):
+
+- 192 KB flash + 24 KB SRAM.
+- 72 MHz Cortex-M4F.
+- Eight UARTs, four SPIs (two with I²S), three I²Cs, one USB FS device.
+- One CAN 2.0B.
+- 16-channel 12-bit ADC + two analog comparators + temperature sensor.
+- 12-channel 12-bit PWM with complementary outputs.
+- 32-channel touch-key controller.
+- 1.5 KB OTP, hardware AES-128/256, SHA-256, TRNG.
+
+## NUC472 / NUC442 — the audio + industrial sweet spot
+
+NUC472 is the parts Nuvoton ships into baby monitors, intercom panels, low-end voice recorders, simple industrial gateways. The differentiator is an integrated I²S audio codec interface plus a 10/100 EMAC plus EBI plus two CAN 2.0B controllers, all on a 100-pin LQFP at 84 MHz. Process is 0.18 µm — old, but the part has been in production for over a decade and Nuvoton keeps it alive for designs that locked in their BOM long ago. New designs in this space should consider M460 instead.
+
+## M480 — the workhorse
+
+M480 is the part that put Nuvoton on the radar of Western firmware engineers around 2018. The hook is the on-chip high-speed USB 2.0 PHY — at the time of launch, every competitor at this tier (STM32F4, GD32F4, Kinetis K) required an external ULPI PHY to get USB 2.0 high-speed (480 Mbps). The M480JIDAE put it on-chip in a 144-pin LQFP, which alone shaved several dollars and a square centimetre of PCB out of any USB-attached design — audio interfaces, USB scopes, mass-storage adapters.
+
+Full peripheral set of M480 high-end variants:
+
+| Block | Count / capability |
+|-------|-------------------|
+| Cortex-M4F | 192 MHz, FPU, DSP, MPU 8-region |
+| Flash | up to 1 MB, dual-bank, supports BG-erase + read-during-write |
+| SRAM | up to 160 KB |
+| USB | 1× USB 2.0 HS (on-chip PHY) + 1× USB 2.0 FS host/device |
+| Ethernet | 10/100 EMAC with IEEE 1588 PTP |
+| CAN | 2× CAN-FD (5 Mbps) or 2× CAN 2.0B |
+| UART | up to 8, two with LIN, two with Smart Card |
+| SPI | up to 4 (one with QSPI), two with I²S |
+| I²C | up to 5 |
+| I²S | 2 (audio codec interface) |
+| SD/SDIO | 2 controllers, SDIO 3.0 |
+| ADC | 16-channel 12-bit at 5 MSPS |
+| DAC | 2 × 12-bit |
+| PWM | 24 channels |
+| Crypto | AES-128/192/256 (ECB/CBC/CFB/OFB/CTR/GCM), SHA-160/224/256/384/512, RSA up to 4096-bit, ECC over NIST P-192/224/256/384/521 and brainpool curves, TRNG |
+| Power | 2.5-5.5 V, 38 mA at 192 MHz, 2 µA standby with RTC |
+
+The crypto block is genuinely strong for the tier — full RSA-4096 and ECC over a wide curve set, hardware GCM, and a TRNG with NIST SP 800-90B compliance. Most STM32F4 variants have only AES; comparable crypto support means moving up to STM32H5 or H7.
+
+## M487 — industrial-grade M480
+
+M487 is a binned, screened, ECC-protected variant of M480 for IEC 61508 / SIL 2 industrial applications. The silicon is essentially identical to M480, but:
+
+- SRAM is ECC-protected (SECDED — single-error-correct, double-error-detect on 32-bit words).
+- Flash has built-in parity with read-back verification on every fetch.
+- Two redundant CAN-FD controllers can be paired for fault-tolerant networks.
+- AEC-Q100 Grade 1 (-40 to +125 °C) qualification.
+- Lockstep configuration option on selected parts (a small companion M0 core checks M4F execution, mostly used for SIL 2 motor drives).
+
+Use M487 for: PLCs, robotic-arm controllers, medical infusion pumps, anything that needs documented SECDED. Use M480 for: anything else.
+
+## M460 — the new high-end
+
+M460 is the 2021 refresh, moved to TSMC 55 nm embedded-flash and pushing the clock to 200 MHz with a larger SRAM (up to 512 KB). The most useful addition is **dual 10/100 EMAC** — two independent Ethernet MACs, which lets the part serve as a Ring/Daisy-Chain endpoint in EtherCAT or PROFINET networks without an external switch chip. The HSUSB PHY is retained, four CAN-FD controllers replace M480's two, and the IEEE 1588 PTP hardware is upgraded to support 1-step transparent clock mode.
+
+## Comparison vs STM32F4 and GD32F4
+
+| Feature | Nuvoton M480 | ST STM32F407 | ST STM32F429 | GigaDevice GD32F470 |
+|---------|--------------|--------------|--------------|----------------------|
+| Max MHz | 192 | 168 | 180 | 240 |
+| Flash | 1 MB | 1 MB | 2 MB | 3 MB |
+| SRAM | 160 KB | 192 KB | 256 KB | 512 KB |
+| USB HS on-chip PHY | **Yes** | No (ULPI required) | No (ULPI required) | No |
+| EMAC | 10/100 | 10/100 | 10/100 | 10/100 |
+| CAN-FD | **2× CAN-FD** | 2× CAN 2.0B | 2× CAN 2.0B | 2× CAN-FD |
+| AES | up to 256 | up to 256 (F437 only) | up to 256 (F437 only) | up to 256 |
+| RSA / ECC | **Yes, on-chip** | No (software) | No (software) | No (software) |
+| Approx unit price (10k) | USD 4.20 | USD 7.50 | USD 8.80 | USD 5.40 |
+
+M480 wins on the integrated USB HS PHY and on-chip RSA/ECC. STM32 wins on ecosystem maturity, available reference designs in English, and breadth of secondary distributors. The pricing gap has narrowed in 2024 and 2025 — pick on peripheral fit, not on cost alone.
+
+## Floating-point and DSP
+
+Cortex-M4F is the same core across all NuMicro M4 parts — single-precision FPU (VFPv4-SP), DSP extensions (32-bit SIMD multiply-accumulate, saturating arithmetic). The CMSIS-DSP library compiles and runs unmodified. A 256-point real FFT on M480 at 192 MHz completes in approximately 165 µs using CMSIS-DSP's optimised radix-4 implementation — comparable to STM32F4 at 168 MHz once you account for the small clock difference.
+
+The MPU is the standard ARM 8-region M-profile MPU. No FPB (no instruction breakpoint comparator on M480 beyond the standard six), no ETM trace pins on most packages (M487 has ETM on a 144-LQFP variant if you really need it).
+
+## Hardware accelerators in detail
+
+The crypto block in M480/M487 deserves a closer look because it changes what is practical to do on-chip:
+
+| Algorithm | Throughput at 192 MHz | Comparison vs software on same MCU |
+|-----------|------------------------|-------------------------------------|
+| AES-128-CBC | 65 MB/s | ~30× speedup |
+| AES-256-GCM | 38 MB/s | ~50× speedup |
+| SHA-256 | 88 MB/s | ~25× speedup |
+| RSA-2048 sign | 110 ms | ~40× speedup over mbedTLS software |
+| RSA-2048 verify | 4.2 ms | ~30× speedup |
+| ECDSA P-256 sign | 12 ms | ~25× speedup |
+| ECDSA P-256 verify | 28 ms | ~25× speedup |
+| TRNG | 1 Mbit/s | n/a |
+
+For a TLS 1.3 handshake the M480 can complete a full ECDHE-ECDSA exchange in roughly 60 ms — fast enough to do per-connection, no PSK fallback needed. For a firmware update verification step the same RSA-2048 verify takes 4 ms, negligible against the flash-write time.
+
+<Callout type="tip" title="Crypto engine has a separate DMA channel">
+The M480 CRYPTO peripheral has its own dedicated DMA path that does not share the main PDMA controller. You can hash a buffer in SRAM while PDMA streams ADC samples into a different SRAM region with zero contention. Use this when designing audio pipelines that need real-time AES encryption — the crypto block runs in parallel with the I²S DMA.
+</Callout>
+
+## Where to use NuMicro M4
+
+Strong fit: industrial gateways (Ethernet + dual CAN-FD + crypto on one die), USB audio interfaces and USB scopes (HS PHY on-chip), HMI panels with capacitive touch, motor controllers needing complementary PWM with dead-time, printer controllers (multi-UART, EBI for paper-sensor arrays). Weak fit: ultra-low-power battery designs (use Ambiq Apollo or STM32U5 — see [STM32 low-power](/docs/vendors/stm32-lowpower)), TrustZone-required secure boot (use [NuMicro M23](/docs/vendors/nuvoton-m23) or STM32U5).
+
+<Callout type="warn" title="Flash dual-bank requires explicit linker setup">
+M480's dual-bank flash supports background erase + read on the inactive bank, but the linker script must place the application image into one bank and the OTA staging buffer into the other. The default StdDriver linker scripts place everything in bank 0. Use the dual-bank example linker from the M480 BSP examples directory as the starting point.
+</Callout>
+
+## Cross-references
+
+- [NuMicro landing page](/docs/vendors/nuvoton)
+- [NuMicro M0 entry](/docs/vendors/nuvoton-m0)
+- [NuMicro M23 secure](/docs/vendors/nuvoton-m23)
+- [Cortex-M4](/docs/cortex-m/m4)
+- [STM32 mainstream F/G/H](/docs/vendors/stm32-mainstream) — direct comparison
+- [NuMicro M480 product page](https://www.nuvoton.com/products/microcontrollers/arm-cortex-m4-mcus/m480-series/) (external)
+- [NuMicro M460 product page](https://www.nuvoton.com/products/microcontrollers/arm-cortex-m4-mcus/m460-series/) (external)
+- [M480 BSP on GitHub](https://github.com/OpenNuvoton/M480BSP) (external)

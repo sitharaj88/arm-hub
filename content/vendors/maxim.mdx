@@ -1,0 +1,116 @@
+---
+title: Maxim Integrated / Analog Devices MAX32
+description: Maxim's MAX32 Cortex-M microcontroller line under ADI. DARWIN low-power architecture, tiny WLP packages for hearables, precision analog integration, BLE radios, and the MAX78000 CNN ML accelerator.
+order: 22
+updated: 2026-05-13
+tags: [vendors, maxim, analog-devices, adi, max32, cortex-m4, darwin, max78000]
+---
+
+Maxim Integrated, founded in 1983 in San Jose by Jack Gifford and a small group of National Semiconductor alumni, spent four decades as a precision-analog and power-management house with a quiet sideline in microcontrollers. The MAX32 line — Cortex-M3 and Cortex-M4F parts marketed under the "DARWIN" low-power architecture banner — never tried to outsell STM32 or PIC32 on volume. It carved out a different niche: physically tiny packages for hearables and wearables, microcontrollers with on-chip precision analog that an STM32 designer would have to bolt on as a discrete chip, and increasingly specialised secure and machine-learning variants.
+
+Analog Devices completed the acquisition of Maxim in August 2021 for around $21 billion in stock — at the time the largest analog-semiconductor merger ever announced. The MAX32 brand was retained, the product line continues, and the Maxim engineering teams (in San Jose, Dallas, and Hillsboro) folded into ADI's processor-and-MCU group. From a designer's perspective the practical changes are visible in three places: the parts are now ordered through analog.com rather than maximintegrated.com (the old domain redirects), the SDK was renamed from "Maxim MSDK" to "ADI MSDK", and the long-term roadmap now appears alongside ADI's MCU and SHARC DSP lines.
+
+<SpecSheet
+  title="Maxim / ADI MAX32 line at a glance"
+  specs={[
+    { label: 'Vendor', value: 'Maxim Integrated, now Analog Devices (acquired August 2021)' },
+    { label: 'Founded', value: '1983, San Jose, California' },
+    { label: 'HQ today', value: 'Wilmington, Massachusetts (ADI corporate); Maxim teams remain in San Jose' },
+    { label: 'Architecture brand', value: 'DARWIN — Maxim\'s shared low-power M4F platform across MAX3260x / 6x / 7x / 9x' },
+    { label: 'Flagship parts', value: 'MAX32690 (BLE 5.2 + M4F @ 120 MHz), MAX78000 (M4F + CNN accelerator)' },
+    { label: 'Smallest package', value: 'MAX32660 — 12-pin WLP, 1.6 x 1.6 mm; fits inside an in-ear hearing aid' },
+    { label: 'SDK', value: 'ADI MSDK — MIT-licensed, Eclipse-based IDE, GNU toolchain, OpenOCD debug' },
+    { label: 'External links', value: 'analog.com/MAX32, github.com/analogdevicesinc/msdk, EE-Sim online simulator' },
+  ]}
+/>
+
+## The DARWIN low-power architecture
+
+DARWIN is Maxim's internal name for the shared building blocks beneath the MAX3260x through MAX32690 parts. The block list is unremarkable on paper — a Cortex-M4F core, multi-level power domains, an integrated DC-DC + LDO power tree, retention SRAM, a flash controller with single-cycle execution under 50 MHz — but the tuning is aggressive. Active-mode current sits at 27 to 50 microamps per megahertz across the family (about half of an STM32L4 and roughly matched to the better Apollo and Ambiq parts), and standby retention with full SRAM hold runs in the high hundreds of nanoamps. The single SIMO (Single-Inductor Multi-Output) DC-DC converter generates the core, IO, and analog rails from one external inductor, saving board area on space-constrained hearable boards where every passive component competes with the battery for volume.
+
+The architecture's distinguishing feature on a system-level diagram is the always-on (AoD) power domain. A small block of the die — a few kilobytes of SRAM, the RTC, low-power timers, a couple of GPIO, and on some parts a low-power UART or low-power comparator — remains powered while the main Cortex-M4F is in deep sleep. Wake-up sources from this domain re-enable the main core in microseconds. The pattern is similar to STM32's "Stop 2" with backup SRAM, but Maxim's tuning prioritises the wake latency over absolute floor current.
+
+## The product family
+
+| Sub-family   | Core / clock         | Distinguishing trait                                | Typical end product                |
+|--------------|----------------------|-----------------------------------------------------|------------------------------------|
+| MAX3260x     | M4F, 96 MHz          | Industrial-grade general-purpose, larger flash      | Industrial wearables, sensor hubs  |
+| MAX32650     | M4F, 120 MHz         | Audio-class: stereo I2S, 24-bit codec interface     | Bluetooth audio, hearables         |
+| MAX32660     | M4F, 96 MHz          | 12-pin WLP, 1.6 mm square, sub-1 mA active          | Hearing aids, earbuds, smart rings |
+| MAX32670/672 | M4F, 100 MHz         | Precision 12 or 16-bit ADC + low-power optimisation | Vital-signs monitors, smart meters |
+| MAX32690     | M4F, 120 MHz         | BLE 5.2 single-mode radio on-die                    | BLE-enabled medical wearables      |
+| MAX32665/666 | Dual M4F, 96 MHz     | BLE 5.0 + secondary M4F for application offload     | Wearables with dual-stack workload |
+| MAX78000     | M4F + CNN engine     | Hardware CNN inference accelerator                  | Always-on ML wake-word, vision     |
+| MAX78002     | M4F + RISC-V + CNN   | Larger CNN, RISC-V coprocessor                      | Edge ML cameras, audio classifiers |
+| MAX32570     | M3 + secure elements | DeepCover secure MCU, payment-card grade            | POS terminals, secure HSM peers    |
+| MAX32550     | M3 + smart-card IO   | Contact and contactless smart-card controller       | EMV chip-card readers              |
+
+Three threads run through the table. The first is package and physical size — the MAX32660 in 12-pin WLP is the smallest meaningful general-purpose Cortex-M4F on the market, and the MAX32650 series goes up to a 121-pin WLP that is still smaller than most QFNs. The second is integrated precision analog: Maxim's heritage shows in the ADC blocks on the MAX32670 and MAX32672, which are not the 12-bit SAR converters typical of competitors but trimmed precision ADCs with documented gain and offset accuracy specifications. The third is the security and ML branches, which are best treated as separate product lines using a shared microcontroller core rather than mainstream MAX32 parts (covered separately under [MAX78000](/docs/vendors/maxim-max78000)).
+
+## Software — ADI MSDK
+
+The MSDK (originally Maxim Software Development Kit, retained verbatim under ADI) lives on GitHub at github.com/analogdevicesinc/msdk under an MIT licence. The repository contains the Hardware Abstraction Layer (HAL), peripheral drivers, example applications, an Eclipse-based IDE configuration, and pre-built support for the major debug probes (CMSIS-DAP, Olimex ARM-USB-TINY, J-Link, OpenOCD's PE-Micro driver). The HAL is C99, single-instance per peripheral, structured similarly to Nordic's nrfx — direct register manipulation underneath, with thin wrappers that handle the typical configuration steps.
+
+```c
+#include "mxc_device.h"
+#include "i2s.h"
+#include "dma.h"
+
+mxc_i2s_req_t i2s_req = {
+    .wordSize    = MXC_I2S_DATASIZE_WORD,
+    .sampleSize  = MXC_I2S_SAMPLESIZE_TWENTYFOUR,
+    .bitsWord    = 32,
+    .justify     = MXC_I2S_MSB_JUSTIFY,
+    .wsPolarity  = MXC_I2S_POL_NORMAL,
+    .channelMode = MXC_I2S_INTERNAL_SCK_WS_0,
+    .stereoMode  = MXC_I2S_STEREO,
+    .clkdiv      = MXC_I2S_CalculateClockDiv(48000, 24),
+    .rawData     = NULL,
+    .txData      = NULL,
+    .rxData      = audio_buf,
+    .length      = AUDIO_BUF_WORDS,
+};
+MXC_I2S_Init(&i2s_req);
+MXC_DMA_Init();
+int ch = MXC_DMA_AcquireChannel();
+MXC_I2S_RXDMAConfig(audio_buf, sizeof(audio_buf));
+```
+
+The toolchain underneath MSDK is GCC for Arm Embedded (arm-none-eabi-gcc 10.3 or 12.2 in the supported configurations), and the build system is GNU Make. CMake support is community-contributed and improving but not the upstream default — production teams that prefer CMake typically write a thin wrapper around the MSDK build rules rather than re-implementing the build from scratch.
+
+<Callout type="tip">
+Cloning the MSDK repository with `--recursive` is mandatory. The repository pulls in CMSIS, FreeRTOS, lwIP, mbedTLS, and the BLE controller stack as submodules; a non-recursive clone leaves you with build errors that are puzzling until you notice the missing directories.
+</Callout>
+
+## Strengths versus the competition
+
+Maxim's competitive position is best understood by what it does not chase. The MAX32 line is not the cheapest 32-bit MCU at any tier (STM32C0 and CH32V0 beat it on bare price), is not the fastest (STM32H7 and i.MX RT win on clock and DMI/CoreMark), and is not the broadest in ecosystem (STM32 is unmatched and will remain so). What MAX32 does win on is integration. A vital-signs wearable built on a MAX32672 plus an internal MAX86178 optical sensor uses two Maxim parts and one battery; the equivalent STM32L4 design needs an STM32, an external high-resolution ADC, a separate sensor front-end, and more PCB layers. The dollar-for-dollar comparison favours STM32 on the BOM cost of the MCU itself and favours MAX32 on the total integrated system cost.
+
+The other competitive lever is package size. Hearing aids, earbuds, smart rings, and continuous glucose monitors are physically constrained products where the printed-circuit area available for the MCU is measured in single square millimetres. The MAX32660's 1.6 by 1.6 millimetre 12-pin WLP package fits inside a hearing aid; almost nothing else in the ARM ecosystem does. Cypress (now Infineon) PSoC 4, Ambiq Apollo3, and Nordic nRF52840 in their smallest WLP variants are the only credible alternatives, and each carries its own design trade-offs.
+
+## Comparison with related M4F families
+
+| Trait                  | MAX32660       | STM32L4Q5       | nRF52840          | Ambiq Apollo3     |
+|------------------------|----------------|-----------------|-------------------|-------------------|
+| Active power           | 27 uA/MHz      | 51 uA/MHz       | 53 uA/MHz         | 6 uA/MHz          |
+| Smallest package       | 12-pin WLP     | 81-pin BGA      | 94-pin aQFN       | 81-pin BGA        |
+| Integrated radio       | No             | No              | BLE 5.0           | BLE 5 (3xxx)      |
+| Integrated DC-DC       | SIMO           | SMPS (some)     | DC-DC             | Optimised         |
+| Smallest size suitable | Earbud / aid   | Wearable        | Smartwatch        | Smart ring        |
+
+The columns are not strictly apples-to-apples — the Apollo3 wins absolute power-per-megahertz handily, the nRF52840 wins on integrated radio — but the table illustrates the position. For products where the dominant constraint is "fit inside this ear canal" or "use this analog accuracy", MAX32 is often the only correct answer.
+
+<Callout type="warn">
+Cross-vendor design migrations into and out of MAX32 are rarely clean. The MSDK HAL is well-documented but not source-compatible with ST HAL, NXP MCUXpresso, or Nordic nrfx; peripheral register names and DMA configuration idioms differ. Budget two to three weeks of porting effort for a non-trivial application moved between MAX32 and any of those families.
+</Callout>
+
+## Cross-references
+
+- [MAX32 general-purpose Cortex-M4F](/docs/vendors/maxim-max32) — detailed coverage of the mainstream parts.
+- [MAX78000 CNN accelerator](/docs/vendors/maxim-max78000) — the headline ML part and its toolchain.
+- [Cortex-M4](/docs/cortex-m/m4) — the core used across MAX32.
+- [Nordic nRF52](/docs/vendors/nordic) — competitor for BLE-class wearables.
+- [Ambiq Apollo3](/docs/vendors/ambiq) — competitor for ultra-low-power wearables.
+- Analog Devices product portal: analog.com/en/product-category/microcontrollers.html.
+- MSDK source: github.com/analogdevicesinc/msdk.
+- EE-Sim online simulator: tools.analog.com/en/simulator.

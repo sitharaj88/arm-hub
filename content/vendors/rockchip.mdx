@@ -1,0 +1,145 @@
+---
+title: Rockchip — RK3399, RK3568, RK3588, and the SBC ecosystem
+description: Rockchip is the largest Chinese application-processor vendor outside mobile. RK3568 for IoT gateways, RK3588 for edge AI workstations, dominant in SBC market.
+order: 21
+updated: 2026-05-13
+tags: [vendors, rockchip, rk3568, rk3588, cortex-a55, cortex-a76, sbc, edge-ai]
+---
+
+Rockchip (Fuzhou, China, founded 2001) is the largest Chinese application-processor vendor outside the mobile market. The company quietly dominates the single-board-computer market — almost every recognisable SBC brand outside the Raspberry Pi orbit ships Rockchip-based products at one or more price points. Pine64, Radxa, Khadas, Banana Pi, FriendlyElec, Rock Pi, Orange Pi, Hardkernel, Libre Computer, all carry Rockchip silicon. Beyond SBCs Rockchip serves education tablets, set-top boxes, automotive head units, IP cameras, smart speakers, and a growing chunk of the edge-AI market with the RK3588 family.
+
+<SpecSheet
+  title="Rockchip at a glance"
+  specs={[
+    { label: 'Founded', value: '2001, Fuzhou, China' },
+    { label: 'Market position', value: 'Largest Chinese application processor vendor outside smartphone, dominant in SBCs and education tablets' },
+    { label: 'Fabrication', value: 'SMIC for older parts (RK3568 22 nm), Samsung 8 nm LPP for RK3588, mixed sourcing' },
+    { label: 'Flagship part', value: 'RK3588 — 4× Cortex-A76 + 4× Cortex-A55, Mali-G610 MP4, 6 TOPS NPU' },
+    { label: 'Mainstream part', value: 'RK3568 — 4× Cortex-A55 @ 2.0 GHz, dual GbE, PCIe Gen3, 0.8 TOPS NPU' },
+    { label: 'SDK', value: 'Buildroot-based vendor BSP, kernel 5.10 LTS fork, RKNN Toolkit for NPU' },
+    { label: 'Community OS', value: 'Armbian, Debian, Ubuntu, DietPi, OpenWrt, Android via vendor BSP' },
+    { label: 'Mainline kernel', value: 'RK3566/3568 well-supported by kernel 6.x; RK3588 catching up rapidly' },
+    { label: 'Documentation', value: 'rockchip.com.cn TRMs, rock-chips GitHub for U-Boot and kernel forks, community Armbian wiki' },
+  ]}
+/>
+
+## The family roadmap
+
+Rockchip's product roadmap can be read as a timeline of process-node migration paired with successive Cortex-A core generations. The major waypoints are:
+
+- **RK3399 (2016)** — dual Cortex-A72 + quad Cortex-A53 big.LITTLE on 28 nm, Mali-T864 GPU. The breakout SBC chip. It is the SoC behind the original Rock Pi 4, Pine64 RockPro64, FriendlyElec NanoPi M4, Khadas Edge, and many others. RK3399 set the template for Rockchip's SBC dominance.
+- **RK3399Pro (2018)** — RK3399 with an integrated 2.4 TOPS NPU. The first widely-shipping Chinese NPU-in-SoC product. Notable in education AI kits.
+- **RK3566 and RK3568 (2021)** — quad Cortex-A55 at 1.8 to 2.0 GHz, Mali-G52 EE GPU, 0.8 to 1 TOPS NPU. SMIC 22 nm. The current volume parts for IoT gateways, NAS boxes, and budget SBCs.
+- **RK3588 and RK3588S (2022 onwards)** — quad Cortex-A76 plus quad Cortex-A55, Mali-G610 MP4 GPU, 6 TOPS NPU, Samsung 8 nm LPP. The flagship and the chip that has displaced NXP i.MX 8M Plus in many SBC and edge-AI products.
+- **RK3582 (2023)** — RK3588 with two of the A76 cores disabled and reduced peripheral set. A binned variant for cost-sensitive products that still want the RK3588 platform.
+- **RK3576 (2024)** — mid-tier between RK3568 and RK3588: 4× Cortex-A72 + 4× Cortex-A53, 6 TOPS NPU, mainline kernel target.
+
+## Roadmap matrix
+
+| SoC | Year | CPU | GPU | NPU | Process | Typical board |
+|-----|------|-----|-----|-----|---------|----------------|
+| RK3399 | 2016 | 2× A72 + 4× A53 @ 1.8/1.4 | Mali-T864 MP4 | none | 28 nm | Rock Pi 4, RockPro64, NanoPi M4 |
+| RK3399Pro | 2018 | 2× A72 + 4× A53 | Mali-T864 MP4 | 2.4 TOPS | 28 nm | Toybrick TB-96AI |
+| RK3566 | 2021 | 4× A55 @ 1.8 GHz | Mali-G52 EE | 1 TOPS | SMIC 22 nm | Radxa CM3, Quartz64 Model B |
+| RK3568 | 2021 | 4× A55 @ 2.0 GHz | Mali-G52 EE | 0.8 TOPS | SMIC 22 nm | Radxa Rock 3A, Banana Pi M2S, Odroid M1 |
+| RK3576 | 2024 | 4× A72 + 4× A53 | Mali-G52 MC3 | 6 TOPS | SMIC 12 nm | LuckFox Lyra, Radxa Rock 5C |
+| RK3582 | 2023 | 2× A76 + 4× A55 | Mali-G610 MP4 | 6 TOPS | Samsung 8 nm | Radxa Rock 5B+ binned |
+| RK3588 | 2022 | 4× A76 + 4× A55 @ 2.4/1.8 | Mali-G610 MP4 | 6 TOPS | Samsung 8 nm | Orange Pi 5 Plus, Rock 5B, NanoPi R6S |
+| RK3588S | 2022 | 4× A76 + 4× A55 | Mali-G610 MP4 | 6 TOPS | Samsung 8 nm | Orange Pi 5, ROCK 5A, Khadas Edge2 |
+
+The clean reading is that RK3568 covers the budget tier (IoT gateways, NAS, signage, light edge inference), RK3576 and RK3582 cover the middle, and RK3588 covers the high end (edge AI workstations, robotics CPUs, mini desktops, multi-camera analytics).
+
+## Where Rockchip wins
+
+The SBC ecosystem is the most visible aspect of Rockchip's market position. The reasons it dominates the SBC space:
+
+- **Aggressive pricing**. Rockchip silicon prices are dramatically below NXP i.MX, TI Sitara, and NVIDIA Jetson for comparable capability tiers. The board makers can hit USD 50 to USD 150 retail price points that would be impossible with other vendor silicon.
+- **No exclusivity demands**. Rockchip does not require board makers to commit to volume contracts or exclusivity. Small SBC makers can buy reels of RK3588 and ship a product without negotiating an OEM agreement.
+- **Reasonable documentation**. The Technical Reference Manuals (TRMs) for RK3399, RK3566/3568, and RK3588 are publicly available with reasonable detail. Not as polished as TI's documentation but far better than Allwinner or Amlogic.
+- **Active community**. The Armbian project, Radxa engineering team, and several individual kernel developers have steadily upstreamed Rockchip support. By kernel 6.6 the RK3566/3568 are extremely well-supported in mainline Linux.
+
+## Where Rockchip loses
+
+- **Closed NPU toolchain**. The RKNN Toolkit is closed-source. Model conversion is a click-through-licence affair and the output blobs are not portable.
+- **Vendor BSP kernel is the practical path for RK3588**. Mainline is catching up but as of mid-2026, the vendor 5.10 kernel is still required for full GPU + NPU + video acceleration on RK3588.
+- **No formal longevity guarantee**. Unlike TI or Renesas, Rockchip does not publish 10-year availability commitments. Industrial products built on Rockchip carry a real obsolescence risk over the long lifecycle.
+- **GPU driver story is rough**. Mali userspace requires closed binary blobs; the open-source Panfrost driver works on Mali-T8xx (RK3399) but lags badly on Mali-G610 (RK3588). For production HMI products plan on shipping the vendor Mali blob.
+
+## Software stack
+
+| Layer | Vendor BSP | Mainline-based |
+|-------|------------|-----------------|
+| Bootloader | rkbin signed loader + U-Boot fork | Mainline U-Boot for RK3568; RK3588 partial |
+| Kernel | 4.19 (RK3399), 4.19 / 5.10 (RK3568), 5.10 (RK3588) | 6.x for RK3566/68; RK3588 6.6+ catching up |
+| GPU userspace | Closed Mali blob | Panfrost (partial RK3588 support) |
+| Video codec | MPP (Media Process Platform) Rockchip-specific | Hantro / rkvdec via V4L2 (kernel 6.x) |
+| NPU | RKNN runtime closed | None mainline; community wrappers only |
+| Distribution | Buildroot reference, Debian / Ubuntu via Linaro / Radxa | Armbian, mainline Debian/Ubuntu, OpenWrt |
+
+For SBC end-users the practical layering is usually: Armbian provides the distribution image, which carries the mainline kernel where possible and falls back to the vendor kernel for GPU/NPU on RK3588. The closed Mali userspace ships as a standard binary package.
+
+<Callout type="warn" title="Vendor BSP is the practical path until kernel 6.x">
+For RK3588 production designs in 2026, the vendor BSP kernel 5.10 is still required for full peripheral coverage — particularly NPU, hardware video encode, and full GPU performance. Mainline kernel 6.6 boots and runs but at reduced media capability. Plan your kernel maintenance burden around the vendor BSP cadence; expect to rebase every 6-12 months as upstream catches up.
+</Callout>
+
+## SBC board landscape
+
+The Rockchip SBC market is fragmented across many vendors. The major players and their flavour preferences:
+
+| Vendor | Flagship Rockchip board | Typical price | Strength |
+|--------|--------------------------|----------------|----------|
+| Radxa | Rock 5B (RK3588) | USD 130-180 | Engineering polish, mainline kernel work |
+| Orange Pi | Orange Pi 5 Plus (RK3588) | USD 100-150 | Aggressive pricing, M.2 expansion |
+| Khadas | Edge2 (RK3588S) | USD 200-280 | Premium build, RK3588S form factor |
+| FriendlyElec | NanoPi R6S (RK3588S) | USD 100-130 | Network-focused, dual 2.5 GbE |
+| Hardkernel | Odroid M1 (RK3568B) | USD 65-90 | Compact, well-documented, NAS-focused |
+| Pine64 | Quartz64 Model A (RK3566) | USD 60-100 | Community-driven, mainline focus |
+| Banana Pi | BPI-W3 (RK3588) | USD 100-150 | Smart router / NAS focus |
+| Libre Computer | Roc-RK3588S-PC (RK3588S) | USD 100-130 | Mainline-only philosophy |
+
+## Vertical applications
+
+Beyond SBCs, Rockchip silicon ships in:
+
+- **Education tablets** — RK3326 and RK3566 dominate the Chinese education tablet market, in particular the kid-targeted "learning machine" segment.
+- **Set-top boxes** — RK3328 and RK3566 power large numbers of Android TV boxes and IPTV devices.
+- **Automotive head units** — RK3568 and the automotive-grade RK3588M variant appear in aftermarket and OEM Chinese-market head units.
+- **IP cameras** — RV1106, RV1126 (Rockchip's camera-focused SoC line) are dominant in the Chinese surveillance camera market.
+- **Smart speakers and displays** — RK3566 and RK3568 ship in many smart-display products from Baidu, Xiaomi, and others.
+
+```bash
+# Pull the Armbian build system to make an Ubuntu image for Rock 5B
+git clone --depth=1 --branch=main https://github.com/armbian/build
+cd build
+
+# Interactive board / distro selection
+./compile.sh build
+
+# Or scripted: Rock 5B running Ubuntu Jammy with the vendor kernel
+./compile.sh build \
+  BOARD=rock-5b \
+  BRANCH=legacy \
+  RELEASE=jammy \
+  BUILD_DESKTOP=no \
+  BUILD_MINIMAL=no \
+  KERNEL_CONFIGURE=no
+
+# Image lands in output/images/
+ls output/images/Armbian_*_Rock-5b_*.img.xz
+```
+
+<Callout type="note" title="Mainline kernel support varies sharply by SoC">
+RK3399 and RK3566/68 have excellent mainline support by kernel 6.x and are good targets for long-lived mainline Linux builds. RK3588 mainline support is improving rapidly through kernel 6.6, 6.8, and 6.10 but still lags the vendor BSP for GPU, NPU, and hardware video. Verify the specific peripheral coverage you need against the current upstream tree before committing to a mainline-only build for RK3588 production.
+</Callout>
+
+## Cross-references
+
+- [Rockchip RK3568](/docs/vendors/rockchip-rk3568) — mainstream IoT and gateway part.
+- [Rockchip RK3588](/docs/vendors/rockchip-rk3588) — flagship edge AI processor.
+- [MediaTek Genio](/docs/vendors/mediatek-genio) — closest competitor for IoT and edge AI.
+- [NXP i.MX](/docs/vendors/nxp) — industrial-grade alternative.
+- [Raspberry Pi](/docs/vendors/raspberry) — RP-series microcontroller comparison.
+- [rockchip.com.cn](https://www.rockchip.com/) (external) — vendor product page.
+- [rock-chips on GitHub](https://github.com/rockchip-linux) (external) — vendor U-Boot and kernel forks.
+- [Armbian Rockchip documentation](https://docs.armbian.com/) (external).
+- [Radxa product line](https://radxa.com/) (external).

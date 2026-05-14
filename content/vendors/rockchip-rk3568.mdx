@@ -1,0 +1,185 @@
+---
+title: Rockchip RK3566 and RK3568 — Cortex-A55 IoT and gateway SoC
+description: Rockchip RK3566 and RK3568. Quad Cortex-A55, Mali-G52, NPU, dual GbE, PCIe Gen3. Buildroot and Armbian, mainline kernel status, device-tree examples.
+order: 22
+updated: 2026-05-13
+tags: [vendors, rockchip, rk3568, rk3566, cortex-a55, iot, sbc]
+---
+
+The Rockchip RK3566 and RK3568 are two variants of the same silicon die, separated by binning and peripheral fusing. Both ship a quad Cortex-A55 cluster at 1.8 to 2.0 GHz, a Mali-G52 EE GPU, a small NPU, and an industrial-friendly peripheral mix that includes PCIe Gen3, dual gigabit Ethernet, multiple SDIO, USB 3.0, and a usable serial peripheral set. They are the workhorse parts of the current Rockchip lineup for IoT gateways, network-attached storage, digital signage, light edge inference, and a wide range of single-board computers. This page covers the silicon details, board landscape, software stack, and where they sit against MediaTek Genio 510 and NXP i.MX 8M Mini.
+
+<SpecSheet
+  title="RK3566 / RK3568 at a glance"
+  specs={[
+    { label: 'CPU', value: 'RK3566: 4× Cortex-A55 @ 1.8 GHz · RK3568: 4× Cortex-A55 @ 2.0 GHz' },
+    { label: 'Cache', value: '32 KB L1I + 32 KB L1D per core · 512 KB shared L2 · 256 KB L3' },
+    { label: 'Architecture', value: 'ARMv8.2-A, AArch64, NEON, FP16, dot-product, crypto extensions' },
+    { label: 'GPU', value: 'Mali-G52 2EE @ 800 MHz, OpenGL ES 3.2, Vulkan 1.1, OpenCL 2.0' },
+    { label: 'NPU', value: 'Rockchip NPU 0.8 TOPS (RK3568) / 1 TOPS (RK3566), INT8' },
+    { label: 'Memory', value: 'LPDDR4 / LPDDR4X / DDR4 / DDR3L up to 8 GB, 32-bit bus' },
+    { label: 'Video decode', value: 'H.265 4K @ 60 fps · H.264 4K @ 30 fps · VP9 4K @ 60 fps' },
+    { label: 'Video encode', value: 'H.264 1080p @ 60 fps · H.265 1080p @ 60 fps' },
+    { label: 'Ethernet', value: 'RK3568: dual GbE (one with PoE support) · RK3566: single GbE' },
+    { label: 'PCIe', value: 'RK3568: PCIe Gen3 ×2 + Gen2 ×1 · RK3566: PCIe Gen2 ×1' },
+    { label: 'USB', value: '1× USB 3.0 OTG, 2× USB 2.0, 1× USB 3.0 host (RK3568 only)' },
+    { label: 'Display', value: 'Dual MIPI-DSI 4-lane, eDP, HDMI 2.0, LVDS, parallel RGB' },
+    { label: 'Camera', value: 'Dual MIPI-CSI 4-lane, dedicated ISP supporting up to 8 MP' },
+    { label: 'Process', value: 'SMIC 22 nm FinFET' },
+    { label: 'Power', value: '1.5–4 W typical, depending on workload and active peripherals' },
+  ]}
+/>
+
+## RK3566 versus RK3568 — what changes
+
+The two parts come off the same wafers. They are binned and fused for different markets. The headline differences:
+
+| Feature | RK3566 | RK3568 |
+|---------|--------|--------|
+| Maximum CPU clock | 1.8 GHz | 2.0 GHz |
+| Ethernet | 1× GbE | 2× GbE (one with PoE PD) |
+| PCIe | Gen2 ×1 | Gen3 ×2 + Gen2 ×1 |
+| SATA | none | 3× SATA 3.0 (multiplexed with PCIe/USB lanes) |
+| USB 3.0 host | OTG only | OTG + dedicated host |
+| NPU TOPS | 1 TOPS | 0.8 TOPS |
+| Target market | Tablets, smart panels, signage | NAS, gateways, industrial PC, IoT routers |
+| Typical price | lower | slightly higher |
+
+The peripheral differences are real but most lanes are multiplexed — the same physical SerDes lane on the RK3568 can be configured as PCIe, SATA, or USB 3.0 depending on the board design. The RK3568B variant adds higher-temperature operation (industrial -40 to +85 C) for embedded products.
+
+## Boards that use these parts
+
+| Board | SoC | Memory | Storage | Notable details |
+|-------|-----|--------|---------|------------------|
+| Radxa ROCK 3A | RK3568 | up to 8 GB LPDDR4 | M.2 NVMe + eMMC | Compact, mainline-friendly, dual GbE |
+| Radxa ROCK 3B | RK3568 | up to 8 GB LPDDR4 | M.2 + eMMC + microSD | Larger form factor, more GPIO |
+| Banana Pi BPI-M2S | RK3568 | 4 GB LPDDR4 | eMMC + microSD | Compact, Raspberry Pi 3 form factor |
+| Banana Pi BPI-R2 Pro | RK3568 | 2 GB DDR4 | eMMC + SATA | Router-focused, 5× GbE via switch |
+| Hardkernel Odroid M1 | RK3568B | up to 8 GB LPDDR4 | M.2 NVMe + eMMC + SATA | NAS-focused, industrial temp variant |
+| FriendlyElec NanoPi R5S | RK3568 | 4 GB LPDDR4 | eMMC + microSD | Triple-GbE router platform |
+| Pine64 Quartz64 Model A | RK3566 | up to 8 GB LPDDR4 | M.2 NVMe + eMMC + microSD | Mainline-first, community board |
+| Radxa CM3 | RK3566 | 8 GB LPDDR4 | eMMC | Compute module, Raspberry Pi CM4 footprint |
+
+The Odroid M1 and Radxa ROCK 3A are the most common choices for NAS and home-server use cases because of the SATA and PCIe support. The NanoPi R5S is a popular target for OpenWrt-based routers because of its three GbE ports.
+
+## Real-world use cases
+
+The RK3566 and RK3568 cover roughly the same workload tier as the Raspberry Pi 4 — Linux-class application processing, light edge inference, GPU-accelerated UI rendering — at meaningfully lower cost on the SoC level. Common deployments:
+
+- **Home NAS** — Odroid M1 with two SATA SSDs and OpenMediaVault or Unraid.
+- **OpenWrt router and edge firewall** — NanoPi R5S with three GbE ports.
+- **IoT gateway** — RK3568 with Modbus over RS-485, MQTT bridge to AWS or Azure.
+- **Digital signage** — RK3568 with 4K HDMI output and CMS client.
+- **Light edge inference** — RK3568 with RKNN running MobileNet or YOLOv5n.
+- **Industrial HMI** — Odroid M1 industrial variant with Qt-based UI.
+
+## Mainline kernel support
+
+The RK3566 and RK3568 are the best-supported Rockchip parts in mainline Linux. By kernel 6.6 essentially all peripherals work upstream:
+
+- CPU, cache, PSCI — full
+- GPU — Panfrost driver works for Mali-G52, with reasonable performance
+- Display — DRM/KMS support for MIPI-DSI, HDMI, eDP, LVDS
+- Camera — partial; MIPI-CSI and ISP support landing piece by piece
+- USB, SDIO, eMMC, NAND — full
+- PCIe — full
+- Ethernet — full
+- SATA — full
+- NPU — none mainline; vendor RKNN runtime only
+
+For most NAS, router, and gateway use cases, mainline kernel 6.6 or later is sufficient. For products that need NPU inference, the vendor 5.10 kernel is the practical choice.
+
+## Device-tree snippet — enabling PCIe and SATA
+
+The RK3568's SerDes lanes are multiplexed. To enable PCIe Gen3 ×2 on a Radxa ROCK 3A carrier, the device tree needs to assert the right combo PHY mode and bring the PCIe controller up. A minimal overlay:
+
+```c
+&combphy0_us {
+    status = "okay";
+};
+
+&pcie3x2 {
+    status = "okay";
+    reset-gpios = <&gpio2 RK_PD6 GPIO_ACTIVE_HIGH>;
+    vpcie3v3-supply = <&vcc3v3_pcie>;
+    num-lanes = <2>;
+    pinctrl-names = "default";
+    pinctrl-0 = <&pcie30x2m1_pins>;
+};
+
+&pcie3x2_phy {
+    status = "okay";
+    rockchip,pcie30-phymode = <PHY_MODE_PCIE_AGGREGATION>;
+};
+
+&sata2 {
+    status = "okay";
+    phys = <&combphy2_psu PHY_TYPE_SATA>;
+    phy-names = "sata-phy";
+};
+```
+
+The `PHY_MODE_PCIE_AGGREGATION` setting on the PCIe PHY combines two ×1 lanes into a single ×2 link. To run as PCIe ×1 plus SATA ×1, set `PHY_MODE_PCIE_NANBNB` instead.
+
+## Software stack
+
+| Layer | Common choices |
+|-------|----------------|
+| Bootloader | rkbin signed loader + U-Boot (vendor or mainline) |
+| Kernel | Mainline 6.6+ for most use cases; vendor 5.10 for NPU |
+| Distribution | Armbian, Debian, Ubuntu, DietPi, OpenMediaVault, OpenWrt |
+| Init system | systemd (Armbian/Debian/Ubuntu) or procd (OpenWrt) |
+| GPU userspace | Panfrost (mainline) or Mali blob (vendor) |
+| Video decode | rkmpp via GStreamer (vendor) or v4l2_request (mainline) |
+| ML inference | RKNN Toolkit (vendor, INT8) or TFLite/ONNX Runtime on CPU |
+| Container runtime | Docker, podman — all work cleanly on Armbian |
+
+For a NAS application, Armbian + OpenMediaVault is a common stack. For an industrial gateway, Debian Bookworm with a custom application service over systemd. For a router, OpenWrt is the natural fit.
+
+```bash
+# Quick path: download Armbian image for Odroid M1 and write to microSD
+wget https://redirect.armbian.com/region/EU/odroidm1/Bookworm_current_minimal
+xz -d Armbian_*_Odroidm1_bookworm_current_*.img.xz
+sudo dd if=Armbian_*.img of=/dev/sdX bs=4M status=progress conv=fsync
+sudo sync
+
+# Boot, then:
+sudo armbian-config   # configure network, hostname, locale
+sudo apt update && sudo apt install openmediavault   # turn it into a NAS
+```
+
+<Callout type="note" title="Mainline kernel covers most needs">
+For RK3568 deployments that do not need NPU inference, the mainline kernel via Armbian is the recommended path. The vendor BSP kernel is only required for products that depend on RKNN-accelerated inference or on hardware video encode beyond what mainline currently supports. This is the opposite of the RK3588 situation, where the vendor BSP is still required for most production workloads.
+</Callout>
+
+## Comparison with the alternatives
+
+| Attribute | Rockchip RK3568 | MediaTek Genio 510 | NXP i.MX 8M Mini |
+|-----------|-----------------|---------------------|-------------------|
+| CPU | 4× A55 @ 2.0 GHz | 4× A55 @ 2.0 GHz | 4× A53 @ 1.8 GHz |
+| GPU | Mali-G52 EE | Mali-G57 MC2 | GC NanoUltra 3D |
+| NPU | 0.8 TOPS | 3 TOPS APU | none on-chip |
+| Process | SMIC 22 nm | TSMC 6 nm | TSMC 14 nm |
+| Memory | LPDDR4 / DDR4 up to 8 GB | LPDDR4X up to 8 GB | LPDDR4 up to 4 GB |
+| Ethernet | dual GbE | single GbE | single GbE |
+| PCIe | Gen3 ×2 + Gen2 ×1 | Gen2 ×2 | Gen2 ×1 |
+| Longevity commitment | informal | informal | 15-year industrial |
+| Typical board price | USD 50-100 | USD 70-130 | USD 100-200 |
+| Mainline kernel | very strong | partial | strong |
+
+The RK3568's strengths are price, ethernet capacity, and mainline kernel support. The Genio 510 wins on NPU performance and fab process. The i.MX 8M Mini wins on industrial longevity and the NXP support ecosystem. For hobby and prosumer products, RK3568 is usually the right call. For long-lived industrial deployments, i.MX 8M Mini remains the safer choice.
+
+<Callout type="warn" title="No formal longevity commitment">
+Rockchip does not publish multi-year availability guarantees the way NXP or TI do for their industrial parts. RK3568 has been broadly available since 2021 and remains in volume production, but for a 10-year industrial design plan validate the lifecycle status through your distributor and ideally negotiate a last-time-buy agreement. The same caveat applies to the Mali-G52 GPU userspace blob.
+</Callout>
+
+## Cross-references
+
+- [Rockchip landing](/docs/vendors/rockchip) — vendor overview.
+- [Rockchip RK3588](/docs/vendors/rockchip-rk3588) — flagship Rockchip with bigger CPU and NPU.
+- [MediaTek Genio 510](/docs/vendors/mediatek-genio) — direct competitor with stronger NPU.
+- [NXP i.MX](/docs/vendors/nxp) — industrial-grade alternative.
+- [Cortex-A55](/docs/cortex-a/a55) — core architecture details.
+- [rockchip.com.cn RK3568 product page](https://www.rock-chips.com/a/en/products/RK35_Series/2021/0427/1392.html) (external).
+- [Radxa ROCK 3A documentation](https://wiki.radxa.com/Rock3) (external).
+- [Hardkernel Odroid M1](https://www.hardkernel.com/shop/odroid-m1-with-4gbyte-ram/) (external).
+- [Armbian for Rockchip](https://www.armbian.com/download/?tx_maker=rockchip) (external).

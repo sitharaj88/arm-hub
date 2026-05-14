@@ -1,0 +1,183 @@
+---
+title: Artery AT32M — motor control on Cortex-M4
+description: AT32MC family — dedicated BLDC, PMSM, stepper, and SRM motor-drive MCUs with high-resolution timers, complementary PWM, dead-time generators, overcurrent comparators, and FOC reference firmware.
+order: 26
+updated: 2026-05-13
+tags: [vendors, artery, at32, at32m, motor-control, foc, bldc, pmsm]
+---
+
+The AT32M sub-line is Artery's pitch for motor control: Cortex-M4F MCUs purpose-built for variable-speed drives of brushless DC (BLDC), permanent magnet synchronous (PMSM), stepper, and switched reluctance (SRM) motors. The line takes the same M4F core and standard peripheral set as the mainstream AT32F4 line and layers on the peripherals that motor designers actually use: a high-resolution timer with sub-nanosecond duty-cycle resolution, advanced-control timers with complementary outputs and programmable dead-time, dedicated analog comparators for over-current trip, sigma-delta ADC inputs for isolated current sensing, and a programmable peripheral matrix that lets the motor designer wire timer events directly to ADC sample triggers without going through software. The combination targets the same workloads as STMicro's STM32G4 — at a substantial price discount for high-volume consumer and industrial drive applications.
+
+This page covers the AT32MC variants, the motor-specific hardware blocks, the reference FOC library, and the use cases where the AT32M wins designs.
+
+<SpecSheet
+  title="AT32MC at a glance"
+  specs={[
+    { label: 'Core', value: 'Cortex-M4F at 168 MHz to 240 MHz, single-precision FPU, Cortex-M4 DSP extensions (SMLAD, SMUAD, etc.)' },
+    { label: 'Flash / SRAM', value: '128 KB to 1 MB flash, 64 KB to 192 KB SRAM with separate CCM-style fast SRAM for motor control variables' },
+    { label: 'PWM resolution', value: '184 ps high-resolution timer (HRTIM-equivalent) on top-end parts; 6.9 ns standard TIM1/TIM8 at 144 MHz' },
+    { label: 'Motor timers', value: 'TIM1 / TIM8 advanced control with 4 channels + 4 complementary outputs, programmable dead-time, hardware brake input' },
+    { label: 'Analog', value: '4 to 6 dedicated overcurrent comparators, 2 to 4 fast 12-bit ADCs at 5 Msps each, optional sigma-delta for shunt sensing' },
+    { label: 'Hardware accelerators', value: 'CORDIC-equivalent trig unit, FIR/IIR filter accelerator, fast divider — all aimed at FOC tightening' },
+    { label: 'FOC library', value: 'AT32 Motor Control SDK with Park / Clarke / observer / current loop / speed loop reference' },
+    { label: 'Safety', value: 'Hardware brake on overcurrent (< 60 ns reaction), gate-driver fault input, watchdog with windowed mode' },
+  ]}
+/>
+
+## Why a dedicated motor-control MCU
+
+Motor control puts unusual demands on an MCU compared with general-purpose embedded:
+
+- The PWM modulator needs to update three phase duty cycles simultaneously and atomically — a half-update produces shoot-through and burns the gate driver.
+- Current measurement (single-shunt, dual-shunt, or three-shunt) must be sampled at a precise point inside the PWM cycle, typically aligned to the centre of the bottom switch on-time.
+- The control loop runs at the PWM rate (commonly 10-20 kHz for low-voltage BLDC, 50-100 kHz for high-voltage variable-frequency drives) and must complete inside one PWM period.
+- Overcurrent or stall must be detected and the drive must be shut off in tens of nanoseconds, not microseconds, to avoid IGBT or MOSFET destruction.
+
+A general-purpose MCU can do this with software, but barely. The AT32M (like the STM32G4 it competes against) builds dedicated hardware for each of these. The advanced-control timer fires the ADC sample at the right moment without CPU involvement; the comparator triggers a hardware brake without an interrupt; the CORDIC computes sin/cos for the Park transform in 40 cycles instead of 400.
+
+## Product variants
+
+The AT32MC family is narrower than the AT32F4 mainstream, with the focus on the parts useful for variable-speed drives.
+
+| Part | Clock | Flash | SRAM | PWM resolution | ADC | Comparators | Target motors |
+|------|-------|-------|------|----------------|-----|-------------|---------------|
+| AT32MC415CB | 168 MHz | 128 KB | 32 KB | 6.0 ns | 2 x 12-bit | 4 | BLDC / PMSM low-volt |
+| AT32MC415RG | 168 MHz | 1 MB | 192 KB | 6.0 ns | 2 x 12-bit | 4 | High-voltage drives |
+| AT32MC403VG | 240 MHz | 1 MB | 224 KB | 4.2 ns | 3 x 12-bit | 6 | Multi-axis servo |
+| AT32MC421RT | 144 MHz | 64 KB | 16 KB | 7.0 ns | 1 x 12-bit | 4 | Compressor, fan, pump |
+| AT32MC437VG | 288 MHz | 1 MB | 384 KB | **184 ps** (HRTIM) | 3 x 12-bit | 6 | High-resolution SMPS + drive |
+
+The "MC" suffix on the part number indicates the motor-control variant; the same package and pinout as the equivalent AT32F4 part, but with the motor-specific peripherals enabled and the standard peripherals (USB, Ethernet) often disabled or reduced in count to free die area.
+
+## The high-resolution timer
+
+Top-end AT32MC variants have a 184 ps resolution timer block — the same resolution as the STM32G4's HRTIM. The use case is digital power and high-frequency motor drive: when the switching frequency is 500 kHz, one duty-cycle bit on a standard 7 ns timer is 0.35% of the period, which is coarse enough to introduce audible noise and regulation error. The 184 ps timer brings that to 0.0092% of the period, fine enough to regulate an LLC half-bridge or a totem-pole PFC without dither.
+
+Programming the high-res timer is more complex than a standard TIM block — it has slave-master synchronisation, multiple comparator events per period, and burst-mode features for power-saving. Artery's reference library wraps the common configurations (centre-aligned 3-phase PWM with dead-time, slope compensation for SMPS, phase-shifted full-bridge) so most designers do not touch the registers directly.
+
+## Comparators and hardware brake
+
+Four to six independent analog comparators sit alongside the timer block. Each comparator has:
+
+- Two inputs (one internal, one pin), each routable from any GPIO or from an internal DAC.
+- Programmable hysteresis (10 to 70 mV in four steps).
+- Output routable directly to TIM1 / TIM8's brake input via the peripheral matrix.
+
+The brake path from comparator to PWM output disable is fully hardware — measured propagation delay is under 60 ns from input crossing to all PWM outputs forced to a safe state. This is fast enough to protect the IGBT from a short-circuit current overshoot before the device's safe operating area (SOA) limit is reached. STM32G4 has the same path with similar latency; AT32M matches the spec.
+
+The comparator is the standard implementation for "sensorless single-shunt FOC with overcurrent protection". One shunt resistor in the DC bus return; the differential voltage across the shunt is amplified by an op-amp (internal or external), the amplified signal feeds both an ADC (for current measurement) and a comparator (for overcurrent trip). The comparator threshold is set ~20% above the maximum operating current; if exceeded, the PWM outputs are disabled in hardware.
+
+## The peripheral matrix
+
+The AT32M peripheral matrix is the equivalent of GigaDevice's "programmable peripheral interconnect" or Nordic's PPI. It lets a peripheral event trigger another peripheral's task without CPU intervention. The motor-control use cases:
+
+- TIM1 update event triggers ADC1 conversion start — sampling current at the centre of the PWM cycle.
+- ADC1 end-of-conversion triggers DMA transfer to SRAM — current samples land in memory.
+- DMA transfer-complete triggers the FOC ISR via a software-generated event — the control loop runs once samples are ready.
+- Comparator overcurrent triggers TIM1 break — all PWM outputs forced low in hardware.
+
+Wiring all four chains in the matrix configuration removes 400-600 ns of ISR overhead per cycle, which is the difference between a 20 kHz and a 25 kHz control loop on the same MCU.
+
+## The FOC reference library
+
+Artery publishes a Motor Control SDK (MC-SDK) under a permissive license — the components:
+
+- **Park and Clarke transforms** — the abc-to-dq and dq-to-abc conversions, hand-tuned assembly using the M4F DSP instructions (single-cycle MAC).
+- **Current observer** — sensorless flux observer with SMO (sliding-mode observer) or Luenberger options.
+- **Current loop** — PI controllers in d and q axes, anti-windup, gain scheduling.
+- **Speed loop** — outer-loop PI, ramp limiting, field-weakening above base speed.
+- **Space-vector PWM modulator** — third-harmonic injection for 15% higher voltage utilisation.
+- **Pre-tuned templates** for common motors — 24V drone ESC, 48V e-bike hub motor, 230V AC compressor.
+
+The library is structured so the application provides the motor parameters (Rs, Ld, Lq, pole pairs, flux linkage) and the control gains; the rest is reference. A working FOC drive comes up in roughly a week of bring-up time from scratch.
+
+```c
+// FOC current-loop tick on AT32MC403 — runs inside the TIM1 update ISR
+static foc_state_t foc;
+
+void TIM1_UP_IRQHandler(void) {
+    tim_flag_clear(TIM1, TIM_FLAG_UPDATE);
+
+    // Read 3-phase currents from ADC (set up via the peripheral matrix)
+    float ia = adc_to_amps(ADC1->ORDINARY_DT);
+    float ib = adc_to_amps(ADC2->ORDINARY_DT);
+    float ic = -(ia + ib);                            // Kirchhoff
+
+    // Clarke + Park
+    float ialpha, ibeta;
+    foc_clarke(ia, ib, ic, &ialpha, &ibeta);
+    foc_park(ialpha, ibeta, foc.theta_e, &foc.id, &foc.iq);
+
+    // PI on d, q
+    foc.vd = pi_step(&foc.pi_d, foc.id_ref - foc.id);
+    foc.vq = pi_step(&foc.pi_q, foc.iq_ref - foc.iq);
+
+    // Inverse Park + SVPWM
+    float valpha, vbeta;
+    foc_park_inv(foc.vd, foc.vq, foc.theta_e, &valpha, &vbeta);
+    foc_svpwm(valpha, vbeta, &foc.duty_a, &foc.duty_b, &foc.duty_c);
+
+    // Update PWM compare registers atomically
+    TIM1->C1DT = (uint16_t)(foc.duty_a * TIM1->PR);
+    TIM1->C2DT = (uint16_t)(foc.duty_b * TIM1->PR);
+    TIM1->C3DT = (uint16_t)(foc.duty_c * TIM1->PR);
+}
+```
+
+On the AT32MC403 at 240 MHz the entire ISR runs in roughly 4.5 µs, leaving 95% of the 100 µs PWM period free for the speed loop, communication, and supervision.
+
+## Comparison with STM32G4
+
+The STM32G4 is the obvious reference. A side-by-side on a typical mid-volume drive design:
+
+| Feature | AT32MC403 | STM32G474 | Note |
+|---------|-----------|-----------|------|
+| Core | M4F @ 240 MHz | M4F @ 170 MHz | AT32M is faster |
+| Flash | 1 MB | 512 KB | AT32M larger |
+| HRTIM resolution | 184 ps (top variants) | 184 ps | Tied |
+| Standard timer res | 4.2 ns | 5.9 ns | AT32M finer |
+| Op-amps | 4 | 6 | STM32G4 has more |
+| DAC channels | 4 | 7 | STM32G4 has more |
+| Comparators | 6 | 4 | AT32M has more |
+| CORDIC | Yes (top variants) | Yes | Tied |
+| Cost (1k qty) | ~$3.50 | ~$5.00 | AT32M ~30% lower |
+| Tooling maturity | New | Mature | STM32G4 wins on docs / community |
+
+The AT32M wins on clock, flash, comparator count, and cost. STM32G4 wins on op-amp count (important for differential current sensing without external amplifiers), DAC, ecosystem maturity, and the X-CUBE-MCSDK reference firmware that has more example motors.
+
+## Target use cases
+
+The AT32M is in volume production in:
+
+- **Drone ESC** — 24-48V BLDC, 30-120A, 20-50 kHz PWM. The fast comparators and 4 ns timer resolution let the ESC switch at high frequency without dead-time penalty.
+- **E-bike controllers** — 48-72V PMSM hub motors, 25-50A, sensorless FOC. Mid-volume Chinese e-bike market is a major user.
+- **White-goods compressor** — variable-frequency drive for AC compressors and refrigerator inverters. Audible-noise-sensitive applications benefit from the HRTIM resolution.
+- **Robotic joint servos** — multi-axis low-voltage PMSM with encoder feedback, EtherCAT or CAN-FD network. AT32MC403's 240 MHz plus CAN-FD on the F437 variant covers this slot.
+- **3D-printer steppers** — high-microstepping stepper drives, where the standard TIM resolution is enough but the cost matters.
+
+<Callout type="warn" title="Hardware brake testing is non-negotiable">
+The comparator-driven hardware brake is the safety mechanism that prevents IGBT destruction. It must be tested on every board revision with a known short-circuit fault, and the trip threshold must be calibrated against the actual shunt voltage at the protection current with the production op-amp. Simulating the fault in software-loop ("write 1 to ADC threshold compare") does not exercise the real path. Use a transistor switched across the motor terminals on the bench and confirm with an oscilloscope that the PWM outputs disable within 100 ns.
+</Callout>
+
+<Callout type="tip" title="Use single-shunt for cost, three-shunt for performance">
+Single-shunt FOC needs one current sensor and one comparator — cheapest BOM. The penalty is observable distortion below 10% duty cycle because the sample window is too narrow. Three-shunt FOC needs three sensors and three op-amps but works across the full operating range without low-modulation-index distortion. Pick single-shunt for fans, pumps, and compressors where low-speed performance is unimportant; pick three-shunt for servos, e-bikes, and ESCs.
+</Callout>
+
+## Cross-references
+
+- [Artery AT32 landing](/docs/vendors/artery) — company and portfolio.
+- [Artery AT32F4 mainstream](/docs/vendors/artery-at32f4) — sibling mainstream line.
+- [STM32 mainstream G series](/docs/vendors/stm32-mainstream) — the STM32G4 reference.
+- [Cortex-M4](/docs/cortex-m/m4) — core architecture and DSP instructions.
+- [DMA](/docs/peripherals/dma) — motor-control DMA chains.
+- [Advanced timers](/docs/peripherals/timers-advanced) — advanced-control timer peripheral details.
+- [CAN-FD](/docs/peripherals/can-fd) — drive network protocol.
+
+## External links
+
+- [AT32MC product page](https://www.arterychip.com/en/product/AT32_MC.jsp)
+- [AT32 Motor Control SDK](https://github.com/ArteryTek/AT32_Motor_Control)
+- [AT32MC reference design — drone ESC](https://www.arterychip.com/en/support/AT32MC_ESC.jsp)
+- [AT32MC reference design — e-bike controller](https://www.arterychip.com/en/support/AT32MC_Ebike.jsp)
+- [Artery FOC application note AN0095](https://www.arterychip.com/file/download/AT32_FOC_AN0095.pdf)
+- [Texas Instruments InstaSPIN FOC overview](https://www.ti.com/tool/INSTASPINFOC) (background reading on motor control concepts)

@@ -1,0 +1,149 @@
+---
+title: GigaDevice GD32
+description: Beijing-based MCU vendor shipping Cortex-M0+/M3/M4/M7/M23/M33/R52 parts as pin-and-register-compatible STM32 alternatives with their own peripheral IP and aggressive pricing.
+order: 20
+updated: 2026-05-13
+tags: [vendors, gigadevice, gd32, stm32-compat]
+---
+
+GigaDevice Semiconductor (兆易创新) sits at an unusual intersection of the MCU market: an Arm licensee that builds its own peripheral IP, packages it into chips that are footprint-compatible with STMicroelectronics' STM32 catalogue, and sells them at a 20-40% discount with a faster lead time. The company is best known outside China for its serial NOR flash business — the GD25 family is in roughly every other consumer device — but inside China the GD32 MCU portfolio has become the default 32-bit choice for cost-sensitive industrial, white-goods, and consumer designs. The company has shipped well over a billion GD32 units since the line launched in 2013.
+
+<SpecSheet
+  title="GigaDevice at a glance"
+  specs={[
+    { label: 'Founded', value: '2005, Beijing, China' },
+    { label: 'IPO', value: 'Shanghai Stock Exchange (688981), August 2016' },
+    { label: 'Arm IP licensed', value: 'Cortex-M3, M4, M7, M23, M33, M0+ (M0+ in GD32E230 entry parts), Cortex-R52' },
+    { label: 'Flagship parts', value: 'GD32F470 (M4F, 240 MHz), GD32F4xx Ethernet, GD32F7xx (M7 200 MHz), GD32W515 (Wi-Fi + BLE)' },
+    { label: 'Process node', value: '110 nm for F1/F3, 55 nm for F4/F7/W5, mostly TSMC; newer parts on TSMC 40 nm ULP' },
+    { label: 'IDE / SDK', value: 'GD32 Embedded Builder (Eclipse), Keil MDK pack, IAR EWARM pack, Segger SES, full GCC + OpenOCD support' },
+    { label: 'Programming tools', value: 'GD-Link (CMSIS-DAP), J-Link, ST-Link with patched FW, ROM USART/USB-DFU bootloader' },
+    { label: 'Website', value: 'gd32mcu.com (English), gigadevice.com (corporate), github.com/GigaDevice-MCU' },
+  ]}
+/>
+
+## Company and positioning
+
+GigaDevice was founded in 2005 by Shu Qingming and Cheng Taiyi, both alumni of Spansion / Cypress. The original business was specialty memory — SPI NOR flash, then NAND, then DRAM. The MCU line started in 2013 with the GD32F103, an unmistakable clone of the STM32F103: same QFP-48 / QFP-64 / QFP-100 pinout, same peripheral register addresses, the same internal flash organisation. The 2013 part swapped the 90 nm STM32F103 process for 55 nm, which let GigaDevice push the clock from 72 MHz to 108 MHz on identical silicon area, and added a built-in serial flash controller because flash is what the company actually builds.
+
+That formula — match the STM32 pinout and register map, swap the process, add one or two peripherals the STM32 part doesn't have, undercut the price — has produced ten generations of mainstream MCUs. The pitch is straightforward: take your existing STM32F103 firmware, change the device header, recompile, and the board works. In practice the migration is usually that simple for legacy parts, with caveats around USB enumeration, ADC sample timing, and clock-tree differences that this site documents on each family page.
+
+The Cortex-R52 line (GD32R) marks a departure: a real-time multicore safety-island processor aimed at functional-safety automotive and industrial drives, not STM32-compatible at all.
+
+## Product family map
+
+| Family | Core | Clock | Flash | Position |
+|--------|------|-------|-------|----------|
+| **GD32F1** | Cortex-M3 | 108 MHz | 16 KB..1 MB | STM32F1-compatible, the original line |
+| **GD32F3** | Cortex-M4F | 168 MHz | 32 KB..3 MB | STM32F3/F4-class general-purpose |
+| **GD32F4** | Cortex-M4F | 240 MHz | up to 3 MB | High-end M4, Ethernet, CAN-FD, FMC SDRAM |
+| **GD32F7** | Cortex-M7 | 200 MHz | up to 3 MB | L1 cache, TCM, STM32F7-compatible |
+| **GD32H7** | Cortex-M7 | 600 MHz | up to 4 MB | Newest H-class flagship (announced 2024) |
+| **GD32E** | Cortex-M4F or M23 | 108..180 MHz | up to 512 KB | Entry / efficient — E230 (M23), E50x (M4) |
+| **GD32L** | Cortex-M23 | 64 MHz | up to 256 KB | Low-power, TrustZone-M, sub-µA stop |
+| **GD32W** | Cortex-M33 | 180 MHz | up to 2 MB + ext | Wi-Fi + BLE wireless MCU |
+| **GD32A** | Cortex-M33 | 200 MHz | up to 1 MB | Automotive AEC-Q100, CAN-FD |
+| **GD32C** | Cortex-M4F | 108 MHz | up to 128 KB | Cost-optimised mainstream |
+| **GD32R** | Cortex-R52 | 400 MHz | external | Real-time safety MCU, lockstep |
+
+The mainstream volume is in GD32F1, GD32F3, GD32F4, GD32E50x — those four cover the majority of design wins.
+
+<BlockDiagram title="GD32 portfolio positioning" width={820} height={340} nodes={[
+  { id: 'f1',  x: 30,  y: 30,  w: 240, h: 80, kind: 'core',    label: 'GD32F1 (M3)', detail: '108 MHz · STM32F1-pin-compat · legacy mainstream' },
+  { id: 'f3',  x: 290, y: 30,  w: 240, h: 80, kind: 'core',    label: 'GD32F3 / F4 (M4F)', detail: '168-240 MHz · FPU · ETH · CAN-FD' },
+  { id: 'f7',  x: 550, y: 30,  w: 240, h: 80, kind: 'core',    label: 'GD32F7 / H7 (M7)', detail: '200-600 MHz · L1 cache · TCM · graphics' },
+  { id: 'l',   x: 30,  y: 130, w: 240, h: 80, kind: 'power',   label: 'GD32L23 / L235 (M23)', detail: '64 MHz · TrustZone · LPUART · sub-µA stop' },
+  { id: 'w',   x: 290, y: 130, w: 240, h: 80, kind: 'radio',   label: 'GD32W51 (M33)', detail: 'Wi-Fi 4 + BLE 5.x · TrustZone-M · 180 MHz' },
+  { id: 'a',   x: 550, y: 130, w: 240, h: 80, kind: 'security',label: 'GD32A50x (M33)', detail: 'AEC-Q100 · 200 MHz · CAN-FD · gateway / body ECU' },
+  { id: 'e',   x: 30,  y: 230, w: 240, h: 80, kind: 'memory',  label: 'GD32E230 / E50x', detail: 'Entry M23 or efficient M4 — mid catalogue fill' },
+  { id: 'c',   x: 290, y: 230, w: 240, h: 80, kind: 'memory',  label: 'GD32C10x (M4F)', detail: 'Cost-optimised M4 · TSSOP / QFN small package' },
+  { id: 'r',   x: 550, y: 230, w: 240, h: 80, kind: 'core',    label: 'GD32R5 (Cortex-R52)', detail: '400 MHz lockstep · ASIL-B/D · drive / safety MCU' },
+]} caption="Mainstream volume is in F1/F3/F4 and E50x. The L, W, A, and R lines are newer specialised verticals that each compete against a specific STM32 sub-family (L4/U5, WB/WL, A-series, and there is no direct STM32 analogue for R52)." />
+
+## The STM32-compatibility trick
+
+The compatibility story is the headline feature, and the level of compatibility varies by family. Three useful tiers:
+
+- **Drop-in compatible** — same package, same pinout, same peripheral base addresses, identical register layouts, identical bootloader. Most of GD32F1 → STM32F1 swaps fall here, as do many GD32F3 → STM32F4 swaps. Recompile against the GD32 device header and the firmware boots.
+- **Source-compatible** — same peripheral semantics but different register addresses or bit layouts. The HAL or LL drivers diverge, but porting against the GigaDevice firmware library is mechanical. Most GD32F4 → STM32F4 falls here for advanced peripherals.
+- **Incompatible** — same core, different IP block. USB OTG is the most common gotcha (GD32 uses its own USB controller, not Synopsys DWC2), as is the Ethernet MAC on some variants and the entire RCC (Reset & Clock Control) on the GD32H7.
+
+| Compatibility area | F1/F3 vs STM32 | F4/F7 vs STM32 | H7/W5/L23 vs STM32 |
+|--------------------|----------------|----------------|--------------------|
+| Pinout / package   | Identical      | Identical      | Different |
+| GPIO / AFIO        | Identical      | Identical      | Similar |
+| USART / UART       | Identical      | Identical      | Similar |
+| SPI / I2C          | Identical      | Identical      | Similar |
+| ADC                | Same registers, **different sample timing** | Same registers, different timing | Different controller |
+| Timers (advanced)  | Identical      | Identical      | Similar |
+| DMA streams        | Identical layout, **different request map** | Different request map | Different |
+| USB device         | **Different IP** — own controller | Different IP | OTG-FS Synopsys on F4-class |
+| Ethernet MAC       | n/a            | Similar to STM32F4 ETH | Different |
+| RCC / clock tree   | Similar PLL, **different multipliers** | Different PLL multipliers | Different |
+
+<Callout type="warn" title="Clock-tree migration is the #1 silent porting bug">
+GD32F103 has a maximum HCLK of 108 MHz vs STM32F103's 72 MHz. The PLL multiplier ranges differ, and some clocks (FLITF wait states, USB clock divider) need explicit reconfiguration. Compiled-and-running STM32 firmware will boot on a GD32 with the wrong system clock — often half the intended frequency — and then strange peripheral timing bugs follow. Always re-derive the clock tree against the GD32 reference manual before declaring a port complete.
+</Callout>
+
+## Software ecosystem
+
+The GD32 firmware library mirrors the structure of the STM32 Standard Peripheral Library (the pre-HAL ST library): `gd32f4xx_gpio.c`, `gd32f4xx_usart.c`, and so on. The function names are similar (`gpio_init`, `usart_enable`) but not identical to STM32 HAL — straightforward to port from the legacy STM32 SPL, more work from STM32 HAL.
+
+GigaDevice also publishes:
+
+- **GD32 Embedded Builder** — Eclipse CDT based IDE, free, bundles GCC and OpenOCD with a GD-Link debug probe driver.
+- **Keil MDK device family pack** (DFP) and **IAR EWARM device packs** — official, free downloads, full register browser support.
+- **Segger Embedded Studio** — Nordic-style support, free for non-commercial use.
+- **CMSIS-DAP compatible GD-Link** — under $10 hardware probe; pyOCD and OpenOCD work.
+
+The community ecosystem is smaller than STM32's but real. PlatformIO has board definitions for the popular GD32F103, GD32F303, GD32F407, GD32F450, and the W515 chips. Zephyr added GD32 support in version 3.3 (covers GD32F4 and GD32F3 with growing peripheral coverage). Rust embedded-hal crates exist for GD32F1 and GD32F3.
+
+```c
+// GD32F4 GPIO blink — note the gigadevice firmware library style
+#include "gd32f4xx.h"
+
+int main(void) {
+    rcu_periph_clock_enable(RCU_GPIOA);
+
+    gpio_mode_set(GPIOA, GPIO_MODE_OUTPUT, GPIO_PUPD_NONE, GPIO_PIN_5);
+    gpio_output_options_set(GPIOA, GPIO_OTYPE_PP, GPIO_OSPEED_50MHZ, GPIO_PIN_5);
+
+    while (1) {
+        gpio_bit_toggle(GPIOA, GPIO_PIN_5);
+        for (volatile uint32_t i = 0; i < 1000000; i++);
+    }
+}
+```
+
+The same code on STM32 LL would be `LL_GPIO_TogglePin(GPIOA, LL_GPIO_PIN_5)`. Semantically identical, syntactically different — a sed script handles 90% of a port.
+
+## Manufacturing, supply, and the global story
+
+GigaDevice fabs at TSMC for most modern parts (55 nm and 40 nm) and at SMIC for legacy 110 nm parts. Packaging is mostly done in mainland China through subcontractors. The 2021-2022 STM32 shortages — when STM32F1 lead times stretched to 50+ weeks — were the single biggest boost to the GD32 line. Procurement engineers who had never considered a second source flipped boards to GD32F103 in a quarter; many never went back.
+
+Distribution outside China runs through Mouser, Digi-Key, LCSC (the dominant Chinese distributor), and a network of regional reps. Lead times have stabilised around 8-12 weeks for mainstream parts, comparable to or better than ST's.
+
+<Callout type="tip" title="Use ST-Link with GigaDevice silicon">
+A stock ST-Link/V2 will refuse to flash a GD32 because the IDCODE doesn't match. Two options: patch the ST-Link firmware (community patch reads any IDCODE), or use a GD-Link or J-Link probe, both of which support GD32 natively. OpenOCD with the `gd32f4x.cfg` target works on any CMSIS-DAP probe.
+</Callout>
+
+## Cross-references
+
+- [GD32F mainstream (M3/M4/M7)](/docs/vendors/gigadevice-gd32f) — the workhorse families.
+- [GD32L low-power (Cortex-M23)](/docs/vendors/gigadevice-gd32l) — battery-powered IoT line.
+- [GD32W wireless (Cortex-M33)](/docs/vendors/gigadevice-gd32w) — Wi-Fi 4 + BLE 5.x.
+- [Artery AT32](/docs/vendors/artery) — the other major Chinese STM32-alternative vendor.
+- [STM32 mainstream](/docs/vendors/stm32-mainstream) — the family being cloned.
+- [Cortex-M4](/docs/cortex-m/m4) — the core inside most GD32F parts.
+- [Cortex-M7](/docs/cortex-m/m7) — the core inside GD32F7 and GD32H7.
+- [OpenOCD](/docs/tools/openocd) — debugger setup for GD32 targets.
+
+## External links
+
+- [GigaDevice corporate site](https://www.gigadevice.com/)
+- [GD32 MCU product portal (English)](https://www.gd32mcu.com/en/)
+- [GD32 firmware library on GitHub](https://github.com/GigaDevice-MCU)
+- [GD32 product selector](https://www.gd32mcu.com/en/product/select)
+- [GD32 application notes](https://www.gd32mcu.com/en/download/4)
+- [GD32 community forum](https://www.gd32mcu.com/en/forum)
+- [Zephyr GigaDevice HAL](https://github.com/zephyrproject-rtos/hal_gigadevice)

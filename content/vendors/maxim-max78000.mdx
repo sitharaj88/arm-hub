@@ -1,0 +1,139 @@
+---
+title: Maxim MAX78000 and MAX78002 CNN accelerator
+description: Maxim's MAX78000 and MAX78002 — Cortex-M4F microcontrollers with a dedicated convolutional neural network engine. Sub-milliwatt inference for keyword spotting, person detection, and audio classification at the edge.
+order: 24
+updated: 2026-05-13
+tags: [vendors, maxim, analog-devices, max78000, max78002, cnn, tinyml, edge-ai, cortex-m4f]
+---
+
+The MAX78000 is the most interesting microcontroller Maxim has ever released, and under ADI it has matured into a small but real product line. The pitch is simple: a Cortex-M4F with a dedicated CNN accelerator on the same die, sharing memory and power management, running fully quantised 8-bit inference at sub-milliwatt average power. Use cases: always-on keyword spotting, person or object detection from a low-resolution camera, audio scene classification, biometric ML — on battery, no cloud.
+
+This page covers the architecture, the toolchain, the realistic performance envelope, and the comparison against running the same network on a Cortex-M55 with Helium or pairing an MCU with a discrete NPU.
+
+<SpecSheet
+  title="MAX78000 and MAX78002 at a glance"
+  specs={[
+    { label: 'Vendor', value: 'Maxim Integrated, now part of Analog Devices' },
+    { label: 'MAX78000 cores', value: 'Cortex-M4F @ 100 MHz + dedicated CNN accelerator (64 layers, 442 KB weight memory)' },
+    { label: 'MAX78002 cores', value: 'Cortex-M4F @ 120 MHz + RISC-V coprocessor + larger CNN accelerator (2 MB weight memory)' },
+    { label: 'Process node', value: '40 nm CMOS (MAX78000); 22 nm (MAX78002)' },
+    { label: 'Inference power', value: 'Under 1 mW for KWS (keyword spotting); ~30 mW for CIFAR-100; well below 100 mW for face ID' },
+    { label: 'Toolchain', value: 'ai8x-synthesis (Python tool mapping PyTorch / TensorFlow models to MAX78000 ops)' },
+    { label: 'Quantisation', value: 'Fully 8-bit weights and activations; quantisation-aware training required' },
+    { label: 'External links', value: 'analog.com/MAX78000, github.com/MaximIntegratedAI/ai8x-synthesis, ai8x-training' },
+  ]}
+/>
+
+## What the CNN engine actually is
+
+The MAX78000 CNN accelerator is not a generic NPU and is not a tiled tensor engine. It is a fixed-function pipeline of convolutional, pooling, and activation operators arranged into a 64-layer processing graph, with weights stored in 442 KB of on-die SRAM dedicated to the engine. The processor groups layers into "quadrants" — sets that share memory routing — and the synthesis toolchain maps the network onto available quadrants.
+
+The MAX78002 enlarges this: 2 MB of weight memory, more layers, more dataflow routing flexibility, and a RISC-V coprocessor that handles pre and post-processing (image downscale, argmax) without burning Cortex-M4F cycles. The MAX78002 also moves to 22 nm, halving per-operation energy versus the 40 nm MAX78000.
+
+The CNN operates strictly on signed 8-bit integer data. Weights, activations, and intermediate tensors are all 8-bit. No 16-bit floats, no sparse weights, no arbitrary tensor shapes. This is the defining limitation. Networks must be designed or retrained with quantisation in mind — drop-in deployment of a GPU-trained model is not an option.
+
+| Trait                    | MAX78000             | MAX78002                |
+|--------------------------|----------------------|-------------------------|
+| Application core         | Cortex-M4F, 100 MHz  | Cortex-M4F, 120 MHz     |
+| Coprocessor              | None                 | RISC-V (RV32IMC)        |
+| CNN weight memory        | 442 KB               | 2 MB                    |
+| CNN max layers           | 64                   | 128                     |
+| Process                  | 40 nm                | 22 nm                   |
+| Camera input             | 8-bit parallel       | 8-bit + MIPI-CSI        |
+| Microphone input         | I2S, PDM             | I2S, PDM, dual PDM      |
+| Flash / SRAM             | 512 KB / 128 KB      | 2.5 MB / 384 KB         |
+| Released                 | 2020                 | 2023                    |
+
+## The ai8x toolchain
+
+Mapping a PyTorch network onto the MAX78000 is done through the `ai8x-synthesis` toolchain, an open-source Python project at github.com/MaximIntegratedAI/ai8x-synthesis. The flow:
+
+1. **Train using `ai8x-training`** — Maxim's PyTorch fork exposing supported layer types as `nn.Module` subclasses. Write a normal PyTorch script using `Conv2d`, `MaxPool2d`, `Linear`, `ReLU` from the `ai8x` module instead of `torch.nn`. The modules constrain you to 8-bit-quantisable arithmetic and supported kernel sizes.
+2. **Quantise** — quantisation-aware training clips, scales, and rounds weights, biases, and activations to 8-bit. Accuracy typically drops 0.5 to 2 points from the FP baseline.
+3. **Synthesise** — `ai8xize.py` takes quantised weights plus a YAML network description and emits C source for the MAX78000: weight tables, a configuration table, and a `cnn_load_input` / `cnn_start` API.
+4. **Build and flash** — the generated C compiles into a standard MSDK project.
+
+The toolchain is more brittle than TensorFlow Lite Micro or ONNX Runtime. Supported operators are limited to standard and depthwise convolutions, pooling, fully connected, ReLU. Residual connections work but consume routing. Batch norm must be folded. Attention layers do not work. The supported model zoo (KWS, CIFAR-100, face ID, image and audio classification) is what most users actually deploy.
+
+```python
+import ai8x
+import torch.nn as nn
+
+class KWS20Model(nn.Module):
+    def __init__(self, num_classes=21, bias=False, **kwargs):
+        super().__init__()
+        self.conv1 = ai8x.FusedConv1dReLU(128, 100, 1, stride=1, padding=0, bias=bias, **kwargs)
+        self.conv2 = ai8x.FusedConv1dReLU(100, 100, 3, stride=1, padding=0, bias=bias, **kwargs)
+        self.conv3 = ai8x.FusedConv1dReLU(100, 50, 3, stride=1, padding=0, bias=bias, **kwargs)
+        self.conv4 = ai8x.FusedConv1dReLU(50, 16, 3, stride=1, padding=0, bias=bias, **kwargs)
+        self.fc = ai8x.Linear(80, num_classes, bias=True, wide=True, **kwargs)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+```
+
+The KWS20 model is the canonical keyword-spotting example, trained on a 20-keyword subset of Google Speech Commands plus an "unknown" class. End-to-end inference takes around 290 us per 1-second audio frame at 100 MHz, average power well below 1 mW including the microphone front-end.
+
+## Use cases that fit
+
+The MAX78000 sweet spot is workloads that satisfy all three of:
+
+- Inference cadence is multiple times per second but not real-time video.
+- Model size under 442 KB of 8-bit weights (or 2 MB on the MAX78002).
+- Power-constrained: battery, no continuous host connection, lifetime in months on a coin cell.
+
+Concrete production examples:
+
+- **Always-on keyword spotting** — wake-word detection on a 2 mAh-scale battery, waking a larger system on positive detection.
+- **Person / object detection** — 64x64 to 128x128 grayscale or RGB, 1 to 5 fps. Used in security sensors, smart doorbells, occupancy detectors.
+- **Audio scene classification** — speech, music, machinery, glass break, baby cry. Smart-home security and industrial condition monitoring.
+- **Biometric ML on the edge** — face ID or fingerprint matching with templates that never leave the device.
+
+## Realistic performance numbers
+
+Maxim's published benchmarks (verified by independent measurements in several deployment write-ups) for the MAX78000 reference designs:
+
+| Workload                          | Inference latency | Active power | Energy / inference |
+|-----------------------------------|-------------------|--------------|---------------------|
+| KWS 20-class (1-second window)    | 290 us            | 0.4 mW       | 0.12 uJ             |
+| CIFAR-10 / 100 (32 x 32 image)    | 1.8 ms            | 30 mW        | 54 uJ               |
+| Face ID (160 x 120 image)         | 23 ms             | 80 mW        | 1.84 mJ             |
+| Audio scene 8-class               | 380 us            | 1 mW         | 0.38 uJ             |
+
+The energy-per-inference numbers are the differentiated figure. A KWS inference at 0.12 uJ is three orders of magnitude better than running the same network on a Cortex-M4F at 100 MHz without the accelerator, and roughly an order of magnitude better than on a Cortex-M55 with Helium. The gap closes for larger networks and for operators the engine handles inefficiently (notably depthwise convolutions).
+
+## Comparison with the alternatives
+
+| Option                                        | Throughput          | Power              | Flexibility               |
+|-----------------------------------------------|---------------------|--------------------|---------------------------|
+| MAX78000 fixed-function CNN engine            | High for fit-models | Very low           | Limited operator set      |
+| Cortex-M55 + Helium (e.g. STM32H573)          | Lower               | Higher             | Full TFLite-Micro support |
+| MCU + discrete NPU (e.g. STM32U5 + Hailo-8L)  | Highest             | Highest of three   | Full model support        |
+| MCU + larger Cortex-A SoC (Jetson, i.MX 8M)   | Much higher         | Much higher        | Full deep learning        |
+
+The MAX78000 wins when the workload fits its operator constraints. It loses when the workload requires operators it does not support, when the model exceeds its weight memory budget, or when the inference cadence is high enough that the energy per inference becomes irrelevant relative to standby power.
+
+<Callout type="tip">
+For a first MAX78000 design, start from the published face-identification reference design (search "MAX78000FTHR FaceID"). It demonstrates the camera capture path, the CNN-engine handoff, the post-processing on the Cortex-M4F, and the power-management state machine. Modifying that reference to your own network is a smaller step than building the application from a blank project.
+</Callout>
+
+<Callout type="warn">
+Network architectures that look reasonable in PyTorch may fail to synthesise to the CNN engine for non-obvious reasons. The most common failures are unsupported kernel sizes, memory routing conflicts between adjacent layers, and intermediate-activation buffers that exceed the engine's per-layer SRAM allocation. Plan for two to three iteration cycles between model design and successful synthesis. Use the `ai8xize.py` tool's verbose output to understand what is failing.
+</Callout>
+
+## Cross-references
+
+- [Maxim / ADI MAX32 landing page](/docs/vendors/maxim) — broader product context.
+- [MAX32 general-purpose Cortex-M4F](/docs/vendors/maxim-max32) — the mainstream parts.
+- [Cortex-M4](/docs/cortex-m/m4) — the application core in MAX78000.
+- [Cortex-M55 and Helium](/docs/cortex-m/m55) — the competing software-NPU approach.
+- [TinyML and edge inference](/docs/systems/tinyml) — system-level context.
+- ADI product page: analog.com/MAX78000.
+- ai8x-synthesis source: github.com/MaximIntegratedAI/ai8x-synthesis.
+- ai8x-training source: github.com/MaximIntegratedAI/ai8x-training.
+- Published reference: "MAX78000 keyword spotting reference design", ADI tutorial TUT0040.

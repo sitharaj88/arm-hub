@@ -1,0 +1,167 @@
+---
+title: Rockchip RK3588 and RK3588S — flagship Cortex-A76 edge AI SoC
+description: Rockchip RK3588 and RK3588S. Quad Cortex-A76 plus quad Cortex-A55, Mali-G610, 6 TOPS NPU, 8K decode. RKNN Toolkit, Orange Pi 5 Plus, Rock 5B, edge AI use cases.
+order: 23
+updated: 2026-05-13
+tags: [vendors, rockchip, rk3588, cortex-a76, edge-ai, sbc, rknn]
+---
+
+The Rockchip RK3588 is the current flagship Chinese application processor and the reference point for edge AI on a budget. Four Cortex-A76 cores at 2.4 GHz alongside four Cortex-A55 cores at 1.8 GHz, a Mali-G610 MP4 GPU, a 6 TOPS NPU, 8K H.265 decode, dual 2.5-or-1 GbE plus 10 GbE-PHY-friendly SerDes, PCIe Gen3 ×4, dual USB 3.1 Gen 1, and the ability to drive multiple 4K displays from one chip. It is the SoC behind every recent high-end Chinese SBC and a steadily growing fraction of the industrial edge-AI deployment base, where its price-versus-capability point has displaced NXP i.MX 8M Plus and put real pressure on the NVIDIA Jetson Orin Nano. This page covers the silicon details, the RK3588 versus RK3588S split, board landscape, RKNN Toolkit, and the comparison with Jetson Orin.
+
+<SpecSheet
+  title="RK3588 / RK3588S at a glance"
+  specs={[
+    { label: 'CPU big cluster', value: '4× Cortex-A76 @ 2.4 GHz, ARMv8.2-A, NEON, SVE-not-supported, 64 KB L1I + 64 KB L1D per core' },
+    { label: 'CPU little cluster', value: '4× Cortex-A55 @ 1.8 GHz, 32 KB L1I + 32 KB L1D per core' },
+    { label: 'L2 / L3 cache', value: '512 KB L2 per A76 · 128 KB L2 per A55 · 3 MB shared L3' },
+    { label: 'GPU', value: 'Mali-G610 MP4 @ 1 GHz, OpenGL ES 3.2, Vulkan 1.2, OpenCL 2.2' },
+    { label: 'NPU', value: '6 TOPS INT8 across three NPU cores, INT4 / INT8 / FP16 supported, RKNN runtime' },
+    { label: 'Memory', value: 'LPDDR4 / LPDDR4X / LPDDR5 up to 32 GB, 64-bit bus, ~24 GB/s peak bandwidth on LPDDR5' },
+    { label: 'Video decode', value: '8K @ 60 fps H.265 / VP9 / AV1 · 4K @ 60 fps H.264' },
+    { label: 'Video encode', value: '8K @ 30 fps H.265 · 4K @ 60 fps H.264 / H.265' },
+    { label: 'Display', value: 'Up to 4× simultaneous 4K @ 60 outputs (HDMI 2.1 + DP 1.4a + dual MIPI-DSI)' },
+    { label: 'Ethernet', value: 'RK3588: 2× 1 GbE + 1× PCIe-based 2.5/10 GbE option · RK3588S: 1× GbE' },
+    { label: 'PCIe', value: 'RK3588: PCIe Gen3 ×4 + Gen2 ×1 · RK3588S: PCIe Gen2 ×1 only' },
+    { label: 'USB', value: '2× USB 3.1 Gen 1, 2× USB 2.0, dual USB-C with DisplayPort Alt Mode' },
+    { label: 'Process', value: 'Samsung 8 nm LPP' },
+    { label: 'Power', value: '3–12 W typical depending on workload; 15 W peak under stress' },
+    { label: 'Tooling', value: 'Vendor BSP kernel 5.10, RKNN Toolkit 2.x, Mali blob userspace, mainline kernel 6.6+ partial' },
+  ]}
+/>
+
+## The RK3588 versus RK3588S split
+
+Both parts share the same silicon die but differ in package and peripheral exposure.
+
+| Feature | RK3588 | RK3588S |
+|---------|--------|---------|
+| Package | 23 × 23 mm FCBGA-957 | 17 × 17 mm FCBGA-737 |
+| PCIe | Gen3 ×4 + Gen2 ×1 | Gen2 ×1 only |
+| HDMI | HDMI 2.1 input + output | HDMI 2.1 output only |
+| Display outputs | 4 simultaneous | 3 simultaneous |
+| Ethernet | dual GbE | single GbE |
+| USB-C | 2 with full alt-mode | 1 with alt-mode |
+| Target | Industrial PC, edge AI, NAS, mini desktop | Tablets, set-top boxes, SBC consumer |
+| Typical board price | USD 130-200 | USD 80-150 |
+
+The RK3588 is the choice for designs needing NVMe SSD via PCIe, multiple network interfaces, or multi-monitor output. The RK3588S is the cheaper, smaller-package variant for products where PCIe ×4 is overkill.
+
+## Boards
+
+| Board | SoC | Memory | Notable details |
+|-------|-----|--------|------------------|
+| Orange Pi 5 Plus | RK3588 | up to 32 GB LPDDR4X | Dual 2.5 GbE, M.2 NVMe, M.2 Wi-Fi, USB-C with DP |
+| Orange Pi 5 | RK3588S | up to 16 GB LPDDR4X | M.2 NVMe, single GbE, compact |
+| Radxa ROCK 5B | RK3588 | up to 16 GB LPDDR4X | Premium build, M.2 NVMe, eDP, HDMI in/out |
+| Radxa ROCK 5A | RK3588S | up to 16 GB LPDDR4X | Compact, single GbE |
+| Khadas Edge 2 | RK3588S | 8 / 16 GB LPDDR4X | Premium aluminum enclosure, eDP, dual USB-C |
+| FriendlyElec NanoPi R6S | RK3588S | 4 / 8 GB | Triple-ethernet router (dual 2.5 GbE + 1 GbE) |
+| FriendlyElec NanoPC-T6 | RK3588 | up to 16 GB | Full RK3588 desktop replacement board |
+| Mixtile Blade 3 | RK3588 | up to 16 GB | OCuLink + PCIe expansion, server form factor |
+| Turing Pi 2 (modules) | RK3588 | varies | RK3588 modules for Turing Pi cluster carrier |
+
+The Orange Pi 5 Plus and Radxa ROCK 5B are the most common targets for general-purpose RK3588 software work. The NanoPi R6S has become a popular OpenWrt router target due to the dual 2.5 GbE configuration.
+
+## RKNN Toolkit and the NPU
+
+The 6 TOPS NPU is the differentiator for RK3588 against earlier Rockchip parts. It is implemented as three independent NPU cores, each delivering 2 TOPS, gangable for a single large model or split across three concurrent inference jobs. Supported numerics are INT4, INT8, and FP16. The flow goes through the RKNN Toolkit: train a model in PyTorch/TensorFlow/Caffe, export to ONNX, run rknn-toolkit2's converter to produce a quantised .rknn file (the converter handles INT8 quantisation with a calibration dataset, layer fusion, and weight repacking), then deploy and run via rknn-toolkit-lite2 (Python) or the C API.
+
+Published performance numbers from Rockchip's RK3588 benchmarks:
+
+| Model | Input | Numerics | Throughput |
+|-------|-------|----------|------------|
+| MobileNet v2 | 224×224 | INT8 | ~550 fps |
+| ResNet-50 | 224×224 | INT8 | ~150 fps |
+| YOLOv5s | 640×640 | INT8 | ~40 fps |
+| YOLOv8n | 640×640 | INT8 | ~60 fps |
+| BERT-base | seq 128 | INT8 | ~12 inferences/s |
+| Llama 2 7B (INT4) | various | INT4 + CPU offload | ~1.5-3 tokens/s |
+
+LLM inference uses the NPU for matrix multiplies plus CPU for token sampling and attention bookkeeping. Performance trails Jetson Orin Nano on transformer-heavy workloads but is workable for chatbot products with modest latency targets.
+
+```python
+import numpy as np
+from rknnlite.api import RKNNLite
+
+# Load a pre-converted RKNN model and run inference
+rknn = RKNNLite()
+ret = rknn.load_rknn('./yolov8n.rknn')
+ret = rknn.init_runtime(core_mask=RKNNLite.NPU_CORE_0_1_2)  # use all three NPU cores
+
+img = np.random.randint(0, 255, (1, 640, 640, 3), dtype=np.uint8)
+outputs = rknn.inference(inputs=[img])
+
+# outputs is a list of np.ndarrays per model output head
+for i, out in enumerate(outputs):
+    print(f'output {i}: shape={out.shape}, dtype={out.dtype}')
+
+rknn.release()
+```
+
+## Comparison with NVIDIA Jetson Orin Nano
+
+This is the comparison most engineers actually want to see.
+
+| Attribute | RK3588 | Jetson Orin Nano 4 GB | Jetson Orin Nano 8 GB |
+|-----------|--------|------------------------|------------------------|
+| CPU | 4× A76 + 4× A55 | 6× A78AE @ 1.5 GHz | 6× A78AE @ 1.5 GHz |
+| GPU | Mali-G610 MP4 | 512 CUDA cores Ampere | 1024 CUDA cores Ampere |
+| NPU / Accelerator | 6 TOPS NPU | shared with GPU | shared with GPU |
+| Combined AI throughput | 6 TOPS NPU + Mali | 20 TOPS | 40 TOPS |
+| Memory | 4-32 GB LPDDR4X/LPDDR5 | 4 GB LPDDR5 | 8 GB LPDDR5 |
+| Memory bandwidth | ~24 GB/s | 34 GB/s | 68 GB/s |
+| Software stack maturity | Closed RKNN, growing | TensorRT, JetPack, mature CUDA | Same as 4 GB variant |
+| Power | 3-15 W | 5-15 W | 7-20 W |
+| Typical SoM/board price | USD 100-200 | USD 200-300 | USD 400-500 |
+| Industrial longevity | informal | NVIDIA Jetson 10-year | Same |
+
+RK3588 is roughly half the price of Jetson Orin Nano 4 GB at similar total capability, but the software ecosystem is meaningfully behind. For products where the engineer can bring up RKNN on a custom model, RK3588 is the cost winner. For products depending on prebuilt TensorRT models, CUDA-only libraries, or NVIDIA's DeepStream frameworks, Jetson is the answer. A practical heuristic: a single well-defined inference job (object detection on one camera, keyword spotting) suits RK3588 well; heterogeneous model stacks or anything pulling from NVIDIA NGC favours Jetson.
+
+## Software stack and kernel status
+
+The RK3588 software situation is more painful than the RK3566/68 because mainline support lags. As of mid-2026:
+
+| Component | Vendor BSP (kernel 5.10) | Mainline (kernel 6.6+) |
+|-----------|---------------------------|--------------------------|
+| CPU, PSCI, big.LITTLE | full | full |
+| Memory controller | full | full |
+| GPU (Mali-G610) | closed blob, full | Panfrost limited; perf ~40-60% of blob |
+| Display | full (HDMI 2.1, DP 1.4, MIPI-DSI) | HDMI working; eDP and dual-DSI partial |
+| Video decode | full 8K | rkvdec2 mainline driver, 4K working, 8K landing |
+| Video encode | full | rkvenc partial |
+| NPU | RKNN runtime, full | none |
+| PCIe | full | full |
+| USB 3.1 Gen 1 | full | full |
+| Ethernet | full | full |
+
+Practical recommendation for production: vendor BSP kernel 5.10 plus Armbian or Debian userspace; plan the rebase to upstream 6.x over 2026-2027 if product lifetime warrants.
+
+<Callout type="warn" title="NPU toolchain is closed-source">
+The RKNN Toolkit's converter and runtime are closed-source binaries with a click-through licence. The converter requires Python 3.8 to 3.10 (newer Python versions are unsupported as of toolkit 2.0), runs on x86_64 Linux only, and uses a calibration dataset to drive INT8 quantisation. There is no open-source alternative that produces compatible .rknn blobs. Plan your build infrastructure around a Linux x86 conversion host even if your application development is on macOS or ARM Linux.
+</Callout>
+
+## Use cases
+
+- **Edge AI workstation** — RK3588 with 16 or 32 GB RAM and NVMe SSD as a developer's edge inference target.
+- **Multi-camera analytics** — four IP cameras decoded via rkvdec, YOLOv8n inference on each stream via NPU partitioning.
+- **Robotics CPU** — high-level navigation and perception on RK3588 paired with a Cortex-M for motor control (similar pattern to [TI Sitara AM62](/docs/vendors/ti-sitara)).
+- **Mini desktop** — full Linux desktop replacing a low-end x86 office machine.
+- **8K signage** — RK3588 driving 8K H.265 streams for premium digital signage.
+- **Local LLM appliance** — RK3588 with 32 GB RAM running quantised 7B-13B language models for on-premises chat.
+
+<Callout type="note" title="Mainline kernel is catching up">
+Kernel 6.6 boots cleanly on RK3588 with most peripherals. Kernel 6.8 and 6.10 are landing further pieces, particularly around the GPU and video encode. If your product has a 2027+ ship window and a long lifecycle, the mainline trajectory looks promising. For 2026 ship dates, the vendor BSP remains the practical answer.
+</Callout>
+
+## Cross-references
+
+- [Rockchip landing](/docs/vendors/rockchip) — vendor overview.
+- [Rockchip RK3568](/docs/vendors/rockchip-rk3568) — lower-cost sibling.
+- [MediaTek Genio 1200](/docs/vendors/mediatek-genio) — direct competitor.
+- [Cortex-A76](/docs/cortex-a/a76) — core architecture details.
+- [Cortex-A55](/docs/cortex-a/a55) — little-cluster core details.
+- [rockchip.com.cn RK3588 page](https://www.rock-chips.com/a/en/products/RK35_Series/2022/0926/1660.html) (external).
+- [rockchip-linux/rknn-toolkit2 on GitHub](https://github.com/rockchip-linux/rknn-toolkit2) (external).
+- [Orange Pi 5 Plus product page](http://www.orangepi.org/html/hardWare/computerAndMicrocontrollers/details/Orange-Pi-5-plus.html) (external).
+- [Radxa ROCK 5B documentation](https://wiki.radxa.com/Rock5/5b) (external).
+- [Armbian for RK3588](https://www.armbian.com/download/?tx_maker=rockchip&tx_soc=rk3588) (external).

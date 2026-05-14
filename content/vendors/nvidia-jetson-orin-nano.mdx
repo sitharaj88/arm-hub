@@ -1,0 +1,133 @@
+---
+title: Jetson Orin Nano and Orin NX
+description: NVIDIA Jetson Orin Nano and Orin NX — Cortex-A78AE plus Ampere GPU on a SODIMM module. 20 to 100 TOPS INT8, 5 to 25 W, pin-compatible across the family. Real workloads, nvpmodel power modes, and a comparison with Raspberry Pi 5 plus Hailo-8.
+order: 31
+updated: 2026-05-13
+tags: [vendors, nvidia, jetson, orin-nano, orin-nx, cortex-a78ae, ampere, edge-ai, jetpack]
+---
+
+The Orin Nano and Orin NX are the cost-conscious half of the Orin generation. Same Ampere GPU and Cortex-A78AE CPU as AGX Orin, but in a smaller SODIMM-style package with lower memory, lower power envelopes, and a hundreds-of-dollars price point that makes Jetson approachable. Orin Nano targets 5 to 15 W; Orin NX targets 10 to 25 W. Both share the same connector and carrier reference, scaling across four variants (Nano 4 GB, Nano 8 GB, NX 8 GB, NX 16 GB).
+
+This page covers the silicon, the power modes, real workloads, and the comparison against the obvious cost-sensitive alternative: Raspberry Pi 5 plus Hailo-8.
+
+<SpecSheet
+  title="Jetson Orin Nano and Orin NX at a glance"
+  specs={[
+    { label: 'Vendor', value: 'NVIDIA Corporation' },
+    { label: 'Released', value: 'Orin Nano: March 2023; Orin NX: October 2022' },
+    { label: 'Module form factor', value: 'SODIMM 260-pin, 70 x 45 mm, pin-compatible across Nano and NX' },
+    { label: 'CPU', value: 'Orin Nano: 6x Cortex-A78AE at 1.5 GHz; Orin NX: 6 or 8x Cortex-A78AE at 2.0 GHz' },
+    { label: 'GPU', value: 'NVIDIA Ampere, 1024 CUDA cores, 32 tensor cores (both Nano and NX)' },
+    { label: 'DLA', value: 'Orin Nano: 0; Orin NX: 2x NVDLA v2' },
+    { label: 'INT8 TOPS', value: 'Orin Nano: 20 to 40; Orin NX: 70 to 100' },
+    { label: 'Memory', value: 'LPDDR5; Nano: 4 or 8 GB; NX: 8 or 16 GB' },
+    { label: 'Software', value: 'JetPack 6 (L4T r36, Ubuntu 22.04 LTS, CUDA 12.x, TensorRT 10.x)' },
+    { label: 'External links', value: 'developer.nvidia.com/embedded/jetson-orin-nano, developer.nvidia.com/embedded/jetson-orin-nx' },
+  ]}
+/>
+
+## The silicon
+
+Orin Nano and Orin NX share the same Tegra T234 die as AGX Orin, with portions disabled (fewer CPU cores, smaller GPU cluster, DLAs fused off on Nano). NVIDIA's peak TOPS is the sum of GPU INT8 peak and DLA INT8 peak; real workloads rarely sustain the published peak.
+
+The CPU is six or eight Cortex-A78AE cores in a single cluster. Orin Nano 4 GB and 8 GB ship six cores at 1.5 GHz; NX 8 GB unlocks 2.0 GHz; NX 16 GB adds an eight-core configuration. The cores carry automotive-enhanced features (lock-step, ECC, fault-detection) but these are not typically enabled outside automotive deployments.
+
+The GPU is 1024 CUDA cores of Ampere across 8 streaming multiprocessors, 32 third-generation tensor cores supporting INT8, INT4, FP16, BF16. Same architecture as RTX 30-series and A100, scaled down. CUDA kernels written for desktop run unmodified.
+
+Orin NX adds two NVDLA v2 deep-learning accelerators — fixed-function INT8 engines for standard convolutional, pooling, and dense layers. TensorRT targets them via `--useDLACore=0` or `--useDLACore=1`. A typical multi-stream pipeline runs the primary detector on the GPU and per-camera secondary inference on each DLA. Orin Nano omits the DLAs.
+
+## Power modes — nvpmodel
+
+NVIDIA configures the operating-point envelope through `nvpmodel`. Each mode is a tuple of CPU core count, CPU clock cap, GPU clock cap, DLA clock cap, and memory clock cap. Modes are defined per-module in `/etc/nvpmodel.conf`. Switching modes takes a few seconds.
+
+| Module        | Mode | CPU cores | CPU max | GPU max  | Memory  | Power cap |
+|---------------|------|-----------|---------|----------|---------|-----------|
+| Orin Nano 4GB | 0    | 6         | 1.5 GHz | 625 MHz  | 2133 MHz| 7 W       |
+| Orin Nano 4GB | 1    | 6         | 1.5 GHz | 625 MHz  | 2133 MHz| 10 W      |
+| Orin Nano 8GB | 0    | 6         | 1.5 GHz | 625 MHz  | 3200 MHz| 7 W       |
+| Orin Nano 8GB | 1    | 6         | 1.5 GHz | 625 MHz  | 3200 MHz| 15 W      |
+| Orin NX 8GB   | 0    | 6         | 2.0 GHz | 765 MHz  | 3200 MHz| 10 W      |
+| Orin NX 8GB   | 1    | 6         | 2.0 GHz | 765 MHz  | 3200 MHz| 15 W      |
+| Orin NX 8GB   | 2    | 6         | 2.0 GHz | 765 MHz  | 3200 MHz| 20 W      |
+| Orin NX 16GB  | 0    | 8         | 2.0 GHz | 918 MHz  | 3200 MHz| 10 W      |
+| Orin NX 16GB  | 1    | 8         | 2.0 GHz | 918 MHz  | 3200 MHz| 15 W      |
+| Orin NX 16GB  | 2    | 8         | 2.0 GHz | 918 MHz  | 3200 MHz| 25 W      |
+
+```bash
+# Query the current mode
+sudo nvpmodel -q
+
+# Switch the Orin NX 16 GB to the 25 W maximum-performance mode
+sudo nvpmodel -m 2
+
+# Lock all clocks to the maximum allowed by the current mode
+sudo jetson_clocks
+
+# Inspect the resulting power consumption and clocks live
+sudo tegrastats --interval 500
+```
+
+`jetson_clocks` is the second half: `nvpmodel` sets the cap; `jetson_clocks` instructs the governor to run at that cap rather than scaling dynamically. Benchmarking runs both: switch mode, lock clocks, capture results, unlock.
+
+Power numbers above are SoM power. A carrier with cooling, cameras, gigabit Ethernet, and NVMe adds 3 to 8 watts.
+
+## Real-world workloads
+
+What the Orin Nano and NX actually run, with rough numbers from published JetPack 6 benchmarks and independent measurements:
+
+| Workload                                      | Orin Nano 8 GB | Orin NX 16 GB | Notes                              |
+|-----------------------------------------------|-----------------|----------------|------------------------------------|
+| YOLOv8n object detection at 1080p, FP16       | 60 fps          | 130 fps        | Single class, standard input size  |
+| YOLOv8m object detection at 1080p, INT8       | 30 fps          | 90 fps         | Useful for product-class accuracy  |
+| Whisper-base speech recognition (real time)   | yes             | yes            | 1x real-time on Nano, 3x on NX     |
+| ResNet-50 image classification, INT8          | 250 inf/s       | 700 inf/s      | TensorRT, batch 1                  |
+| BERT-base NLI inference, INT8                 | 50 inf/s        | 180 inf/s      | Batch 1, sequence length 128       |
+| Stable Diffusion 1.5 (512 x 512, 20 steps)   | n/a             | 12 s/image     | Tight memory on NX 16 GB           |
+| VSLAM (ORB-SLAM3, 30 fps stereo)              | yes             | yes            | CPU + GPU combined                 |
+| 4-camera batched inference (1080p, YOLOv8n)   | n/a             | 30 fps each    | Uses 1 DLA + GPU concurrently      |
+
+The standout workloads are YOLO-class detection at real-time frame rates and end-to-end Whisper transcription. Both fit comfortably on Orin Nano 8 GB, the most common deployment.
+
+## Comparison with Raspberry Pi 5 plus Hailo-8
+
+The most direct competitor in 2025 is a Raspberry Pi 5 (Cortex-A76 quad-core at 2.4 GHz, 4 to 8 GB LPDDR4X) paired with a Hailo-8 or Hailo-8L NPU via the PCIe M.2 module. The combination targets the same price band as Orin Nano 8 GB. The comparison favours Jetson on developer experience and Pi-plus-Hailo on raw compute per dollar.
+
+| Trait                       | Orin Nano 8 GB              | Raspberry Pi 5 + Hailo-8         |
+|-----------------------------|-----------------------------|-----------------------------------|
+| CPU                         | 6x Cortex-A78AE at 1.5 GHz  | 4x Cortex-A76 at 2.4 GHz          |
+| GPU                         | 1024 CUDA cores Ampere      | VideoCore VII (no general compute)|
+| Dedicated NPU TOPS          | 40 (GPU INT8)               | 26 (Hailo-8) or 13 (Hailo-8L)     |
+| Memory                      | 8 GB LPDDR5                 | 8 GB LPDDR4X                      |
+| All-in module / board price | $299 dev kit                | $80 Pi 5 + $250 Hailo M.2         |
+| Software stack              | JetPack, CUDA, TensorRT     | Raspberry Pi OS + Hailo SDK       |
+| Model deployment            | TensorRT from any framework | Hailo Dataflow Compiler           |
+| Operator coverage           | Comprehensive               | Limited; verify on each model     |
+| Camera path                 | NVIDIA libargus, GStreamer  | libcamera, V4L2                   |
+| Ecosystem maturity          | Production-class            | Improving rapidly                  |
+
+For a developer with a CUDA-trained model who wants to ship it, Orin Nano is the path of less resistance. For an application from a known model Hailo's compiler supports, Pi-plus-Hailo is cheaper. The choice comes down to whether the team can absorb the porting cost.
+
+<Callout type="tip">
+For multi-camera deployments, prefer the Orin NX over the Orin Nano even if the inference TOPS would fit on the Nano. The DLAs on the NX let you run a per-camera inference path without saturating the GPU, which then remains available for pre-processing, tracking, or a secondary classification model. Without the DLAs, multi-camera pipelines on the Nano serialize through the GPU and starve.
+</Callout>
+
+## Carrier boards and developer kits
+
+NVIDIA's Orin Nano developer kit ($249 retail for the 8 GB variant) includes a carrier with HDMI, two MIPI-CSI slots, M.2 for NVMe and Wi-Fi, gigabit Ethernet, USB 3.2. The same carrier accepts an Orin NX module, though NVIDIA does not sell a bundled Orin NX kit — NX ships as a bare SoM.
+
+Third-party carriers include Connect Tech (rugged Photon and Boson lines), Auvidea (compact drone-focused JNX30/JN30), Forecr (cost-focused). Production usually uses a third-party carrier or a custom in-house design. The carrier design guide in the Jetson developer documentation specifies pinout and trace constraints.
+
+<Callout type="warn">
+JetPack 6 dropped support for the Orin Nano 4 GB in some early development builds because of memory pressure during boot. Verify the L4T release notes before committing to a JetPack version on the 4 GB variant; the 8 GB Nano is the more conservative choice for new designs.
+</Callout>
+
+## Cross-references
+
+- [NVIDIA Jetson landing page](/docs/vendors/nvidia-jetson) — full family overview.
+- [Jetson AGX Orin and Thor](/docs/vendors/nvidia-jetson-agx) — the higher-end siblings.
+- [Cortex-A78AE](/docs/cortex-a/a78ae) — the automotive-enhanced application core.
+- [Edge AI system design](/docs/systems/edge-ai) — broader architectural context.
+- [Raspberry Pi 5](/docs/vendors/raspberry) — the competing low-cost platform.
+- NVIDIA Orin Nano developer site: developer.nvidia.com/embedded/jetson-orin-nano.
+- JetPack 6 documentation: docs.nvidia.com/jetson/jetpack.
+- Carrier board design guide: published in the Jetson Orin Nano design files at developer.nvidia.com/embedded/downloads.

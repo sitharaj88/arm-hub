@@ -1,0 +1,155 @@
+---
+title: GigaDevice GD32F — mainstream M3, M4, M7
+description: GD32F1 through GD32F7 — the workhorse Cortex-M3/M4/M7 line. Pin-and-register compatibility with STM32F1/F3/F4/F7, the migration gotchas, and which part to pick for which design.
+order: 21
+updated: 2026-05-13
+tags: [vendors, gigadevice, gd32, gd32f4, gd32f7, cortex-m3, cortex-m4, cortex-m7]
+---
+
+The GD32F line is GigaDevice's mainstream Cortex-M catalogue and the reason the company is on most embedded engineers' radar. It started in 2013 as a frank clone of STMicroelectronics' STM32F1, picked up Cortex-M4F variants in 2015 (GD32F3 → STM32F4-class), and added Cortex-M7 in 2018 (GD32F7 → STM32F7-class). Across all four sub-families the strategy is the same: same package, same pinout, same peripheral register layout, same boot-from-system-memory USART ROM bootloader — but on a smaller process node, with a higher max clock, and at a 20-40% lower price.
+
+This page is the deep dive on the four mainstream sub-families and what migration from STM32 actually looks like.
+
+<SpecSheet
+  title="GD32F mainstream at a glance"
+  specs={[
+    { label: 'GD32F1', value: 'Cortex-M3 at 108 MHz, 16 KB..1 MB Flash, 6..96 KB SRAM, STM32F103 footprint and register map' },
+    { label: 'GD32F3', value: 'Cortex-M4F at 168 MHz, 32 KB..3 MB Flash, single-precision FPU, STM32F405/407-class peripherals' },
+    { label: 'GD32F4', value: 'Cortex-M4F at 200..240 MHz, up to 3 MB dual-bank Flash, Ethernet, CAN-FD on newer variants, FMC SDRAM controller' },
+    { label: 'GD32F7', value: 'Cortex-M7 at 200 MHz, L1 cache (16 KB I + 16 KB D), TCM, STM32F7-compatible footprint' },
+    { label: 'Process', value: 'F1: 110 nm SMIC; F3/F4: 55 nm TSMC; F7: 55 nm TSMC LP' },
+    { label: 'IDE / SDK', value: 'GD32 Firmware Library (SPL-style C), Keil/IAR DFPs, GCC + OpenOCD, PlatformIO' },
+    { label: 'Bootloader', value: 'ROM USART bootloader on PA9/PA10 (BOOT0 high), USB-DFU on F4/F7 with USB pins' },
+    { label: 'Typical price (1k qty)', value: 'GD32F103C8 ~$1.20, GD32F405RG ~$3.50, GD32F470ZK ~$6.00, GD32F750IK ~$10' },
+  ]}
+/>
+
+## GD32F1 — the original STM32F103 clone
+
+GD32F103 is footprint and register compatible with the STM32F103. The differences:
+
+- **Core clock**: 108 MHz max vs 72 MHz on STM32F103. The PLL has a wider range; you can run sequentially `HSI -> PLL x 13.5 -> SYSCLK 108 MHz` from internal RC if you don't have a crystal.
+- **Flash performance**: zero wait states up to 30 MHz, two wait states at 108 MHz, with an instruction prefetch buffer that effectively hides them on linear code paths.
+- **SRAM**: ranges from 6 KB (F130/F150) to 96 KB (F107VC) — the larger end exceeds STM32F103's max.
+- **USB**: GD32F103 implements a USB 2.0 FS device controller that is **register-compatible with STM32F103's USB-FS device** (the original ST controller, not OTG). Drop-in for CDC-ACM, HID, MSC firmware.
+- **Connectivity line**: GD32F107 mirrors STM32F107 with Ethernet 10/100 MAC and USB OTG-FS host/device. Note: the OTG IP is GigaDevice's, not Synopsys DWC2 — same registers but with documented behavioural differences in suspend/resume.
+
+| Part | Flash | SRAM | Package | Use case |
+|------|-------|------|---------|----------|
+| GD32F130F4 | 16 KB | 4 KB | TSSOP-20 | Tiny cost-down replacement for 8051 |
+| GD32F103C8 | 64 KB | 20 KB | LQFP-48 | The "blue pill" replacement |
+| GD32F103RC | 256 KB | 48 KB | LQFP-64 | Mid-range industrial |
+| GD32F103ZE | 512 KB | 64 KB | LQFP-144 | Large I/O industrial |
+| GD32F107VC | 256 KB | 64 KB | LQFP-100 | Ethernet + USB OTG |
+
+The GD32F1 line is still in active production in 2026 and remains the volume-shipping part. New designs use it for cost-down or as a pin-compatible second source to STM32F103.
+
+## GD32F3 — Cortex-M4F with FPU
+
+GD32F303/GD32F305/GD32F307 launched 2015 as the first M4F GigaDevice MCUs. The pinout matches the STM32F405/F407 in the same package; many peripheral blocks were lifted directly from the F1 line and re-clocked. Up to 168 MHz with single-precision FPU, 3 MB Flash on the largest die, 80 KB SRAM. Notable peripherals:
+
+- **TIMER0/7** advanced control timers with complementary outputs, dead-time generators, and break inputs — useful for motor control and SMPS.
+- **EXMC** external memory controller for SRAM, NOR, NAND, PC card — same EXMC name as STM32 FSMC, similar interface.
+- **OTG-FS** USB device and host controller on F305/F307.
+- **CTC** Clock Trim Controller — auto-trims internal HSI against an external 1 PPS or USB SOF for USB without a crystal.
+
+## GD32F4 — the modern flagship
+
+GD32F4 is the high-volume modern part. The GD32F405/F407 launched 2017 to match STM32F405/F407; the GD32F450 and GD32F470 followed in 2019 and 2022 with higher clocks, more flash, and CAN-FD. The current top of the line is GD32F470 at 240 MHz with 3 MB dual-bank flash and 768 KB SRAM, well above the STM32F407 it nominally replaces.
+
+| Part | Core MHz | Flash | SRAM | Ethernet | CAN-FD | Notable |
+|------|----------|-------|------|----------|--------|---------|
+| GD32F405RG | 168 | 1 MB | 192 KB | No | No | F405 drop-in |
+| GD32F407ZE | 168 | 512 KB | 192 KB | Yes | No | F407 drop-in |
+| GD32F427VG | 200 | 1 MB | 256 KB | Yes | Classic CAN x 2 | F427 alternative |
+| GD32F450ZK | 200 | 3 MB | 256 KB | Yes | Classic CAN x 2 | Higher Flash than F450 |
+| GD32F470ZK | 240 | 3 MB | 768 KB | Yes | CAN-FD x 2 | Top of line, TFT-LCD controller |
+
+The TFT-LCD controller and 2D graphics accelerator (IPA — Image Processing Accelerator) are GigaDevice's analogue to STM32's LTDC + Chrom-ART, with similar interfaces but different register names. Resolution support is up to 800 x 600 at 24-bit color, sufficient for HMI panels.
+
+The F470 also adds an internal SDRAM-friendly EXMC with separate SDRAM bank controller, supporting 32-bit data bus to external SDRAM at up to 120 MHz — for video buffer or larger application data.
+
+## GD32F7 — Cortex-M7 with cache
+
+GD32F7 brings Cortex-M7 to the GigaDevice catalogue. Same footprint family as STM32F746/F750/F767. The cache and TCM organisation:
+
+| Memory | Size | Latency | Notes |
+|--------|------|---------|-------|
+| ITCM | 16 KB | 1 cycle | Hot ISR / control loop code |
+| DTCM | 64 KB | 1 cycle | Stack, control variables, DMA buffers |
+| L1 I-cache | 16 KB | 1 cycle hit | Backs Flash and AXI |
+| L1 D-cache | 16 KB | 1 cycle hit | **Not coherent with DMA** |
+| AXI SRAM | 256 KB | ~2 cycles | Bulk RAM |
+| AHB1 SRAM | 192 KB | via AHB | Peripheral-adjacent |
+
+The cache coherency problem is the same as on any M7: DMA buffers in cacheable regions need explicit `SCB_CleanDCache_by_Addr` before a DMA out, and `SCB_InvalidateDCache_by_Addr` after a DMA in. Or, simpler, place DMA buffers in DTCM or in an MPU region marked non-cacheable.
+
+GD32F7 maxes at 200 MHz vs the STM32F7's 216 MHz — a 7% performance gap. The price difference is wider than 7%, so the line still makes sense for cost-sensitive M7 designs.
+
+<Callout type="warn" title="ADC sample-time semantics differ from STM32">
+GD32F4 ADC has the same register layout as STM32F4 ADC but the minimum sample times required for a given source impedance are different (and not always longer — sometimes shorter is required). STM32 firmware that uses `ADC_SAMPLE_15_CYCLES` for a high-impedance source will read OK on the STM32 and read noisy on the GD32. Re-derive sample times from the GD32F4 reference manual datasheet electrical characteristics — section "ADC accuracy" tables — before porting any ADC-heavy firmware.
+</Callout>
+
+## Peripherals — what STM32 doesn't have
+
+GigaDevice has been opportunistic about adding peripherals where ST didn't:
+
+- **Extra UARTs** — most GD32F4 parts have 8 UARTs vs 6 on the equivalent STM32F4.
+- **Faster ADC sampling** — GD32F303 spec'd at 2.6 Msps vs STM32F405's 2.4 Msps on the same 12-bit ADC.
+- **IPA 2D blitter** — present on GD32F4 even on parts where STM32 lacks Chrom-ART.
+- **CTC** — Clock Trim Controller for crystal-less USB; appears on F1/F3/F4 across the catalogue.
+- **TSI** — Touch Sensor Interface on GD32F303/F403 — capacitive touch sensing without external IC.
+
+Conversely, GD32F4 lacks STM32's USB OTG-HS (high-speed PHY interface) on most parts — only the GD32F470 has it. SDIO is on the F4 mainstream but not on the smallest packages where STM32 still has it. SAI (Serial Audio Interface) is missing — there's an I2S in its place.
+
+## Build and migration example
+
+A typical migration from STM32F407VG to GD32F407VK using GCC and CMake. The toolchain stays the same; only the device header and startup file change.
+
+```bash
+# CMake target with GigaDevice headers
+arm-none-eabi-gcc \
+    -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard \
+    -DGD32F407 -DUSE_STDPERIPH_DRIVER \
+    -I GD32F4xx_Firmware_Library/CMSIS/GD/GD32F4xx/Include \
+    -I GD32F4xx_Firmware_Library/GD32F4xx_standard_peripheral/Include \
+    -T gd32f407vk_flash.ld \
+    main.c gd32f4xx_it.c system_gd32f4xx.c startup_gd32f407.s \
+    -o firmware.elf
+
+# Program with OpenOCD + GD-Link
+openocd -f interface/cmsis-dap.cfg -f target/gd32f4x.cfg \
+    -c "program firmware.elf verify reset exit"
+```
+
+For STM32 HAL projects, the canonical port path is:
+
+1. Replace `stm32f4xx_hal_gpio.c` etc. with `gd32f4xx_gpio.c` from the GigaDevice firmware library.
+2. Rewrite `SystemClock_Config` against the GD32 RCC register layout.
+3. Re-derive Flash wait states for the new core clock.
+4. Re-verify USB and Ethernet initialisation against the GD32 reference manual.
+5. Run timing-critical code paths (ADC, motor control) on hardware with logic analyser before declaring done.
+
+<Callout type="tip" title="STM32CubeMX clock-tree visualisation still useful">
+CubeMX targets STM32 only, but for a GD32 design with very similar peripherals you can run CubeMX against the equivalent STM32 part to **visualise** the clock tree and validate PLL settings, then translate the values into GD32 RCC register writes. The GD32 reference manual has the same clock-tree diagram as the STM32 RM with multipliers renamed; the workflow is the fastest way to get bring-up right.
+</Callout>
+
+## Cross-references
+
+- [GigaDevice GD32 landing](/docs/vendors/gigadevice) — company and portfolio context.
+- [GD32L low-power](/docs/vendors/gigadevice-gd32l) — sibling line for battery-powered designs.
+- [STM32 mainstream F/G/H](/docs/vendors/stm32-mainstream) — the parts being targeted.
+- [Cortex-M3](/docs/cortex-m/m3) — GD32F1 core details.
+- [Cortex-M4](/docs/cortex-m/m4) — GD32F3 / F4 core details.
+- [Cortex-M7](/docs/cortex-m/m7) — GD32F7 core, cache, TCM.
+- [DMA](/docs/peripherals/dma) — GD32 DMA controller layout.
+- [OpenOCD](/docs/tools/openocd) — debug probe configuration.
+
+## External links
+
+- [GD32F4xx datasheets](https://www.gd32mcu.com/en/download/0?kw=GD32F4)
+- [GD32F4xx Firmware Library on GitHub](https://github.com/GigaDevice-MCU/GD32F4xx_Firmware_Library)
+- [GD32F7xx user manual](https://www.gd32mcu.com/en/download/7?kw=GD32F7)
+- [GD32 ISP tool (USART bootloader programmer)](https://www.gd32mcu.com/en/download/8)
+- [PlatformIO GD32 board definitions](https://github.com/CommunityGD32Cores/platform-gd32)
+- [GD32F103 reverse-engineering wiki](https://github.com/iliasam/OpenSimpleLidar/wiki/GD32F103-vs-STM32F103)

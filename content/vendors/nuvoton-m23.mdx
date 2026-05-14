@@ -1,0 +1,163 @@
+---
+title: Nuvoton NuMicro M23
+description: NuMicro Cortex-M23 secure family — M2351 / M2354 with TrustZone-M, ROM-based secure boot, anti-tamper, Key Store, PSA Certified Level 2 silicon. Nuvoton's answer to STM32L5.
+order: 23
+updated: 2026-05-13
+tags: [vendors, nuvoton, numicro, m23, trustzone, secure, psa]
+---
+
+The NuMicro M2351 was Nuvoton's first TrustZone-M chip and one of the earliest Cortex-M23 parts to ship in volume — sampling in 2018, in production by mid-2019, alongside STM's L5 series. The pitch is the same as L5 and Microchip SAM L11 in the same era: bring ARMv8-M TrustZone down from the M33 high-end into the entry tier, package it with a credible crypto engine, ROM-based secure boot, and tamper-detection logic, and offer the result as a one-chip security platform for IoT endpoints, secure payment dongles, asset trackers, and provisioning-sensitive industrial devices. M2354 followed in 2021 with higher clocks, more flash, and PSA Certified Level 2 silicon certification.
+
+<SpecSheet
+  title="NuMicro M23 secure at a glance"
+  specs={[
+    { label: 'Vendor', value: 'Nuvoton Technology' },
+    { label: 'Founded', value: 'M2351 sampled 2018, M2354 in 2021' },
+    { label: 'HQ', value: 'Hsinchu, Taiwan' },
+    { label: 'Flagship part', value: 'M2354SI (Cortex-M23 with TrustZone, 96 MHz, 1 MB flash, 256 KB SRAM, PSA L2 Certified)' },
+    { label: 'Key fact', value: 'ROM-resident secure boot ROM with vendor-signed image verification; Key Store retains AES, RSA, ECC keys across power-off without exposing them to CPU' },
+    { label: 'SDK', value: 'NuTool + StdDriver BSP + TF-M (Trusted Firmware-M) port + Mbed TLS port' },
+    { label: 'Links', value: 'nuvoton.com/products/iot-solution/iot-security/secure-microcontrollers' },
+  ]}
+/>
+
+## The two parts
+
+| Part | Core | Max clock | Flash | SRAM | Defining feature |
+|------|------|-----------|-------|------|------------------|
+| **M2351** | Cortex-M23 with TrustZone | 64 MHz | 512 KB | 96 KB | First Nuvoton TrustZone-M, PSA L1 |
+| **M2354** | Cortex-M23 with TrustZone | 96 MHz | up to 1 MB | up to 256 KB | PSA L2 silicon, higher clock, larger memory, USB 2.0 HS PHY on selected SKUs |
+
+Both share the same security architecture; M2354 is the recommended part for new designs, with M2351 kept alive for existing customers.
+
+## What Cortex-M23 brings
+
+Cortex-M23 is the entry tier of ARMv8-M — a stripped-down M33 without the FPU, without DSP extensions, with a simpler two-stage pipeline running at roughly 0.98 DMIPS/MHz (compared to 1.5 DMIPS/MHz on M4F and 1.5 DMIPS/MHz on M33). The reason to use M23 instead of M0+ is the **Security Extension** — the same TrustZone-M technology found on M33, dropped into a lower-cost lower-power core. You get the secure/non-secure partition, the SAU (Security Attribution Unit), the IDAU, secure function entry points (NSC regions), but without the FPU/MVE/coprocessor overhead.
+
+For an IoT endpoint that mostly waits, occasionally measures a sensor, and needs to verify a signed firmware update once a week, the M23 has all the security architecture and none of the FPU cost. It is a deliberate choice for cost-sensitive secure designs.
+
+## The M2351 / M2354 security stack
+
+Nuvoton wraps the M23 core with a stack of hardware blocks that together provide a documented PSA Certified Level 2 implementation:
+
+| Block | Purpose |
+|-------|---------|
+| **Secure Boot ROM** | Immutable ROM containing the first-stage bootloader. Verifies signature of secure-world image at every reset using a public key fused into the OTP region. |
+| **Key Store** | Hardware key vault. AES, RSA, ECC keys can be loaded into the Key Store at provisioning time; they are addressable by key ID for use by the crypto engine, but the key bytes themselves are never readable by CPU. |
+| **CRYPTO engine** | AES-128/192/256 (ECB, CBC, CFB, OFB, CTR, GCM, CCM, GHASH), SHA-160/224/256/384/512, HMAC, RSA up to 4096-bit, ECC over NIST P-192/224/256/384/521 plus brainpool, TRNG. |
+| **TRNG** | NIST SP 800-90B compliant, includes health tests. |
+| **OTP (One-Time-Programmable)** | 4 KB of write-once memory for fused keys, device identity, lifecycle state. |
+| **Tamper detection** | Dedicated tamper pins (up to 6 channels), with optional internal active mesh detection; triggers erase of the Key Store and tamper-event log. |
+| **PDID (Product Identification)** | 96-bit unique die ID, readable by both secure and non-secure worlds. |
+| **XOM (eXecute-Only Memory)** | A flash region from which code can execute but cannot be read by debugger or software. Used for sensitive algorithm bytecode. |
+
+The result is a part that meets PSA Certified Level 2 — independently evaluated by SGS Brightsight (the PSA certification body) and listed on the PSA Certified registry. Level 2 means the silicon has been audited against attacks including side-channel analysis (DPA, SPA), fault injection (clock glitching, voltage glitching, laser fault injection), and software exploitation, and has provided documented countermeasures.
+
+## Power consumption
+
+For a battery-powered secure IoT endpoint, the active-mode current matters as much as the security:
+
+| Mode | Conditions | Typical current |
+|------|------------|-----------------|
+| Run | 96 MHz, all peripherals | 12 mA |
+| Run | 4 MHz, MCU only | 600 µA |
+| Idle | CPU clock gated, RTC on | 30 µA |
+| Power-down | Deep sleep, RTC on, 8 KB SRAM retained | 2.1 µA |
+| Power-down | Deep sleep, RTC off | 800 nA |
+| Standby | Backup domain only (RTC + 8 bytes tamper RAM) | 100 nA |
+
+M2354's deep-sleep numbers are competitive with STM32L5 (~1.5 µA Stop 2 with RTC) but not class-leading — for sub-µA sleep on a TrustZone part, STM32U5 or Ambiq Apollo4 are still ahead. Where M2354 wins is on price: roughly USD 2.50 in 10k volume against USD 4.50 for STM32L5 and USD 5.20 for STM32U5 at equivalent flash/SRAM.
+
+## TrustZone-M model
+
+The ARMv8-M Security Extension partitions all memory and all peripherals between two worlds:
+
+- **Secure world (S)** — holds the secure boot bootloader, the crypto provisioning code, the firmware update verification routine, the cryptographic keys (in Key Store), and any other code that must never be tampered with.
+- **Non-secure world (NS)** — runs the application: sensor sampling, business logic, network stack, RTOS.
+
+Non-secure code calls into secure code only through documented entry points (`__attribute__((cmse_nonsecure_entry))` functions in NSC — Non-Secure Callable — flash regions). The hardware enforces this; a stray jump from NS code into the middle of a secure function triggers a SecureFault.
+
+The **SAU** (Security Attribution Unit) is the table that tells the CPU which addresses are secure and which are non-secure. It is configured at boot by the secure-world code. Get it wrong — for example, mark a region as NSC that contains data instead of valid entry-point gateways — and the system will fault on legitimate calls.
+
+```c
+/* Configure SAU regions on M2354 to partition the address space.
+ * Run from secure-world code very early in boot, before NS image is launched. */
+
+#include "NuMicro.h"
+#include "partition_M2354.h"
+
+void sau_init(void)
+{
+    /* SAU region 0: 0x00100000 - 0x001FFFFF = APROM NS region.
+     * The first 0x100000 (1 MB / 2) is secure; second 0x100000 is NS. */
+    SAU->RNR  = 0;
+    SAU->RBAR = (0x00100000u & SAU_RBAR_BADDR_Msk);
+    SAU->RLAR = (0x001FFFE0u & SAU_RLAR_LADDR_Msk) | SAU_RLAR_ENABLE_Msk;
+
+    /* SAU region 1: NSC veneer table. 0x000FFE00 - 0x000FFFFF.
+     * Holds the cmse_nonsecure_entry trampolines that NS code calls. */
+    SAU->RNR  = 1;
+    SAU->RBAR = (0x000FFE00u & SAU_RBAR_BADDR_Msk);
+    SAU->RLAR = (0x000FFFE0u & SAU_RLAR_LADDR_Msk)
+              | SAU_RLAR_NSC_Msk | SAU_RLAR_ENABLE_Msk;
+
+    /* SAU region 2: 0x20100000 - 0x2017FFFF = SRAM NS region.
+     * SRAM bank 0 stays secure; bank 1 is non-secure. */
+    SAU->RNR  = 2;
+    SAU->RBAR = (0x20100000u & SAU_RBAR_BADDR_Msk);
+    SAU->RLAR = (0x2017FFE0u & SAU_RLAR_LADDR_Msk) | SAU_RLAR_ENABLE_Msk;
+
+    /* SAU region 3: 0x40000000 peripheral region — most peripherals NS,
+     * but specific blocks (CRYPTO, KS, FMC, SCU) remain secure-only via
+     * the SCU peripheral attribution registers, configured separately. */
+    SAU->RNR  = 3;
+    SAU->RBAR = (0x40000000u & SAU_RBAR_BADDR_Msk);
+    SAU->RLAR = (0x4FFFFFE0u & SAU_RLAR_LADDR_Msk) | SAU_RLAR_ENABLE_Msk;
+
+    /* Enable SAU. ALLNS = 0 means use the region table; default to S. */
+    SAU->CTRL = SAU_CTRL_ENABLE_Msk;
+
+    __DSB(); __ISB();
+}
+```
+
+The companion `partition_M2354.h` header — generated by NuTool — defines the SAU regions and the SCU (Security Configuration Unit) peripheral attribution table in a form the compiler can validate. NuTool's GUI lets you click regions onto a memory map and exports the header; it is by far the safest way to author the partition.
+
+## TF-M support
+
+Nuvoton maintains a Trusted Firmware-M (TF-M) port for M2351 and M2354 in the upstream TF-M tree (`platform/ext/target/nuvoton/`). TF-M is the reference PSA implementation maintained by Arm — it provides the Internal Trusted Storage (ITS), Protected Storage (PS), Cryptographic Service, Attestation Service, and Firmware Update Service, all running in secure world and exposed to non-secure applications through PSA APIs. Using TF-M means your application calls `psa_crypto_init()` and `psa_aead_encrypt()` instead of vendor-specific crypto APIs, which makes porting between PSA-certified silicon (STM32L5/U5, NuMicro M2354, NXP LPC55, Microchip SAM L11) much easier.
+
+The Nuvoton TF-M port is functional but trails ST's TF-M support by about a release; for production work pin to a specific TF-M tag rather than tracking master.
+
+## Anti-tamper hardware
+
+M2354 has six tamper-detect input pins. Each can be configured for:
+
+- **Static detection** — input level transitions trigger a tamper event.
+- **Dynamic detection** — input must match a pseudorandom pattern generated by an LFSR; an attacker driving the pin to a static level triggers a tamper event.
+- **Differential detection** — paired pins must always be at opposite levels; if shorted, tamper triggers.
+
+When a tamper event fires, the hardware can be configured to: clear the Key Store automatically, log the event with a timestamp from the RTC backup register, hold the CPU in reset, or assert a tamper output pin for an external supervisor. All without CPU involvement — even if the application firmware is compromised, tamper detection still functions.
+
+<Callout type="warn" title="Tamper pins draw a few nA each — design for it">
+Each enabled tamper input adds approximately 30 nA to the always-on backup-domain current at room temperature, more at elevated temperature. For coin-cell-powered tamper-protected designs (smart locks, asset trackers), budget the additional leakage explicitly. Disable unused tamper channels in the TAMPER->TICR register to save power.
+</Callout>
+
+## Where to use M2354
+
+Strong fit: secure payment terminals (POS, mPOS, EMV card readers), IoT endpoints needing PSA Certified Level 2 silicon (regulatory pressure rising in EU under EN 18031), asset trackers with tamper-protected provisioned keys, secure firmware-over-the-air for industrial sensors, smart-lock electronics, electricity meters with privacy-sensitive consumption data. Weak fit: anything needing FPU (M23 has none — move to NuMicro M4 with software-only secure boot, or upgrade to STM32U5 for M33 + TrustZone + FPU).
+
+<Callout type="tip" title="Lifecycle states matter for PSA certification">
+The M2354 implements a lifecycle state machine in OTP: CHIP_MANUFACTURE → DEVICE_MANUFACTURE → SECURE → SECURED_WITH_RMA → DECOMMISSIONED. Each transition is irreversible and disables debug interfaces progressively. Production silicon must ship in SECURE state with debug disabled in secure world. Test your provisioning flow on engineering samples in DEVICE_MANUFACTURE state before locking real units — there is no path back.
+</Callout>
+
+## Cross-references
+
+- [NuMicro landing page](/docs/vendors/nuvoton)
+- [NuMicro M0 entry](/docs/vendors/nuvoton-m0)
+- [NuMicro M4 mainstream](/docs/vendors/nuvoton-m4)
+- [Cortex-M23](/docs/cortex-m/m33-m23)
+- [STM32 low-power L5 and U5](/docs/vendors/stm32-lowpower) — direct comparison for TrustZone IoT
+- [NuMicro M2354 product page](https://www.nuvoton.com/products/iot-solution/iot-security/secure-microcontrollers/m2354-series/) (external)
+- [Nuvoton TF-M port on GitHub](https://github.com/OpenNuvoton/M2354BSP) (external)
+- [PSA Certified registry](https://www.psacertified.org/products/) (external — search for Nuvoton)

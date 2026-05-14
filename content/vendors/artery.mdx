@@ -1,0 +1,137 @@
+---
+title: Artery Technology AT32
+description: Shanghai-based vendor of high-performance Cortex-M4 MCUs targeting STM32F4 replacement at lower cost — 240 MHz clocks, larger flash, AT-Link debug, and aggressive China-market pricing.
+order: 24
+updated: 2026-05-13
+tags: [vendors, artery, at32, stm32-compat]
+---
+
+Artery Technology (雅特力科技) is a Shanghai-headquartered fabless MCU company founded in 2016. Inside three years it shipped the AT32F403, a pin-compatible higher-clocked replacement for STMicroelectronics' STM32F103; by 2021 the AT32F4 line ran at 240 MHz versus the STM32F407's 168 MHz, with more flash and lower prices, and Artery had become — alongside GigaDevice — one of the two serious Chinese competitors in the Cortex-M4 mainstream. The company is not as broad as GigaDevice (no Wi-Fi, no Cortex-M7, no Cortex-R) and is laser-focused on M4 performance at low cost for industrial, motor-control, and consumer designs.
+
+This page covers the company, the portfolio shape, and the engineering trade-offs of choosing AT32 over STM32 or GD32 for a new project.
+
+<SpecSheet
+  title="Artery Technology at a glance"
+  specs={[
+    { label: 'Founded', value: '2016, Shanghai, China; private (no IPO as of 2026)' },
+    { label: 'Arm IP licensed', value: 'Cortex-M0+ (entry parts), Cortex-M4F (volume parts), Cortex-M33 announced for wireless line' },
+    { label: 'Flagship parts', value: 'AT32F435 / F437 (M4F @ 288 MHz, 4 MB flash), AT32F423 (M4F @ 150 MHz, low-cost), AT32WB415 (BLE)' },
+    { label: 'Process node', value: 'TSMC 55 nm for most parts, TSMC 40 nm ULP for newest WB / efficient lines' },
+    { label: 'IDE / SDK', value: 'Artery BSP (LL-style + HAL-style), Keil MDK DFP, IAR EWARM DFP, GCC + OpenOCD, AT32 Work Bench (Eclipse)' },
+    { label: 'Programming tools', value: 'AT-Link (CMSIS-DAP), AT-Link Pro (with isolation), J-Link supported, ROM USART / USB-DFU bootloader' },
+    { label: 'Website', value: 'arterychip.com (English) / arterytek.com' },
+    { label: 'Distribution', value: 'LCSC dominant, Mouser and Digi-Key carry common parts, regional Chinese reps' },
+  ]}
+/>
+
+## Company and positioning
+
+Artery was founded in 2016 by ex-Spansion and ex-ISSI engineers. The pitch from day one was narrower than GigaDevice's: don't try to build the whole MCU portfolio, build the Cortex-M4 part that the market actually buys — high-clock, big-flash, peripheral-rich, pin-compatible with STM32F407 — and sell it at a discount. The first part, AT32F403, was a pin-compatible STM32F103 clone running at 240 MHz on the M4 core (more capable than the F1's M3) with double the flash. It found design wins in domestic-market motor drives and industrial controllers almost immediately.
+
+Through the 2020-2022 STM32 shortage, Artery rode the same wave as GigaDevice. The catalogue widened to include the AT32F435 / F437 (288 MHz M4F, the highest-clocked Cortex-M4 mainstream MCU available from any vendor as of 2026), the AT32F421 cost-optimized M4F, the AT32F423 with USB and CAN, and the AT32A403A automotive-grade variant for AEC-Q100 industrial. Wireless was announced as AT32WB415 (BLE 5.0 + M4F) in 2023 but volume shipment didn't begin until late 2024.
+
+The company has aggressive published roadmaps for a Cortex-M33 line (AT32S series, security-focused) and an "AT32M" dedicated motor-control line. Both are covered on this site as separate pages where they exist in volume.
+
+## Product family map
+
+| Line | Core | Clock | Flash | Position |
+|------|------|-------|-------|----------|
+| **AT32F403** | Cortex-M4F | 240 MHz | up to 1 MB | First-gen STM32F103 replacement at higher clock |
+| **AT32F403A / F407** | Cortex-M4F | 240 MHz | up to 1 MB | Connectivity line — Ethernet, USB OTG |
+| **AT32F415** | Cortex-M4F | 150 MHz | up to 256 KB | Mid-range with USB |
+| **AT32F421** | Cortex-M4F | 120 MHz | up to 64 KB | Cost-optimised M4F entry |
+| **AT32F423** | Cortex-M4F | 150 MHz | up to 256 KB | USB + CAN, mainstream |
+| **AT32F425** | Cortex-M4F | 96 MHz | up to 64 KB | USB-C, USB-PD reference |
+| **AT32F435 / F437** | Cortex-M4F | **288 MHz** | up to 4 MB | High-performance flagship |
+| **AT32A403A** | Cortex-M4F | 240 MHz | up to 1 MB | Automotive AEC-Q100 |
+| **AT32M412 (planned)** | Cortex-M4F | tbd | tbd | Dedicated motor-control sub-line |
+| **AT32WB415** | Cortex-M4F | 168 MHz | 1 MB | BLE 5.0 + M4F, in production from 2024 |
+
+Volume in 2026 is in the F403A/F407 (drop-in STM32F407 replacement), the F421/F423 (cost-down small designs), and the F435/F437 (designs that need maximum M4 throughput).
+
+<BlockDiagram title="AT32 portfolio positioning" width={820} height={300} nodes={[
+  { id: 'f403', x: 30,  y: 30,  w: 240, h: 80, kind: 'core',    label: 'AT32F403 / F407', detail: '240 MHz M4F · STM32F407 pin-compat · ETH · USB OTG' },
+  { id: 'f435', x: 290, y: 30,  w: 240, h: 80, kind: 'core',    label: 'AT32F435 / F437', detail: '288 MHz M4F · 4 MB flash · CAN-FD · SDIO' },
+  { id: 'fauto',x: 550, y: 30,  w: 240, h: 80, kind: 'security',label: 'AT32A403A', detail: 'AEC-Q100 · automotive 240 MHz M4F' },
+  { id: 'f421', x: 30,  y: 130, w: 240, h: 80, kind: 'memory',  label: 'AT32F421 / F425', detail: 'Cost-optimised entry M4F · USB-PD' },
+  { id: 'f423', x: 290, y: 130, w: 240, h: 80, kind: 'core',    label: 'AT32F423', detail: 'Mainstream 150 MHz · USB · CAN classic' },
+  { id: 'wb',   x: 550, y: 130, w: 240, h: 80, kind: 'radio',   label: 'AT32WB415', detail: 'BLE 5.0 + M4F · ramping 2024' },
+]} caption="Artery is much narrower than GigaDevice — every line is Cortex-M4F. The differentiation runs along package size, clock speed, flash size, and a small number of vertical-specific peripherals." />
+
+## The STM32F4 compatibility story
+
+Artery's pitch leans harder on direct STM32F4 compatibility than GigaDevice's does. The F403A and F407 are designed to be drop-in replacements for STM32F405 / F407 — same pinout in the same package, same peripheral register addresses, same vector table, same ROM bootloader on the same UART pins. In Artery's own benchmark a stock STM32F407 binary running CoreMark on an AT32F407 with no recompilation scores 614 CoreMark vs the original 608, just by virtue of the higher clock.
+
+| Compatibility area | AT32F403A vs STM32F405 | AT32F435 vs STM32F407 | AT32F423 vs STM32F412 |
+|--------------------|------------------------|------------------------|------------------------|
+| Pinout / package   | Identical | Identical | Similar |
+| GPIO / AFIO        | Identical | Identical | Similar |
+| USART / SPI / I2C  | Identical | Identical | Identical |
+| ADC                | Identical | Similar, **wider input range** | Similar |
+| DMA streams        | Identical | Identical | Similar |
+| USB OTG-FS         | Identical (Synopsys-derived) | Identical | Identical |
+| Ethernet MAC       | Identical | Identical | n/a |
+| CAN                | bxCAN identical | **CAN-FD added** | bxCAN identical |
+| Flash organisation | Identical sectors | **Dual-bank, larger** | Identical |
+| Clock tree         | Same PLL, **wider PLL N range** | Different multiplier ranges | Similar |
+| SDIO               | Present | Present | Not present |
+
+Performance differences worth noting:
+
+- **AT32F4 clocks at 240 MHz**, the STM32F4 maxes at 180 MHz. Real CoreMark for the AT32F435 at 288 MHz is ~720, vs ~600 on a same-package STM32F407 at 168 MHz.
+- **Flash size is larger** on equivalent parts. AT32F437ZM has 4 MB of internal flash on a 144-pin LQFP; STM32F407 maxes at 2 MB.
+- **Some peripherals are missing**. AT32F407 does not have SDIO (it has it on F415 instead); STM32F407 does. AT32F407 has 8 UARTs; STM32F407 has 6.
+- **Flash latency** is similar at the matching clock, but the AT32F435 needs more wait states to reach 288 MHz — Artery's flash accelerator (their analogue to ART) is necessary above 100 MHz.
+
+## Software ecosystem
+
+Artery publishes their own firmware library in two flavours:
+
+- **AT32 BSP (Board Support Package)** — a single repo per device family containing the CMSIS device header, a HAL-style high-level driver layer, an LL-style register-direct layer, the startup file in GCC / IAR / Keil flavours, and a set of example projects per peripheral. The HAL layer mirrors STMicro's old Standard Peripheral Library function names (`gpio_init`, `usart_enable`) rather than the modern STM32 HAL — closer to a port of the SPL than to a port of the new HAL.
+- **AT32 Work Bench** — Eclipse-CDT based IDE bundled with GCC and AT-Link drivers. Free.
+
+Toolchain support outside Artery's own packaging:
+
+- **Keil MDK** — device family pack maintained by Artery, installable through Keil's Pack Manager. Full register browser, debug script, J-Link integration.
+- **IAR EWARM** — DFP installable through IAR.
+- **PlatformIO** — community-maintained `platform-artery` repository covers the popular AT32F403, F407, F415, F421, F435, F437 boards.
+- **Zephyr** — initial support added in 3.5 (limited coverage; F405A / F407 / F435 / F437 with UART, GPIO, SPI, I2C, ADC, no Ethernet yet).
+- **Rust embedded-hal** — `at32f4xx-hal` crate exists for F403 and F407, contributor-maintained.
+
+The **AT-Link** is Artery's official debug probe, an under-$10 CMSIS-DAP plus a USART-to-USB adapter on one board. The Pro version adds galvanic isolation. Both are sold openly through Mouser, LCSC, and Artery's webstore. OpenOCD with the `at32f4x.cfg` target file recognises the chip's IDCODE and works against any CMSIS-DAP probe.
+
+## Differences from STM32F4 to plan for
+
+The pinout matches and the register map almost matches, but enough deviates that you should not ship STM32 firmware on an AT32 board without re-validation. The recurring gotchas:
+
+- **Clock tree multipliers** — the AT32F4 PLL has multiplier ranges that overlap STM32F4 but the integer bounds are different. The clock-tree configurator in Artery's BSP generates correct values; a hand-coded `RCC->CFGR` from STM32 firmware will likely produce the wrong frequency.
+- **Flash erase time** — Artery flash sectors take 20% to 30% longer to erase than STM32 sectors at the same address. Code that polls FLASH_SR with a hard timeout calibrated for STM32 will fail.
+- **ADC sample timing** — the AT32 ADC has a wider input voltage tolerance and slightly different minimum sample-time requirements per source impedance. Re-run sample-time calculation from the AT32 datasheet electrical characteristics.
+- **USB enumeration timing** — the AT32F407 USB OTG is Synopsys-compatible but a few status-register bits differ. Most USB stacks (TinyUSB, ChibiOS USB, FreeRTOS+USB) have an AT32 port that handles the differences.
+
+<Callout type="warn" title="Errata sheets are mandatory reading">
+Artery publishes a per-device errata document, and several entries have no software workaround. Examples: AT32F403A errata note 0001 (USART noise on parity error with stop-bit clearing must be done in a specific order), AT32F435 errata 0007 (SDIO interrupt latency above 240 MHz). Always pull the latest errata before tape-out — Artery updates these documents quietly and the website does not always link the newest revision.
+</Callout>
+
+<Callout type="tip" title="Pre-validate the clock tree before shipping firmware">
+The single most common source of "STM32 firmware doesn't work on AT32" bug reports is wrong PLL configuration silently producing 75% or 50% of the intended core clock. Wire a known-frequency GPIO toggle in `main()`, scope it on the bench against the expected period, and confirm the system clock before touching any peripheral. This catches more bugs than any other single technique.
+</Callout>
+
+## Cross-references
+
+- [AT32F4 mainstream](/docs/vendors/artery-at32f4) — deep dive into the F403 / F407 / F415 / F421 / F423 / F435 / F437 lines.
+- [AT32M motor control](/docs/vendors/artery-at32m) — dedicated motor-control variants.
+- [GigaDevice GD32](/docs/vendors/gigadevice) — the other major Chinese vendor.
+- [STM32 mainstream](/docs/vendors/stm32-mainstream) — the parts being targeted.
+- [Cortex-M4](/docs/cortex-m/m4) — core architecture.
+- [OpenOCD](/docs/tools/openocd) — debug probe setup for AT-Link.
+
+## External links
+
+- [Artery Technology corporate site](https://www.arterychip.com/en/index.jsp)
+- [AT32 product catalog](https://www.arterychip.com/en/product/index.jsp)
+- [AT32 firmware libraries on GitHub](https://github.com/ArteryTek)
+- [AT32 application notes (English)](https://www.arterychip.com/en/support/index.jsp)
+- [AT-Link debug probe documentation](https://www.arterychip.com/en/support/AT-Link.jsp)
+- [LCSC AT32 listings](https://www.lcsc.com/products/MCU_Microcontroller_Units_MCUs_11329.html)
+- [PlatformIO Artery platform](https://github.com/Artery-MCU/platform-artery)

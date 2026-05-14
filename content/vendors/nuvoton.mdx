@@ -1,0 +1,110 @@
+---
+title: Nuvoton NuMicro
+description: Nuvoton Technology — Taiwan's quiet Cortex-M heavyweight. NuMicro M0/M23/M4/M55 portfolio, fabless-with-fab strategy, NuTool ecosystem, where it beats STM32 and where it doesn't.
+order: 20
+updated: 2026-05-13
+tags: [vendors, nuvoton, numicro, m0, m23, m4, m55]
+---
+
+Nuvoton Technology is the kind of MCU vendor most Western firmware engineers have never written a line of code for, yet it ships tens of millions of Cortex-M parts a year into Taiwanese, Chinese, and pan-Asian designs. Spun off from Winbond Electronics in 2008, headquartered in Hsinchu Science Park, Nuvoton is unusual among modern MCU houses in that it still runs its own wafer fab — a 200 mm line in Hsinchu that produces parts on mature 0.18 µm and 90 nm processes. The strategy is unfashionable in a fabless world, but it gives Nuvoton tight control over supply, long product lifecycles (15+ years on flagship parts), and the ability to price aggressively against TSMC-fabbed competitors.
+
+<SpecSheet
+  title="Nuvoton at a glance"
+  specs={[
+    { label: 'Vendor', value: 'Nuvoton Technology Corporation' },
+    { label: 'Founded', value: '2008 (spun off from Winbond Electronics, founded 1987)' },
+    { label: 'HQ', value: 'Hsinchu Science Park, Taiwan' },
+    { label: 'Flagship part', value: 'M55M1 (Cortex-M55 with Helium, 220 MHz)' },
+    { label: 'Key fact', value: 'Owns its own 200 mm wafer fab in Hsinchu; full 8-bit 8051, Cortex-M0..M55, and Cortex-A35 portfolio' },
+    { label: 'SDK', value: 'NuTool (pin/peripheral GUI) + BSP libraries + NuEclipse IDE + free Nu-Link2 debug probe' },
+    { label: 'Links', value: 'nuvoton.com, github.com/OpenNuvoton, forum.nuvoton.com' },
+  ]}
+/>
+
+## Position in the market
+
+In raw shipment volume Nuvoton sits behind STM, NXP, Renesas, and Microchip globally, but inside the Greater China supply chain it punches well above its weight. Local appliance brands (TCL, Haier, Midea), Taiwanese motherboard houses (ASUS, Gigabyte super-I/O controllers — that's Nuvoton on every PC you own), Chinese consumer electronics OEMs, and a steady stream of industrial-automation customers in the region make up the bulk of revenue. The company is also one of the major suppliers of BMC (baseboard management controller) silicon for server motherboards — a niche worth several hundred million dollars a year and dominated by ASPEED, Nuvoton, and a handful of others.
+
+What's interesting for non-Asian engineers is that Nuvoton ships a coherent Cortex-M portfolio that mirrors the STM32 lineup family-for-family, often at lower distributor pricing, with surprisingly competitive peripherals and a free first-party debug probe (Nu-Link2) that costs nothing if you buy any Nuvoton dev board.
+
+## NuMicro family map
+
+| Sub-family | Core | Max clock | Position |
+|------------|------|-----------|----------|
+| **NUC100 / NUC200** | Cortex-M0 | 50 MHz | Original NuMicro, legacy mainstream M0 |
+| **NANO100 / NANO103** | Cortex-M0+ | 42 MHz | Ultra-low-power, battery-grade |
+| **M0510 / M0518 / M0519** | Cortex-M0 | 50 MHz | Cost-optimised, small packages |
+| **M031 / M032** | Cortex-M0 | 72 MHz | Modern entry, USB device |
+| **M251 / M252** | Cortex-M23 | 48 MHz | Entry TrustZone, very low cost |
+| **M2351 / M2354** | Cortex-M23 | 96 MHz | PSA-Certified secure IoT |
+| **M451 / M453** | Cortex-M4F | 72 MHz | Entry M4F |
+| **NUC472 / NUC442** | Cortex-M4F | 84 MHz | Mainstream M4F, EBI, CAN |
+| **M480 / M487** | Cortex-M4F | 192 MHz | Top M4F — HS USB, Ethernet, CAN-FD, crypto |
+| **M460** | Cortex-M4F | 200 MHz | Industrial M4F, dual Ethernet |
+| **M45xD / M45xG** | Cortex-M4F | 72 MHz | Touch, voice, motor specialty |
+| **M55M1** | Cortex-M55 (Helium) | 220 MHz | Newest, AI / ML / DSP class |
+| **MA35D1** | Cortex-A35 + M4 | 800 MHz / 180 MHz | HMI, Linux + RT companion (Nuvoton calls this NuMicroPro) |
+| **N9H series** | ARM9 / Cortex-A35 | up to 1 GHz | Industrial HMI SoCs |
+
+The split is mostly intuitive: the four digits after the family letter encode the package, flash size, and peripheral mix, with the leading two digits selecting a sub-family. M480 is the workhorse, M2351 is the secure flagship, M55M1 is the new headline part for edge ML.
+
+## Manufacturing and process
+
+Nuvoton's Hsinchu fab runs at 0.18 µm and 90 nm, which sounds quaint next to TSMC's 5 nm halo nodes but is exactly the right node for general-purpose MCUs — embedded flash works well at these geometries, leakage is low, and supply is plentiful. The M55M1 and M460 high-end parts move to TSMC 40 nm ULP for higher clock speeds and lower active power, but the bulk of the catalogue runs on the in-house line. This dual-source strategy has helped Nuvoton stay relatively immune to the foundry capacity crunches that hit pure-fabless vendors during 2021 and 2022.
+
+## Comparison against the obvious rivals
+
+| Tier | Nuvoton | ST | NXP | Microchip / Atmel |
+|------|---------|-----|-----|-------------------|
+| Cortex-M0/M0+ entry | NUC100, M031 | STM32F0, G0, C0 | LPC11xx | SAM D10/D20 |
+| Cortex-M0+ ULP | NANO100 | STM32L0 | KL series | SAM L10/L11 |
+| Cortex-M23 secure | M2351, M2354 | STM32L5 (M33 in fact) | LPC55S0x | SAM L11 |
+| Cortex-M4F mainstream | M480, M460 | STM32F4 | Kinetis K series | SAM E5x |
+| Cortex-M55 edge AI | M55M1 | none yet | i.MX RT500 (M33+M7) | none yet |
+| Cortex-A + M companion | MA35D1 | STM32MP1/MP2 | i.MX 8, i.MX 9 | none |
+
+Where Nuvoton wins is unit price and lead time inside Asia — distributors like WPG, Avnet Taiwan, and Sertek hold deep inventory. Where it loses against ST is documentation maturity (the reference manuals are competent but thin on application notes) and the breadth of community examples in English. NXP and Microchip generally have stronger tooling polish. Nuvoton's Nu-Link2 probe and NuTool configurator are functional but feel a generation behind CubeMX and MCUXpresso.
+
+## Software ecosystem
+
+The Nuvoton software stack is fragmented but workable:
+
+- **NuTool — Pin Configure** — graphical pin assignment, clock tree, peripheral mux. The CubeMX analogue.
+- **NuTool — PeripheralCfg** — clickthrough peripheral configuration generator.
+- **BSP libraries** — per-family driver libraries (StdDriver, plus higher-level libraries for USB, CAN, Ethernet). Published openly at github.com/OpenNuvoton — refreshingly source-available, not just headers.
+- **NuEclipse** — Eclipse-based IDE bundled with GCC, GDB, and Nu-Link2 support. Free. Slow, as Eclipse always is.
+- **Keil and IAR** — both have first-class Nuvoton pack support; most production teams in Asia use Keil.
+- **Nu-Link2** — Nuvoton's USB debug probe. Bundled with every dev board, sells separately for under USD 20. Supports SWD, ICP (in-circuit programming), and a Virtual COM port. The host driver works on Windows and Linux; macOS support is community-maintained.
+
+For RTOS support, FreeRTOS ports are official; Zephyr support exists for selected M23 and M4 parts via the upstream tree (`soc/arm/nuvoton_numicro/`), and is improving but still patchy compared to ST or NXP.
+
+<Callout type="tip" title="Use the OpenNuvoton GitHub, not the vendor download page">
+Nuvoton's official download portal serves zipped BSPs that lag behind master by months. The github.com/OpenNuvoton organisation hosts the live source for the StdDriver, BSP samples, TF-M port, and FreeRTOS examples, and accepts pull requests. For any new project, clone from there and pin to a release tag.
+</Callout>
+
+## LD-ROM and APROM — the dual-flash boot trick
+
+A defining Nuvoton quirk worth knowing: every NuMicro part splits its on-chip flash into two regions, **APROM** (Application ROM, the main flash where your firmware lives) and **LD-ROM** (Loader ROM, a smaller separate flash bank that holds an immutable second-stage bootloader). The CPU can be configured at reset (via the CBS — Chip Boot Select — configuration bits) to boot from either APROM or LD-ROM. There is also a small ROM-resident IAP (In-Application Programming) library that lets the running firmware flip the boot source and reset.
+
+The practical effect is that you can ship a bulletproof bootloader in LD-ROM, lock it with `LDROM_LOCK`, and update the application in APROM in the field without ever risking a bricked device — the LD-ROM bootloader cannot be overwritten by buggy application code. STM32 simulates the same pattern with a "system memory" ROM bootloader and option bytes, but Nuvoton's dual-bank flash is more flexible because the LD-ROM is writable during manufacturing — you ship your own bootloader, not ST's.
+
+<Callout type="warn" title="LD-ROM lock is irreversible">
+Setting `CONFIG0.LDLOCK = 0` permanently write-protects LD-ROM on most NuMicro parts. Do this only on production binaries that have survived field testing. Recovery requires a mass-erase via ICP, which on locked parts may also be disabled.
+</Callout>
+
+## When to pick Nuvoton
+
+Pick Nuvoton when you're sourcing through an Asian supply chain, when the BOM target is aggressive, when long-term availability matters more than the latest 40 nm process, or when you need a specific peripheral mix that Nuvoton offers cheaper than ST — for example, M480's combination of high-speed USB, dual CAN-FD, and Ethernet on a 100-pin LQFP for under USD 5 is hard to match elsewhere. For BMC, super-I/O, and embedded controller designs, Nuvoton is already the incumbent and the ecosystem is built around it.
+
+## Cross-references
+
+- [NuMicro M0 entry](/docs/vendors/nuvoton-m0)
+- [NuMicro M23 secure](/docs/vendors/nuvoton-m23)
+- [NuMicro M4 mainstream](/docs/vendors/nuvoton-m4)
+- [Cortex-M0 / M0+](/docs/cortex-m/m0-m0plus)
+- [Cortex-M4](/docs/cortex-m/m4)
+- [Cortex-M23](/docs/cortex-m/m33-m23)
+- [Nuvoton corporate site](https://www.nuvoton.com) (external)
+- [OpenNuvoton GitHub organisation](https://github.com/OpenNuvoton) (external)
+- [Nuvoton technical wiki](https://www.nuvoton.com/support/online-resource/) (external)
+- [Nuvoton community forum](https://forum.nuvoton.com) (external)

@@ -1,0 +1,148 @@
+---
+title: GigaDevice GD32L — Cortex-M23 low-power
+description: GD32L23 and GD32L235 — sub-microamp stop modes, TrustZone-M, LPUART, LPTIM, and the GigaDevice answer to the STM32L0/L4 battery-IoT slot.
+order: 22
+updated: 2026-05-13
+tags: [vendors, gigadevice, gd32, gd32l, cortex-m23, low-power]
+---
+
+GD32L is GigaDevice's low-power line, built around the Armv8-M Baseline Cortex-M23 core. The first parts (GD32L23x) shipped in 2021, and the more capable GD32L235 series followed in 2023. Both target the same applications as STMicro's STM32L0 / L4 and Renesas's RA2 — battery-powered IoT sensor nodes, wearables, smart-card terminals, electronic shelf labels, and any design where the deep-sleep current and the wake-up latency determine the battery life. The Cortex-M23 choice (instead of M0+ as on STM32L0) brings TrustZone-M for secure boot and signed firmware updates, which the STM32L0 lacks.
+
+This is the smaller, quieter half of the GD32 portfolio — not pin-compatible with any STM32 part, sold on power numbers rather than compatibility.
+
+<SpecSheet
+  title="GD32L23x / L235 at a glance"
+  specs={[
+    { label: 'Core', value: 'Arm Cortex-M23 (Armv8-M Baseline), 64 MHz max, optional TrustZone-M' },
+    { label: 'Flash', value: '64 KB to 256 KB on L23x, up to 512 KB on L235; 6 ns access at 0 wait state below 24 MHz' },
+    { label: 'SRAM', value: '16 KB to 32 KB on L23x, 64 KB on L235, with retention support across stop modes' },
+    { label: 'Voltage range', value: '1.65 V to 3.6 V; internal regulator with main / low-power / sub-band modes' },
+    { label: 'Run current', value: '110 µA/MHz typical at 3.0 V (L235), 130 µA/MHz on L23x' },
+    { label: 'Deep-sleep', value: 'Stop 0: 4 µA, Stop 1: 1.6 µA, Stop 2: 0.6 µA, Standby with RTC: 0.3 µA, Standby no RTC: 0.05 µA' },
+    { label: 'Wake-up latency', value: '5 µs from Stop 0, 14 µs from Stop 1, 32 µs from Stop 2, 250 µs from Standby' },
+    { label: 'Package range', value: 'QFN-32 (3 x 3 mm) up to LQFP-100; WLCSP-25 for the smallest' },
+  ]}
+/>
+
+## Where the GD32L fits
+
+The L23 and L235 are GigaDevice's bid to displace STM32L0 in legacy designs and to compete against STM32L4 / L4+ in new designs. The pitch:
+
+- **Smaller package, lower price** than STM32L4 for entry-level battery devices.
+- **TrustZone-M** that the STM32L0 doesn't have — important for IEC 62443 and PSA Certified Level 2 conformant designs.
+- **Sub-microamp deep-sleep** matching STM32L4's Stop 2 numbers.
+- **5 µs wake-up from Stop 0** — fast enough for periodic sensor sampling without breaking the duty cycle budget.
+
+Where it loses to STM32L4 / U5 is in peripheral diversity: no SDIO, no Ethernet, no USB OTG-HS, no LCD glass driver on the standard variants. For a wearable or a sensor tag this is fine; for an industrial gateway it isn't.
+
+| Variant | Flash | SRAM | Max MHz | TrustZone | LPUART | Notable |
+|---------|-------|------|---------|-----------|--------|---------|
+| GD32L233CC | 256 KB | 32 KB | 64 | No | 1 | Mainstream L23x |
+| GD32L233RB | 128 KB | 24 KB | 64 | No | 1 | Smaller die |
+| GD32L235RB | 128 KB | 32 KB | 64 | Yes | 2 | TrustZone-M, dual LPUART |
+| GD32L235CC | 256 KB | 64 KB | 64 | Yes | 2 | Mainstream with secure boot |
+| GD32L235VK | 512 KB | 64 KB | 64 | Yes | 2 | Top of line |
+
+## The Cortex-M23 choice
+
+Cortex-M23 sits one rung above Cortex-M0+ in the Armv8-M lineup. It adds:
+
+- Armv8-M Baseline ISA — same instruction set as Armv6-M (used on M0+) plus integer divide, compare-and-branch, and a handful of system instructions.
+- Optional TrustZone-M with Secure and Non-secure worlds, Secure Attribution Unit (SAU), and Secure/Non-secure interrupt routing.
+- Single-cycle 32-bit multiply (the M0+ has it too, optionally).
+- No FPU, no DSP — those are M4 / M33 features.
+
+For a sensor-node workload — wake, sample I2C, format a packet, transmit over UART/SPI, sleep — the Cortex-M23 is roughly 1.5x the throughput of an M0+ at the same MHz. The Dhrystone numbers from GigaDevice's datasheet quote 1.95 DMIPS/MHz, very close to the Arm reference of 0.98 CoreMark/MHz.
+
+The TrustZone-M block is optional and present only on GD32L235 (not L23x). When enabled, the secure firmware lives in the lowest portion of flash, the non-secure application above; the Secure Attribution Unit defines which addresses belong to which world. Secure code can call non-secure code and vice versa only through the SG (Secure Gateway) veneer instruction. See [Cortex-M33 / M23](/docs/cortex-m/m23) for a full treatment.
+
+## Power architecture
+
+The power tree is the headline feature, and the GD32L mirrors STM32L0/L4 closely in structure but with GigaDevice's own numbers.
+
+| Mode | Core | RAM retention | Peripherals | Wake source | Typical I |
+|------|------|---------------|-------------|-------------|-----------|
+| Run | On | All | All | n/a | 110-180 µA/MHz |
+| Sleep | Off (WFI) | All | Most | Any IRQ | 30 µA/MHz |
+| Deep-sleep / Stop 0 | Off | All | LPTIM, LPUART, RTC, COMP | EXTI, RTC, LPUART | 4 µA |
+| Stop 1 | Off | All | LPTIM, RTC | EXTI, RTC | 1.6 µA |
+| Stop 2 | Off | Partial | RTC only | RTC | 0.6 µA |
+| Standby | Off | Backup only | RTC optional | RTC, WKUP pin, IWDG | 0.3 µA / 0.05 µA |
+| Shutdown | Off | None | None | WKUP pin only | 0.02 µA |
+
+The numbers are at 3.0 V, 25 °C, internal regulator in low-power mode. At 1.8 V (the bottom of the voltage range) the figures drop another 30%.
+
+Peripheral autonomy is the critical low-power feature. LPUART and LPTIM remain functional in Stop 0 and Stop 1; the chip can receive a UART frame, decode it, and pattern-match it (the LPUART has a 7-bit address-match register) before waking the core. The same is true for LPTIM driving a periodic wake-up.
+
+```c
+// LPTIM autonomous wake every 1 second from Stop 1 — GD32L235
+rcu_periph_clock_enable(RCU_LPTIMER);
+rcu_periph_clock_enable(RCU_PMU);
+rcu_osci_on(RCU_LXTAL);                                  // 32.768 kHz crystal
+while (!rcu_flag_get(RCU_FLAG_LXTALSTB));
+rcu_lptimer_clock_config(RCU_LPTIMERSRC_LXTAL);
+
+lptimer_struct_para_init(&lptimer_init);
+lptimer_init.clocksource = LPTIMER_LPCLKSOURCE_INTERNAL;
+lptimer_init.prescaler   = LPTIMER_PSC_32;
+lptimer_init.countersource = LPTIMER_COUNTER_INTERNAL;
+lptimer_init.outputpolarity = LPTIMER_OUTPUT_NOTINVERTED;
+lptimer_init.outputmode = LPTIMER_OUTPUT_PWMORONESHOT;
+lptimer_init.triggermode = LPTIMER_TRIGGER_SOFTWARE;
+lptimer_init_periph(LPTIMER, &lptimer_init);
+
+lptimer_compare_value_config(LPTIMER, 1023);             // ~1 s at 32.768 kHz / 32
+lptimer_interrupt_enable(LPTIMER, LPTIMER_INT_CMPM);
+lptimer_counter_start(LPTIMER, LPTIMER_OPERATION_CONTINUOUS);
+
+pmu_to_deepsleepmode(PMU_LDO_LOWPOWER, PMU_LOWDRIVER_DISABLE, WFI_CMD);
+// Core wakes on LPTIMER compare match. SRAM is retained.
+```
+
+## RTC and tamper
+
+The RTC is shared with STM32L4 style: a 32-bit calendar with sub-second precision, two alarms, a periodic wake-up timer, and backup registers. Five tamper inputs (analog or digital) trigger an erase of the backup registers and an interrupt or reset. The smartcard / payment-terminal use case is the obvious target.
+
+## Brown-out and supply monitoring
+
+The BOR (Brown-Out Reset) and PVD (Programmable Voltage Detector) are present:
+
+- BOR has four levels: 1.7 V, 2.0 V, 2.5 V, 2.8 V. Reset assertion within 200 ns of supply crossing the threshold.
+- PVD monitors VDD against a programmable threshold (2.0 to 3.0 V) and raises an interrupt before the BOR fires — useful for "save state to backup RAM" sequences when the battery is about to brown out.
+
+<Callout type="warn" title="LXTAL stabilisation before Stop mode entry">
+Entering Stop with the LSE (LXTAL) crystal not yet stable will cause the RTC to free-run on a stale value and the wake-up alarm to fire at the wrong time — or never. GigaDevice's reference code waits for `RCU_FLAG_LXTALSTB` before configuring the RTC, but does not gate the first Stop entry on it. On battery devices with a slow-starting 32.768 kHz crystal (some watch crystals take 1.5 s to stabilise), block the first sleep for at least the crystal datasheet's startup time. After that, the LXTAL stays on across all Stop modes.
+</Callout>
+
+## Application use cases
+
+The L23 / L235 has shipped in:
+
+- **Electronic shelf labels** — wake on RF, refresh e-paper, sleep. 5-year coin-cell life on 8000 daily refreshes.
+- **Smart-card readers** — TrustZone-M for the secure session, fast wake-up for the EMV transaction window.
+- **Wearable activity trackers** — LPTIM-driven sampling of accelerometer, periodic BLE advertisement.
+- **Battery-powered sensor nodes** — temperature / humidity / CO2, with LoRaWAN or BLE radio on a companion chip.
+- **RF-tag readers / writers** — NFC controller plus M23 host, often on a single LiSOCl2 battery.
+
+For all of these the design constraint is mean current under 10 µA averaged over the duty cycle; the M23 spends >99% of its time in Stop 1 or Stop 2.
+
+<Callout type="tip" title="Use the EFM32 power-profiler approach for validation">
+The published datasheet currents are the **best-case** numbers at room temperature with the internal regulator in low-power mode. Real-world averages on a production board can be 2-3 µA higher because of leakage on tied-but-undriven GPIOs and quiescent current of the external regulator. A current-shunt monitor (INA226 or the Joulescope JS220) with logging over a 24-hour cycle is the right qualifier before tape-out — datasheet numbers alone will overpromise.
+</Callout>
+
+## Cross-references
+
+- [GigaDevice GD32 landing](/docs/vendors/gigadevice) — full portfolio.
+- [GD32F mainstream](/docs/vendors/gigadevice-gd32f) — the M3/M4/M7 lines.
+- [GD32W wireless](/docs/vendors/gigadevice-gd32w) — the Wi-Fi / BLE sibling.
+- [STM32 low-power](/docs/vendors/stm32-lowpower) — the L0/L4/U5 it competes against.
+- [Cortex-M23](/docs/cortex-m/m23) — core architecture and TrustZone-M details.
+- [Cortex-M low-power techniques](/docs/cortex-m/low-power) — sleep modes and wake-up latency.
+
+## External links
+
+- [GD32L23x datasheet portal](https://www.gd32mcu.com/en/download/0?kw=GD32L23)
+- [GD32L235 user manual](https://www.gd32mcu.com/en/download/7?kw=GD32L235)
+- [GD32L23x firmware library on GitHub](https://github.com/GigaDevice-MCU/GD32L23x_Firmware_Library)
+- [GigaDevice low-power application notes](https://www.gd32mcu.com/en/download/4)
+- [PSA Certified GigaDevice listings](https://www.psacertified.org/certified-products/)

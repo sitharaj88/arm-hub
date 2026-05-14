@@ -1,0 +1,142 @@
+---
+title: Ambiq Apollo5 / Apollo510
+description: Apollo510 — first commercial Cortex-M55 with Helium MVE for wearables, dedicated NPU for on-device AI, 4 MB MRAM, MIPI-DSI and MIPI-CSI. The platform for the AI smartwatch generation.
+order: 26
+updated: 2026-05-13
+tags: [vendors, ambiq, apollo, apollo5, apollo510, m55, helium, npu, ai, ml, wearable]
+---
+
+Apollo510 is Ambiq's bet on the next wave of wearable and hearable devices: products where the user expects on-device AI for wake-word recognition, fall detection, ECG arrhythmia analysis, gesture recognition, continuous biometric authentication, and adaptive noise cancellation, all without a round trip to a phone or the cloud. Released in 2024, it is the first commercial Cortex-M55 part for the wearable market and the first Ambiq part to combine Helium vector extensions, a dedicated neural processing unit, and MRAM-based fast non-volatile storage on a single die. The trade-off Ambiq made — and the reason Apollo510 has a different power profile from Apollo4 — is that the CPU and ML throughput went up dramatically while the µA-per-MHz number went up too, because vector compute and NPU operations cannot be done at the same sub-threshold voltages as scalar Cortex-M4F execution.
+
+<SpecSheet
+  title="Apollo510 at a glance"
+  specs={[
+    { label: 'Vendor', value: 'Ambiq Micro' },
+    { label: 'Founded', value: 'Apollo510 announced 2023, sampling 2024, production late 2024 — first Cortex-M55 for the wearable / hearable market' },
+    { label: 'HQ', value: 'Austin, Texas' },
+    { label: 'Flagship part', value: 'Apollo510 (Cortex-M55 with Helium MVE, 250 MHz, dedicated NPU, 4 MB MRAM, 4 MB SRAM, MIPI-DSI, MIPI-CSI, USB HS)' },
+    { label: 'Key fact', value: 'Helium vector compute delivers approximately 5× scalar M4F throughput on int8 ML kernels; NPU adds another 10× on top for supported operator sets' },
+    { label: 'SDK', value: 'AmbiqSuite SDK with Helium-optimised CMSIS-DSP and CMSIS-NN, TensorFlow Lite for Microcontrollers, NemaGFX, FreeRTOS' },
+    { label: 'Links', value: 'ambiq.com/apollo510' },
+  ]}
+/>
+
+## What's inside
+
+| Block | Detail |
+|-------|--------|
+| **CPU** | Cortex-M55 at 250 MHz with FPU, Helium MVE (128-bit vector), MPU 16-region, ETM trace |
+| **NPU** | Ambiq in-house design; supports int8 and int16 quantised convolution, depthwise, fully connected, attention; roughly 250 GOP/s peak at typical operating point |
+| **Non-volatile memory** | 4 MB MRAM (Magnetoresistive RAM) — non-volatile, no wear limit, read latency comparable to SRAM at 250 MHz |
+| **SRAM** | 4 MB total, organised as 1 MB tightly-coupled DTCM + 3 MB system SRAM, all power-gated per bank |
+| **Display** | MIPI-DSI controller, 4 lanes up to 1.5 Gbps each, AMOLED driver, NemaGFX 2D GPU |
+| **Camera** | MIPI-CSI input, 2 lanes — for low-resolution monochrome on-device computer vision (face wake, gesture detection) |
+| **USB** | USB 2.0 high-speed with on-chip PHY |
+| **BLE** | Optional via companion radio; some Apollo510 SKUs ship with integrated BLE 5.3 |
+| **Audio** | 4× I²S, PDM (8-channel mic array), low-power voice activity detector that wakes the NPU |
+| **Crypto** | AES-128/192/256, SHA-256/512, ECC P-256/384, RSA-2048/4096, TRNG, secure key store |
+| **Process** | TSMC 22 nm ULL with SPOT customised cell library |
+| **Package** | WLCSP, BGA 156-ball, 5.5 × 5.5 mm |
+
+The combination of CPU + NPU + camera input + audio array + display + USB on one die is the design point. Previously a smart-glasses or AI-earbud reference design needed a multi-chip stack — Apollo510 collapses it to a single MCU plus a few external sensors.
+
+## Helium MVE in practice
+
+Helium is Arm's M-profile Vector Extension — a 128-bit SIMD ISA designed specifically for low-power microcontrollers. Unlike NEON on Cortex-A, Helium reuses the FPU register file (so no separate vector registers to spill on context switch) and is designed around two-beat execution that aligns with the M55's two-issue pipeline, keeping silicon area modest. The instruction set supports 8-bit, 16-bit, and 32-bit integer lanes plus 16- and 32-bit float, with predication for branchless loops and tail-handling.
+
+For ML inference, Helium gives roughly 5× speedup on int8 convolution kernels versus scalar Cortex-M4F at the same clock. Combined with the M55's higher clock (250 MHz vs Apollo4's 192 MHz), real-world end-to-end throughput is around 7-8× for typical TFLM models — wake-word detection, person presence, simple gesture classification — that previously required either offloading to a phone or running on an external NPU companion chip.
+
+For non-ML signal processing — biquad audio filters, FFTs for sensor analytics, beamforming for mic arrays — Helium gives 3-4× speedup. CMSIS-DSP ships Helium implementations of every kernel that benefits, so existing code that calls `arm_fft_init_q15` and `arm_fft_q15` picks up the speedup with no source changes — just a recompile against a Helium-enabled toolchain.
+
+## The NPU
+
+For workloads that exceed what Helium alone can deliver — large always-on wake-word models, on-device speaker verification, continuous biometric ECG classification — Apollo510's dedicated NPU adds another order of magnitude. The NPU is a fixed-function accelerator with hardware datapaths for int8 and int16 quantised operators commonly found in CNN and Transformer models: convolution (1D and 2D), depthwise convolution, pointwise convolution, fully connected, attention (Q-K-V matrix multiplies), softmax, layer normalisation, activation functions (ReLU, sigmoid, tanh, GELU). It has its own dedicated SRAM tile for weights and activations to avoid hammering main SRAM, and its own DMA path to/from main SRAM and MRAM for streaming inputs and outputs.
+
+Performance numbers Ambiq publishes for the Apollo510 NPU:
+
+| Model | Operator count | Helium-only inference | NPU-accelerated inference | Speedup |
+|-------|----------------|------------------------|---------------------------|---------|
+| KWS (keyword spotting, 8 classes) | 130 K params | 12 ms | 1.4 ms | 8.6× |
+| VAD (voice activity detection) | 60 K params | 5 ms | 0.6 ms | 8.3× |
+| Person presence (visual, 96×96 mono) | 280 K params | 35 ms | 3.2 ms | 11× |
+| Gesture classification (IMU, 3-axis) | 90 K params | 8 ms | 1.0 ms | 8× |
+| ECG arrhythmia (1D conv, 10 s window) | 500 K params | 95 ms | 7.5 ms | 12.7× |
+
+Energy per inference drops by a similar factor — the NPU's pipelined fixed-function silicon is dramatically more energy-efficient than running the same operators through Helium on the M55. For an always-on wake-word workload running 100× per second, the energy budget difference between Helium-only and NPU-accelerated is the difference between a 60-hour and a 14-day battery life.
+
+## MRAM as fast non-volatile
+
+The 4 MB of MRAM is one of Apollo510's most consequential architectural decisions. MRAM (Magnetoresistive Random Access Memory) stores bits as the magnetic orientation of a small tunnel junction; it is non-volatile (data survives power-off), has no measurable wear limit (unlike flash, which wears after 10⁴ to 10⁶ erase cycles), and reads at SRAM-comparable latencies — roughly 4 ns access time, fast enough to execute code at 250 MHz with minimal wait states. Writes are slower than reads (around 50 ns per word) but vastly faster than flash (which needs page-erase plus word-program, taking milliseconds).
+
+What this enables architecturally:
+
+- **No cache miss penalty on cold code paths.** Conventional flash-based MCUs add wait states for flash reads at high clocks; you need a sizable cache to hit decent performance. MRAM lets Apollo510 run code XIP at full clock with no cache, freeing the cache transistors for other uses.
+- **Fast persistent storage for ML weights.** A 2 MB model can live in MRAM, be loaded into NPU tiles via DMA at SRAM speeds, and survive power-off without flash-write wear concerns.
+- **Frequent OTA-style firmware updates without flash wear worries.** Many wearable products push minor model updates monthly — on flash, this would eventually wear the part out; on MRAM, it is unbounded.
+- **No periodic flash refresh.** Some embedded flash technologies suffer from charge loss over years and require periodic refresh; MRAM has no such failure mode and is rated for 10+ years retention without refresh.
+
+The cost is silicon area and process complexity — MRAM cells are larger than flash cells at the same node, and MRAM requires custom process steps that constrain which fabs can produce it. Ambiq's MRAM is fabricated at TSMC 22 nm ULL with their custom magnetic tunnel junction process.
+
+## Power consumption
+
+Apollo510 power numbers reflect the higher clocks and the vector / NPU hardware:
+
+| Mode | Conditions | Typical current |
+|------|------------|-----------------|
+| Run | 250 MHz, Helium active, NPU active | 50 mA |
+| Run | 250 MHz, M55 scalar only | 8 mA |
+| Run | 96 MHz, M55 scalar | 2.9 mA (30 µA/MHz) |
+| Run | 24 MHz, M55 scalar | 720 µA |
+| Sleep | CPU off, RTC + LP timer + VAD running | 8 µA |
+| Deep sleep | All SRAM gated except 256 KB, RTC on | 2 µA |
+| Off | Backup domain only | 800 nA |
+
+The active-mode µA/MHz at 96 MHz (30 µA/MHz) is higher than Apollo4's 4 µA/MHz — vector compute and NPU operations cannot run at sub-threshold supply voltages, so when those blocks are active the core voltage rises and current rises with it. The Apollo510 design pattern is **bursty inference**: keep the M55 and NPU off most of the time, wake them for a brief inference window (millisecond range), return to deep sleep. The 8 µA always-on with VAD is the figure that matters for an always-on wake-word product — the rest of the system stays asleep until the VAD fires.
+
+## Comparison with Apollo4
+
+| Aspect | Apollo4 Blue Plus | Apollo510 |
+|--------|---------------------|-----------|
+| Core | Cortex-M4F | Cortex-M55 with Helium MVE |
+| Max clock | 192 MHz | 250 MHz |
+| Flash / NVM | 2 MB embedded flash | 4 MB MRAM |
+| SRAM | 2.75 MB | 4 MB |
+| ML acceleration | Scalar M4F + DSP | Helium MVE + dedicated NPU |
+| Peak ML throughput (int8) | ~1 GOP/s effective | ~250 GOP/s peak (NPU) |
+| Display | MIPI-DSI 1-2 lanes | MIPI-DSI 4 lanes |
+| Camera | None | MIPI-CSI 2 lanes |
+| Audio mic array | 2-channel PDM | 8-channel PDM with beamforming |
+| Active power scalar | 4 µA/MHz | 30 µA/MHz |
+| Deep sleep | 1.7 µA | 2 µA |
+| Approx unit price (10k) | USD 6 | USD 14 |
+
+For a smartwatch design that doesn't need on-device AI, Apollo4 remains the cheaper and lower-power choice. Apollo510 makes sense specifically when on-device ML inference is required and offloading to a phone or the cloud is unacceptable for latency, privacy, or duty-cycle reasons.
+
+## Use cases
+
+Apollo510 is sampled into:
+
+- **AI smartwatches** with on-device fall detection, real-time ECG arrhythmia classification, continuous PPG-based atrial fibrillation screening.
+- **AR glasses** with display, mono camera input for hand-tracking and gesture recognition, mic array for spatial audio capture.
+- **Smart hearables with adaptive noise cancellation.** The NPU runs a real-time ANC model fed by the mic array; the M55 + Helium handles the audio rendering path and BLE codec. Power budget allows full-day use on small in-ear batteries.
+- **Medical wearables with continuous biometric authentication.** ECG or PPG signals are continuously classified to verify the wearer is the registered user; if biometrics drift, the device locks itself.
+- **Hearing aids with directional audio processing.** Mic array beamforming + NPU-accelerated noise reduction + speaker output, all on a single die in a hearing-aid form factor.
+
+<Callout type="tip" title="TensorFlow Lite for Microcontrollers with Helium needs the right kernel set">
+TFLM's default scalar kernels do not use Helium — even if you compile with `-march=armv8.1-m.main+mve+fp` you get scalar paths because TFLM dispatches at runtime based on registered kernel sets. AmbiqSuite ships a `tflm_apollo510` library that registers Helium- and NPU-accelerated kernel implementations. Call `tflite::MicroMutableOpResolver` with the Ambiq-provided op resolver, not the default `AllOpsResolver`, or the speedup vanishes.
+</Callout>
+
+<Callout type="warn" title="NPU operator coverage is not 100% of TFLM">
+The NPU handles the common operators in CNN, RNN, and simple Transformer models — convolution, depthwise, fully connected, attention, softmax, common activations. Less common operators (custom layers, exotic activations, dynamic shapes) fall back to Helium on the M55. Check the AmbiqSuite NPU operator coverage table during model design — a model that hits NPU 95% of the time is dramatically faster than one that falls back to Helium every other layer.
+</Callout>
+
+## Cross-references
+
+- [Ambiq landing page](/docs/vendors/ambiq)
+- [Apollo4 family](/docs/vendors/ambiq-apollo4)
+- [Cortex-M55](/docs/cortex-m/m55)
+- [Helium / M-profile Vector Extension](/docs/cortex-m/helium-mve)
+- [TensorFlow Lite for Microcontrollers](/docs/ai-ml/tflm)
+- [Apollo510 product page and datasheet](https://ambiq.com/apollo510/) (external)
+- [Ambiq Helium kernel implementations on GitHub](https://github.com/AmbiqMicro) (external)
+- [Arm Helium technology overview](https://developer.arm.com/Architectures/Helium) (external)

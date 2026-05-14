@@ -1,0 +1,172 @@
+---
+title: Artery AT32F4 — mainstream Cortex-M4
+description: AT32F403 through AT32F437 — the high-clock M4F mainstream. Pinout-compat with STM32F407, up to 288 MHz, 4 MB flash, CAN-FD. Architectural detail and migration mechanics.
+order: 25
+updated: 2026-05-13
+tags: [vendors, artery, at32, at32f4, cortex-m4]
+---
+
+The AT32F4 line is Artery Technology's volume product and the catalogue that the company is best known for. It runs from the original AT32F403 (240 MHz Cortex-M4F, pin-compatible with STM32F407) through to the AT32F437 (288 MHz M4F with 4 MB internal flash and CAN-FD) — currently the highest-clocked Cortex-M4 mainstream MCU available from any vendor as of 2026. The line is positioned squarely against STMicroelectronics' STM32F4 series, with a higher base clock, more flash, similar peripheral set, and a price 20-30% lower in the volume parts.
+
+This page is the engineering-level walkthrough: what each sub-family contains, where the peripheral set differs from STM32F4, the migration mechanics, and the performance numbers that motivate the choice.
+
+<SpecSheet
+  title="AT32F4 mainstream at a glance"
+  specs={[
+    { label: 'Cores', value: 'Cortex-M4F with single-precision FPU and DSP extensions on all parts' },
+    { label: 'Clock range', value: '120 MHz (F421) up to 288 MHz (F435 / F437)' },
+    { label: 'Flash size', value: '32 KB on F421 entry, 1 MB on F407, 2 MB on F437, **4 MB on F437ZM**' },
+    { label: 'SRAM', value: '8 KB on F421, 192 KB on F407, **512 KB on F437** (split across multiple domains)' },
+    { label: 'Process', value: 'TSMC 55 nm for F403/F407/F415/F421/F423, TSMC 40 nm ULP for F435/F437' },
+    { label: 'Peripheral highlights', value: 'USB OTG-FS, Ethernet 10/100 (F407A), QSPI, SDIO, CAN classic (all) + CAN-FD (F435/F437), Quad SPI XIP' },
+    { label: 'Performance', value: 'CoreMark 720 at 288 MHz on F437 (Artery datasheet); 2.5 DMIPS/MHz Cortex-M4 baseline' },
+    { label: 'Cost (1k qty)', value: 'AT32F421C8 ~$0.90, AT32F407VG ~$3.20, AT32F437ZM ~$5.80' },
+  ]}
+/>
+
+## AT32F403 / F407 — STM32F407 drop-in
+
+The original part. AT32F403 launched 2018, the F403A and F407 followed with USB OTG and Ethernet. Footprint and pinout match STM32F405/F407 in LQFP-64 / LQFP-100 / LQFP-144 / BGA-176 packages. Register map matches the STM32F4 closely enough that recompiling against the AT32 device header with the Artery startup file is usually sufficient.
+
+| Part | Clock | Flash | SRAM | Ethernet | USB | Use case |
+|------|-------|-------|------|----------|-----|----------|
+| AT32F403CC | 240 | 256 KB | 96 KB | No | OTG-FS | LQFP-48 mainstream |
+| AT32F403RG | 240 | 1 MB | 224 KB | No | OTG-FS | LQFP-64 industrial |
+| AT32F403AVG | 240 | 1 MB | 224 KB | No | OTG-FS | F405-equivalent, no ETH |
+| AT32F407VG | 240 | 1 MB | 224 KB | Yes | OTG-FS | F407 drop-in |
+| AT32F407ZG | 240 | 1 MB | 224 KB | Yes | OTG-FS | LQFP-144, gateway / HMI |
+
+CoreMark for the F407 at 240 MHz is in the 590-620 range — slightly faster than an STM32F407 at 168 MHz despite the same DMIPS/MHz, simply because of the higher clock.
+
+## AT32F415 / F423 — mid-range with USB / CAN
+
+AT32F415 fills the slot between AT32F421 cost-down and AT32F403 high-end. 150 MHz Cortex-M4F, 32-256 KB flash, USB device, two SPI, three USART, one CAN. AT32F423 is the more recent (2022) generation with a refreshed peripheral set, dual CAN classic, and 150 MHz max.
+
+These parts target small designs that need USB (audio dongles, custom HID, USB-to-UART converters) and fit in LQFP-48 or LQFP-64 packages.
+
+## AT32F421 / F425 — cost-optimised entry
+
+AT32F421 is the cost-down variant: 120 MHz Cortex-M4F, 16-64 KB flash, 8-16 KB SRAM, in packages from TSSOP-20 up to LQFP-48. Aimed at 8-bit replacement and at applications where an M0 / M0+ would normally suffice but the user wants an FPU available.
+
+AT32F425 adds USB-C with USB-PD 3.0 controller in firmware — a small number of designs use it for USB-PD trigger boards and source / sink reference designs at a lower BOM cost than the dedicated TI / Cypress USB-PD controllers.
+
+## AT32F435 / F437 — the 288 MHz flagship
+
+The headline product. AT32F435 / F437 launched 2021 at 288 MHz, doubled to 4 MB internal flash on the F437ZM, added FDCAN (CAN-FD) and QSPI XIP execute-in-place from external NOR. Process moved to TSMC 40 nm ULP for the higher clock at acceptable power.
+
+| Part | Clock | Flash | SRAM | Ethernet | CAN-FD | Notable |
+|------|-------|-------|------|----------|--------|---------|
+| AT32F435CG | 288 | 1 MB | 192 KB | No | 2 | LQFP-48 high-clock |
+| AT32F435RG | 288 | 1 MB | 192 KB | No | 2 | LQFP-64 mainstream |
+| AT32F435VM | 288 | 4 MB | 384 KB | No | 2 | LQFP-100, large flash |
+| AT32F437VG | 288 | 1 MB | 192 KB | Yes | 2 | LQFP-100 with ETH |
+| AT32F437ZM | 288 | 4 MB | 512 KB | Yes | 2 | LQFP-144, top of line |
+
+The 288 MHz figure deserves a note. The Cortex-M4 architectural ceiling depends on the implementer's process and timing closure. Most M4 designs cap at 168-200 MHz; Artery's 288 MHz is achieved by careful pipelining of the flash accelerator (their analogue to STM32's ART) and aggressive 40 nm timing optimisation. The penalty is more wait states at the top clock — 7 wait states on F437 at 288 MHz, vs 5 on F407 at 168 MHz — but the prefetch buffer absorbs most of the cost on linear code.
+
+## Performance numbers
+
+CoreMark and Dhrystone numbers from Artery's published benchmark suite. All compiled with `-O2 -mthumb -mfpu=fpv4-sp-d16`.
+
+| Part | Clock | CoreMark | CoreMark/MHz | DMIPS | DMIPS/MHz |
+|------|-------|----------|--------------|-------|-----------|
+| AT32F403 | 240 | 600 | 2.50 | 624 | 2.60 |
+| AT32F407 | 240 | 608 | 2.53 | 624 | 2.60 |
+| AT32F423 | 150 | 380 | 2.53 | 390 | 2.60 |
+| AT32F435 | 288 | 718 | 2.49 | 749 | 2.60 |
+| AT32F437 | 288 | 720 | 2.50 | 749 | 2.60 |
+| STM32F407 (ref) | 168 | 425 | 2.53 | 437 | 2.60 |
+| STM32F446 (ref) | 180 | 458 | 2.54 | 468 | 2.60 |
+
+The per-MHz number is identical across all M4F implementations — that is the Cortex-M4 architectural number. The headline number scales linearly with clock.
+
+## Compatibility table — what differs from STM32F4
+
+| Area | AT32F407 | STM32F407 | Notes |
+|------|----------|-----------|-------|
+| Package / pinout | LQFP-100 same | LQFP-100 same | Drop-in |
+| Vector table | Same | Same | Drop-in |
+| GPIO registers | Same | Same | Drop-in |
+| USART | Same (8 instances) | Same (6 instances) | AT32 has more |
+| SPI | Same (4) | Same (3) | AT32 has more |
+| I2C | Same | Same | — |
+| TIM1-TIM14 | Same | Same | Drop-in for timer code |
+| ADC sample time | 4-cycle min vs 3-cycle on STM32 | 3-cycle min | Reconfigure |
+| Flash erase time | 22 ms vs 19 ms on STM32 (16 KB sector) | 19 ms | Reconfigure timeouts |
+| RCC PLL N range | 31-432 | 50-432 | Configurator outputs differ |
+| USB OTG-FS | Synopsys-compat | Synopsys | Same stack works |
+| Ethernet MAC | Same | Same | Drop-in |
+| SDIO | Not on F407, on F415 | Present | Different sub-family |
+| CAN | bxCAN | bxCAN | Drop-in |
+
+## Building and flashing — toolchain example
+
+A reference build with arm-none-eabi-gcc, the Artery BSP, and the AT-Link probe via OpenOCD:
+
+```bash
+# Pull the Artery BSP — the device family pack
+git clone https://github.com/ArteryTek/AT32F435_437_Firmware_Library
+
+# Compile against the BSP
+arm-none-eabi-gcc \
+    -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard \
+    -DAT32F437ZMT7 -DAT32F435_437xx \
+    -I AT32F435_437_Firmware_Library/cmsis/cm4/core_support \
+    -I AT32F435_437_Firmware_Library/cmsis/cm4/device_support \
+    -I AT32F435_437_Firmware_Library/libraries/drivers/inc \
+    -T AT32F437ZMT7_FLASH.ld \
+    main.c at32f435_437_int.c system_at32f435_437.c startup_at32f435_437.s \
+    -o firmware.elf
+
+# Flash with OpenOCD and AT-Link (CMSIS-DAP)
+openocd -f interface/cmsis-dap.cfg -f target/at32f4x.cfg \
+    -c "program firmware.elf verify reset exit"
+
+# Or use Artery's own ICP (In-Circuit Programmer)
+AT32_Programmer_CLI -c port=SWD -d AT32F437ZM -w firmware.bin 0x08000000 -v
+```
+
+For STM32 HAL projects, the migration path is the same as for GigaDevice: replace `stm32f4xx_hal.h` with `at32f4xx.h`, replace the HAL drivers with the Artery BSP equivalents, regenerate the linker script and startup file from the BSP templates, re-verify the clock tree against the AT32 reference manual.
+
+## Where it wins, where it loses
+
+Cases where the AT32F4 makes sense:
+
+- **Cost-down of an existing STM32F407 design** with proven firmware. The port is a one-engineer-week job, the BOM cost drops $1-2 per unit, and the lead time is shorter.
+- **High-clock M4 designs** that need 240+ MHz. The next STM32 step up is the H7 at 480 MHz, which costs 3x more and changes the toolchain (cache management).
+- **Large internal flash** without external XIP. AT32F437ZM has 4 MB, more than any STM32F4 part.
+- **CAN-FD on a sub-$6 part** with M4F — AT32F437 has it; equivalent STM32 needs an STM32G4 or H7.
+
+Cases where it doesn't:
+
+- **High-volume export designs** where ST's brand recognition, FAE support, or documented EOL roadmaps matter to the procurement team.
+- **PSA-certified secure boot** — Artery does not publish a PSA Certified Level 1 or 2 certificate as of 2026.
+- **Cortex-M7 performance** — Artery has no M7 part. STM32H7 or NXP i.MX RT is the only Arm option.
+- **Wireless** — AT32WB415 is just ramping; STM32WB and Nordic are far ahead.
+
+<Callout type="tip" title="The 288 MHz clock is real but needs careful PCB decoupling">
+Running the AT32F437 at the top 288 MHz pulls roughly 95 mA from VDD typical, with current spikes during cache misses and burst flash reads. Stock decoupling for an STM32F407 (4x 100 nF + 1x 10 µF near the package) is **not enough** at 288 MHz — add at least one 100 nF per VDD pin (the F437ZM has 8 of them) plus a 4.7 µF bulk cap on the same side of the PCB as the chip. Otherwise you will see EMI peaks above 200 MHz and intermittent reset on supply-voltage-droop edges. This is the most common new-design issue with the high-clock variants.
+</Callout>
+
+<Callout type="warn" title="Source-level recompile is not always enough">
+For F407 to F407 (Artery) the recompile usually works. For F407 to F437 — same family but bigger — the linker script and startup file need to be regenerated because the flash layout (sectors and dual-bank organisation) is different. Firmware that boots fine on F407 will mysteriously fail on F437 if the linker script puts the vector table at an address that is no longer the start of bank 0.
+</Callout>
+
+## Cross-references
+
+- [Artery AT32 landing](/docs/vendors/artery) — company and portfolio.
+- [Artery AT32M motor control](/docs/vendors/artery-at32m) — motor-drive-focused variants.
+- [GigaDevice GD32F mainstream](/docs/vendors/gigadevice-gd32f) — the parallel Chinese alternative.
+- [STM32 mainstream](/docs/vendors/stm32-mainstream) — the parts being targeted.
+- [Cortex-M4](/docs/cortex-m/m4) — core architecture.
+- [DMA](/docs/peripherals/dma) — STM32-class DMA controller layout.
+- [CAN-FD](/docs/peripherals/can-fd) — for AT32F435 / F437 FDCAN details.
+
+## External links
+
+- [AT32F437 product page](https://www.arterychip.com/en/product/AT32F437.jsp)
+- [AT32F435_437 firmware library on GitHub](https://github.com/ArteryTek/AT32F435_437_Firmware_Library)
+- [AT32F437 reference manual](https://www.arterychip.com/file/download/AT32F435_437_RM_V2.04.pdf)
+- [AT32F437 datasheet](https://www.arterychip.com/file/download/AT32F435_437_DS_V2.07.pdf)
+- [AT-Link debug probe getting started](https://www.arterychip.com/en/support/AT-Link.jsp)
+- [Artery ICP and ISP programmer downloads](https://www.arterychip.com/en/support/downloads.jsp)

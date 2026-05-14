@@ -1,0 +1,135 @@
+---
+title: Maxim MAX32 general-purpose Cortex-M4F
+description: The mainstream Maxim MAX32 Cortex-M4F parts — MAX32660 in 1.6 mm WLP, MAX32670/72 with precision ADCs, MAX32650 for audio, and MAX32690 with on-die BLE 5.2. Power, peripherals, and an I2S DMA example.
+order: 23
+updated: 2026-05-13
+tags: [vendors, maxim, analog-devices, max32, cortex-m4f, wlp, low-power, ble]
+---
+
+The MAX32 general-purpose line is the workhorse half of Maxim's Cortex-M4F portfolio — the parts for wearables, audio devices, vital-signs monitors, and small BLE peripherals where system constraints are physical size, integrated analog quality, or battery life rather than raw throughput. The modern parts are the MAX3260x, MAX32650, MAX32660, MAX32670, MAX32672, and MAX32690, all sharing the DARWIN low-power architecture but tuned for different application classes.
+
+This page walks through the four parts that anchor the line, with attention to package size, precision-analog quality, audio interfaces, and integrated radio. The MAX78000 ML accelerator and the MAX32570 secure microcontroller are covered separately.
+
+<SpecSheet
+  title="MAX32 general-purpose family"
+  specs={[
+    { label: 'Vendor', value: 'Maxim Integrated, now part of Analog Devices' },
+    { label: 'Founded / acquired', value: 'Maxim founded 1983; ADI acquisition closed August 2021' },
+    { label: 'HQ', value: 'San Jose, California (legacy Maxim); Wilmington, MA (ADI corporate)' },
+    { label: 'Flagship part', value: 'MAX32690 — Cortex-M4F @ 120 MHz with BLE 5.2 single-mode radio' },
+    { label: 'Smallest package', value: 'MAX32660 — 1.6 x 1.6 mm 12-pin WLP' },
+    { label: 'Largest flash / RAM', value: 'MAX32670 — 3 MB flash / 384 KB SRAM' },
+    { label: 'Active current', value: '27 to 50 microamps per megahertz across the family' },
+    { label: 'SDK', value: 'ADI MSDK (MIT licence, github.com/analogdevicesinc/msdk)' },
+    { label: 'External links', value: 'analog.com/MAX32, ADI EE-Sim, ARM Mbed support (legacy)' },
+  ]}
+/>
+
+## MAX32660 — the smallest serious Cortex-M4F
+
+The MAX32660 is the part the line is best known for. It packs a Cortex-M4F (with FPU and the M4's DSP-extension instructions) running up to 96 MHz, 256 KB flash, 96 KB SRAM, two SPI, two I2C, two UART, a 4-channel 10-bit ADC, four timers, and a watchdog into a 12-pin Wafer-Level Package that measures 1.6 millimetres on a side. The WLP exposes the silicon die directly to the solder ball; there is no plastic encapsulation. The footprint is smaller than a 0402 resistor pair and the height is under 0.4 millimetres.
+
+That package is the only meaningful reason to pick a MAX32660. Cheaper M0+ parts and faster M7 parts exist; nothing else delivers an M4F that fits inside an in-ear hearing aid module or a smart-ring PCB. Maxim publishes hearing-aid reference designs pairing it with their MAX98050 audio codec.
+
+The penalty is pin count. Twelve pins (four power and ground) leaves SWD debug, reset, and five general-purpose IOs multiplexed across all peripherals. Real designs use the MAX32660 alongside a separate audio codec handling the bulk of IO over I2C, with the MAX32660 acting as system controller and DSP. The same silicon is available in 16-pin and 20-pin TQFN for projects needing more IO.
+
+## MAX32670 and MAX32672 — precision analog
+
+The MAX32670 raises flash to 1 MB and SRAM to 192 KB, up to 3 MB flash / 384 KB SRAM in the larger variants — the most memory of any DARWIN part. Clock runs to 100 MHz. IO expands to four SPI, three I2C, three UART, two I2S, ten timers, and a 24-channel DMA. The 12-bit SAR ADC is paired with an integrated PGA that allows direct connection to thermocouple-class signals without an external instrumentation amplifier.
+
+The MAX32672 is the same silicon with a higher-resolution ADC option (16-bit sigma-delta on some sub-parts) and tighter analog specifications. ADI documents ADC INL, DNL, and gain-error in a way more typical of standalone precision ADCs than of MCU-integrated converters. For vital-signs applications (ECG, bioimpedance, PPG), the MAX32672 saves a separate ADC chip on the BOM.
+
+## MAX32650 — audio with stereo I2S
+
+The MAX32650 targets the audio-MCU niche. Cortex-M4F at 120 MHz, 3 MB flash, 1 MB SRAM (sized for audio buffer pools), and the headline feature: a stereo I2S with full master and slave modes, 8 to 32-bit word width, fractional dividers for standard audio sample rates, and DMA bursting into a dedicated audio buffer region of SRAM. The part supports Philips, left-justified, and DSP serial formats. STM32 and NXP SAI peripherals cover the same protocol space, generally without the dedicated buffer architecture.
+
+A representative capture pipeline sets up I2S to receive 24-bit stereo samples at 48 kHz, configures a DMA channel for circular buffer transfer, and posts interrupts at half and full boundaries for ping-pong processing. The MSDK includes a working example at `Examples/MAX32650/I2S`.
+
+```c
+#include "mxc_device.h"
+#include "i2s.h"
+#include "dma.h"
+
+#define SAMPLE_RATE_HZ 48000
+#define BIT_DEPTH      24
+#define WORD_BYTES     4
+#define BUF_SAMPLES    1024
+
+static int32_t audio_buf[BUF_SAMPLES * 2];
+
+void i2s_dma_setup(void) {
+    mxc_i2s_req_t req = {
+        .wordSize    = MXC_I2S_DATASIZE_WORD,
+        .sampleSize  = MXC_I2S_SAMPLESIZE_TWENTYFOUR,
+        .justify     = MXC_I2S_MSB_JUSTIFY,
+        .wsPolarity  = MXC_I2S_POL_NORMAL,
+        .channelMode = MXC_I2S_INTERNAL_SCK_WS_0,
+        .stereoMode  = MXC_I2S_STEREO,
+        .clkdiv      = MXC_I2S_CalculateClockDiv(SAMPLE_RATE_HZ, BIT_DEPTH),
+        .rxData      = audio_buf,
+        .length      = BUF_SAMPLES * 2,
+    };
+    MXC_I2S_Init(&req);
+    MXC_DMA_Init();
+    int ch = MXC_DMA_AcquireChannel();
+    MXC_I2S_RXDMAConfig(audio_buf, sizeof(audio_buf));
+    NVIC_EnableIRQ(DMA0_IRQn + ch);
+}
+```
+
+The interrupt handler runs at the DMA half-transfer boundary, processes the half-buffer (CMSIS-DSP biquad or RMS), and yields. Ping-pong processing keeps end-to-end latency below 11 ms at 48 kHz.
+
+## MAX32690 — BLE 5.2 on-die
+
+The MAX32690 is the line's wireless flagship. Cortex-M4F at 120 MHz, 3 MB flash, 1 MB SRAM, integrated BLE 5.2 single-mode controller with LE Coded PHY and LE 2M PHY, four SPI, three I2C, three UART, two CAN-FD controllers, USB 2.0 full-speed, 12-bit 16-channel ADC. The radio supports concurrent links as both peripheral and central. CAN-FD is unusual on a wireless MCU and reflects the part's role in industrial and medical telemetry.
+
+The MAX32690 sits in the same band as Nordic nRF52840 and Silicon Labs EFR32BG24: 120 vs 64 vs 78 MHz CPU, 3 MB vs 1 MB vs 1.5 MB flash, comparable BLE sensitivity (-95 dBm at 1 Mbps). The MAX32690 has more flash, more RAM, and a faster CPU; the Nordic and Silicon Labs parts have more mature wireless stacks, broader Zephyr support, and more polished tooling.
+
+| Trait                  | MAX32690        | nRF52840        | EFR32BG24       | Apollo4           |
+|------------------------|-----------------|-----------------|-----------------|-------------------|
+| CPU core               | Cortex-M4F      | Cortex-M4F      | Cortex-M33      | Cortex-M4F        |
+| Max CPU clock          | 120 MHz         | 64 MHz          | 78 MHz          | 192 MHz           |
+| Flash / SRAM           | 3 MB / 1 MB     | 1 MB / 256 KB   | 1.5 MB / 256 KB | 2 MB / 2.75 MB    |
+| BLE version            | 5.2             | 5.4 (with SDK)  | 5.3             | 5.0               |
+| Concurrent links       | Multiple        | Multiple        | Multiple        | Multiple          |
+| CAN-FD                 | 2x integrated   | None            | None            | None              |
+| USB                    | USB 2.0 FS      | USB 2.0 FS      | None on BG24    | USB 2.0 HS        |
+| Zephyr maturity        | Improving       | Reference       | Strong          | Improving         |
+
+For a BLE-only wearable, Nordic remains the default. For BLE plus CAN-FD on one die — an industrial sensor reporting over wireless during operation and over CAN during commissioning — the MAX32690 is the only mainstream choice.
+
+## Power positioning
+
+| Mode                          | MAX32660    | STM32L4Q5   | nRF52840    | Apollo3      |
+|-------------------------------|-------------|-------------|-------------|--------------|
+| Active at max clock           | 27 uA/MHz   | 51 uA/MHz   | 53 uA/MHz   | 6 uA/MHz     |
+| Active CPU @ 1 MHz            | 27 uA       | 51 uA       | 53 uA       | 6 uA         |
+| Standby (RTC + retention)     | 1.0 uA      | 1.4 uA      | 2.8 uA      | 1.0 uA       |
+| Deep sleep wake latency       | 5 us        | 14 us       | 16 us       | 6 us         |
+
+Wake latency is a real differentiator: applications that wake every few milliseconds (heart-rate sampling, button scan, BLE advertising intervals) pay the wake cost on every cycle.
+
+<Callout type="tip">
+For BLE designs on MAX32690, validate the radio stack timing under your application load before committing the design. The Cordio BLE stack used in MSDK is competent and has improved markedly since the ADI acquisition, but it has not seen the test mileage of the Nordic SoftDevice. Bench-test connection-event timing under worst-case application load (TLS handshake, flash erase, crypto operations) on a representative prototype.
+</Callout>
+
+## Designing on MAX32
+
+- **Use the SIMO converter.** The MAX32660 and MAX32670 expose SIMO DC-DC output pins as separate rails (V_CORE, V_IO, V_AON). Tie them together at your peril; the part assumes each routes to its dedicated decoupling network.
+- **Match flash wait states to clock.** Zero wait states up to 48 MHz; two wait states above. The MSDK clock-init handles this, but custom clock changes need to update the wait-state register first.
+- **Track errata.** ADI publishes errata as separate documents (search "MAX32xxx errata"). Several silicon revisions have known issues with I2C clock stretching and ADC reference settling.
+
+<Callout type="warn">
+The WLP variants of MAX32660 are sensitive to PCB thermal stress during reflow. Maxim's application note AN6262 documents the recommended reflow profile (ramp rate, peak temperature, time above liquidus). Production yield drops noticeably if a contract manufacturer runs a more aggressive profile to speed throughput. Confirm the profile before signing the CM contract.
+</Callout>
+
+## Cross-references
+
+- [Maxim / ADI MAX32 landing page](/docs/vendors/maxim) — product portfolio overview.
+- [MAX78000 CNN accelerator](/docs/vendors/maxim-max78000) — the ML branch of the line.
+- [Cortex-M4](/docs/cortex-m/m4) — the core used across MAX32.
+- [Low-power MCU design](/docs/systems/low-power) — battery-life patterns relevant to MAX32.
+- [Nordic nRF52](/docs/vendors/nordic) — BLE-class competitor.
+- ADI product portal: analog.com/en/product-category/microcontrollers.html.
+- MSDK source: github.com/analogdevicesinc/msdk.
+- Application note AN6262 (MAX32660 PCB and reflow guidance).

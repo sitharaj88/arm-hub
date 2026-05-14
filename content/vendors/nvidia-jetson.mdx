@@ -1,0 +1,123 @@
+---
+title: NVIDIA Jetson — edge AI on Cortex-A
+description: NVIDIA's Jetson family — Cortex-A CPUs plus NVIDIA GPU and DLA on a single SoM. From TK1 in 2014 to Thor in 2025, the JetPack SDK, TensorRT, CUDA, and why Jetson dominates serious edge AI.
+order: 30
+updated: 2026-05-13
+tags: [vendors, nvidia, jetson, cortex-a, edge-ai, cuda, tensorrt, orin, thor]
+---
+
+NVIDIA Jetson is the dominant platform for serious edge AI — workloads too large or too latency-sensitive for an MCU-class NPU like MAX78000 or Coral Edge TPU but where shipping data to a cloud GPU is unacceptable. The defining capability is software portability: a model trained on an NVIDIA workstation or H100 cluster deploys to a Jetson with the same CUDA kernels, the same cuDNN, and the same TensorRT inference engine. No cross-vendor conversion, no operator-coverage gaps, no quantisation surprises beyond the ones the developer chooses to introduce.
+
+The hardware platform is a System-on-Module (SoM) — typically 70 x 45 mm for Nano-class and 100 x 87 mm for AGX-class — combining a Cortex-A application processor, NVIDIA GPU, deep-learning accelerator (DLA) on newer generations, NVDEC and NVENC video blocks, ISP, and LPDDR memory. The customer designs a carrier board that breaks out the SoM connector. NVIDIA supplies a reference carrier (the developer kit); production uses a custom carrier from a third-party integrator or in-house design.
+
+<SpecSheet
+  title="NVIDIA Jetson at a glance"
+  specs={[
+    { label: 'Vendor', value: 'NVIDIA Corporation' },
+    { label: 'Founded', value: '1993, Santa Clara, California' },
+    { label: 'Product line', value: 'Jetson — edge AI System-on-Module family, 2014 to present' },
+    { label: 'Current generations', value: 'Orin (2022 to present); Thor (2024 to 2025 ramp)' },
+    { label: 'Flagship part', value: 'Jetson AGX Thor — 14-core Neoverse-derived A720AE + Blackwell GPU, 2000 TOPS INT8' },
+    { label: 'Entry part', value: 'Jetson Orin Nano 4 GB — 6-core Cortex-A78AE + Ampere GPU, 20 TOPS INT8' },
+    { label: 'Software stack', value: 'JetPack SDK = Linux for Tegra + CUDA + cuDNN + TensorRT + DeepStream + Isaac' },
+    { label: 'External links', value: 'developer.nvidia.com/embedded, NGC catalog, Jetson Linux releases' },
+  ]}
+/>
+
+## Family timeline
+
+The Jetson family started with the Tegra K1 module in 2014. Each generation tracks NVIDIA's discrete-GPU architecture by roughly two years. The CPU side has migrated from off-the-shelf Cortex-A to NVIDIA's custom Carmel core and now to Cortex-A78AE and the Neoverse-derived A720AE — automotive-grade cores with safety-island features.
+
+| Generation       | Year | CPU                              | GPU             | INT8 TOPS  | Notable use cases                              |
+|------------------|------|----------------------------------|-----------------|------------|------------------------------------------------|
+| TK1              | 2014 | 4x Cortex-A15                    | Kepler 192 SP   | n/a        | Drone vision research, early robotics          |
+| TX1              | 2015 | 4x Cortex-A57                    | Maxwell 256 SP  | 1          | Skydio drones, NVIDIA Shield TV                |
+| TX2              | 2017 | 2x Denver + 4x Cortex-A57        | Pascal 256 SP   | 1.3        | Industrial robotics, smart cameras             |
+| Xavier NX        | 2019 | 6x Carmel (A75-class custom)     | Volta 384 SP    | 21         | Mid-tier robots, smart retail                  |
+| AGX Xavier       | 2018 | 8x Carmel                        | Volta 512 SP    | 32         | Autonomous mobile robots, medical imaging      |
+| Orin Nano        | 2022 | 6x Cortex-A78AE                  | Ampere 1024 SP  | 20 to 40   | Cost-sensitive edge AI, ROS robots             |
+| Orin NX          | 2022 | 8x Cortex-A78AE                  | Ampere 1024 SP  | 70 to 100  | Vision pipelines, drones, AGV                  |
+| AGX Orin         | 2022 | 12x Cortex-A78AE                 | Ampere 2048 SP  | 200 to 275 | Full-stack autonomy, multi-camera, large LLMs  |
+| AGX Thor         | 2024 to 2025 | 14x A720AE (Neoverse-derived) | Blackwell      | 2000       | Humanoid robotics, autonomous driving          |
+
+The "AE" suffix marks the automotive-enhanced variant — dual-core lock-step, ECC on L1 and L2 caches, fault-detection / safety-island architecture suitable for ISO 26262 ASIL B (and, with appropriate system design, ASIL D). Jetson is the platform of choice in AV development not because the GPU is uniquely fast but because the CPU complex carries the safety-certification path that consumer-grade ARM SoCs do not.
+
+## What you actually get on a Jetson
+
+The Jetson value proposition is not just the GPU. Every current Jetson SoM has:
+
+- **CPU cluster** — 6 to 14 cores of Cortex-A running Ubuntu 22.04 LTS via NVIDIA's Linux for Tegra (L4T) distribution with NVIDIA kernel modules baked in.
+- **GPU** — the headline accelerator. CUDA-compatible from day one; same `nvcc`, cuDNN, cuBLAS, and Triton inference server as a discrete NVIDIA GPU.
+- **DLA** — fixed-function INT8 inference engine on Xavier and Orin. Programmed via TensorRT with `--useDLACore`. Two DLAs on AGX Xavier and AGX Orin; zero on Orin Nano.
+- **NVDEC / NVENC** — hardware video decode and encode, H.264, H.265, AV1 (Orin onwards). Multi-stream 4K30 decode is the typical motivation.
+- **ISP** — raw Bayer MIPI-CSI camera input with demosaic, white balance, exposure, denoise, gamma. Camera-vendor partnerships cover Sony, OmniVision, onsemi.
+- **Tensor cores** — matrix-multiply-accumulate units inside the GPU since Volta. Used by TensorRT for INT8, FP16, FP8, INT4. Drive the published TOPS numbers.
+
+| Block          | Orin Nano 8 GB | Orin NX 16 GB | AGX Orin 64 GB | AGX Thor       |
+|----------------|----------------|---------------|----------------|----------------|
+| CPU cores      | 6              | 8             | 12             | 14             |
+| CPU clock      | 1.5 GHz        | 2.0 GHz       | 2.2 GHz        | 2.6 GHz        |
+| GPU SP cores   | 1024 (Ampere)  | 1024 (Ampere) | 2048 (Ampere)  | Blackwell      |
+| Tensor cores   | 32             | 32            | 64             | Transformer    |
+| DLA count      | 0              | 2             | 2              | Integrated     |
+| Memory         | 8 GB LPDDR5    | 16 GB LPDDR5  | 64 GB LPDDR5   | 128 GB LPDDR5X |
+| Peak INT8 TOPS | 40             | 100           | 275            | 2000           |
+| Power envelope | 7 to 15 W      | 10 to 25 W    | 15 to 60 W     | up to 130 W    |
+
+## JetPack — the software stack
+
+JetPack is NVIDIA's bundled software distribution. Each release pairs with a specific L4T version and supported hardware:
+
+- **L4T** — Ubuntu 22.04 LTS plus NVIDIA kernel modules, GPU driver, multimedia codecs, BSP. U-Boot on older generations, Cboot or UEFI on Orin and Thor.
+- **CUDA Toolkit** — same CUDA as workstations. JetPack 6 ships CUDA 12.x.
+- **cuDNN** — NVIDIA's deep-learning primitive library.
+- **TensorRT** — the inference engine, taking ONNX, torchscript, or SavedModel and producing an optimised engine with INT8 calibration, layer fusion, and kernel auto-tuning.
+- **DeepStream** — GStreamer-based video-analytics pipeline framework for multi-stream RTSP capture, decode, batched inference, tracking, output.
+- **Isaac** — robotics platform bridging to ROS 2 with Isaac Sim and robotics primitives.
+- **Container Runtime** — `nvidia-docker` and NGC catalog.
+
+The cadence is roughly twice a year for Orin, with longer support on LTS releases.
+
+## Why Jetson dominates serious edge AI
+
+Plausible alternatives exist — Qualcomm RB5/RB6, AMD Versal AI Edge, Intel Movidius / Habana, Hailo-8 paired with a Raspberry Pi 5 or i.MX 8M, Coral Edge TPU. Jetson wins consistently in production for three reasons that have little to do with peak TOPS.
+
+First, software lock-in favours NVIDIA. Models are trained on NVIDIA GPUs because that is what is available in cloud, research, and workstations. Moving to a Hailo or Qualcomm or Coral requires conversion, re-quantisation, often re-training, and operator-coverage limits. Moving to Jetson means running TensorRT on the saved checkpoint and accepting a few percent INT8 accuracy loss. The first takes weeks; the second takes hours.
+
+Second, platform breadth. A robotics pipeline is RTSP ingest from N cameras, NVDEC decode, ISP, inference, CUDA post-processing for SLAM or tracking, NVENC encode for storage, network output. On Jetson all of this runs on one chip with NVIDIA-supported plumbing. On alternatives most pieces are separate vendor responsibilities.
+
+Third, tooling maturity. CUDA is a stable, documented API a decade old. TensorRT is nearly as mature. Documentation is good; known bugs have findable workarounds. Alternatives are newer and shifting more.
+
+## Pricing tiers and where each fits
+
+| Module                | Approx. unit price | Target deployments                                  |
+|-----------------------|---------------------|-----------------------------------------------------|
+| Orin Nano 4 GB        | $199                | Hobbyist, education, low-cost industrial vision     |
+| Orin Nano 8 GB        | $299                | Cost-sensitive vision pipelines, smart cameras      |
+| Orin NX 8 GB          | $399                | Mid-tier robotics, drones, advanced smart cameras   |
+| Orin NX 16 GB         | $599                | Multi-camera ingest, ROS-based mobile robots        |
+| AGX Orin 32 GB        | $999                | Mobile robotics, medical imaging carts              |
+| AGX Orin 64 GB        | $1,999              | Autonomous vehicles development, surgical robots    |
+| AGX Thor 64 GB        | $3,000+ (early)     | Humanoid robotics, automotive Level 4 development   |
+
+Volume pricing is materially lower than the developer-kit list prices above. Customers on multi-thousand-unit programmes typically see 30 to 50 percent discounts.
+
+<Callout type="tip">
+The Orin family uses a SODIMM-style connector that is mechanically and pin-compatibly identical across Orin Nano and Orin NX. A single carrier board accepts any of the four Nano / NX variants, allowing the system designer to scale price-performance after the carrier is in production. The AGX Orin and Thor modules use a different, larger connector — not pin-compatible with the Nano / NX family.
+</Callout>
+
+<Callout type="warn">
+The Jetson SoM connector pinout has changed between major generations (Xavier NX to Orin Nano was not pin-compatible). Designing a carrier board that "future-proofs" across generations is not feasible without a re-spin. Plan carrier-board revisions in lockstep with module-generation changes.
+</Callout>
+
+## Cross-references
+
+- [Jetson Orin Nano / Orin NX detailed coverage](/docs/vendors/nvidia-jetson-orin-nano).
+- [Jetson AGX Orin and Thor detailed coverage](/docs/vendors/nvidia-jetson-agx).
+- [Cortex-A78AE](/docs/cortex-a/a78ae) — the automotive-grade core in Orin.
+- [Edge AI system design](/docs/systems/edge-ai) — system-level architectural context.
+- [TI Sitara AM62A](/docs/vendors/ti-sitara) — alternative edge-AI Cortex-A platform.
+- NVIDIA Jetson developer site: developer.nvidia.com/embedded.
+- JetPack documentation: docs.nvidia.com/jetson/jetpack.
+- NGC container catalog: catalog.ngc.nvidia.com.
+- Jetson Linux releases: developer.nvidia.com/embedded/jetson-linux.

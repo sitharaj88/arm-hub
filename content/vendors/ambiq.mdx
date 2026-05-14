@@ -1,0 +1,108 @@
+---
+title: Ambiq Micro
+description: Ambiq's sub-threshold voltage SPOT technology — the silicon behind every multi-week-battery-life smartwatch and hearing aid. Apollo family from Apollo1 to Apollo510, software stack, why wearables design teams choose it.
+order: 24
+updated: 2026-05-13
+tags: [vendors, ambiq, apollo, low-power, wearable, hearable, spot]
+---
+
+Ambiq Micro occupies a strange and specific niche in the Cortex-M market: it is the company whose silicon you reach for when the BOM tolerates a small premium but the battery life specification is non-negotiable. If you have ever wondered how a Garmin Fenix watch runs GPS, an optical heart rate sensor, a barometer, a colour MIPI-DSI display, and Bluetooth for two weeks on a 300 mAh cell — or how a modern hearing aid bridges audio with a fifty-hour battery on a zinc-air cell smaller than a peppercorn — much of the time the answer is an Ambiq Apollo, run at the magic trick that defines the company: sub-threshold voltage operation.
+
+<SpecSheet
+  title="Ambiq Micro at a glance"
+  specs={[
+    { label: 'Vendor', value: 'Ambiq Micro Inc.' },
+    { label: 'Founded', value: '2010, founded by Scott Hanson and Dr David Blaauw out of University of Michigan' },
+    { label: 'HQ', value: 'Austin, Texas' },
+    { label: 'Flagship part', value: 'Apollo510 (Cortex-M55 with Helium, 250 MHz, dedicated NPU, 4 MB MRAM, 2024)' },
+    { label: 'Key fact', value: 'Patented SPOT (Sub-threshold Power Optimized Technology) runs the digital core near transistor threshold voltage (~0.5 V), cutting active power per MHz by 3-5× vs conventional CMOS' },
+    { label: 'SDK', value: 'AmbiqSuite SDK (BSP + HAL + FreeRTOS + BLE host stack + NemaGFX graphics + TensorFlow Lite for Microcontrollers)' },
+    { label: 'Links', value: 'ambiq.com, github.com/AmbiqMicro, AmbiqSuite SDK on the developer portal' },
+  ]}
+/>
+
+## The SPOT trick
+
+Sub-threshold operation is the company's foundational IP and the reason Apollo numbers look the way they do. Conventional CMOS digital logic is designed to operate at supply voltages well above the transistor threshold voltage (Vth, typically 0.3 to 0.5 V depending on process). Run a standard cell library at 1.2 V and gates switch fast; halve the supply and you save roughly 4× on dynamic power (proportional to V²×f) but also gates barely switch at all because Vgs–Vth is too small to push the channel into strong inversion.
+
+Ambiq's contribution is a full standard-cell library, SRAM macro, flash macro, and PLL design that operates **at or just below threshold** — supplies around 0.5 V. At that voltage point, gates are in weak inversion, which is exponential in Vgs–Vth rather than the quadratic region used by conventional CMOS. Throughput drops dramatically — circuits run at tens of MHz instead of hundreds — but dynamic power drops faster, and leakage drops with the lowered supply too. The combined effect is roughly 3 to 5× lower active power per MHz compared to a conventional CMOS implementation of the same Cortex-M4F core at the same process node.
+
+Ambiq calls this SPOT (Sub-threshold Power Optimized Technology). The trick is patented across several layers of cell-library design, body-bias control, and on-chip voltage regulation. Every Apollo part has an internal Buck-Boost SIMO (Single-Inductor Multiple-Output) regulator that generates the sub-threshold core supply directly from the battery — there is no external LDO, no separate core-rail capacitor pattern, the regulator is on-die.
+
+## The Apollo progression
+
+| Part | Year | Core | Max clock | Flash | SRAM | Headline addition |
+|------|------|------|-----------|-------|------|---------------------|
+| **Apollo** | 2014 | Cortex-M4F | 24 MHz | 512 KB | 64 KB | First SPOT chip, 30 µA/MHz active |
+| **Apollo2** | 2016 | Cortex-M4F | 48 MHz | 1 MB | 256 KB | Crypto block, 10 µA/MHz active |
+| **Apollo3 / 3 Blue** | 2018 | Cortex-M4F | 48 MHz (96 MHz turbo) | 1 MB | 384 KB | Integrated BLE 5 radio, 6 µA/MHz |
+| **Apollo4 / 4 Plus / 4 Blue Plus** | 2021 | Cortex-M4F | 192 MHz | 2 MB | up to 2.75 MB | MIPI-DSI display, 2D GPU, 4 µA/MHz |
+| **Apollo4 Lite** | 2022 | Cortex-M4F | 96 MHz | 1 MB | 1 MB | Cost-optimised, no display IF |
+| **Apollo510** | 2024 | Cortex-M55 with Helium | 250 MHz | 4 MB MRAM | 4 MB | Dedicated NPU for on-device AI |
+
+Apollo1 through Apollo3 used a 40 nm ULP process; Apollo4 and Apollo510 moved to 22 nm ULL. The MRAM (Magnetoresistive RAM) introduced on Apollo510 deserves attention — it is non-volatile like flash but has SRAM-like read/write speeds and no wear limit, which lets Ambiq put the entire 4 MB of "flash" effectively at SRAM speed, removing the cache-miss penalty that limits other M55 parts.
+
+## Why wearables and hearables converged on Ambiq
+
+The wearable market — smartwatches, fitness bands, optical heart-rate patches, continuous glucose monitors — and the hearable market — true wireless earbuds, hearing aids, audio cochlear processors — share a defining constraint: the battery is small (50 to 400 mAh), the always-on duty cycle is high (sensors, BLE advertising, display peeks every few seconds), and the user expectation for battery life keeps creeping up. A 2014 fitness band with a week of battery was best-in-class; the equivalent 2024 product is expected to run two weeks while running an AMOLED always-on display and continuous SpO2.
+
+The math only works at sub-µA-per-MHz active currents. Conventional 22 nm CMOS Cortex-M4F parts run at 50 to 70 µA/MHz. Ambiq Apollo3 runs at 6 µA/MHz, Apollo4 at 4 µA/MHz, Apollo510 at 30 µA/MHz at much higher clocks and with vector compute. Across a representative wearable workload (heart-rate sampling at 100 Hz, accelerometer at 50 Hz, BLE advertising every second, display refresh every 5 seconds) Ambiq Apollo3 averages 1.2 mA total; an equivalent design on an STM32U5 averages 3.5 to 4 mA. On a 250 mAh cell the difference is the gap between a 7-day battery and a 14-day battery.
+
+Major customers that have publicly disclosed Ambiq usage include Garmin (Fenix, Forerunner, Venu lines), Huawei (some watch generations), Xiaomi (Mi Band 6/7/8/9), and a long list of Chinese OEMs producing white-label wearable reference designs. In hearables, Onsemi's RSL10 used to dominate but Ambiq Apollo3 and 4 Blue Plus have taken share for higher-tier hearing aids needing more processing and display capability.
+
+## AmbiqSuite SDK
+
+The software story is more conventional than the silicon. AmbiqSuite is a BSP + HAL + middleware bundle that wraps the Cortex-M core in a familiar layer:
+
+| Layer | Contents |
+|-------|----------|
+| **HAL** | C drivers for every peripheral — `am_hal_gpio.c`, `am_hal_uart.c`, `am_hal_iom.c` (I/O master for SPI/I²C), `am_hal_ble.c`, etc. |
+| **BSP** | Per-board pin configurations and clock setups for Ambiq's own dev boards (Apollo3 EVB, Apollo4 Blue Plus EVB, Apollo510 EVB). |
+| **FreeRTOS port** | Tickless idle integration with the Cortex-M sleep modes; this is the supported RTOS. |
+| **BLE host stack** | A port of the open Cordio BLE host (now Arm's PacketCraft). Manages GATT, ATT, L2CAP, SMP. The controller runs in a separate hardware block. |
+| **NemaGFX graphics library** | Licensed from Think Silicon; 2D blit, antialiased text, animation, JPEG decode. Drives the MIPI-DSI controller on Apollo4 Plus and Apollo510. |
+| **TensorFlow Lite for Microcontrollers** | Pre-integrated with Helium acceleration on Apollo510 and scalar fallback on Apollo3/4. Kernels for fully connected, conv1D, conv2D, depthwise conv, attention, plus quantisation runtime. |
+| **MCUboot** | Reference bootloader with image signing, AES-encrypted images, A/B slot management. |
+
+The SDK has a strong reputation for being lean — no auto-generated bloat, no graphical configurator (CubeMX-style), drivers are readable, well-commented, and short. The downside is that documentation is functional rather than exhaustive; engineers new to Apollo typically learn by reading the example projects rather than from a reference manual.
+
+## Compared to other low-power M4F vendors
+
+| Vendor / part | Active µA/MHz | Standby with RTC | Process | Headline differentiator |
+|---------------|----------------|-------------------|---------|--------------------------|
+| **Ambiq Apollo3 Blue** | 6 | 1 µA | 40 nm ULP | SPOT, integrated BLE 5 |
+| **Ambiq Apollo4 Plus** | 4 | 1.7 µA | 22 nm ULL | MIPI-DSI, 2D GPU |
+| **STM32U585** | 19 (range 1) | 0.3 µA (stop 2) | 40 nm ULP | TrustZone, autonomous peripherals |
+| **NXP K32W148** | 35 (run) | 1.5 µA | 40 nm | BLE + 802.15.4 dual radio |
+| **Renesas RA4W1** | 56 | 0.45 µA | 40 nm | Cheap BLE |
+| **Nordic nRF52840** | 50 (TX off) | 1.5 µA | 55 nm | Industry-standard BLE |
+| **Silicon Labs EFR32MG24** | 38 | 1.3 µA | 40 nm | Matter / Thread / Zigbee |
+
+Ambiq wins decisively on active current. It loses on integrated radio breadth — Apollo3 and 4 Blue Plus have BLE only, where Nordic, Silicon Labs, and NXP wireless parts cover BLE, 802.15.4, Thread, Matter, and proprietary 2.4 GHz from a single die. Ambiq's strategy is to pair its MCU with a dedicated radio companion (Apollo4 Plus + an external BLE controller, for instance) when wider radio support is needed.
+
+<Callout type="tip" title="The SPOT advantage shows up in active mode, not in deep sleep">
+Apollo3 / 4 deep-sleep currents (around 1-2 µA with RTC) are competitive but not class-leading — STM32U5 hits 0.3 µA in Stop 2. The Ambiq advantage is in *active* mode, when the CPU is actually running. For a workload that spends 95% of wall time in deep sleep with brief wake-ups, the µA/MHz active number dominates the average and Ambiq wins. For a workload that already sleeps for entire seconds between brief sensor reads, the deep-sleep number dominates and STM32U5 may match or beat Apollo.
+</Callout>
+
+## The transition to Cortex-M55 — Apollo510
+
+Apollo510 is Ambiq's response to the rising AI/ML demands of on-device wake-word detection, gesture recognition, biometric ML, and adaptive noise cancellation. It is the first commercially shipping Cortex-M55 part for the wearable/hearable market — sampling 2023, production 2024 — and it brings Arm's Helium MVE (M-profile Vector Extension) along with a dedicated NPU (Neural Processing Unit, Ambiq's in-house design) running alongside the M55 core. The TensorFlow Lite Micro runtime in AmbiqSuite has kernel implementations that automatically dispatch to Helium or the NPU based on operator type, achieving roughly 10× the ML throughput of Apollo4 for typical wearable models.
+
+For new designs targeting always-on wake-word detection, real-time fall detection, ECG arrhythmia classification, or adaptive noise cancellation, Apollo510 is the part to evaluate. See [Apollo5 family](/docs/vendors/ambiq-apollo5) for the deep dive.
+
+## Where Ambiq makes sense — and where it doesn't
+
+Strong fit: smartwatches, fitness bands, hearing aids, true wireless earbuds, optical heart-rate patches, continuous glucose monitors, smart-ring formfactors, AR / smart glasses. Any product where active power dominates the energy budget and the user expects multi-week battery life. Weak fit: line-powered industrial designs (no benefit over conventional MCUs), connected designs needing Thread / Matter / Zigbee on the same die (use Silicon Labs or NXP), safety-certified medical devices needing IEC 60601 documentation breadth (Ambiq's certification packages exist but trail ST's and TI's), automotive applications (Ambiq is not AEC-Q100 qualified).
+
+The Apollo family is also expensive at low volumes. Below 10k units the per-unit price tracks STM32U5, but above 100k the Ambiq parts can come in cheaper than equivalent integrated wireless MCUs because the BOM saves the external regulator, the external RTC crystal load capacitors, and (on Apollo510) the external NPU accelerator that competing designs would need.
+
+## Cross-references
+
+- [Apollo4 sub-µA M4F](/docs/vendors/ambiq-apollo4)
+- [Apollo5 family with M55 and NPU](/docs/vendors/ambiq-apollo5)
+- [Cortex-M4](/docs/cortex-m/m4)
+- [Cortex-M55](/docs/cortex-m/m55)
+- [STM32 low-power L and U](/docs/vendors/stm32-lowpower) — comparison point for non-wearable low-power
+- [Ambiq corporate site](https://ambiq.com) (external)
+- [AmbiqMicro on GitHub](https://github.com/AmbiqMicro) (external)
+- [Apollo510 datasheet and AmbiqSuite SDK](https://ambiq.com/apollo510/) (external)

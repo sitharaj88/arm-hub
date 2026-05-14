@@ -1,0 +1,150 @@
+---
+title: MediaTek Genio — IoT, HMI, and edge AI
+description: MediaTek Genio family for IoT and edge AI. Genio 350 to Genio 1200 — Cortex-A35 to Cortex-A78, Mali GPU, NeuroPilot APU, Yocto BSP, NPU model conversion.
+order: 19
+updated: 2026-05-13
+tags: [vendors, mediatek, genio, cortex-a55, cortex-a78, iot, edge-ai, neuropilot]
+---
+
+MediaTek Genio is the IoT and edge-AI product line. The lineup sits between two markets — too capable for the Cortex-M space, too cost-constrained for the smartphone Dimensity line — and serves products where a Linux-class application processor with a GPU and an NPU is justified but cannot afford NVIDIA Jetson pricing. Genio competes most directly with Rockchip's RK3566/RK3568 and RK3588, NXP i.MX 8M Plus and i.MX 95, and the low end of NVIDIA Jetson (Nano, Orin Nano). What differentiates Genio is the integrated NeuroPilot APU on the upper SKUs, TSMC 6-nm manufacturing on the flagship, and reasonable upstream Linux trajectory.
+
+<SpecSheet
+  title="Genio family at a glance"
+  specs={[
+    { label: 'Genio 350', value: '4× Cortex-A35 @ 1.5 GHz, Mali-G52 MC1, no NPU, 12 nm, sub-2 W typical' },
+    { label: 'Genio 510', value: '4× Cortex-A55 @ 2.0 GHz, Mali-G57 MC2, 3 TOPS APU, TSMC 6 nm' },
+    { label: 'Genio 700', value: '2× Cortex-A78 + 6× Cortex-A55, Mali-G57 MC3, 4 TOPS APU, TSMC 6 nm' },
+    { label: 'Genio 1200', value: '4× Cortex-A78 + 4× Cortex-A55 @ 2.0/2.0 GHz, Mali-G57 MC5, 5 TOPS APU, 6 nm, Wi-Fi 6' },
+    { label: 'Memory', value: 'LPDDR4X up to 8 GB (Genio 510/700), 16 GB (Genio 1200)' },
+    { label: 'Video', value: '4K60 H.265 decode on Genio 510 and above; 4K30 H.265 encode on Genio 700/1200' },
+    { label: 'SDK', value: 'Genio Yocto BSP (kirkstone-based), NeuroPilot SDK, Android variant for kiosks' },
+    { label: 'Reference platforms', value: 'I-Pi SMARC, ADLINK LEC-EHL form factor, MediaTek EVK boards' },
+    { label: 'Documentation', value: 'Genio Developer Portal, NeuroPilot docs, mediatek-labs GitHub' },
+  ]}
+/>
+
+## The family in detail
+
+The Genio line breaks cleanly into four tiers: an entry HMI tier (Genio 350), a mainstream IoT tier (Genio 510), a performance tier with big.LITTLE (Genio 700), and a flagship with integrated Wi-Fi 6 (Genio 1200). The split is driven mostly by the CPU cluster topology and the APU TOPS rating. GPU and video block configurations scale roughly linearly with the part number.
+
+### Genio 350
+
+Quad Cortex-A35 at 1.5 GHz on a 12-nm process. No NPU. Mali-G52 MC1 GPU adequate for 720p UI rendering or 1080p single-display. The Genio 350 targets the cheapest end of the embedded Linux market: smart thermostats, factory HMI for simple machines, retail signage that just plays a looping video, low-end POS terminals. Power dissipation is well under 2 W in typical use, which means fanless plastic enclosures with no heatsink. The part lands cost-wise between a high-end Cortex-M and a Raspberry Pi CM4.
+
+### Genio 510
+
+Quad Cortex-A55 at 2.0 GHz on TSMC 6-nm. Mali-G57 MC2 GPU. 3 TOPS APU. This is the volume part. A 3 TOPS NPU is enough for real-time MobileNet-class image classification at 30 fps, single-person pose estimation, voice keyword spotting, and lightweight object detection (YOLOv5n at 720p inputs). The 510 has displaced Rockchip RK3568 in several recent reference designs because of the better fab process and the NPU presence — RK3568's NPU is nominally 0.8 TOPS and noticeably weaker.
+
+### Genio 700
+
+Two Cortex-A78 and six Cortex-A55 in a big.LITTLE configuration. Mali-G57 MC3. 4 TOPS APU. The Genio 700 is the answer for products that need an interactive HMI plus heavier per-frame inference: video analytics on multiple camera streams, multi-modal voice plus vision assistants, factory inspection cameras that need real-time defect classification.
+
+### Genio 1200
+
+Four Cortex-A78 and four Cortex-A55 in a balanced cluster, Mali-G57 MC5 GPU, 5 TOPS APU, and on-die Wi-Fi 6. The Genio 1200 is positioned against Jetson Orin Nano and Rockchip RK3588 for the highest-end edge AI products — robotics control panels, smart vending machines with computer-vision inventory, premium digital signage with real-time content adaptation, e-bike control panels with camera-based situational awareness.
+
+## SoM form factors and pin compatibility
+
+| SKU | Typical SoM | Display | Camera | Notable boards |
+|-----|-------------|---------|--------|----------------|
+| Genio 350 | ADLINK LEC-MTK-G350 | Single MIPI-DSI 4-lane | Single MIPI-CSI 2-lane | I-Pi SMARC 350 |
+| Genio 510 | ADLINK LEC-MTK-G510 | Dual MIPI-DSI / LVDS | Dual MIPI-CSI 4-lane | I-Pi SMARC 510, MediaTek Genio 510 EVK |
+| Genio 700 | ADLINK LEC-MTK-G700 | Dual MIPI-DSI + HDMI | Triple MIPI-CSI | I-Pi SMARC 700 |
+| Genio 1200 | iWave iW-RainboW SoM | Dual MIPI-DSI + HDMI 2.0 + eDP | Quad MIPI-CSI | MediaTek Genio 1200 EVK, AAEON RICO-MTK |
+
+The 510 and 700 share an effectively compatible SMARC 2.1 SoM pinout, which means you can prototype on a Genio 510 SoM and upgrade to Genio 700 without a carrier respin. The Genio 350 is a smaller package and uses its own SoM footprint. The Genio 1200 is a full SoM-form module with a different connector class.
+
+## NeuroPilot and the APU
+
+NeuroPilot is the SDK and runtime for MediaTek's APU (the on-chip NPU). It accepts standard TFLite models and converts them through the MDLA (MediaTek Deep Learning Accelerator) compiler. The conversion handles quantisation to INT8 or INT16, layer fusion, and weight repacking. The runtime is a thin C++ library that loads the compiled blob and exposes a TFLite Delegate interface, which means you can swap a CPU-only TFLite invocation for an APU-accelerated one by setting a single delegate.
+
+Typical performance numbers from MediaTek's published benchmarks: MobileNet v2 INT8 at 224x224 input runs at roughly 350 fps on Genio 510 (3 TOPS) and 600 fps on Genio 1200 (5 TOPS) compared to roughly 35 fps on the quad Cortex-A55 cluster alone. The speedup is most dramatic on convolution-heavy vision models. Transformer and attention workloads are less mature on the MDLA — most language models will run partially on APU and partially on CPU through the delegate fallback path.
+
+```python
+import numpy as np
+import tflite_runtime.interpreter as tflite
+
+# Load the model with the NeuroPilot APU delegate
+apu_delegate = tflite.load_delegate('libneuronusdk_adapter.mtk.so')
+interp = tflite.Interpreter(
+    model_path='mobilenet_v2_quant.tflite',
+    experimental_delegates=[apu_delegate],
+)
+interp.allocate_tensors()
+
+input_details = interp.get_input_details()
+output_details = interp.get_output_details()
+
+img = np.random.randint(0, 255, size=(1, 224, 224, 3), dtype=np.uint8)
+interp.set_tensor(input_details[0]['index'], img)
+interp.invoke()
+logits = interp.get_tensor(output_details[0]['index'])
+print('top class:', int(np.argmax(logits)))
+```
+
+## Genio 510 versus the alternatives
+
+The Genio 510 sits in an interesting position. It is priced near the Rockchip RK3568, which has been the cheap edge-Linux default for several years, and it competes on capability with the more expensive Jetson Orin Nano. The decision matrix usually looks like the table below.
+
+| Attribute | Genio 510 | Rockchip RK3568 | Jetson Orin Nano 4 GB |
+|-----------|-----------|-----------------|------------------------|
+| CPU | 4× A55 @ 2.0 GHz | 4× A55 @ 2.0 GHz | 6× A78AE @ 1.5 GHz |
+| GPU | Mali-G57 MC2 | Mali-G52 EE | Ampere 512-CUDA-core, 20 TOPS |
+| NPU | APU 3 TOPS | 0.8 TOPS NPU | shared GPU TOPS |
+| Process | TSMC 6 nm | SMIC 22 nm | Samsung 8 nm |
+| Memory bandwidth | LPDDR4X up to 17 GB/s | LPDDR4 up to 8.5 GB/s | LPDDR5 68 GB/s |
+| Typical SoM price | mid (USD 60-90) | low (USD 30-50) | high (USD 200+) |
+| Linux ecosystem | Yocto BSP, partial mainline | Armbian, Debian, strong mainline | NVIDIA L4T, JetPack |
+| Edge AI software | NeuroPilot (closed) | RKNN Toolkit (closed) | TensorRT (closed but mature) |
+
+For products where the absolute lowest BOM cost wins and the NPU is a nice-to-have, RK3568 still wins. For products where Jetson's CUDA ecosystem and TensorRT optimisation are unavoidable, Orin Nano wins. Genio 510 wins the middle: better fab process than RK3568, real NPU performance, much lower price than Orin Nano.
+
+<Callout type="note" title="NPU toolchain is closed-source">
+NeuroPilot's MDLA compiler and runtime are distributed as closed binaries under a click-through licence. The TFLite interface is open and standard, but the actual model compilation step requires MediaTek's tools. If your product roadmap requires fully reproducible open-source build chains, this is a hard constraint. The RKNN toolkit on Rockchip has the same property; TensorRT on Jetson has the same property. There is currently no fully open edge-NPU vendor in this price tier.
+</Callout>
+
+## Building a Genio image
+
+The Genio BSP is a Yocto layer maintained by MediaTek and published through their GitLab. The build follows standard Yocto conventions but pulls in MediaTek-specific layers for kernel, GPU userspace, APU libraries, and the SoM-specific device tree.
+
+```bash
+mkdir genio-build && cd genio-build
+repo init -u https://gitlab.com/mediatek/aiot/bsp/manifest.git -b kirkstone
+repo sync -j$(nproc)
+source poky/oe-init-build-env build
+
+# Genio 510 EVK
+MACHINE=genio-510-evk bitbake rity-demo-image
+
+# Genio 700 EVK
+MACHINE=genio-700-evk bitbake rity-demo-image
+
+# Flash with fastboot
+fastboot flash bootloaders out/bl2.img
+fastboot flash system out/rity-demo-image-genio-510-evk.wic
+```
+
+The resulting image is a roughly 2 GB rootfs with the Genio kernel (currently 5.15 in the kirkstone branch), GPU userspace, NeuroPilot runtime, GStreamer with MediaTek-accelerated video plugins, and a Qt 6 demo HMI.
+
+<Callout type="warn" title="Mainline kernel support is partial">
+Mainline kernel 6.6 supports Genio 350 reasonably well and Genio 510 partially (no APU, partial GPU). Genio 700 and Genio 1200 require the vendor 5.15 kernel for the GPU, APU, and video acceleration to work. If your product needs a long-term mainline path, plan to track the upstream landing of these drivers over the 2026-2027 window.
+</Callout>
+
+## Real-world use cases
+
+- **Factory HMI panels** — 10-inch to 21-inch touchscreens with PLC connectivity, vision-based operator assistance, voice control. Typical part is Genio 510 or 700.
+- **Smart retail kiosks** — interactive signage with face detection for demographic analytics, product recognition. Genio 700 or 1200.
+- **E-bike and scooter dashboards** — combined navigation display, camera-based rear-view, voice assistant. Genio 510.
+- **Medical bedside terminals** — patient information display, barcode scanner, vitals monitoring HMI. Genio 510 with safety-conscious software stack.
+- **Robotics teach pendants** — robot control panels with 3D visualisation and inference for object recognition. Genio 700 or 1200.
+
+## Cross-references
+
+- [MediaTek landing](/docs/vendors/mediatek) — overall vendor view.
+- [MediaTek Filogic](/docs/vendors/mediatek-filogic) — Wi-Fi router silicon from the same vendor.
+- [Rockchip RK3568](/docs/vendors/rockchip-rk3568) — closest Genio 510 competitor.
+- [Rockchip RK3588](/docs/vendors/rockchip-rk3588) — closest Genio 1200 competitor.
+- [TI Sitara AM62x](/docs/vendors/ti-sitara) — industrial HMI alternative.
+- [MediaTek Genio product page](https://www.mediatek.com/products/iot) (external).
+- [Genio Developer Portal](https://mediatek.gitlab.io/aiot/doc/aiot-dev-guide/master/index.html) (external).
+- [I-Pi SMARC boards](https://ipi-smarc.adlinktech.com/) (external) — common Genio SoM carriers.
