@@ -1,0 +1,182 @@
+---
+title: Drone flight controller
+description: Inside a Pixhawk-class flight controller — Cortex-M7 at 480 MHz, 8 kHz attitude loop, IMU + barometer + GPS, DSHOT ESCs, PX4 on NuttX.
+order: 3
+updated: 2026-05-12
+tags: [systems, drone, flight-controller, cortex-m7, real-time, px4]
+---
+
+import SpecSheet from '~/components/SpecSheet.astro';
+import SystemBlock from '~/components/SystemBlock.astro';
+import Callout from '~/components/Callout.astro';
+
+A multirotor stays in the air because a Cortex-M7 reads its inertial measurement unit 8000 times per second, runs an extended Kalman filter, and updates four motor PWM outputs faster than the human reaction time. Lose any one of those, lose the aircraft. This is hard real-time at its purest.
+
+## At a glance
+
+<SpecSheet specs={[
+  { label: 'Product class', value: 'Open-source FC for racing / fixed-wing / multirotor (Pixhawk-class)' },
+  { label: 'Typical MCU', value: 'STM32H743 / STM32H753 / STM32H757 (Cortex-M7 dual-core variant)', link: '/docs/vendors/stm32/' },
+  { label: 'Newer designs', value: 'Renesas RA8M1 (Cortex-M85) — Helium for ML, faster scalar' },
+  { label: 'Core', value: 'Cortex-M7 @ 480 MHz · L1 I/D cache · FPU SP+DP · ITCM/DTCM', link: '/docs/cortex-m/m7/' },
+  { label: 'RAM', value: '1 MB SRAM + 64 KB ITCM + 128 KB DTCM' },
+  { label: 'Flash', value: '2 MB internal (dual-bank for safe update)' },
+  { label: 'Sensors', value: '2× IMU (redundant), barometer, magnetometer, optical flow, lidar' },
+  { label: 'Connectivity', value: 'GPS (UART), telemetry radio (UART), R/C receiver (SBUS/CRSF), CAN' },
+  { label: 'Outputs', value: '8–16 PWM/DSHOT channels to ESCs' },
+  { label: 'RTOS', value: 'NuttX (PX4) or ChibiOS (ArduPilot) or Betaflight (bare metal)', link: '/docs/rtos/landscape/' },
+  { label: 'Control loop', value: '8 kHz attitude, 1 kHz EKF, 100 Hz position' },
+  { label: 'Certifications', value: 'None for hobby, DO-178C for commercial UAS (rare)' },
+]} />
+
+## Why Cortex-M7 specifically
+
+The control loop budget on an 8 kHz attitude controller is **125 µs per iteration**. In that window the firmware must:
+
+1. Read both IMUs over SPI (gyro + accel + temp = 14 bytes × 2 = 28 bytes).
+2. Apply calibration, temperature compensation, and a low-pass filter.
+3. Run the inner-loop PID controller (rate → motor command).
+4. Mix the four-motor allocation matrix.
+5. Update the four PWM/DSHOT outputs.
+
+A Cortex-M4 at 168 MHz can just barely do this without the FPU; an M7 at 480 MHz with cache + dual-issue does it with ~20% CPU headroom. The headroom is what lets you add velocity estimation, log to SD, stream MAVLink telemetry, and respond to mode changes — all without missing a control deadline.
+
+<Callout type="warn" title="Why caches make timing scary on M7">
+The Cortex-M7 has L1 I/D caches that aren't coherent with DMA. If a control function isn't cached and you happen to fall on a cache miss inside the 125 µs window, you can pay 30+ cycles of stall. Real FC firmware **locks hot code into ITCM** via the linker script (see [Cortex-M7](/docs/cortex-m/m7/)) and places DMA buffers in DTCM or non-cacheable SRAM.
+</Callout>
+
+## Block diagram
+
+<SystemBlock
+  title="Pixhawk-class FC SoC + carrier"
+  blocks={[
+    [
+      { kind: 'core', label: 'Cortex-M7 @ 480 MHz', detail: 'L1 cache · FPU DP · ITCM/DTCM' },
+      { kind: 'core', label: 'Cortex-M4 @ 240 MHz', detail: 'Optional dual-core; logging/IO companion' },
+    ],
+    [
+      { kind: 'memory', label: 'ITCM 64 KB + DTCM 128 KB', detail: 'single-cycle, hot ISRs + DMA buf', span: 2 },
+    ],
+    [
+      { kind: 'memory', label: 'SRAM (cacheable) 800 KB', detail: 'main heap' },
+      { kind: 'memory', label: 'SRAM (non-cacheable) 96 KB', detail: 'DMA descriptor rings' },
+    ],
+    [
+      { kind: 'periph', label: 'SPI ×6 to IMUs', detail: 'BMI270, ICM-42688, hardware CS', span: 2 },
+    ],
+    [
+      { kind: 'periph', label: 'TIM1/TIM8 advanced', detail: 'DSHOT600/1200 generation' },
+      { kind: 'periph', label: 'TIM2/TIM5 (32-bit)', detail: 'µs timestamps' },
+    ],
+    [
+      { kind: 'periph', label: 'UART ×6', detail: 'GPS, RC, telemetry, gimbal' },
+      { kind: 'periph', label: 'I²C ×4', detail: 'baro, mag, airspeed' },
+    ],
+    [
+      { kind: 'periph', label: 'CAN-FD ×2', detail: 'DroneCAN / UAVCAN' },
+      { kind: 'periph', label: 'SDMMC + USB', detail: 'log to SD, USB CDC console' },
+    ],
+  ]}
+  caption="STM32H753-class flight controller. The dual-core variant runs telemetry and logging on the M4 to keep the M7's 8 kHz loop deterministic."
+/>
+
+## The 8 kHz attitude loop
+
+Single most important code path in the firmware:
+
+```c
+// Pseudocode — runs from ITCM, ISR triggered by TIM5 at 8 kHz
+__attribute__((section(".itcm.text"), no_inline))
+void attitude_loop_isr(void) {
+    uint32_t start = DWT->CYCCNT;            // for timing watchdog
+
+    // 1. Pull fresh IMU samples (already in DTCM via DMA)
+    imu_sample_t s = imu_samples[imu_select_best(/* health */)];
+
+    // 2. Apply notch filter to remove motor-frequency vibration
+    rate_filtered = notch_apply(s.gyro);
+
+    // 3. Inner-loop PID: rate setpoint → torque demand
+    torque = pid_rate.update(rate_setpoint, rate_filtered);
+
+    // 4. Mixer: torque + thrust → 4× motor demands
+    motor_mix(torque, thrust_setpoint, motors);
+
+    // 5. Write to DSHOT600 timer DMA buffer (4 channels)
+    dshot_write(motors);
+
+    // 6. Watchdog — fail if we're more than 80 µs in
+    if (DWT->CYCCNT - start > 38400) panic("attitude overrun");
+}
+```
+
+Notable details:
+
+- **No malloc, no logging, no waiting on a mutex.** Anything that can block is banned.
+- **Notch filters** are critical because brushless motors generate strong vibration at their commutation frequency, which appears in the gyro as broadband noise. Adaptive notches (PX4 calls them "harmonic notch") track the motor RPM and follow the noise peak.
+- **DSHOT** (digital signal for ESCs) is a 16-bit serial protocol where the throttle value is sent over a single PWM line at 150 / 300 / 600 / 1200 kHz. Generated via the timer's DMA + advanced-timer hardware.
+- **DWT cycle counter** is the precision timestamp for the watchdog. See [SysTick & timing](/docs/cortex-m/systick/).
+
+## The EKF (state estimation)
+
+The inner loop knows the *rate* (gyro). To know the *attitude* (rotation) and *position*, the firmware runs an Extended Kalman Filter at 250 Hz – 1 kHz that fuses:
+
+- Gyro (high frequency, drifts over seconds)
+- Accelerometer (low frequency, noisy short-term)
+- Magnetometer (heading, low frequency, distorted by motors)
+- GPS (position + velocity, ~10 Hz, ~2 m accuracy)
+- Barometer (altitude, 50 Hz, slow drift)
+- Optical flow (velocity, available indoors, when present)
+
+PX4's EKF2 (ekf2) and ArduPilot's EKF3 are both 24-state filters running on the Cortex-M7. Each iteration ≈ 200–500 µs depending on which observations are being incorporated. The matrix math relies heavily on the FPU.
+
+## Software stack
+
+**ArduPilot** runs on ChibiOS. **PX4** runs on NuttX (a POSIX-like RTOS — see [the RTOS landscape](/docs/rtos/landscape/)). **Betaflight** (racing/freestyle drones) runs essentially bare-metal with a tiny scheduler.
+
+```
+Boot ROM → custom bootloader → flight stack
+                                    │
+                                    ▼
+                            ┌────────────────────┐
+                            │ Sensor drivers     │  SPI/I²C tasks
+                            │ Estimator (EKF)    │  250 Hz – 1 kHz
+                            │ Controllers (PID)  │  8 kHz attitude, 100 Hz pos
+                            │ Mixer + outputs    │
+                            │ Logging (uLog/.bin)│  to SD or via MAVLink
+                            │ MAVLink telemetry  │  over radio + USB
+                            │ Failsafe state-mach│
+                            └────────────────────┘
+```
+
+Failsafes are non-negotiable: if R/C link is lost for &gt;500 ms, auto-RTL (return to launch); if battery &lt;20%, smart-land; if attitude excursion &gt;75° while in stabilize mode, auto-recover or kill. These are tested mercilessly because the alternative is hardware in trees.
+
+## Real products
+
+| Product | MCU | Notes |
+|---|---|---|
+| **Holybro Pixhawk 6X** | STM32H753 + STM32F103 IO MCU | Standard reference; multi-IMU redundancy |
+| **Holybro Pixhawk 6C** | STM32H743 | Single-MCU, cost-optimized |
+| **CUAV V5+ / Nora+** | STM32H753 | Industrial-grade, popular in commercial UAS |
+| **Matek H743-WING** | STM32H743 | Fixed-wing optimized, integrated PDB |
+| **Mateksys H743 SLIM** | STM32H743 | Tiny FPV racing form factor |
+| **mRo X21** | STM32F765 (older) | Compact open-source design |
+
+Newer 2024+ designs are starting to use **STM32H7+ dual-core**, **Renesas RA8M1 (Cortex-M85)**, or **NXP i.MX RT1170** — all aimed at running ML-based vision/obstacle-avoidance alongside the traditional flight stack.
+
+## Tradeoffs you make
+
+- **More CPU headroom = more features** — vibration analysis, log rate, MAVLink streams, vision filters.
+- **More peripherals = more wiring complexity** — every UART is a connector; every connector is a failure mode.
+- **Dual-core (H757) = simpler timing** — M7 owns the fast loop, M4 owns logging + telemetry, neither preempts the other.
+- **Hard vs. soft failsafes** — DSHOT bidirectional gives you actual motor RPM feedback, enabling smarter failsafes. Costs extra CPU.
+
+## See also
+
+- [Cortex-M7](/docs/cortex-m/m7/) — the dominant flight controller core.
+- [Cortex-M85 / M55](/docs/cortex-m/m55-m85/) — where new designs are headed.
+- [Linker scripts](/docs/programming/linker-scripts/) — putting hot code in ITCM.
+- [DMA](/docs/peripherals/dma/) — IMU and DSHOT streaming.
+- [Timers & PWM](/docs/peripherals/timers/) — DSHOT generation.
+- [CAN](/docs/peripherals/can/) — DroneCAN/UAVCAN bus.
+- [PX4 source](https://github.com/PX4/PX4-Autopilot) and [ArduPilot source](https://github.com/ArduPilot/ardupilot) (external).

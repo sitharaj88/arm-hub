@@ -1,0 +1,149 @@
+---
+title: STM32 low-power — L and U series
+description: STM32 L series (M3/M4/M33 low-power) and U series (M33 with TrustZone, ultra-low-power), stop-mode currents below 1 µA, LPTIM and LPUART autonomous peripherals, designing a battery-powered system from the silicon up.
+order: 12
+updated: 2026-05-13
+tags: [vendors, stm32, stm32l4, stm32u5, low-power, battery, trustzone]
+---
+
+STM32's low-power lineage runs from the original L1 (Cortex-M3, 2010) through L0/L4/L5 to the current U5 (Cortex-M33 with TrustZone, 2021) and the latest U0/U3 cost-optimised variants. The defining metric is **sleep current** — how few microamps the part draws when most of the chip is off — and the supporting story is **wake-up latency** — how fast it gets back to the active loop without paying the energy of a cold boot.
+
+For battery-powered designs, smoke detectors, asset trackers, glucose sensors, water meters, and small wearable nodes, these are the parts. This page walks through the architecture choices that drive the low-power numbers, the autonomous peripherals that let the CPU stay off longer, and the firmware patterns that turn a microamp-grade datasheet figure into microamp-grade real-world average current.
+
+<SpecSheet
+  title="STM32 low-power at a glance"
+  specs={[
+    { label: 'L series cores', value: 'L0: M0+; L1: M3; L4/L4+: M4F; L5: M33 with TrustZone' },
+    { label: 'U series', value: 'U0: M0+ cost-optimised; U3: M33 mid-range; U5: M33 flagship with TrustZone, secure boot, AES, PKA' },
+    { label: 'Stop 2 current', value: 'L4: ~1.1 µA; U5: ~0.3 µA (RTC running, 8 KB SRAM retained)' },
+    { label: 'Stop 0 wake-up', value: 'L4: ~5 µs; U5: ~1.7 µs (from full SRAM-retained stop)' },
+    { label: 'Standby with backup', value: 'U5: ~80 nA, backup domain RTC + 2 KB battery-backed SRAM' },
+    { label: 'Shutdown mode', value: 'U5: ~16 nA, only Vbat pin domain remains, wake via WKUP pin' },
+    { label: 'Autonomous peripherals (U5)', value: 'LPTIM, LPUART, LPDMA, LPCOMP, LPADC, GPDMA can run in Stop 2 with the CPU off' },
+    { label: 'Process node', value: 'L4: 90 nm; L5: 40 nm; U5: 40 nm ULP optimised' },
+    { label: 'Voltage range', value: '1.71..3.6 V; range 2 / range 1 scaling for performance vs efficiency' },
+  ]}
+/>
+
+## The power-budget story
+
+A device that runs from a 220 mAh CR2032 coin cell for ten years has an average current budget of 220 mAh / (10 × 365 × 24 h) ≈ **2.5 µA**. The CPU active current alone — even a low-power M0+ at 1 MHz — is several hundred µA. The only way to make the budget work is to spend almost all wall-clock time asleep at sub-µA, wake up briefly for a measurement, and sleep again.
+
+A typical duty cycle for a temperature sensor with 1-second sampling at 0.5 mA active for 1 ms each cycle:
+
+```
+average = (1 ms × 500 µA + 999 ms × 1 µA) / 1000 ms
+        = 0.5 µA + 0.999 µA
+        ≈ 1.5 µA
+```
+
+That's the design target. Now look at where the 1 µA sleep current comes from in real silicon and what makes it grow.
+
+## Power modes — what's on, what's off
+
+STM32 low-power parts have a hierarchy of sleep modes, each turning off more domains. Naming differs slightly by family; the U5 nomenclature:
+
+| Mode | CPU | RAM retained | Peripherals | RTC | Wake-up time | Typical I |
+|------|-----|-------------|-------------|-----|--------------|-----------|
+| Run, Range 1 | On (160 MHz) | All | All | On | 0 | 50 mA (full SoC) |
+| Run, Range 2 | On (24 MHz) | All | All | On | 0 | 5 mA |
+| Sleep | Off, peripherals run | All | All | On | &lt;1 cycle | 1–3 mA |
+| Low-power run | On, slow (2 MHz) | All | All | On | 0 | 100 µA |
+| Stop 0 | Off | All | Off (autonomous in Stop) | On | ~5 µs | 8 µA |
+| Stop 1 | Off | All | Off (HSI off) | On | ~7 µs | 4 µA |
+| Stop 2 | Off | Configurable | Off | On | ~7 µs | **0.3 µA** |
+| Stop 3 (U5) | Off | 8 KB | Off | On | ~10 µs | 0.16 µA |
+| Standby + RTC | Off | None (backup only) | Off | On | ~14 µs cold boot | 80 nA |
+| Shutdown | Off | None | Off | Off (LSE optional) | Reset | 16 nA |
+
+The trade is **retained state versus current**. Stop 2 keeps all SRAM and the CPU's register file warm, so on wake the firmware continues from `WFI` as if it never slept — no boot, no init. Standby loses everything except a small "backup SRAM" (typically 2–4 KB) that lives in the always-on Vbat domain — fast wake (~14 µs) but you must reinitialise everything in your `main`. Shutdown turns off even the regulator, drawing nanoamps, and wakes via a hard reset.
+
+## Autonomous peripherals — sleep with eyes open
+
+The key innovation of the U series is that several peripherals continue to operate **while the CPU is in Stop 2**, with no CPU cycles consumed. Wake-up only happens when something interesting is detected:
+
+- **LPTIM** — Low-Power Timer. 16-bit timer clocked from LSE/LSI/HSI, runs in Stop 2. Generates a periodic wake-up tick (e.g. "wake me every 4 seconds") without any CPU involvement.
+- **LPUART** — Low-Power UART. Receives at standard baud rates in Stop 2 by clocking off LSE; wakes the CPU on RX activity (start bit, full byte, match on a programmed character).
+- **LPDMA** — Low-Power DMA. Can move data between LPUART/LPI2C/LPADC and SRAM4 (the backup domain SRAM) without waking the CPU.
+- **LPCOMP** — Low-power analog comparator. Wakes when an analog input crosses a threshold.
+- **LPADC** — Low-power ADC. Performs a conversion every N µs (via LPTIM trigger), DMAs results to SRAM4, wakes the CPU only when M values are accumulated or a threshold crossed.
+- **GPDMA** — Newer DMA controller; on U5 with autonomous mode, can run a linked-list of transfers in Stop 2.
+
+The pattern this enables: configure LPTIM to fire every 100 ms, configure LPADC to convert one channel on the trigger, configure LPDMA to move the result into a 256-entry circular buffer in SRAM4. Go to Stop 2. The CPU sleeps for ~26 seconds while the autonomous chain logs 256 samples. Wake on DMA "transfer complete" interrupt, process the buffer in a few milliseconds, return to Stop 2. Average current ≈ 0.5 µA for the autonomous chain plus the CPU's 0.3 µA sleep — under a microamp total.
+
+<Callout type="tip">
+SRAM4 (in the backup domain on H7/U5) is the right place for autonomous DMA buffers — it stays powered in Stop 2 and survives Standby. Main SRAM banks 1/2/3 are powered off in Stop 2 unless explicitly marked for retention, which costs extra leakage. Keep the working set small.
+</Callout>
+
+## Walking through a battery-powered sensor design
+
+A practical example: a soil-moisture sensor for agtech, sends one reading per hour to a LoRaWAN gateway, runs for five years on a 2400 mAh AA cell.
+
+**Budget**
+
+- Battery: 2400 mAh × 3.0 V ≈ 26 kJ usable
+- Lifetime: 5 years = 43800 hours
+- Permissible average current: 2400 / 43800 ≈ **55 µA**
+
+**Active components per hour**
+
+| Phase | Duration | Current | Charge per cycle |
+|-------|----------|---------|------------------|
+| Stop 2 (sleep) | 3599.5 s | 0.5 µA | 1.8 µAs (i.e. µA·s) |
+| Sensor warm-up + ADC | 0.1 s | 3 mA | 0.3 mAs |
+| LoRaWAN TX (SF7, 14 dBm) | 0.4 s | 35 mA | 14 mAs |
+| LoRaWAN RX2 wait | 1 s | 13 mA | 13 mAs |
+| Per-hour total |  |  | **27.3 mAs** |
+
+Average current = 27.3 mAs / 3600 s ≈ 7.6 µA. Well inside the 55 µA budget; runway for self-discharge, leakage on supporting components, and three SF12 retransmits per day for poor link conditions.
+
+**Silicon choice**: STM32U5 + Semtech SX1262 LoRa radio, or single-chip STM32WL (M4 + M0+ Sub-GHz; see [STM32 wireless](/docs/vendors/stm32-wireless)).
+
+**Boot pattern**: Standby with backup SRAM. The backup SRAM holds the LoRaWAN session keys (DevAddr, NwkSKey, AppSKey, frame counter). Standby wake-up is a partial reset; firmware checks `RCC->CSR.IWUF` to recognise wake-from-standby and skips the LoRaWAN join — using the cached session.
+
+**Brown-out trap**: An AA cell sags under the 35 mA LoRa TX load to ~2.4 V at 50% depth-of-discharge and below 2 V near end-of-life. The PVD (Programmable Voltage Detector) is configured at 2.2 V to fire a low-priority interrupt — the firmware reduces TX power, drops to SF12 (less efficient but lower peak), and ultimately stops transmitting before the cell collapses.
+
+## L5 and U5: TrustZone arrives
+
+The L5 and U5 both bring ARMv8-M TrustZone to the low-power line. Memory is partitioned between **secure** and **non-secure** worlds via the SAU (Security Attribution Unit) and IDAU. Secure-world code holds the LoRaWAN session keys, the firmware update signing key, the secure boot ROM keys. Non-secure code is the application — sensor sampling, business logic — which calls into secure entry points (`NSC` regions) for the few operations that need privileged keys.
+
+This split matters in battery designs because:
+
+- **Secure boot** verifies the application image at every power-on. Without secure boot, an attacker with physical access can reflash the part with their own firmware. With it, only correctly-signed images run.
+- **OTA update** needs the same key to verify a new image before committing it. Holding that key in non-secure flash is unsafe.
+- **Audit and certification** — IEC 62443 industrial security, EN 18031 EU radio equipment cybersecurity, FIPS 140-3 cryptography — all increasingly require hardware-isolated key storage.
+
+The U5 adds the **Memory Cipher (MCE)** for on-the-fly encryption of external flash — so even if you cost-optimise to use external XIP flash, the contents are encrypted with a key that never leaves the chip.
+
+<Callout type="warn">
+TrustZone has a steep learning curve. The SAU table partitions the address space at compile time; getting it wrong locks the CPU out of memory it needs. ST's TrustZone-aware Cube projects come with working SAU initialisation — use them as the starting point. Reading the ARMv8-M architecture spec (DDI 0553) for the security extensions is mandatory for designing a secure boot story from scratch.
+</Callout>
+
+## L4 vs U5 — when to pick which
+
+L4 is the value choice — Cortex-M4F at 80 MHz, no TrustZone, mature ecosystem, lots of reference designs, ~$3 in moderate quantities. U5 is the future-proof choice — M33 at 160 MHz, TrustZone, secure boot, faster math, autonomous peripherals, ~$5 in similar quantities.
+
+For a new design with a long expected market life (medical, automotive, infrastructure), U5 is the safer pick — TrustZone and secure boot become regulatory requirements over the device's life. For a short-run consumer product that ships and forgets, L4 still wins on cost.
+
+| Aspect | L4 (L476) | U5 (U585) |
+|--------|-----------|-----------|
+| Core | M4F | M33 with TrustZone |
+| Max MHz | 80 | 160 |
+| Flash | 1 MB | 2 MB |
+| RAM | 128 KB | 786 KB |
+| Stop 2 | 1.1 µA | 0.3 µA |
+| Standby + RTC + 32 KB SRAM | 0.3 µA | 0.2 µA |
+| Secure boot | Optional | Built-in (RSS + SBSFU) |
+| AES | Yes (128/256) | Yes + PKA + SHA-256/512 |
+| TRNG | Yes | Yes (NIST SP 800-90B) |
+| Autonomous DMA | Limited | Full GPDMA + LPDMA |
+| Process | 90 nm | 40 nm ULP |
+
+## Cross-references
+
+- [STM32 mainstream F, G, H](/docs/vendors/stm32-mainstream) — when battery life isn't the constraint.
+- [STM32 wireless WB and WL](/docs/vendors/stm32-wireless) — adds Sub-GHz LoRa or BLE radio to the same low-power story.
+- [Cortex-M33](/docs/cortex-m/m33) — the core in L5 and U5, including TrustZone.
+- [Iot sensor node](/docs/systems/iot-sensor-node) — full system-level walkthrough.
+- ST AN5188 — STM32U5 low-power application note.
+- ST RM0438 (U5), RM0394 (L4), RM0444 (L5) — reference manuals.

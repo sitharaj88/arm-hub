@@ -1,0 +1,194 @@
+---
+title: CMSIS-DSP
+description: The ARM CMSIS-DSP library — vector math, FIR/IIR filters, FFT, matrix ops, statistics, and transforms. Q-format fixed-point, performance on M0/M4F/M7/M55 Helium, and practical audio and PID examples.
+order: 9
+updated: 2026-05-13
+tags: [programming, cmsis, dsp, fixed-point, fir, fft, helium]
+---
+
+CMSIS-DSP is ARM's reference signal-processing library — about 60 categories of functions covering everything from vector add/multiply through FIR/IIR filtering, complex math, transforms (FFT, DCT, RFFT), matrix algebra, statistics, sorting, classification, and machine-learning kernels. It is free, ships as source, and is the only DSP library you can be confident is tuned for every Cortex-M variant from M0 through M85.
+
+If you're writing audio code, motor control, sensor fusion, gesture recognition, or any kind of real-time math on an ARM microcontroller, CMSIS-DSP is the right starting point. Roll-your-own works for one filter; for a system of forty filters, twelve FFTs, and a couple of PID loops, the library is faster to integrate, faster at runtime, and easier to certify.
+
+<SpecSheet
+  title="CMSIS-DSP at a glance"
+  specs={[
+    { label: 'Source', value: 'github.com/ARM-software/CMSIS-DSP — ARM-maintained, Apache 2.0 licensed' },
+    { label: 'Supported cores', value: 'Cortex-M0/M0+/M3 (scalar), M4F/M7 (DSP-ext + SP/DP FPU), M33 (DSP optional), M55/M85 (Helium MVE vector ISA), Cortex-A (NEON)' },
+    { label: 'Data types', value: 'q7_t, q15_t, q31_t (fixed-point), f16_t (half), f32_t (float), f64_t (double)' },
+    { label: 'Function naming', value: 'arm_&lt;op&gt;_&lt;suffix&gt;(...) — suffix encodes data type: _q15, _q31, _f32, _f16' },
+    { label: 'Function categories', value: 'BasicMath, Complex, Filtering, Transform, Matrix, Statistics, Support, Distance, Interpolation, Quaternion, SVM, Bayes, MFCC, Window' },
+    { label: 'Build size', value: 'Per-function objects — link only what you use. Filtering subset ~30 KB; FFT subset ~50 KB with twiddle tables' },
+    { label: 'Determinism', value: 'No malloc, no syscalls. Stack usage bounded. Safe for real-time and safety-certified builds' },
+  ]}
+/>
+
+## Why use it rather than rolling your own
+
+Three reasons, in descending order of importance.
+
+**Performance.** Every function exists in scalar (M0), DSP-ext (M4F+, uses SMLAD/SMLALD packed multiplies), and Helium (M55/M85, full vector ISA) variants. The library picks the right one at compile time based on `__ARM_FEATURE_DSP`, `__ARM_FEATURE_MVE`, and `__FPU_PRESENT`. A 256-point Q15 FIR runs in ~600 cycles on M4F and ~80 cycles on M55 with Helium — you will not match that with hand-written C.
+
+**Numerical correctness.** Saturation, rounding, accumulator widths, and overflow handling are all worked out and tested. The Q15 FIR uses a 64-bit accumulator, rounds with `RND` mode, and saturates the final result to 16 bits. Getting these details right by hand is more work than people expect, and a single sign-extension bug ruins a year of validation work.
+
+**Certifiability.** CMSIS-DSP has been used in IEC 60601 medical and ISO 26262 automotive products. ARM provides test vectors and verification artefacts for the library. A pre-validated math kernel saves months in your safety case.
+
+## Q-format fixed-point
+
+Half the library exists in fixed-point form because most Cortex-M parts don't have an FPU, or have only single-precision, or are bandwidth-bound on float loads. CMSIS-DSP uses **Q-format**:
+
+| Type | Bits | Range | Resolution |
+|------|------|-------|------------|
+| q7_t | 8 | [-1.0, 1.0 - 2^-7] = [-1, 0.9921875] | 2^-7 ≈ 7.8 × 10^-3 |
+| q15_t | 16 | [-1.0, 1.0 - 2^-15] | 2^-15 ≈ 3.05 × 10^-5 |
+| q31_t | 32 | [-1.0, 1.0 - 2^-31] | 2^-31 ≈ 4.66 × 10^-10 |
+
+The Q-format represents fractional values in `[-1, 1)`. A `q15_t` value of `0x4000` is `0.5`, `0x7FFF` is just under `1.0`, `0x8000` is `-1.0`. Multiplication of two Q15 values gives a Q30 value (or Q31 if you absorb the sign bit). The library handles the bookkeeping; you call `arm_mult_q15(srcA, srcB, dst, blockSize)` and it does Q15 × Q15 → Q15 with rounding and saturation.
+
+Conversions:
+
+```c
+q15_t f = (q15_t)(2.0f * 32768.0f * 0.25f);   // 0.25 in Q15 -> 0x2000
+float g = (float)f / 32768.0f;                  // back to float
+```
+
+CMSIS provides `arm_float_to_q15`, `arm_q15_to_float`, and friends for block conversion.
+
+<Callout type="tip">
+Pick the smallest Q-format that meets your dynamic range. Audio at 16-bit ADC depth fits perfectly in Q15. Sensor fusion that needs 24+ bits wants Q31. PID loops where the integrator can grow large want Q31 or even floating-point. Going wider costs you cycles, code size, and memory bandwidth — go as narrow as you can defend.
+</Callout>
+
+## Performance: scalar vs DSP-ext vs Helium
+
+Three generations of math acceleration in the Cortex-M family:
+
+<CoreCompare
+  rows={[
+    { core: 'Cortex-M0 / M0+ / M3 (scalar)', notes: 'Pure 32-bit ALU. CMSIS-DSP runs but is several × slower. No SIMD, no FPU on M0/M0+. M3 has UMULL/UMLAL for 64-bit multiply-accumulate.' },
+    { core: 'Cortex-M4 / M7 (DSP extensions)', notes: 'SMLAD/SMLALD: two 16x16 multiplies + 32-bit add in one cycle. SSAT/USAT for saturation. 1-cycle MAC into 64-bit accumulator. Most M-class DSP code targets this baseline.' },
+    { core: 'Cortex-M33 (DSP optional)', notes: 'DSP extensions are an implementation option. Many vendor SKUs include them; some do not. Check `__ARM_FEATURE_DSP`.' },
+    { core: 'Cortex-M55 / M85 (Helium MVE)', notes: 'Full 128-bit vector ISA. 8x q15 multiplies in parallel, lane-wise predication, scatter/gather. Order-of-magnitude speedup for FIR, FFT, matrix.' },
+  ]}
+/>
+
+A benchmark snapshot — 256-point Q15 FIR, 64-tap filter:
+
+| Core | Cycles | At 100 MHz |
+|------|--------|------------|
+| M0+  | ~5500  | 55 µs |
+| M3   | ~3000  | 30 µs |
+| M4F  | ~600   | 6 µs |
+| M7   | ~520   | 5.2 µs |
+| M55 (Helium) | ~80 | 0.8 µs |
+
+The 7× jump from M3 to M4F is the DSP extensions; the 7× jump from M4F to M55 is Helium. If your math budget is tight and the part choice is open, this is one of the biggest single levers you can pull.
+
+## Filtering
+
+The filtering category is the largest and most-used. Three filter families:
+
+**FIR — Finite Impulse Response.** A convolution of input samples with a fixed coefficient vector. Always stable, linear phase if symmetric coefficients, but expensive (N taps × N samples per block). CMSIS provides `arm_fir_q15`, `arm_fir_f32`, decimation/interpolation variants, and a fast SIMD FIR that requires aligned coefficients.
+
+**IIR — Infinite Impulse Response.** Recursive filters with feedback. Far fewer coefficients for the same frequency response, but can be unstable and have non-linear phase. CMSIS implements IIR as **biquad cascades** — each biquad is a 2nd-order IIR section, and you cascade as many as needed for higher order. This is numerically stable in fixed-point, where direct-form IIR would overflow.
+
+**Lattice and adaptive (LMS, NLMS).** Less common but supported. Lattice forms are useful for speech codecs; LMS/NLMS for noise cancellation and echo suppression.
+
+A biquad audio filter, Q15:
+
+```c
+#define NUM_STAGES 4
+static q15_t state[4 * NUM_STAGES];   // 4 state words per stage
+static const q15_t coeffs[6 * NUM_STAGES] = {
+    /* b0, 0, b1, b2, a1, a2 for each stage — pre-shifted */
+    0x4000, 0, 0x4000, 0, -0x5A82, 0x3000,
+    /* ... */
+};
+
+arm_biquad_casd_df1_inst_q15 S;
+arm_biquad_cascade_df1_init_q15(&S, NUM_STAGES, coeffs, state, 1 /* postShift */);
+
+q15_t in[BLOCK], out[BLOCK];
+while (1) {
+    /* fill in[] with new samples ... */
+    arm_biquad_cascade_df1_q15(&S, in, out, BLOCK);
+    /* push out[] to DAC ... */
+}
+```
+
+The `postShift` parameter scales the output to absorb gain in the filter without overflow — a typical Butterworth high-pass needs 1 or 2 bits of headroom per stage.
+
+## FFT and transforms
+
+CMSIS-DSP provides forward and inverse FFT in radix-2, radix-4, and mixed-radix variants, in q15, q31, and f32. Sizes are powers of two from 16 to 4096 (Q-format) and 16 to 16384 (float). Real-input variants (`arm_rfft_q15`, etc.) exploit conjugate symmetry to use half the cycles.
+
+```c
+arm_rfft_instance_q15 fft;
+q15_t input[256];                    // 256 real samples
+q15_t output[512];                   // 256 complex output bins (real, imag interleaved)
+
+arm_rfft_init_q15(&fft, 256, 0 /* forward */, 1 /* bitReverse */);
+arm_rfft_q15(&fft, input, output);
+
+/* Magnitude */
+q15_t mag[128];
+arm_cmplx_mag_q15(output, mag, 128);
+```
+
+FFT costs ~N log N operations; on M4F a 256-point Q15 RFFT runs in roughly 14 000 cycles. The twiddle tables are precomputed in flash — about 4 KB of read-only data for the 256-point case.
+
+## Matrix and statistics
+
+The matrix functions handle add, subtract, multiply, transpose, inverse, Cholesky, LU decomposition, and QR for f32 and f64. Sizes are arbitrary at runtime. Used heavily in Kalman filtering, MPC (model predictive control), and sensor fusion.
+
+Statistics covers mean, variance, RMS, min, max, standard deviation, entropy, and quantile estimates. Often used in front of the FFT for windowing and DC removal.
+
+## Practical: a PID loop with CMSIS-DSP
+
+The library provides a PID controller object that handles output saturation:
+
+```c
+arm_pid_instance_f32 pid = {
+    .Kp = 0.5f,
+    .Ki = 0.05f,
+    .Kd = 0.02f,
+};
+arm_pid_init_f32(&pid, 1 /* resetStateBuffer */);
+
+void control_loop(float setpoint, float measured) {
+    float error = setpoint - measured;
+    float output = arm_pid_f32(&pid, error);
+    set_motor_pwm(output);
+}
+```
+
+Internally, the structure stores the three error states needed for the discrete PID recurrence, computes derivative on error (or measurement, configurable), and clamps the output. Q15 and Q31 variants exist too — the Q15 version is the right choice for a hard real-time motor commutation loop on an M0+.
+
+<Callout type="warn">
+The CMSIS-DSP PID does not include integral anti-windup. If your system has actuator saturation (a motor that hits the rail), you must wrap the call with your own anti-windup logic — clamp the integrator or zero it on saturation. Otherwise the integral term builds up while the actuator is rail-locked and overshoots badly on recovery.
+</Callout>
+
+## Build and link
+
+CMSIS-DSP ships as source. Two integration styles:
+
+**Per-function compilation.** Add only the `.c` files you use to your build. A typical audio app pulls in ~30 files for filtering, ~10 for transforms, ~5 for support. Total around 50 KB of code.
+
+**Precompiled library.** ARM ships `libCMSISDSP.a` for each core/feature combination. Add `-lCMSISDSP` to your link flags and the linker pulls in only the used symbols.
+
+Compile flags that matter:
+
+- `-DARM_MATH_LOOPUNROLL` — enable loop unrolling. ~20% faster, ~30% larger.
+- `-DARM_MATH_DSP` — assume DSP extensions are present (M4F+).
+- `-DARM_MATH_MVEI`, `-DARM_MATH_MVEF` — assume Helium integer/float (M55/M85).
+- `-DARM_MATH_AUTOVECTORIZE` — let the compiler auto-vectorise; useful on Helium where Cortex-M compilers can generate MVE from scalar source.
+
+The library detects the active CMSIS-Core header (`<Device>.h`) and selects implementations accordingly. You don't need to do anything special beyond setting `-mcpu=cortex-m4` etc. correctly.
+
+## Further reading
+
+- [CMSIS overview](/docs/programming/cmsis) — the broader CMSIS ecosystem
+- [Cortex-M4 DSP extensions](/docs/cortex-m/dsp-ext) — what SMLAD and friends do at the ISA level
+- [Helium / MVE](/docs/architecture/helium) — the M55/M85 vector ISA
+- [Embedded C patterns](/docs/programming/embedded-c) — including fixed-point idioms
+- CMSIS-DSP API documentation: arm-software.github.io/CMSIS-DSP/
+- Lyons, *Understanding Digital Signal Processing* — the canonical filtering reference

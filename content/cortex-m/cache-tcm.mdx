@@ -1,0 +1,234 @@
+---
+title: Cache & TCM
+description: Cortex-M7/M55/M85 I-cache, D-cache, and tightly-coupled memory. Line size, write-back vs write-through, invalidate/clean, DMA coherency, ITCM/DTCM bring-up.
+order: 21
+updated: 2026-05-13
+tags: [cortex-m, cache, tcm, dma, coherency, m7, m55, m85]
+---
+
+Most Cortex-M cores have no cache. Flash and SRAM are accessed directly through the bus matrix, with wait states accounted for in cycle budgets. This is fine up to ~150 MHz on modern flash — beyond that, the wait states grow faster than the clock, and the core spends more time waiting on instruction fetches than executing them.
+
+The Cortex-M7, M55, and M85 all add **optional caches** (I-cache and D-cache) and **optional tightly-coupled memory** (ITCM and DTCM) to break this wall. Cached parts can clock to 400–750 MHz with effective IPC near 1.0 on cache-friendly workloads. The cost is two engineering burdens: cache coherency with DMA (the cache is *not* automatically kept in sync with DMA writes to RAM), and bring-up complexity (caches must be invalidated and enabled in a specific order).
+
+This page covers both caches and TCM, with the practical bring-up code and the DMA-coherency patterns that everyone needs to get right.
+
+<BlockDiagram
+  title="Cortex-M7 memory hierarchy — caches vs TCM"
+  width={760}
+  height={360}
+  nodes={[
+    { id: 'cpu', x: 40, y: 150, w: 140, h: 60, kind: 'core', label: 'Cortex-M7 core', detail: 'I-bus / D-bus' },
+    { id: 'icache', x: 230, y: 30, w: 140, h: 50, kind: 'memory', label: 'L1 I-cache', detail: '16–32 KB · 32 B line' },
+    { id: 'dcache', x: 230, y: 100, w: 140, h: 50, kind: 'memory', label: 'L1 D-cache', detail: 'write-back / through' },
+    { id: 'itcm', x: 230, y: 200, w: 140, h: 50, kind: 'memory', label: 'ITCM', detail: 'single-cycle code' },
+    { id: 'dtcm', x: 230, y: 270, w: 140, h: 50, kind: 'memory', label: 'DTCM', detail: 'single-cycle data · DMA-safe' },
+    { id: 'axi', x: 420, y: 65, w: 140, h: 50, kind: 'periph', label: 'AXI matrix', detail: 'cacheable masters' },
+    { id: 'flash', x: 600, y: 30, w: 130, h: 50, kind: 'storage', label: 'External flash', detail: 'wait-stated' },
+    { id: 'sram', x: 600, y: 100, w: 130, h: 50, kind: 'memory', label: 'SRAM-AXI', detail: 'cacheable' },
+    { id: 'dma', x: 420, y: 270, w: 140, h: 50, kind: 'periph', label: 'DMA controller', detail: 'bypasses D-cache' },
+  ]}
+  edges={[
+    { from: 'cpu', to: 'icache', label: 'I-fetch' },
+    { from: 'cpu', to: 'dcache', label: 'load/store' },
+    { from: 'cpu', to: 'itcm', label: 'direct', tone: 'success' },
+    { from: 'cpu', to: 'dtcm', label: 'direct', tone: 'success' },
+    { from: 'icache', to: 'axi' },
+    { from: 'dcache', to: 'axi' },
+    { from: 'axi', to: 'flash', tone: 'accent' },
+    { from: 'axi', to: 'sram', tone: 'accent', arrow: 'both' },
+    { from: 'dma', to: 'sram', tone: 'destructive', arrow: 'both' },
+    { from: 'dma', to: 'dtcm', tone: 'success', arrow: 'both' },
+  ]}
+  caption="Cached paths (CPU → I/D-cache → AXI → flash/SRAM) get throughput at the cost of DMA coherency: DMA writes to SRAM-AXI bypass the D-cache, so software must clean/invalidate. TCM accesses (green) skip the cache entirely — that's why DMA buffers placed in DTCM are coherent for free."
+/>
+
+
+<SpecSheet
+  title="Cache & TCM at a glance"
+  specs={[
+    { label: 'Cores with cache', value: 'Cortex-M7 (option), Cortex-M55 (option), Cortex-M85 (option). Not on M0/M0+/M3/M4/M23/M33.' },
+    { label: 'I-cache size', value: '4 KB to 64 KB, vendor-configurable. STM32H7 = 16 KB; MIMXRT1170 = 32 KB' },
+    { label: 'D-cache size', value: '4 KB to 64 KB. STM32H7 = 16 KB; MIMXRT1170 = 32 KB' },
+    { label: 'Line size', value: '32 bytes — always (architecturally fixed)' },
+    { label: 'D-cache policy', value: 'Write-back or write-through, per region (MPU sets cacheability)' },
+    { label: 'TCM', value: 'ITCM (instruction-side) and DTCM (data-side), each up to 16 MB architecturally — typical silicon 64 KB to 1 MB' },
+    { label: 'TCM access latency', value: 'Single cycle, deterministic. No cache management.' },
+    { label: 'ITCM alias', value: 'Mapped at 0x0000_0000 on most parts (so code can run from ITCM at the reset PC region)' },
+    { label: 'DTCM alias', value: 'Mapped at 0x2000_0000 on most parts (so data lives in the normal SRAM range)' },
+  ]}
+/>
+
+## I-cache
+
+The instruction cache is the simpler of the two. The core fetches instructions from flash (slow) the first time, the line lands in the I-cache, and subsequent fetches from the same line are single-cycle. For straight-line code, the I-cache hit rate is near 100% after the first pass; the win is huge.
+
+I-cache is **read-only from software's perspective** — no writes go through it. The only management operations are:
+
+- **Enable** — `SCB_EnableICache()` from CMSIS
+- **Invalidate** — discard all lines (after writing new code to flash, for example)
+- **Disable** — rare, mostly for debugging
+
+```c
+SCB_InvalidateICache();    /* invalidate before enable to clear power-on noise */
+SCB_EnableICache();
+```
+
+That's it. Once enabled, the I-cache is transparent. The only time you need to invalidate again is if flash contents change underneath the cache (after a self-update, for example), and even then most vendors flush automatically on flash write.
+
+## D-cache — the hard one
+
+The data cache is where the complexity lives. Reads load through the cache; writes go to the cache; and the cache decides when (or whether) to push writes through to main memory. Two policies:
+
+- **Write-back** — writes hit the cache line, mark it dirty, but don't go to memory. The line is written back later (on eviction or explicit clean). Faster, but main memory holds stale data until the writeback.
+- **Write-through** — writes hit both the cache and memory simultaneously. Slower per write but main memory is always current.
+
+Per-region cacheability is set in the MPU. With no MPU, default cacheability comes from the [memory model](/docs/architecture/memory-model) — code region cacheable, SRAM region cacheable write-back, peripheral region non-cacheable.
+
+### Cache management operations
+
+The D-cache offers four management operations, all addressable per cache line (32 bytes):
+
+| Operation | Effect |
+|---|---|
+| Clean | Write dirty lines back to memory, but keep them cached |
+| Invalidate | Discard cache lines without writing back. Loses data if dirty. |
+| Clean+Invalidate | Write back, then discard |
+| Disable | Turn the cache off entirely |
+
+CMSIS exposes these as:
+
+```c
+SCB_CleanDCache_by_Addr((uint32_t*)buf, size);
+SCB_InvalidateDCache_by_Addr((uint32_t*)buf, size);
+SCB_CleanInvalidateDCache_by_Addr((uint32_t*)buf, size);
+SCB_CleanDCache();          /* whole cache */
+SCB_InvalidateDCache();
+```
+
+The `_by_Addr` variants round the start address down and the end address up to 32-byte boundaries — **make sure your buffer is 32-byte aligned and a multiple of 32 bytes**, or you'll touch lines that span buffer boundaries and corrupt neighbouring data.
+
+### DMA coherency — the canonical problem
+
+DMA writes go straight to SRAM, bypassing the D-cache. So when DMA completes and the CPU reads the buffer, it gets cached (stale) data. Conversely, when the CPU writes a buffer and asks DMA to read it, DMA may see stale main-memory data if the CPU's write is still in the cache.
+
+Three solutions, in order of preference:
+
+**1. Mark the DMA buffer as non-cacheable.** Use the MPU to declare a small region containing all DMA buffers as non-cacheable. The CPU's accesses to that region bypass the cache, so DMA and CPU see consistent data. Simplest, slightly slower CPU access.
+
+```c
+/* Region: 4 KB of DMA buffers at 0x24000000, non-cacheable */
+ARM_MPU_SetRegion(
+    ARM_MPU_RBAR(0, 0x24000000),
+    ARM_MPU_RASR(1, ARM_MPU_AP_FULL, 1, 0, 0, 0, 0,   /* TEX=001, C=0, B=0 = non-cacheable */
+                 ARM_MPU_REGION_SIZE_4KB));
+```
+
+**2. Place the DMA buffer in DTCM.** TCM is outside the cache hierarchy by design. DMA writing to DTCM and CPU reading from DTCM is automatically coherent. Single-cycle access, no MPU configuration needed. The constraint is DTCM size — usually 64–256 KB total.
+
+**3. Clean/invalidate around DMA operations.** Standard pattern:
+
+```c
+/* Tx: CPU writes buffer, then DMA reads it */
+prepare_tx_data(tx_buf, n);
+SCB_CleanDCache_by_Addr((uint32_t*)tx_buf, n);    /* flush CPU writes to RAM */
+start_dma_tx(tx_buf, n);
+
+/* Rx: DMA writes buffer, then CPU reads it */
+SCB_InvalidateDCache_by_Addr((uint32_t*)rx_buf, n);  /* discard stale cache lines */
+start_dma_rx(rx_buf, n);
+wait_dma_complete();
+SCB_InvalidateDCache_by_Addr((uint32_t*)rx_buf, n);  /* discard CPU's pre-fetched stale data */
+process_rx_data(rx_buf, n);
+```
+
+The invalidate-before-AND-after on RX is needed because the CPU may have speculatively read the buffer (cached the stale memory contents) between starting the DMA and waiting for completion. The post-DMA invalidate guarantees the next read fetches fresh data.
+
+<Callout type="danger" title="The most common cache bug">
+DMA TX where the buffer is on the stack and the function returns before DMA completes. The cache line for the stack location may have been clean-by-addr'd, but later code may rewrite that stack slot, and the new cache contents will overwrite the in-flight DMA data on the next clean. Always use heap or static buffers for DMA, and always Clean+Invalidate after TX completes.
+</Callout>
+
+### Cache enable sequence
+
+The order matters:
+
+```c
+SCB_DisableDCache();
+SCB_InvalidateDCache();   /* clear out any garbage from power-on */
+SCB_EnableDCache();
+SCB_DisableICache();
+SCB_InvalidateICache();
+SCB_EnableICache();
+```
+
+CMSIS startup does this on M7 parts by default. On M55/M85 you may need to call it explicitly.
+
+## TCM — tightly-coupled memory
+
+TCM is single-cycle SRAM wired directly to the core through dedicated ports, bypassing the bus matrix and the cache. ITCM connects to the I-bus, DTCM to the D-bus. Both are typically 64 KB to 1 MB in commercial silicon (architectural limit is 16 MB).
+
+The key properties:
+
+- **Single-cycle latency, deterministic.** No wait states, no cache misses.
+- **No cache management.** TCM is outside the cache hierarchy.
+- **Linker-placed.** You explicitly put code in ITCM and data in DTCM via the linker script.
+
+### ITCM and DTCM aliases
+
+On most M7/M55/M85 silicon, TCM is mapped to two address ranges:
+
+- **ITCM alias at 0x0000_0000** — overlaps the boot region. Code placed here runs at the reset PC. CMSIS startup typically copies the vector table and critical handlers here.
+- **DTCM alias at 0x2000_0000** — overlaps the normal SRAM region. Data placed here looks like ordinary SRAM addresses to software but lives in DTCM physically.
+
+Some vendors also expose TCM at a "raw" address (e.g., STM32H7: ITCM at 0x0000_0000, DTCM at 0x2000_0000, raw access at 0x20000000). Check the reference manual.
+
+### Linker placement
+
+```
+MEMORY {
+    ITCM (rwx) : ORIGIN = 0x00000000, LENGTH = 64K
+    DTCM (rw)  : ORIGIN = 0x20000000, LENGTH = 128K
+    FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 2M
+    RAM (rw)   : ORIGIN = 0x24000000, LENGTH = 512K
+}
+
+SECTIONS {
+    .itcm_code : {
+        *(.itcm.*)               /* code marked __attribute__((section(".itcm.*"))) */
+    } >ITCM AT>FLASH
+
+    .dtcm_data : {
+        *(.dtcm.*)
+    } >DTCM AT>FLASH
+}
+```
+
+Then in C:
+
+```c
+__attribute__((section(".itcm.fast_isr")))
+void fast_isr(void) {
+    /* runs from ITCM — single-cycle fetches, no flash wait states */
+}
+
+__attribute__((section(".dtcm.audio")))
+static int16_t audio_buffer[4096];   /* DMA-safe, cache-free */
+```
+
+The startup code copies the initialised data from flash (the AT region) to TCM at boot, the same way `.data` gets copied to RAM.
+
+### When to use ITCM vs cache
+
+- **ITCM**: time-critical handlers (audio ISR, motor commutation), kernel-mode code that must be deterministic, exception vectors and table.
+- **D-cache**: most application code paths in flash. The cache hit rate covers the bulk of accesses; cache misses are still amortised by the cache machinery.
+- **DTCM**: DMA buffers, performance-critical scalars (RTOS task control blocks, ring-buffer indices), and any data where cache management would be a constant nuisance.
+
+A typical STM32H7 bring-up places: vector table in ITCM, FreeRTOS critical section code in ITCM, audio/sensor DMA buffers in DTCM, application code and read-mostly data in flash with D-cache enabled. Net: most code paths get cache benefit, hot ISRs get TCM determinism, no manual cache management beyond the DMA pattern above.
+
+## Cross-references
+
+- [Cortex-M7](/docs/cortex-m/m7) · [M55](/docs/cortex-m/m55) · [M85](/docs/cortex-m/m85)
+- [MPU](/docs/cortex-m/mpu) — region cacheability attributes
+- [Memory model](/docs/architecture/memory-model) — default cacheability per region
+- [Linker scripts](/docs/programming/linker-scripts) — TCM placement
+- [Linker script editor](/tools/linker-script)
+- ARMv7-M ARM section B2 (memory system); cache TRM appendices for M7/M55/M85

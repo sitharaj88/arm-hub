@@ -1,0 +1,192 @@
+---
+title: SMBus & PMBus
+description: System Management Bus and Power Management Bus — extensions on top of I²C with packet error checking, address resolution, alert response, and the standardized PMBus power-supply command set used by every modern point-of-load converter.
+order: 14
+updated: 2026-05-13
+tags: [peripherals, smbus, pmbus, i2c, power-management]
+---
+
+SMBus is the bus that lives on every PC motherboard, every server backplane, and most modern embedded power supplies — but it's surprisingly invisible to firmware engineers because it looks, on the wire, exactly like I²C. The differences are in the protocol layer above: stricter timing, packet error checks, a standardized command vocabulary, address-resolution mechanisms for hot-pluggable devices, and an alert-response system that lets slaves interrupt the master. PMBus then adds a 100+ command standardized set for digital power supplies, which is why every server-grade DC-DC converter, AC-PFC stage, and battery management IC speaks it.
+
+This page covers what SMBus adds to I²C, the PMBus command model, and the practical considerations when using the STM32 I²C peripheral's hardware SMBus support.
+
+<SpecSheet
+  title="SMBus & PMBus at a glance"
+  specs={[
+    { label: 'Physical layer', value: 'Same as I²C — SDA and SCL, open-drain, pull-up resistors. 3.3 V or 5 V typical' },
+    { label: 'Speed grades', value: 'SMBus 1.0: 100 kHz; SMBus 2.0: 400 kHz; SMBus 3.0/3.1: 1 MHz (high-speed)' },
+    { label: 'Maximum bus capacitance', value: '400 pF (vs I²C 400 pF) — same in practice' },
+    { label: 'Address range', value: '7-bit (1–126 usable). SMBus reserves several addresses (0x08 host, 0x0C alert response, 0x61 device default)' },
+    { label: 'Packet Error Check', value: 'Optional 8-bit CRC (CRC-8, poly 0x07) appended to every multi-byte transaction' },
+    { label: 'Timeout', value: 'Mandatory — clock low > 25 ms triggers bus reset (vs unbounded in I²C)' },
+    { label: 'PMBus version', value: '1.3.1 (current) — 100+ standardized commands for power-supply telemetry and control' },
+  ]}
+/>
+
+## What SMBus adds to I²C
+
+I²C is permissive: any timing, any speed (within limits), any command structure, no error checking, no enforced master/slave protocol. SMBus tightens all of this for the system-management use case where multiple devices from multiple vendors must coexist reliably.
+
+### Timeout
+
+The single most consequential difference. In I²C, a slave can hold SCL low indefinitely (clock stretching), and a master must wait — if the slave hangs, the bus hangs. SMBus mandates a 25–35 ms maximum clock-low time; if SCL is held longer, every device must release the bus and reset its internal state. This guarantees recovery from any single-device failure.
+
+The STM32 I²C peripheral (V2 generation — F7, H7, G0, G4, U5, L4) implements this in hardware: `I2C_TIMEOUTR.TIMEOUTA` programs the threshold; `I2C_TIMEOUTR.TIMOUTEN` enables it. On a timeout, the peripheral aborts the transaction and signals `ISR.TIMEOUT`.
+
+### Packet Error Check (PEC)
+
+Optional, but used by every well-designed SMBus device. A CRC-8 (polynomial `0x07`, no XOR-in, no XOR-out, no reflection) is computed across every byte of the transaction starting from the address byte, and appended as the last byte before the stop. The slave checks; if the CRC fails, it NACKs the byte and the master must retry.
+
+For a typical write-byte transaction:
+```
+S | ADDR<<1|W | CMD | DATA | PEC | P
+                              ^^^
+                              CRC-8 over (ADDR<<1|W), CMD, DATA
+```
+
+For a read-byte:
+```
+S | ADDR<<1|W | CMD | Sr | ADDR<<1|R | DATA | PEC | P
+                                        ^^^
+                                        CRC over all preceding bytes
+```
+
+STM32 I²C V2 calculates PEC in hardware (`CR1.PECEN`). When enabled, the peripheral automatically appends PEC on transmit and verifies on receive, raising `ISR.PECERR` on mismatch.
+
+### Quick Command
+
+Single-bit command — the master sends just the address with R/W bit and a stop. R/W=0 turns the device "off," R/W=1 turns it "on" (or vice-versa, device-defined). Used by simple devices that have only a binary state. The STM32 peripheral handles this naturally: program `NBYTES = 0` and start.
+
+### Block Read / Block Write
+
+A length byte precedes the data, so the slave can return variable-length responses (up to 255 bytes for SMBus 3.0; 32 bytes for earlier versions):
+
+```
+S | ADDR<<1|W | CMD | Sr | ADDR<<1|R | N | D1..DN | PEC | P
+```
+
+The N byte lets the master know how many bytes to read. Many telemetry queries — temperature histories, error logs, manufacturer info strings — use Block Read. Hardware support requires the peripheral to update its byte-count register mid-transaction; STM32 I²C V2 does this via the `RELOAD` mechanism.
+
+### Address Resolution Protocol (ARP)
+
+SMBus devices that need to hot-plug (e.g. server power supplies that get inserted live) ship without a fixed address. Instead, they listen on `0x61` (the "default device address") for ARP commands and provide a 128-bit UDID (Unique Device IDentifier) on request. The master collects UDIDs, assigns each device a unique address, and writes that address back via ARP.
+
+ARP commands include:
+
+| Command | Function |
+|---------|----------|
+| Prepare-to-ARP (`0x01`) | Master tells all ARP-capable devices to reset their state |
+| Reset Device (`0x02`) | Make a device discoverable again |
+| Get UDID (`0x03`) | Read the 128-bit UDID of a specific device |
+| Assign Address (`0x04`) | Write a new 7-bit address into a discovered device |
+
+ARP is rarely used in embedded designs because most embedded power supplies have fixed addresses pinned to the package. It's much more common in server hardware.
+
+### Alert Response Protocol
+
+I²C slaves can't initiate transfers. SMBus solves this with a third wire (`SMBALERT#`, sometimes called `ALERT`) that any slave can pull low to signal an event. The master sees the alert and issues a Read Byte from the special address `0x0C` ("Alert Response Address" — ARA). Every alerting slave participates in I²C-style arbitration on its own 7-bit address; the winner reports its address and clears the alert.
+
+The STM32 peripheral provides hardware support: `CR1.ALERTEN` configures the SMBA pin as an open-drain output (slave mode) or input with interrupt (master mode). Polling the ARA after an alert is a normal Read Byte transaction.
+
+<Callout type="tip">
+Alert is the right pattern for any "telemetry crosses a threshold" use case — over-temperature, fan-fail, brown-out — because polling several slaves at 1 kHz wastes bus bandwidth and CPU time. With alert, slaves are silent until they have something to report. The cost is one extra wire and a slightly more complex master state machine.
+</Callout>
+
+## PMBus — power management on top of SMBus
+
+PMBus is a standardized command set for digital power supplies. It defines:
+
+- A **command table** of 100+ standardized commands (read voltage out, read current out, set output voltage, set OV warning limit, etc.).
+- A **fault model** with mask/status/clear registers.
+- A **page model** for multi-output supplies — a 12-channel buck regulator selects which channel a subsequent command applies to via the `PAGE` command (`0x00`).
+- A **linear data format** for telemetry (11-bit mantissa + 5-bit exponent, similar to a float).
+
+The standard PMBus commands every device implements:
+
+| Command | Code | Description |
+|---------|------|-------------|
+| PAGE | 0x00 | Select rail/channel |
+| OPERATION | 0x01 | On/off control, soft-stop, margin high/low |
+| VOUT_COMMAND | 0x21 | Set target output voltage |
+| VOUT_MAX | 0x24 | Maximum allowed output voltage |
+| READ_VIN | 0x88 | Input voltage telemetry |
+| READ_IIN | 0x89 | Input current telemetry |
+| READ_VOUT | 0x8B | Output voltage telemetry |
+| READ_IOUT | 0x8C | Output current telemetry |
+| READ_TEMPERATURE_1 | 0x8D | Internal/junction temperature |
+| STATUS_BYTE | 0x78 | Compact fault status |
+| STATUS_WORD | 0x79 | Full 16-bit fault status |
+| CLEAR_FAULTS | 0x03 | Clear all latched faults |
+| MFR_ID | 0x99 | Manufacturer ID (block read string) |
+| MFR_MODEL | 0x9A | Product model (block read string) |
+
+The format of each telemetry value depends on the device's chosen format mode. Most devices use **linear11**: 16-bit value = `(5-bit signed exponent << 11) | (11-bit signed mantissa)`; actual value = mantissa × 2^exponent.
+
+```c
+// Decode linear11 telemetry
+int16_t mantissa = (raw & 0x07FF);
+if (mantissa & 0x0400) mantissa -= 0x0800;     // sign-extend 11-bit
+int8_t exponent = (raw >> 11);
+if (exponent & 0x10) exponent -= 0x20;         // sign-extend 5-bit
+float value = mantissa * pow(2.0f, exponent);
+```
+
+`READ_VOUT` uses a slightly different format (linear16 with an exponent set via `VOUT_MODE`) because output voltage needs more precision near nominal.
+
+## Practical SMBus on STM32
+
+STM32's I²C V2 peripheral (F7 and later) is the first generation that does SMBus properly. Key configuration bits:
+
+| Register / bit | Purpose |
+|----------------|---------|
+| `CR1.SMBHEN` | Acknowledge SMBus Host (0x08) address |
+| `CR1.SMBDEN` | Acknowledge SMBus Device Default (0x61) address |
+| `CR1.PECEN` | Enable hardware PEC calculation and check |
+| `CR1.ALERTEN` | Drive/sense SMBALERT pin |
+| `TIMEOUTR.TIMOUTEN` | Enable bus-low timeout |
+| `TIMEOUTR.TIMEOUTA` | Timeout threshold (~25 ms) |
+| `TIMEOUTR.TIDLE` | Enable bus-idle timeout (master-mode only) |
+| `CR2.PECBYTE` | Append PEC on the next transmission |
+
+A typical PMBus master read of `READ_VOUT` looks like:
+
+```c
+// Read VOUT (linear16) from device at 0x40
+I2C1->CR2 = (0x40 << 1) | (1 << 16)              // 1-byte write
+          | I2C_CR2_PECBYTE                       // no PEC on cmd byte
+          | I2C_CR2_START;
+while (!(I2C1->ISR & I2C_ISR_TXIS)) { }
+I2C1->TXDR = 0x8B;                                 // READ_VOUT
+while (!(I2C1->ISR & I2C_ISR_TC)) { }
+
+I2C1->CR2 = (0x40 << 1) | (2 << 16)              // 2-byte read
+          | I2C_CR2_RD_WRN                        // read direction
+          | I2C_CR2_PECBYTE                       // append PEC byte
+          | I2C_CR2_AUTOEND
+          | I2C_CR2_START;
+while ((I2C1->ISR & I2C_ISR_RXNE_Pos) == 0) { }
+uint16_t v = I2C1->RXDR;
+while ((I2C1->ISR & I2C_ISR_RXNE_Pos) == 0) { }
+v |= I2C1->RXDR << 8;
+// PEC byte arrives next; controller auto-checks it
+```
+
+<Callout type="warn">
+PMBus devices implementing PEC will hang the transaction if your master doesn't send PEC. The hardware will retry, then timeout, then bus-reset. Always either turn PEC off on both sides for bring-up, or enable hardware PEC and trust the controller — don't mix software PEC and hardware PEC.
+</Callout>
+
+## Common SMBus / PMBus pitfalls
+
+- **I²C-mode driver on SMBus bus** — without timeouts, a slave can hang the bus indefinitely. Always enable the timeout when an SMBus device shares the bus.
+- **Missing PEC handling** — devices that mandate PEC (TI UCD90xxx family, most server PSUs) will NACK every transaction without it. Check the datasheet's "PEC mandatory?" column.
+- **Pull-up sizing for fast SMBus** — at 1 MHz (SMBus 3.0), 10 kΩ pull-ups produce a rise time of ~30 ns × 400 pF = 12 µs, far too slow. Use 1–2 kΩ.
+- **Block reads truncated at 32 bytes** — old SMBus libraries cap block reads at 32 bytes even when SMBus 3.0 allows 255. Watch for surprises in long manufacturer-info strings.
+- **Address conflicts with reserved SMBus addresses** — don't assign 0x08, 0x0C, 0x10, 0x18, 0x28, 0x37, 0x61 to your own devices.
+
+## Cross-references
+
+- [I2C](/docs/peripherals/i2c) — the underlying physical and link layer
+- [GPIO alternate functions](/docs/peripherals/gpio-af) — open-drain configuration for SDA/SCL/SMBALERT
+- [CMSIS](/docs/programming/cmsis) — driver model for I²C/SMBus
+- SMBus 3.1 specification — System Management Interface Forum
+- PMBus 1.3.1 specification — PMBus Implementers Forum

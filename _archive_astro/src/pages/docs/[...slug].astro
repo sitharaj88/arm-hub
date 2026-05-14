@@ -1,0 +1,37 @@
+---
+import { type CollectionEntry, getCollection, render } from 'astro:content';
+import DocLayout from '~/layouts/DocLayout.astro';
+import { sections } from '~/utils/nav';
+
+type Section = 'architecture' | 'cortex-m' | 'cortex-a' | 'cortex-r' | 'peripherals' | 'programming' | 'rtos' | 'tools' | 'vendors' | 'systems';
+
+export async function getStaticPaths() {
+  const keys: Section[] = ['architecture', 'cortex-m', 'cortex-a', 'cortex-r', 'peripherals', 'programming', 'rtos', 'tools', 'vendors', 'systems'];
+  const all = (
+    await Promise.all(
+      keys.map(async (k) =>
+        (await getCollection(k as any, ({ data }: any) => !data.draft)).map((e: any) => ({ key: k, e })),
+      ),
+    )
+  ).flat();
+  return all.map(({ key, e }) => ({
+    params: { slug: `${key}/${e.id.replace(/\.(md|mdx)$/, '').replace(/\/index$/, '')}` },
+    props: { entry: e, sectionKey: key },
+  }));
+}
+
+interface Props { entry: CollectionEntry<Section>; sectionKey: Section }
+const { entry, sectionKey } = Astro.props;
+const { Content, headings } = await render(entry);
+const section = sections.find((s) => s.key === sectionKey);
+---
+<DocLayout
+  title={entry.data.title}
+  description={entry.data.description}
+  sectionKey={sectionKey}
+  updated={entry.data.updated}
+  headings={headings}
+  badge={entry.data.badge}
+>
+  <Content />
+</DocLayout>

@@ -1,0 +1,192 @@
+---
+title: FreeRTOS
+description: The pragmatic RTOS — task creation, scheduling, the Cortex-M port internals, queues, semaphores, software timers, and tickless idle.
+order: 2
+updated: 2026-05-12
+tags: [rtos, freertos]
+---
+
+
+FreeRTOS ships on more Cortex-M designs than any other RTOS — by orders of magnitude. It's MIT-licensed, ~6 KB minimum, has a port for every Cortex-M variant in existence, and its API has been essentially stable since 2010. You learn it once.
+
+## The basic structure
+
+```c
+#include "FreeRTOS.h"
+#include "task.h"
+
+void blink_task(void *arg) {
+    (void)arg;
+    while (1) {
+        toggle_led();
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
+
+int main(void) {
+    SystemClock_Config();
+    gpio_init();
+
+    xTaskCreate(blink_task, "blink", 128, NULL, 1, NULL);
+
+    vTaskStartScheduler();
+    while (1) {}    // should never reach here
+}
+```
+
+Three things to notice:
+
+- **Tasks take a `void *` arg** — typically you cast a struct pointer to it, or pass `NULL`.
+- **Stack size is in words, not bytes**. `128` here means 128 × 4 = 512 bytes of stack.
+- **Priority is unsigned**. `0` is lowest. `configMAX_PRIORITIES - 1` is highest.
+
+After `vTaskStartScheduler()`, FreeRTOS is in charge. Your `main` becomes irrelevant.
+
+<StateDiagram title="FreeRTOS task lifecycle" width={720} height={340} states={[
+  { id: 'ready',   label: 'Ready', x: 40,  y: 140, w: 150, h: 60, tone: 'accent' },
+  { id: 'running', label: 'Running', x: 280, y: 140, w: 150, h: 60, tone: 'success' },
+  { id: 'blocked', label: 'Blocked', x: 530, y: 30,  w: 150, h: 60, tone: 'warning' },
+  { id: 'susp',    label: 'Suspended', x: 530, y: 250, w: 150, h: 60, tone: 'muted' },
+]} transitions={[
+  { from: 'ready', to: 'running', label: 'scheduler picks' },
+  { from: 'running', to: 'ready', label: 'preempt / yield' },
+  { from: 'running', to: 'blocked', label: 'queue/sem/delay' },
+  { from: 'blocked', to: 'ready', label: 'event / timeout' },
+  { from: 'running', to: 'susp', label: 'vTaskSuspend' },
+  { from: 'susp', to: 'ready', label: 'vTaskResume', curve: 40 },
+]} caption="Every FreeRTOS task is in exactly one of these four states; PendSV walks the ready list and picks the highest-priority Ready task to become Running." />
+
+## The Cortex-M port internals
+
+The FreeRTOS Cortex-M port uses three exceptions:
+
+- **SysTick** at lowest priority. Drives the tick counter; if a task should preempt, it pends PendSV.
+- **PendSV** at lowest priority. Does the actual context switch (saves r4–r11 + LR onto the current task's stack, picks the next task, loads its registers).
+- **SVC** at high priority. Only used to start the first task (escape from `vTaskStartScheduler` into task context).
+
+Lowest priority for the schedulers because they shouldn't preempt user ISRs. Your high-priority hardware ISR runs to completion; *then* PendSV runs if a higher-priority task became ready.
+
+### `configMAX_SYSCALL_INTERRUPT_PRIORITY`
+
+A FreeRTOS configuration constant — the priority threshold for ISRs that can call FreeRTOS APIs. ISRs with priority **higher** than this (i.e. lower numerical value) cannot call FreeRTOS — they're invisible to the kernel. Useful for ultra-low-latency hardware ISRs that can't tolerate scheduler interference.
+
+```c
+// Typical STM32 with 4 priority bits implemented
+#define configKERNEL_INTERRUPT_PRIORITY        (15 << 4)   // PendSV/SysTick at lowest
+#define configMAX_SYSCALL_INTERRUPT_PRIORITY   (5  << 4)   // anything priority < 5 is invisible
+```
+
+This is *the* config knob you'll get wrong on first use. Document it for your team.
+
+## Queues — the main IPC primitive
+
+```c
+QueueHandle_t q = xQueueCreate(10, sizeof(struct event));
+
+// Producer
+struct event ev = { .type = EV_BUTTON };
+xQueueSend(q, &ev, portMAX_DELAY);
+
+// Consumer
+struct event ev;
+xQueueReceive(q, &ev, portMAX_DELAY);
+```
+
+Queues are **copy-by-value**. The 10 × `sizeof(struct event)` of storage is allocated inside `xQueueCreate`. The sender's `ev` is memcpy'd into the queue; the receiver's `ev` is memcpy'd out.
+
+This is *the* recommended pattern. Don't pass pointers between tasks unless you have a clear lifetime story — copies sidestep most synchronisation bugs.
+
+## Notifications — the lightweight signal
+
+Each task has a 32-bit "notification value". You can set it from anywhere, and a task can wait on it.
+
+```c
+// In producer
+xTaskNotify(consumer_task, 0x01, eSetBits);
+
+// In consumer
+uint32_t flags;
+xTaskNotifyWait(0, 0xFFFFFFFF, &flags, portMAX_DELAY);
+if (flags & 0x01) { /* handle */ }
+```
+
+Faster than a queue (no copy, no separate data structure) and uses less RAM (the notification value is part of the TCB). Great for signalling "something happened" without payload.
+
+## Software timers
+
+```c
+TimerHandle_t t = xTimerCreate("blink", pdMS_TO_TICKS(500),
+                                pdTRUE,       // auto-reload
+                                NULL,         // ID
+                                timer_cb);
+xTimerStart(t, 0);
+
+void timer_cb(TimerHandle_t t) {
+    toggle_led();
+}
+```
+
+The callback runs in the **timer daemon task**, not in an ISR. Don't do long work in it.
+
+A common confusion: software timers are *not* hardware-accurate. They fire on tick boundaries, with jitter up to one tick. For sub-millisecond timing, use a hardware timer and an ISR.
+
+## Tickless idle
+
+When all tasks are blocked, the idle task runs. If you enable tickless idle (`configUSE_TICKLESS_IDLE = 1`), the idle task computes the time until the next scheduled wake-up, programs SysTick (or a low-power timer) to fire then, and issues `WFI` — the chip sleeps until the wake-up.
+
+```c
+// Define in your config — the maximum expected idle period
+#define configEXPECTED_IDLE_TIME_BEFORE_SLEEP  20  // ticks
+```
+
+If your `WFI` takes the chip into a deep sleep mode that loses peripheral state, you can override `portSUPPRESS_TICKS_AND_SLEEP()` to do whatever preparation/recovery is needed (saving peripheral state, switching clock sources, etc.).
+
+This is the standard low-power pattern. Without tickless idle, the SysTick fires every millisecond regardless of whether anything is happening; with it, your chip stays asleep until something needs to happen.
+
+## Stack overflow detection
+
+```c
+#define configCHECK_FOR_STACK_OVERFLOW 2
+
+void vApplicationStackOverflowHook(TaskHandle_t t, char *name) {
+    // Halt or log — overflow was detected
+    __BKPT(0);
+}
+```
+
+Method 1 checks the SP against the task's stack bounds on context switch. Method 2 additionally fills the stack with a known pattern (0xA5A5A5A5) and checks the top words on each switch. Method 2 catches more overflows for a small CPU cost.
+
+In production, definitely enable method 2 during development. Whether you keep it on in release is a project decision.
+
+## Static vs dynamic allocation
+
+By default, FreeRTOS uses its own heap (`pvPortMalloc`). For projects that ban malloc, every API has a `*Static` variant that takes pre-allocated storage:
+
+```c
+StaticTask_t blink_tcb;
+StackType_t blink_stack[128];
+
+xTaskCreateStatic(blink_task, "blink", 128, NULL, 1, blink_stack, &blink_tcb);
+```
+
+Set `configSUPPORT_DYNAMIC_ALLOCATION = 0` and `configSUPPORT_STATIC_ALLOCATION = 1` to enforce static-only at compile time.
+
+## The five heap implementations
+
+FreeRTOS ships five `pvPortMalloc` implementations:
+
+- **heap_1** — no free. Allocate-only. Used when you allocate all your kernel objects at boot and never free anything.
+- **heap_2** — best-fit, no coalescence. Predictable but fragments.
+- **heap_3** — wraps the C library's `malloc`/`free`. Use this if you want a single heap with newlib.
+- **heap_4** — first-fit with coalescence. **The default for most projects.** Reasonable fragmentation behaviour.
+- **heap_5** — heap_4 across multiple non-contiguous memory regions. Use when you want to expose two SRAM banks as one heap.
+
+<Callout type="tip" title="Run with heap_4 and watch xPortGetFreeHeapSize">
+Print the free heap size periodically. If it monotonically decreases, you have a leak. If it bounces, you're fine but the working set may be near the limit — increase `configTOTAL_HEAP_SIZE`.
+</Callout>
+
+## See also
+
+- [The RTOS landscape](/docs/rtos/landscape/) — comparison with Zephyr, ThreadX.
+- [NVIC](/docs/cortex-m/nvic/) — the priority story underneath the scheduler.
+- [SysTick](/docs/cortex-m/systick/) — the tick source.

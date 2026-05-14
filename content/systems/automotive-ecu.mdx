@@ -1,0 +1,186 @@
+---
+title: Automotive ECU (body / chassis class)
+description: Inside a typical body-control or chassis ECU — Cortex-R52 lockstep + Cortex-M I/O cores, CAN-FD, ISO 26262, AUTOSAR Classic. The firmware that keeps the airbag from misfiring.
+order: 6
+updated: 2026-05-12
+tags: [systems, automotive, ecu, cortex-r52, asil, autosar]
+badge: ASIL
+---
+
+
+A modern car has 50–150 ECUs. The flashy ones are the infotainment head unit (a Cortex-A Linux box) and the ADAS controller (Cortex-A + ML accelerators). The *interesting* ones — and the most numerous — are the body-control modules, BMS, chassis, brake, transmission, and engine controllers. These are **safety-rated real-time systems** running on Cortex-R or, increasingly, on safety-qualified Cortex-M variants.
+
+## At a glance
+
+<SpecSheet specs={[
+  { label: 'Product class', value: 'Body control / chassis ECU (ASIL-B to ASIL-D)' },
+  { label: 'Typical MCU', value: 'TI Hercules TMS570, Infineon AURIX TC3xx (TriCore), Renesas RH850' },
+  { label: 'ARM-based', value: 'Cortex-R52 lockstep (Renesas RZ/T2L, NXP S32G3)', link: '/docs/cortex-r/lockstep/' },
+  { label: 'Companion MCU', value: 'Cortex-M (M4/M7) for non-safety I/O concentration' },
+  { label: 'RAM', value: '512 KB – 4 MB SRAM with ECC' },
+  { label: 'Flash', value: '4 MB – 16 MB embedded with ECC + lifecycle protection' },
+  { label: 'Comms', value: 'CAN-FD ×4–8, FlexRay (legacy), Ethernet AVB, LIN' },
+  { label: 'Safety standards', value: 'ISO 26262 ASIL-B/C/D, ISO 21434 (cybersecurity), UNECE R155/156' },
+  { label: 'Software', value: 'AUTOSAR Classic on top of certified RTOS (ETAS, Vector, EB)' },
+  { label: 'Operating range', value: '−40 °C to +125 °C' },
+  { label: 'Service life', value: '15 years / 240k miles typical OEM warranty' },
+]} />
+
+## What "safety-rated" means in practice
+
+A typical brake-control or steering ECU has to **detect any single hardware fault and fail safe within 100 ms** (the *fault tolerant time interval*, or FTTI). Mechanisms used in combination:
+
+- **Dual-core lockstep** — two cores execute the same instructions; a comparator faults on mismatch. See [Lockstep & ASIL](/docs/cortex-r/lockstep/).
+- **ECC SECDED** on every RAM, every flash bank, every TCM, every bus interface.
+- **Memory protection unit (MPU)** isolating ASIL partitions from QM partitions.
+- **Hardware watchdog** windowed (catches "stuck" *and* "running too fast").
+- **Clock supervision** — separate oscillator monitors the main clock.
+- **Voltage supervision** — multiple comparators trip on out-of-spec rails.
+- **Built-in self-test (BIST)** on boot, and optionally periodically while running.
+- **Plausibility checks** in software — sensor outputs cross-checked against models.
+
+The ECU you'll write firmware for typically reports an **FMEDA** (Failure Modes, Effects, and Diagnostic Analysis) document showing which random faults each mechanism catches and how that combines to claim ASIL-D coverage.
+
+## Block diagram
+
+<BlockDiagram
+  title="ASIL-D automotive ECU — lockstep + companion"
+  width={860}
+  height={560}
+  minWidth={760}
+  nodes={[
+    { id: 'r52a',   x: 40,  y: 46,  w: 210, h: 64, kind: 'core',     label: 'Cortex-R52 core A', detail: 'ARMv8-R · MPU' },
+    { id: 'r52b',   x: 40,  y: 132, w: 210, h: 64, kind: 'core',     label: 'Cortex-R52 core B', detail: 'lockstep · delayed compare' },
+    { id: 'cmp',    x: 315, y: 86,  w: 170, h: 72, kind: 'security', label: 'Lockstep comparator', detail: 'mismatch → fault pin' },
+    { id: 'safe',   x: 315, y: 206, w: 240, h: 64, kind: 'periph',   label: 'Safety interconnect', detail: 'MPU · ECC · error signaling' },
+    { id: 'm4',     x: 620, y: 86,  w: 190, h: 72, kind: 'core',     label: 'Cortex-M4F companion', detail: 'diagnostics · non-safety IO' },
+    { id: 'tcm',    x: 40,  y: 236, w: 210, h: 56, kind: 'memory',   label: 'ATCM / BTCM', detail: 'ECC · safety code/data' },
+    { id: 'mem',    x: 40,  y: 320, w: 210, h: 56, kind: 'memory',   label: 'SRAM + flash', detail: 'ECC · A/B images' },
+    { id: 'hsm',    x: 620, y: 206, w: 190, h: 64, kind: 'security', label: 'HSM (EVITA Full)', detail: 'auth · keys · AES-MAC' },
+    { id: 'sup',    x: 315, y: 320, w: 240, h: 64, kind: 'security', label: 'Supervisors', detail: 'watchdog · BIST · voltage/clock' },
+    { id: 'can',    x: 40,  y: 424, w: 210, h: 56, kind: 'periph',   label: 'CAN-FD ×6', detail: 'powertrain · body · diag' },
+    { id: 'eth',    x: 315, y: 424, w: 240, h: 56, kind: 'periph',   label: 'Automotive Ethernet ×2', detail: 'SOME/IP gateway' },
+    { id: 'lin',    x: 620, y: 424, w: 190, h: 56, kind: 'periph',   label: 'LIN ×4', detail: 'doors · mirrors' },
+    { id: 'sens',   x: 40,  y: 508, w: 210, h: 36, kind: 'sensor',   label: 'Sensors' },
+    { id: 'act',    x: 315, y: 508, w: 240, h: 36, kind: 'external', label: 'Actuators' },
+    { id: 'hu',     x: 620, y: 508, w: 190, h: 36, kind: 'cloud',    label: 'Head unit / cloud' },
+  ]}
+  edges={[
+    { from: 'r52a', to: 'cmp', tone: 'destructive' },
+    { from: 'r52b', to: 'cmp', tone: 'destructive' },
+    { from: 'cmp',  to: 'safe', label: 'checked retire', tone: 'destructive' },
+    { from: 'r52a', to: 'tcm' },
+    { from: 'r52a', to: 'mem' },
+    { from: 'safe', to: 'hsm',  label: 'auth', tone: 'destructive' },
+    { from: 'sup',  to: 'safe', tone: 'destructive', style: 'dashed' },
+    { from: 'safe', to: 'can',  label: 'AUTOSAR COM', tone: 'primary', arrow: 'both' },
+    { from: 'safe', to: 'eth',  arrow: 'both' },
+    { from: 'm4',   to: 'lin',  arrow: 'both' },
+    { from: 'm4',   to: 'can',  tone: 'accent', arrow: 'both' },
+    { from: 'sens', to: 'can',  label: 'wheel · brake', tone: 'accent', arrow: 'forward' },
+    { from: 'can',  to: 'act',  label: 'commands', tone: 'success', arrow: 'forward' },
+    { from: 'eth',  to: 'hu',   label: 'SOME/IP', tone: 'primary', arrow: 'both' },
+  ]}
+  caption="Two R52 cores execute the same instructions; the comparator faults the system if outputs ever disagree (random hardware fault). Supervisors (watchdog, voltage, BIST) catch failures the lockstep can't see. The M4 companion handles diagnostics on a separate trust island."
+/>
+
+## The CAN-FD bus
+
+Almost every actuator and sensor in the car talks to its ECU over **CAN-FD** (the modern CAN, see [CAN](/docs/peripherals/can/)). A typical body-control bus:
+
+```
+  500 kbps arbitration · 2 Mbps data phase
+
+  ECU             Function
+  ─────────────────────────────────────────────
+  BCM             body control (this ECU)
+  DCM             driver door module
+  PCM             passenger door module
+  HVAC            climate control
+  LCM             lighting control
+  RCM             restraint control (airbag)
+  WHEEL           steering-wheel buttons
+  ...
+```
+
+Messages have fixed IDs and fixed dispatch tables. The ECU's network database (DBC file) defines:
+
+- Which message IDs it transmits and at what cycle time (1 ms to 1000 ms).
+- Which message IDs it receives and what action to take.
+- Signal-level encoding (bit positions, scale, offset, units).
+
+AUTOSAR's COM stack consumes these DBCs and generates the dispatch tables; you write only the application logic.
+
+## AUTOSAR Classic — the dominant software architecture
+
+Almost every ASIL-rated ECU runs **AUTOSAR Classic** (CP), a layered architecture mandating:
+
+```
+   ┌──────────────────────────────────────┐
+   │  Application Layer                    │  ← your code (SWCs)
+   │   ┌──────────────────────────────┐    │
+   │   │ Runnable: lambda(input, dt)  │    │
+   │   └──────────────────────────────┘    │
+   ├──────────────────────────────────────┤
+   │  RTE (Runtime Environment)            │  ← generated glue
+   ├──────────────────────────────────────┤
+   │  Services (COM, NM, OS, DEM, DCM)     │
+   ├──────────────────────────────────────┤
+   │  ECU Abstraction                      │
+   ├──────────────────────────────────────┤
+   │  MCAL (microcontroller abstraction)   │  ← vendor-provided
+   ├──────────────────────────────────────┤
+   │  Hardware (MCU + drivers)             │
+   └──────────────────────────────────────┘
+```
+
+Your application is a collection of **Software Components (SWCs)** with ports. The **RTE** is auto-generated from a configuration tool (DaVinci Configurator, EB tresos) and handles all inter-SWC communication. The **OS** is an OSEK/AUTOSAR-compliant scheduler with tasks, alarms, and resources — usually qualified to ASIL-D.
+
+Writing AUTOSAR is unlike anything in consumer embedded. You spend more time in configuration GUIs than in C code, and a "release" involves regenerating tens of MBs of code from XML.
+
+## Cybersecurity (ISO 21434 + UNECE R155)
+
+As of 2024, every new car sold in the EU must comply with **UNECE R155** (cybersecurity management). The ECU side of this includes:
+
+- **Secure boot** — every boot stage signed and verified. Cortex-R52's PACBTI + TrustZone-R help.
+- **Secure flashing** — only signed firmware images accepted; rollback protection.
+- **HSM (Hardware Security Module)** — separate cryptographic processor (often EVITA Full spec — a dedicated coprocessor with its own RAM/keys).
+- **Authenticated CAN** — newer message specs include CMAC tags to prevent message injection.
+- **Intrusion detection** — logging of anomalous message patterns; reported via DEM (Diagnostic Event Manager).
+
+Compared to consumer IoT, automotive cybersecurity is much more codified, audited, and enforced.
+
+## Real ECU examples (publicly disclosed)
+
+| Vehicle / system | ECU MCU | Notes |
+|---|---|---|
+| **Tesla Body Controller (East/West)** | TI Hercules + TI Sitara A53 | Centralized body control, replaces ~30 traditional ECUs |
+| **BMW i3 BMS** | Infineon TC275 (TriCore) | Older AURIX, battery management |
+| **VW MQB platform BCM** | Renesas RH850 | Volkswagen Group standard since 2015 |
+| **Bosch ESP unit (brake control)** | Infineon TC3xx | ASIL-D ABS+ESC controller |
+| **Continental MK C2 brake** | Infineon TC3xx | Combined brake + ESP |
+| **Tier-1 next-gen** | NXP S32G3 (Cortex-R52 + A53) | Zonal architecture, software-defined vehicle |
+| **NVIDIA Drive Thor** | A78AE (auto-grade Cortex-A) + dedicated safety MCU | Cockpit + ADAS converged compute |
+
+Note the shift: traditional ECUs use **Infineon TriCore** or **Renesas RH850** (non-ARM proprietary cores). The newer "zonal" and "software-defined vehicle" architectures are converging on **NXP S32G3** and **NXP S32K3** which are **ARM Cortex-R52 + Cortex-A53** combos.
+
+ARM is currently a minority share of safety automotive but the market is moving in its direction.
+
+## Tooling reality check
+
+Writing automotive firmware is *very* different from hobby/consumer embedded:
+
+- **Compiler must be certified** — TI Code Composer with QualNet, IAR Functional Safety, Green Hills MULTI, Wind River Diab. GCC/LLVM is used (under packaging like AdaCore GNATPro) but less common.
+- **Build is hours, not seconds** — full AUTOSAR builds with code generation take 30+ minutes; CI runs across hundreds of variants.
+- **Tools cost money** — Vector CANoe (CAN simulation), DaVinci (AUTOSAR config), ETAS INCA (calibration): tens of thousands per seat.
+- **Changes are slow** — adding a CAN signal involves DBC update, RTE regen, code change, calibration update, signoff. Days, not hours.
+
+## See also
+
+- [Cortex-R overview](/docs/cortex-r/overview/) — what makes Cortex-R different.
+- [Lockstep & ASIL](/docs/cortex-r/lockstep/) — the safety architecture.
+- [CAN](/docs/peripherals/can/) — the dominant in-vehicle bus.
+- [TrustZone](/docs/architecture/trustzone/) — for HSM and secure boot.
+- [TI](/docs/vendors/ti/) — Hercules family for ASIL-D.
+- [Infineon](/docs/vendors/infineon/) — AURIX (TriCore, not ARM, but you'll meet it).
+- [AUTOSAR.org](https://www.autosar.org) (external) — the standards body.

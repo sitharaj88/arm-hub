@@ -1,0 +1,178 @@
+---
+title: Embedded C patterns
+description: The C patterns that show up in every Cortex-M codebase — volatile, register access, alignment, packed structs, weak symbols, and what they actually mean.
+order: 1
+updated: 2026-05-12
+tags: [programming, c, patterns]
+---
+
+
+C on a microcontroller looks like C anywhere else, but the constraints are different. There's no OS to catch your bugs, no malloc safety net, no thread that "just" reschedules around your busy wait. The patterns below are what experienced firmware engineers reach for; ignoring them gets you ghost bugs that disappear when you add a debug print.
+
+## `volatile` — what it does and doesn't do
+
+```c
+volatile uint32_t *const STATUS = (uint32_t *)0x40000000;
+while (*STATUS & 1) { /* wait */ }
+```
+
+`volatile` tells the compiler: **do not optimise away accesses to this variable**. Every read in the source becomes a load instruction; every write becomes a store. Without it, the compiler will hoist `*STATUS` out of the loop and your code spins forever.
+
+What `volatile` does *not* do:
+
+- **It is not atomic.** `volatile int x; x++;` is still load-modify-store on Cortex-M, and an interrupt between them will corrupt `x`.
+- **It is not a memory barrier.** It orders accesses *to the same volatile variable*, but the compiler is free to reorder volatile accesses relative to non-volatile data, and the CPU is free to reorder memory accesses generally (see [memory model](/docs/architecture/memory-model/)).
+- **It is not magic peripheral synchronisation.** You still need `__DSB()` after writing to a peripheral register if the next instruction depends on the side effect.
+
+The rule: `volatile` only for hardware registers and variables shared with ISRs. Don't sprinkle it elsewhere — it disables useful optimisations.
+
+## Bit manipulation idioms
+
+```c
+// Set bit
+reg |= (1u << n);
+
+// Clear bit
+reg &= ~(1u << n);
+
+// Toggle bit
+reg ^= (1u << n);
+
+// Test bit
+if (reg & (1u << n)) { ... }
+
+// Set a multi-bit field to a value
+reg = (reg & ~(MASK << POS)) | ((value & MASK) << POS);
+```
+
+The last one — clearing the field, then writing the new value — is the standard pattern for peripheral register fields. Don't write the simpler `reg |= (value << POS)` because if `value` has bits clear that were previously set, you won't actually clear them.
+
+CMSIS provides `_Msk` and `_Pos` macros for every documented register field:
+
+```c
+USART2->BRR = (USART2->BRR & ~USART_BRR_DIV_Mantissa_Msk)
+            | (mantissa << USART_BRR_DIV_Mantissa_Pos);
+```
+
+## Packed structures
+
+A struct laid out by the compiler usually has padding for alignment:
+
+```c
+struct frame {
+    uint8_t  type;       // 1 byte
+    uint32_t length;     // 4 bytes — but offset 4, not 1, because of alignment
+    uint16_t crc;
+};
+sizeof(struct frame) == 12;   // not 7!
+```
+
+When the bytes have to match a wire format or memory-mapped layout, force packed:
+
+```c
+struct __attribute__((packed)) frame {
+    uint8_t  type;
+    uint32_t length;
+    uint16_t crc;
+};
+sizeof(struct frame) == 7;
+```
+
+<Callout type="warn" title="Packed structs can be slow on Cortex-M0">
+Cortex-M0/M0+ doesn't support unaligned loads/stores at all — accessing a misaligned 32-bit field via a packed struct triggers a fault. Cortex-M3+ supports them but emits more instructions. Prefer `memcpy()` into properly-aligned locals when you have a choice.
+</Callout>
+
+## Alignment
+
+```c
+__attribute__((aligned(64))) static uint8_t dma_buf[1024];   // GCC
+alignas(64) static uint8_t dma_buf[1024];                    // C11 stdalign.h
+```
+
+DMA buffers should be aligned to cache lines (32 bytes on Cortex-M7) when the buffer will be flushed/invalidated, otherwise the maintenance op spills into adjacent data.
+
+Stacks should be 8-byte aligned (AAPCS requirement). The startup code typically ensures this.
+
+## Weak symbols and the default handler
+
+In every CMSIS startup file, every exception handler is declared weak:
+
+```c
+__attribute__((weak, alias("Default_Handler"))) void NMI_Handler(void);
+__attribute__((weak, alias("Default_Handler"))) void HardFault_Handler(void);
+// ...
+
+void Default_Handler(void) {
+    while (1) {}
+}
+```
+
+If you define `HardFault_Handler` in your code, the linker uses yours; otherwise it falls back to `Default_Handler`. This is how vendor startup files work without forcing you to implement every handler.
+
+You can apply the same trick to library functions you want users to be able to override:
+
+```c
+__attribute__((weak)) void on_button_press(void) { /* default no-op */ }
+// User can define their own on_button_press elsewhere
+```
+
+## Atomicity on Cortex-M
+
+For a read-modify-write on a shared variable:
+
+**Cortex-M0/M0+** — no LDREX/STREX. Disable interrupts:
+
+```c
+uint32_t primask = __get_PRIMASK();
+__disable_irq();
+counter++;
+__set_PRIMASK(primask);
+```
+
+**Cortex-M3 and up** — use `<stdatomic.h>`:
+
+```c
+#include <stdatomic.h>
+atomic_uint_least32_t counter;
+atomic_fetch_add_explicit(&counter, 1, memory_order_relaxed);
+```
+
+GCC emits a LDREX/STREX loop. For most counters, `memory_order_relaxed` is enough. For lock-free linked lists, you need `memory_order_acquire/release`.
+
+## Avoiding `malloc`
+
+Most firmware codebases either:
+
+- **Don't use malloc at all** — every buffer is statically allocated, sized at compile time.
+- **Use a fixed-size pool allocator** — `freertos+CMSIS_OS2 osMemoryPoolNew()` or similar.
+- **Use FreeRTOS heap_4** as the global malloc — it's deterministic-ish, defrag-friendly, and trackable.
+
+The reason: vanilla `malloc()` from newlib fragments after a few thousand allocations, and a 16 KB heap will silently start failing in a way that's nearly impossible to reproduce in debug. Static allocation makes worst-case memory use a *compile-time* property.
+
+## `restrict` and aliasing
+
+If you tell the compiler that two pointers don't alias, it can keep values in registers across stores:
+
+```c
+void copy(int * restrict dst, const int * restrict src, size_t n) {
+    for (size_t i = 0; i < n; i++) dst[i] = src[i];
+}
+```
+
+Without `restrict`, the compiler must assume `src[i+1]` might be the same address as `dst[i]`, so it can't keep src values in registers across the store. With `restrict`, it can.
+
+Especially impactful on Cortex-M7 (dual-issue) and M85 (Helium). Saves ~10–30% on tight loops with multiple arrays.
+
+## `static const` for tables in flash
+
+```c
+static const uint8_t sine_table[256] = { /* values */ };
+```
+
+The `static const` puts the table in `.rodata`, which the linker places in flash. Without `const`, it goes in `.data`, which is *copied* from flash to RAM at startup and lives in RAM forever. For a 256-byte table that's annoying; for a 64 KB voice prompt it's catastrophic.
+
+## See also
+
+- [CMSIS](/docs/programming/cmsis/) — the standard register definitions.
+- [Linker scripts](/docs/programming/linker-scripts/) — controlling where data lives.
+- [Memory model](/docs/architecture/memory-model/) — what volatile doesn't give you.

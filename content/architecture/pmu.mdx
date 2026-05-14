@@ -1,0 +1,225 @@
+---
+title: Performance Monitoring Unit (PMU)
+description: How ARM counts cycles, instructions, cache misses, and dozens of other events — the PMU on Cortex-A and Cortex-R, the lightweight DWT counters on Cortex-M, and how to use them to measure IPC, branch mispredict rates, and cache pressure.
+order: 17
+updated: 2026-05-13
+tags: [architecture, pmu, performance, profiling, dwt, cache-miss]
+---
+
+Performance is invisible unless you measure it. The ARM **Performance Monitoring Unit** (PMU) is the hardware that gives you the numbers — cycle counts, instructions retired, cache hits and misses, branch mispredicts, TLB misses, and dozens of other microarchitectural events — sampled non-intrusively while your code runs at full speed. On Cortex-A you get a full PMU with multiple programmable counters and a hundred-plus event types. On Cortex-R the PMU is similar in shape but with a different (real-time-oriented) event list. On Cortex-M you get a much smaller subset embedded in the **DWT** (Data Watchpoint and Trace) — just a cycle counter and a handful of fixed event counters — but it's enough to measure IPC and characterise hot paths.
+
+This page covers the full picture: what events the PMU exposes, how to program the counters, the register block, the difference between Cortex-A's PMU and Cortex-M's DWT, and practical recipes for "what's my IPC?" and "how often does this loop miss the I-cache?"
+
+<SpecSheet
+  title="ARM PMU at a glance"
+  specs={[
+    { label: 'Available on', value: 'Cortex-A (full PMU), Cortex-R (full PMU, smaller event list), Cortex-M (lightweight DWT subset)' },
+    { label: 'PMU versions', value: 'PMUv2 (ARMv7-A, R), PMUv3 (ARMv8-A, R), PMUv3p1/p4/p5/p7 (ARMv8.1/.4/.5/.7 — more events)' },
+    { label: 'Cycle counter', value: 'Always present. PMCCNTR_EL0 (AArch64) / PMCCNTR (AArch32) — 64-bit on PMUv3' },
+    { label: 'Event counters', value: '2 to 31 programmable counters. Cortex-A53/A55 have 6; A72/A76/A78 have 6; A715/A720 have 8' },
+    { label: 'Event count', value: '~80 architectural events + implementation-defined. Common: cache misses, branch mispredicts, TLB walks, memory stalls' },
+    { label: 'Cortex-M DWT counters', value: 'CYCCNT (32-bit cycles), CPICNT (CPI extra cycles), EXCCNT (cycles in exceptions), SLEEPCNT, LSUCNT (load/store stall), FOLDCNT (folded branches)' },
+    { label: 'Access', value: 'System registers via MSR/MRS (AArch64) or coprocessor (AArch32). EL0/EL1 access controlled by PMUSERENR_EL0' },
+    { label: 'Sampling', value: 'Periodic overflow interrupt (PMINTENSET_EL1) — used by perf, statistical profiling' },
+  ]}
+/>
+
+## What the PMU measures
+
+The PMU exposes a fixed list of **events**. An event is "something the CPU does" — execute an instruction, miss the L1 D-cache, mispredict a branch, take an interrupt, walk a page table. Each programmable counter is configured to count one specific event by writing the event number to `PMEVTYPER<n>_EL0`. When the chosen event fires, the corresponding `PMEVCNTR<n>_EL0` increments. After a measurement window, software reads the counter and divides by elapsed cycles or instructions to derive a rate.
+
+The architectural events (common to all PMUv3 implementations) include:
+
+| Event ID (hex) | Name | What it counts |
+|----------------|------|----------------|
+| 0x00 | SW_INCR | Software increment (debug only) |
+| 0x01 | L1I_CACHE_REFILL | L1 instruction cache miss → refill |
+| 0x02 | L1I_TLB_REFILL | L1 instruction TLB miss |
+| 0x03 | L1D_CACHE_REFILL | L1 data cache miss → refill |
+| 0x04 | L1D_CACHE | L1 data cache access (hit + miss) |
+| 0x05 | L1D_TLB_REFILL | L1 data TLB miss |
+| 0x08 | INST_RETIRED | Instructions retired (architectural execution) |
+| 0x09 | EXC_TAKEN | Exceptions taken |
+| 0x0A | EXC_RETURN | Exception returns |
+| 0x10 | BR_MIS_PRED | Branch mispredicted or not predicted |
+| 0x11 | CPU_CYCLES | CPU cycles (same as PMCCNTR) |
+| 0x12 | BR_PRED | Predictable branches |
+| 0x16 | L2D_CACHE | L2 data-side cache access |
+| 0x17 | L2D_CACHE_REFILL | L2 data cache miss |
+| 0x18 | L2D_CACHE_WB | L2 cache writeback |
+| 0x19 | BUS_ACCESS | Bus accesses |
+| 0x40+ | (Implementation-defined) | Microarchitecture-specific |
+
+The implementation-defined events vary per core. Cortex-A78 has events for "front-end stall cycles," "back-end stall cycles," dispatch-slot utilization, etc. — these are critical for performance tuning on the specific core but won't port to a different CPU.
+
+## The register block (PMUv3, AArch64)
+
+The PMU register file follows a regular pattern:
+
+| Register | Purpose |
+|----------|---------|
+| `PMCR_EL0` | Control register — enable, reset, divider (clock cycle / 64) |
+| `PMCNTENSET_EL0` / `PMCNTENCLR_EL0` | Per-counter enable bitmask |
+| `PMCCNTR_EL0` | Cycle counter — 64-bit |
+| `PMCCFILTR_EL0` | Cycle-counter filter (count only at EL0? EL1? non-secure?) |
+| `PMEVCNTR<n>_EL0` | Counter n value (32-bit normally, 64-bit with PMUv3p5+) |
+| `PMEVTYPER<n>_EL0` | Counter n event selector (which event to count) |
+| `PMOVSSET_EL0` / `PMOVSCLR_EL0` | Overflow status — which counters have overflowed |
+| `PMINTENSET_EL1` / `PMINTENCLR_EL1` | Overflow interrupt enable |
+| `PMUSERENR_EL0` | User-mode access enable (EL0 read access to counters) |
+| `PMSELR_EL0` | Counter select (for legacy unified access) |
+
+Programming a counter is straightforward:
+
+```c
+// Count L1 D-cache misses on counter 0 (AArch64)
+asm volatile (
+    "msr PMEVTYPER0_EL0, %0   \n"     // event ID 0x03
+    "msr PMCNTENSET_EL0, %1   \n"     // enable counter 0
+    "msr PMCR_EL0, %2         \n"     // enable PMU, reset counters
+    :
+    : "r"(0x03), "r"(1UL << 0), "r"(0x7)
+);
+
+// ... run code under measurement ...
+
+uint64_t miss_count;
+asm volatile ("mrs %0, PMEVCNTR0_EL0" : "=r"(miss_count));
+```
+
+On AArch32 (Cortex-A in 32-bit mode, Cortex-R52) the same registers exist but accessed via coprocessor `c9`:
+
+```c
+asm volatile ("mcr p15, 0, %0, c9, c12, 1" : : "r"(1));   // enable cycle counter
+```
+
+## EL0 access — letting userspace read PMU
+
+By default the PMU is EL1+ only — userspace cannot read counters. To enable EL0 reads (so Linux's `perf` can sample without a syscall), the kernel sets `PMUSERENR_EL0.EN = 1`. Linux's `perf` does this on boot if `kernel.perf_event_paranoid` is set permissively.
+
+This is why on a Linux ARM box, `perf stat ./mybin` "just works" — the kernel has armed the PMU, exposed userspace access, and arranged for `perf` to multiplex counters across events when you ask for more events than the hardware has counters.
+
+## Cortex-M DWT — the lightweight version
+
+Cortex-M doesn't have a full PMU. Instead, the DWT (Data Watchpoint and Trace) unit includes a handful of fixed counters:
+
+| Counter | What it counts | Width |
+|---------|----------------|-------|
+| `CYCCNT` | CPU cycles | 32-bit |
+| `CPICNT` | Extra cycles per instruction (beyond 1) | 8-bit, saturating |
+| `EXCCNT` | Cycles spent in exception entry/exit | 8-bit |
+| `SLEEPCNT` | Cycles spent in WFI/WFE sleep | 8-bit |
+| `LSUCNT` | Load-store stall cycles | 8-bit |
+| `FOLDCNT` | Folded (single-cycle) branches | 8-bit |
+
+Enabling the cycle counter:
+
+```c
+CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;    // master trace enable
+DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;               // turn on CYCCNT
+DWT->CYCCNT = 0;
+// ... measured region ...
+uint32_t cycles = DWT->CYCCNT;
+```
+
+CYCCNT is the workhorse — anyone profiling Cortex-M code uses it. Enable once at boot, sample at start and end of regions, subtract, divide by `SystemCoreClock` to get seconds.
+
+The other DWT counters (CPICNT, EXCCNT, LSUCNT, FOLDCNT) are 8-bit saturating, which makes them useful for very short windows (< 256 events) but they overflow quickly. You enable them via `DWT->CTRL`:
+
+```c
+DWT->CTRL |= DWT_CTRL_CPIEVTENA_Msk    // enable CPICNT
+          |  DWT_CTRL_EXCEVTENA_Msk    // enable EXCCNT
+          |  DWT_CTRL_LSUEVTENA_Msk    // enable LSUCNT
+          |  DWT_CTRL_FOLDEVTENA_Msk;  // enable FOLDCNT
+```
+
+A practical use: read all four counters at start, then at end, subtract, and you have a microarchitectural breakdown of the region: total cycles (CYCCNT), how many cycles were "extra" CPI (CPICNT), how many in exceptions (EXCCNT), how many were load-store stalls (LSUCNT), how many branches got folded out (FOLDCNT). The instructions retired count is implicit: `(CYCCNT - EXCCNT - SLEEPCNT - LSUCNT - CPICNT)` approximates it for non-branch instructions, plus FOLDCNT for folded branches.
+
+<Callout type="tip">
+For real Cortex-M profiling, supplement DWT with **DWT PC sampling**: enable `DWT_CTRL.PCSAMPLENA` and the trace stream emits the current PC every N cycles. A SWO-attached host (SEGGER Ozone, J-Link's PCSampler) builds a statistical profile of where the CPU spends its time. Zero instrumentation in the firmware — just a debugger plus SWO.
+</Callout>
+
+## Computing IPC and branch mispredict rate
+
+The canonical performance metric is **Instructions Per Cycle** (IPC). On Cortex-A:
+
+```c
+// Counter 0: instructions retired (event 0x08)
+// PMCCNTR_EL0:  cycles
+
+uint64_t cycles_start, inst_start;
+asm volatile ("mrs %0, PMCCNTR_EL0"   : "=r"(cycles_start));
+asm volatile ("mrs %0, PMEVCNTR0_EL0" : "=r"(inst_start));
+
+// ... measured code ...
+
+uint64_t cycles_end, inst_end;
+asm volatile ("mrs %0, PMCCNTR_EL0"   : "=r"(cycles_end));
+asm volatile ("mrs %0, PMEVCNTR0_EL0" : "=r"(inst_end));
+
+double ipc = (double)(inst_end - inst_start) / (cycles_end - cycles_start);
+```
+
+Typical IPC values:
+- **Cortex-A53 (in-order, 2-wide)**: 0.5–1.2 depending on workload
+- **Cortex-A55 (in-order, 2-wide)**: 0.6–1.4
+- **Cortex-A72 (OOO, 3-wide)**: 1.2–2.5
+- **Cortex-A78 (OOO, 4-wide)**: 1.5–3.5
+- **Cortex-M7 (in-order, dual-issue)**: 0.8–1.5 (DWT-derived)
+
+Branch mispredict rate:
+
+```c
+// counter 0: event 0x10 BR_MIS_PRED
+// counter 1: event 0x12 BR_PRED
+double mispredict_rate = (double)br_mis_pred / (br_mis_pred + br_pred);
+```
+
+A rate above 5% on a hot path is worth investigating — even on Cortex-A55, a mispredict costs ~10 cycles, so 5% misprediction on a 1-cycle-per-iter loop doubles the iteration time.
+
+Cache miss rate at L1D:
+
+```c
+// counter 0: event 0x03 L1D_CACHE_REFILL (miss)
+// counter 1: event 0x04 L1D_CACHE       (total access)
+double miss_rate = (double)l1d_miss / l1d_access;
+```
+
+L1D miss rates above 2% on a hot loop usually indicate a working-set-too-big problem — either reorganize data (struct-of-arrays vs array-of-structs), tile the loop, or accept the cost.
+
+## Statistical profiling — the PMU as a sampler
+
+The PMU can interrupt on counter overflow. Program a counter to count a small number of events (say, "10000 instructions"), wait for the overflow interrupt, capture PC + callstack at the interrupt, reset the counter, repeat. After running for some time you have a statistical sample of where the CPU spends instructions — which is exactly what Linux's `perf record` does:
+
+```
+perf record -e instructions -c 10000 ./mybin
+```
+
+The `-c 10000` says "sample every 10000 instructions." The kernel arms a PMU counter, sets the overflow interrupt to fire after 10000, records `perf_event` samples on each overflow. Resulting profile is statistically accurate down to function-level (and with `--call-graph dwarf` you get callstacks too).
+
+On a bare-metal Cortex-R52, the same idea works but you implement the overflow ISR yourself. ARM's CMSIS-FreeRTOS+ port has hooks. Custom profilers (Tracealyzer, Lauterbach TRACE32) tap directly into the PMU register block.
+
+## ARMv8.x additions
+
+Each ARMv8.x revision has added events and capabilities:
+
+- **ARMv8.1** — PMUv3p1: 64-bit counters (PMEVCNTR&lt;n&gt; widened from 32 to 64 bits)
+- **ARMv8.4** — PMUv3p4: more events for memory model, atomics, system stalls
+- **ARMv8.5** — PMUv3p5: Statistical Profiling Extension (SPE) — adds detailed per-instruction sampling with full microarchitectural metadata
+- **ARMv8.7** — PMUv3p7: additional events for branch predictors, vector workloads
+
+**SPE** (Statistical Profiling Extension) is the standout. Rather than counting events, SPE samples *individual instructions* with rich metadata: was this load a hit or miss at L1/L2/L3? What was the latency? Was this branch predicted correctly? Was there a back-end stall? This is the gold standard for ARM performance analysis and is supported by `perf` on suitably new kernels.
+
+<Callout type="warn">
+PMU counters are **mostly** non-intrusive — the act of reading or programming them doesn't perturb the workload. But the *overflow interrupt* used for sampling does perturb: the ISR runs on the same core, evicts cache lines, takes branches. For pure measurement (one-shot read), use direct reads; for sampling profiles, accept the perturbation and average over enough samples.
+</Callout>
+
+## Cross-references
+
+- [Debug architecture](/docs/architecture/debug) — DWT lives in the debug subsystem on Cortex-M
+- [DWT cycle counter](/docs/cortex-m/dwt-cyccnt) — practical Cortex-M cycle measurement
+- [Cortex-M7 cache](/docs/cortex-m/cache) — what L1 cache miss rate tells you on M7
+- [Branch prediction](/docs/architecture/branch-prediction) — what the BR_MIS_PRED event counts
+- ARMv8-A Architecture Reference Manual, section D7 (Performance Monitors Extension)
+- ARM Statistical Profiling Extension v1.x (ARM DDI 0586) — SPE specification
+- Brendan Gregg's "Linux perf Examples" — practical perf-on-ARM walkthroughs

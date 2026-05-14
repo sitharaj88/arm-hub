@@ -1,0 +1,15 @@
+---
+interface Props { title?: string; prompt?: string }
+const { title = 'armhub ~ shell', prompt = '$' } = Astro.props;
+---
+<div class="dark surface overflow-hidden shadow-panel">
+  <div class="terminal-chrome">
+    <span class="terminal-dot bg-err/70"></span>
+    <span class="terminal-dot bg-warn/70"></span>
+    <span class="terminal-dot bg-ok/70"></span>
+    <div class="ml-3 font-mono text-xs text-ink-faint">{title}</div>
+  </div>
+  <div class="terminal px-5 py-4">
+    <slot />
+  </div>
+</div>

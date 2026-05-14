@@ -1,0 +1,170 @@
+---
+title: Advanced DMA — MDMA, DMA2D, GPDMA
+description: Beyond the classic stream-based DMA — master DMAs that initiate transfers across the bus matrix, 2D blending engines for graphics, linked-list scatter-gather, and cache coherency on Cortex-M7 systems.
+order: 15
+updated: 2026-05-13
+tags: [peripherals, dma, mdma, dma2d, gpdma, cache-coherency]
+---
+
+The basic DMA model on Cortex-M is a per-stream copy engine: configure source, destination, length, transfer direction, increment modes, hit GO. That's fine for moving 16 ADC samples into RAM every conversion cycle. But modern systems — graphics, networking, motor control, real-time media — need DMA that can chain transfers, blend pixels in 2D, span arbitrary buses, and integrate cleanly with caches. This page covers the three "advanced" DMA families that ship on Cortex-M7 and Cortex-M33 SoCs: STM32 **MDMA**, **DMA2D** (Chrom-ART), and the new **GPDMA** on STM32U5.
+
+<SpecSheet
+  title="Advanced DMA at a glance"
+  specs={[
+    { label: 'STM32 classic DMA', value: 'Per-stream config registers, simple linear transfer, ~8 streams per controller, AHB-only master' },
+    { label: 'STM32 MDMA (H7)', value: 'Master DMA — sits on AHB and AXI, can move from any peripheral/memory to any other. Linked-list, packed/unpacked, byte-swap, trigger sources from any DMA1/2/BDMA channel' },
+    { label: 'STM32 DMA2D (Chrom-ART)', value: '2D pixel engine — fills, copies with format conversion, alpha blends two layers. Up to 4 bytes/cycle at 200 MHz = 800 MB/s' },
+    { label: 'STM32U5 GPDMA', value: 'General-purpose DMA with linked-list descriptors in RAM, 16 channels, security/privilege per-channel for TrustZone' },
+    { label: 'NXP eDMA', value: 'Enhanced DMA on i.MX RT — 32 channels, scatter-gather via TCD (Transfer Control Descriptor) chains, channel preemption' },
+    { label: 'Cache concerns', value: 'On M7/M55 with D-cache, every DMA buffer needs explicit clean (before TX) and invalidate (after RX) — or place buffer in non-cacheable region' },
+  ]}
+/>
+
+## MDMA — master DMA on STM32H7
+
+The classic STM32 DMA1/DMA2 controllers sit on AHB and can only access AHB-reachable memory and peripherals. On STM32H7, the bus matrix is much larger — AXI for the M7 core and main flash, AHB for most peripherals, two separate SRAM banks on different buses (D1, D2, D3 domains). The classic DMAs can't reach across domains efficiently.
+
+MDMA (Master DMA) is the answer. It sits on both AXI and AHB and can move data between **any two locations** in the address map. Key features:
+
+- **Two ports** — AXI master and AHB master, both active at once. Can do AXI-to-AHB, AHB-to-AXI, AXI-to-AXI, or AHB-to-AHB.
+- **16 channels**, each with its own descriptor RAM (`MDMA_CCRx`, `MDMA_CTCRx`, `MDMA_CBNDTRx`, `MDMA_CSARx`, `MDMA_CDARx`, etc.).
+- **Linked-list mode** — each descriptor in RAM contains a pointer to the next descriptor. The controller chains transfers without CPU intervention. Used heavily by Ethernet, SDMMC, and graphics pipelines.
+- **Packed / unpacked transfers** — read 8-bit, write 32-bit (packing 4 bytes into a word) or vice-versa. Avoids software unpacking loops.
+- **Byte/half-word/word swap** — endianness conversion in hardware.
+- **Trigger sources** — can be started by a classic DMA channel's end-of-transfer, a timer event, a peripheral request, or software. The H7 DMA-MDMA cooperation pattern is: a small classic DMA channel handles the per-peripheral fast path (e.g. UART RX), then signals MDMA to bulk-move the FIFO contents to long-term storage in another SRAM domain.
+
+```c
+// MDMA example: copy 1024 bytes from D1-SRAM to D3-SRAM
+MDMA_Channel0->CTCR = (3 << 18)   // dst burst = 4 beats
+                    | (3 << 15)   // src burst = 4 beats
+                    | (2 << 8)    // 32-bit dst
+                    | (2 << 6);   // 32-bit src
+MDMA_Channel0->CBNDTR = 1024;
+MDMA_Channel0->CSAR = (uint32_t)src;
+MDMA_Channel0->CDAR = (uint32_t)dst;
+MDMA_Channel0->CCR  = MDMA_CCR_EN | MDMA_CCR_SWRQ;   // software request
+```
+
+The descriptor pointer (`MDMA_CLAR`) is the killer feature: instead of N software-driven `CCR_SWRQ` writes, you build a linked list of descriptors in RAM and let MDMA walk through them at memory speed.
+
+## DMA2D — Chrom-ART for 2D graphics
+
+DMA2D, branded "Chrom-ART Accelerator" by ST, is a fixed-function 2D blitter. It does four operations:
+
+1. **Register-to-memory** — fill a rectangle with a constant color.
+2. **Memory-to-memory** — copy a rectangle from one framebuffer to another.
+3. **Memory-to-memory with PFC** — copy with pixel-format conversion (RGB565 → ARGB8888, etc.).
+4. **Memory-to-memory with blending** — combine two source layers (foreground + background) using per-pixel alpha and write the blended result.
+
+Operations are described by:
+
+| Register | Purpose |
+|----------|---------|
+| `DMA2D_CR.MODE` | One of the four operation modes |
+| `DMA2D_FGMAR` / `BGMAR` / `OMAR` | Foreground / background / output memory addresses |
+| `DMA2D_FGPFCCR` / `BGPFCCR` / `OPFCCR` | Pixel format (RGB565, RGB888, ARGB8888, L8, A8, L4, A4, ...) |
+| `DMA2D_NLR` | Number of lines × pixels per line |
+| `DMA2D_FGOR` / `BGOR` / `OOR` | Output offset — pixels between lines, for blitting into a larger framebuffer |
+| `DMA2D_FGCOLR` | Foreground color (for register-to-memory mode) |
+| `DMA2D_AMTCR` | Dead-time between AHB transactions — useful for sharing bus with CPU |
+
+At 200 MHz, DMA2D moves 800 MB/s peak. A full 800×480×4-byte framebuffer (1.5 MB) clears in under 2 ms. With Chrom-ART driving the framebuffer and LTDC (the LCD controller) reading it for scan-out, the CPU is free for UI logic.
+
+The TouchGFX, LVGL, and Embedded Wizard graphics stacks all integrate Chrom-ART. Manual use is rare outside of niche industrial HMI work — but the underlying ideas (fill, copy, blend, format-convert) are useful to know when debugging frame-rate issues.
+
+<Callout type="tip">
+DMA2D's "pixel format converter" path is overlooked — it can turn an 8-bit-per-pixel CLUT image into ARGB8888 at full DMA speed, faster than any software lookup loop. For sprite-based UIs (icons, glyphs) where assets are stored in compact CLUT formats, this is the canonical decoder.
+</Callout>
+
+## GPDMA — the new STM32U5 controller
+
+STM32U5 introduces GPDMA — a redesigned DMA that replaces both the classic DMA1/2 and the BDMA from L4/H7. Two GPDMA instances (GPDMA1, GPDMA2), each with eight channels. Key changes from classic DMA:
+
+- **Linked-list descriptors in RAM**, not on-chip registers. A descriptor is an 8-word block containing source address, destination address, length, control, and a pointer to the next descriptor. The CPU builds a chain in RAM, hands the head pointer to GPDMA, and the controller walks the chain autonomously.
+- **Per-channel privilege and security attributes** for TrustZone. A channel can be set "secure" or "non-secure," and a non-secure CPU thread cannot access a secure channel. Critical for TrustZone-aware systems where some peripherals (crypto, secure flash) must only be DMA-ed by secure code.
+- **Hardware triggers** — any peripheral event can start a channel; multiple channels can be chained via cross-triggers.
+- **2D mode** — built-in support for source-stride and destination-stride patterns, like a simplified DMA2D for non-graphics use cases (e.g. transposing a matrix or sampling every Nth column of a sensor array).
+
+Descriptor layout (simplified):
+
+| Offset | Field | Description |
+|--------|-------|-------------|
+| 0x00 | CTR1 | Control: data widths, increments, burst sizes |
+| 0x04 | CTR2 | Trigger source, transfer-complete event, allocation |
+| 0x08 | CBR1 | Block size in bytes |
+| 0x0C | CSAR | Source address |
+| 0x10 | CDAR | Destination address |
+| 0x14 | CTR3 | Source-stride, destination-stride (2D mode) |
+| 0x18 | CBR2 | 2D block count |
+| 0x1C | CLLR | Pointer to next descriptor (or 0 to stop) |
+
+The HAL `HAL_DMAEx_List_BuildLinkedList` builds this chain at runtime; for static chains, the firmware can place them in `.rodata` and pass the head pointer directly.
+
+## Cache coherency on Cortex-M7 and M55
+
+DMA buffers and CPU caches are the most fragile interaction in the entire system. On Cortex-M7 with both I-cache and D-cache enabled (the default in any performant H7 application):
+
+- Before a **TX** DMA (peripheral reads from RAM): the buffer must be flushed from D-cache to memory, so the DMA sees the latest CPU-written data.
+- After an **RX** DMA (peripheral writes to RAM): the buffer must be invalidated in D-cache, so the next CPU read fetches fresh data from memory, not stale cache.
+
+CMSIS exposes `SCB_CleanDCache_by_Addr` (clean = write-back without invalidating) and `SCB_InvalidateDCache_by_Addr` (invalidate = drop without writing back). The buffer alignment must be a multiple of the cache line size (32 bytes on M7).
+
+```c
+// Before starting an RX DMA into rxbuf:
+SCB_InvalidateDCache_by_Addr((uint32_t*)rxbuf, sizeof(rxbuf));
+HAL_UART_Receive_DMA(&huart1, rxbuf, sizeof(rxbuf));
+
+// Before triggering a TX DMA from txbuf:
+SCB_CleanDCache_by_Addr((uint32_t*)txbuf, sizeof(txbuf));
+HAL_UART_Transmit_DMA(&huart1, txbuf, sizeof(txbuf));
+```
+
+Forgetting the clean before TX produces frames with whatever was in memory the *last* time the cache wrote back — often "looks right but mysteriously wrong" data corruption. Forgetting the invalidate before RX produces software that reads phantom old data, even though the DMA wrote new data to RAM moments ago.
+
+The safest alternative is to place all DMA buffers in **non-cacheable memory**. On STM32H7 this means using one of the unused TCM regions or marking a chunk of SRAM4 as non-cacheable in the MPU. Performance cost is real (uncached writes are slower) but correctness comes for free.
+
+<Callout type="danger">
+Cache-coherency bugs are non-deterministic and depend on cache state — a buffer might work for hours, then corrupt on the one Ethernet frame that happened to evict the cache line at the wrong time. If you see "Ethernet works at boot but degrades after running for a while" or "audio plays cleanly until I scroll the UI," check cache management on DMA buffers first.
+</Callout>
+
+## Linked-list and scatter-gather
+
+Both MDMA and GPDMA support linked-list operation. This is the right pattern for any DMA workload where:
+
+- The data layout is not a single contiguous block (e.g. an audio frame composed of several producer-supplied buffers).
+- The transfer parameters change over time (every nth transfer goes to a different destination — common in Ethernet RX with descriptor rings).
+- You want to chain a long sequence of small transfers without per-transfer CPU interrupts.
+
+Ethernet RX descriptor rings are the canonical case. Each descriptor (16 bytes on the STM32 ETH peripheral) describes one Ethernet frame buffer and points to the next descriptor. The MAC fills frames into the buffer chain and, on each completion, optionally fires an interrupt. With 16-descriptor rings and frame coalescing, you process 16 received frames per CPU interrupt — at gigabit speeds, this is the only way to avoid drowning in interrupt overhead.
+
+## NXP eDMA on i.MX RT
+
+i.MX RT (RT10xx, RT11xx) uses the eDMA controller — a different design with similar capabilities. Highlights:
+
+- **32 channels**, two banks of 16.
+- **TCD** (Transfer Control Descriptor) — a 32-byte structure that describes one transfer. Channels can chain TCDs via scatter-gather pointers.
+- **Channel link** — a channel completing can automatically start another channel (minor link) or start itself with a new TCD (major link via scatter-gather).
+- **Preemption** — high-priority channels preempt low-priority running channels with single-transfer granularity.
+
+The DMAMUX peripheral routes any of ~150 trigger sources (each peripheral has one or more) to any of the 32 channels. Programming is dense — the TCD has 11 fields including source/destination offsets per minor loop and per major loop — but extremely flexible.
+
+## Comparison
+
+<CoreCompare
+  rows={[
+    { core: 'Classic DMA', notes: 'Linear, single-stream, AHB-only. Good for ADC/UART/SPI. Limited to one peripheral region per controller.' },
+    { core: 'MDMA (H7)', notes: 'Cross-bus master DMA, linked-list, packing, byte-swap. Use for large bulk moves and cross-domain transfers.' },
+    { core: 'DMA2D', notes: '2D pixel engine. Use for framebuffer ops, alpha blending, format conversion. Not a general-purpose DMA.' },
+    { core: 'GPDMA (U5)', notes: 'Replaces classic DMA on U5. Linked-list, 2D stride, TrustZone-aware. The new baseline.' },
+    { core: 'eDMA (i.MX RT)', notes: 'NXP equivalent — 32 channels, TCDs, channel linking, preemption. Most flexible scatter-gather model.' },
+  ]}
+/>
+
+## Cross-references
+
+- [DMA](/docs/peripherals/dma) — classic stream-based DMA
+- [Cortex-M7](/docs/cortex-m/m7) — cache architecture that interacts with DMA
+- [Memory model](/docs/architecture/memory-model) — Normal vs Device memory and DMA coherency
+- [TrustZone](/docs/architecture/trustzone) — security context for DMA channels on U5
+- [Ethernet](/docs/peripherals/ethernet) — heavy descriptor-ring DMA user
+- [SDMMC](/docs/peripherals/sdmmc) — high-rate DMA from peripheral FIFO into RAM

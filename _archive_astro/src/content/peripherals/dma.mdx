@@ -1,0 +1,131 @@
+---
+title: DMA
+description: Direct Memory Access — moving bytes without the CPU, channel/stream architectures, request signals, double-buffering, and cache coherency on Cortex-M7.
+order: 6
+updated: 2026-05-12
+tags: [peripherals, dma]
+---
+
+import Callout from '~/components/Callout.astro';
+
+DMA is the silent productivity gain in firmware. Configured right, the CPU sleeps while a DMA controller streams ADC samples, services UART traffic, refreshes a display, and copies SPI flash sectors — all in parallel. Configured wrong, you get cache coherency bugs, half-transferred buffers, and IRQ storms.
+
+## What a DMA controller is
+
+A DMA controller is itself a bus master — it can issue reads and writes on the system bus without CPU involvement. It has:
+
+- **Channels** (or "streams" on STM32 F4/F7/H7) — parallel transfer engines, typically 6–16 per controller.
+- **Request lines** from peripherals — when a UART receiver gets a byte, it asserts its DMA-request line, telling the DMA controller "come fetch me".
+- **Source and destination addresses** — peripheral register, memory buffer, or another peripheral.
+- **Transfer counter** — number of items remaining.
+- **Address increment** — auto-increment for buffers, fixed for peripheral registers.
+- **Item width** — byte, half-word, word.
+- **Trigger mode** — peripheral-triggered (most common), software-triggered (for mem-to-mem).
+
+## Channel vs. stream architectures
+
+Different vendors organise DMA differently:
+
+- **STM32 F0/F1/F3/L4** — channel-based. Each channel has *one* request source, hardwired by silicon, configured via a request selector register.
+- **STM32 F4/F7** — stream-based. Each stream has 8 *channels* (request selectors) and you pick one per stream.
+- **STM32 H7 / G4** — DMAMUX. Any of 128 request sources can be routed to any DMA stream — flexible.
+- **NXP eDMA** — channels with TCD (Transfer Control Descriptor) memory-mapped structures. Powerful but more complex setup.
+- **Nordic EasyDMA** — DMA is baked into each peripheral; no separate "DMA controller" to configure.
+
+Check your reference manual for the exact request mapping table — this is the highest-friction part of DMA bring-up.
+
+## A typical setup
+
+```c
+// Memory-to-peripheral DMA: send a buffer over UART
+DMA1_Stream6->PAR  = (uint32_t)&USART2->TDR;   // peripheral address
+DMA1_Stream6->M0AR = (uint32_t)tx_buf;          // memory address
+DMA1_Stream6->NDTR = sizeof(tx_buf);            // count
+
+DMA1_Stream6->CR = (4 << DMA_SxCR_CHSEL_Pos)   // channel 4 = USART2_TX
+                 | DMA_SxCR_DIR_0              // memory-to-peripheral
+                 | DMA_SxCR_MINC               // memory increment
+                 | DMA_SxCR_TCIE               // IRQ on transfer complete
+                 | DMA_SxCR_EN;                // start
+
+USART2->CR3 |= USART_CR3_DMAT;                  // tell USART to use DMA-TX
+```
+
+The peripheral's DMA-request enable bit (`DMAT` for USART transmit) is the trigger — without it, the DMA controller sits idle even with `EN=1`.
+
+## Modes: single, circular, double-buffer
+
+### Single
+
+Transfer completes after `NDTR` items, IRQ fires, you reload. Use for: one-shot copies, command-response patterns.
+
+### Circular
+
+When `NDTR` reaches 0, the DMA controller auto-reloads it and the address pointer, continuing forever. Use for: ADC continuous sampling, UART RX into a ring buffer.
+
+### Double-buffer
+
+Two memory addresses (M0AR, M1AR). When M0AR fills, the controller switches to M1AR and fires the transfer-complete IRQ — your code consumes M0AR while the controller fills M1AR. Then it swaps back. Use for: audio I²S, camera DCMI, anything streaming where you can't afford a buffer copy.
+
+```c
+DMA2_Stream0->M0AR = (uint32_t)bufA;
+DMA2_Stream0->M1AR = (uint32_t)bufB;
+DMA2_Stream0->CR  |= DMA_SxCR_DBM;             // enable double-buffer
+```
+
+## Half-transfer interrupts
+
+For circular mode, the **half-transfer** interrupt fires at the midpoint. Combined with the full-transfer interrupt, this gives you a producer-consumer pattern:
+
+- Half-transfer IRQ → first half is ready, process it while the controller fills the second half.
+- Full-transfer IRQ → second half is ready, process it while the controller wraps and fills the first half.
+
+```c
+void DMA1_Stream5_IRQHandler(void) {
+    if (DMA1->HISR & DMA_HISR_HTIF5) {       // half
+        DMA1->HIFCR = DMA_HIFCR_CHTIF5;
+        process_chunk(rx_buf, SIZE / 2);
+    }
+    if (DMA1->HISR & DMA_HISR_TCIF5) {       // full
+        DMA1->HIFCR = DMA_HIFCR_CTCIF5;
+        process_chunk(rx_buf + SIZE / 2, SIZE / 2);
+    }
+}
+```
+
+## Cache coherency on Cortex-M7
+
+The Cortex-M7 has L1 caches that aren't coherent with DMA. Three correct strategies (covered in depth in [Cortex-M7](/docs/cortex-m/m7/)):
+
+1. **Mark DMA buffers non-cacheable** via MPU region.
+2. **`SCB_CleanDCache_by_Addr()` before DMA-out**, **`SCB_InvalidateDCache_by_Addr()` after DMA-in** (32-byte aligned, 32-byte multiples).
+3. **Place buffers in DTCM** — single-cycle, not behind the cache.
+
+<Callout type="warn" title="Default linker scripts put DMA buffers behind the cache">
+A buffer declared `static uint8_t buf[1024]` lives in regular SRAM, which is cacheable on M7. Move it to a named section in your linker script and place that section in non-cacheable SRAM (typically the lower bank, marked NC in the MPU).
+</Callout>
+
+## Mem-to-mem
+
+Most DMA controllers can do memory-to-memory copies. Configure both addresses with increment, set the direction to "memory-to-memory" (no peripheral request), and set EN. Useful for fast `memcpy` of large buffers — though for small copies, the CPU's own `LDM/STM` is faster (no setup overhead).
+
+```c
+DMA2_Stream0->PAR  = (uint32_t)src;
+DMA2_Stream0->M0AR = (uint32_t)dst;
+DMA2_Stream0->NDTR = nbytes;
+DMA2_Stream0->CR  = DMA_SxCR_DIR_1 | DMA_SxCR_MINC | DMA_SxCR_PINC | DMA_SxCR_EN;
+```
+
+## What can go wrong
+
+- **DMA stream stalled at 0/N transfers** → peripheral DMA-request enable not set, or wrong request mapping.
+- **Garbage at start of UART transfer** → RX DMA wasn't ready when first byte arrived.
+- **Half-transferred buffer on cache-flush** → cache range not aligned to 32 bytes.
+- **Periodic data corruption every few seconds** → another DMA stream on the same controller stealing bus bandwidth; consider stream priorities.
+
+## See also
+
+- [Cortex-M7](/docs/cortex-m/m7/) — cache coherency in detail.
+- [Memory model](/docs/architecture/memory-model/) — barriers for DMA hand-off.
+- [UART](/docs/peripherals/uart/) — IDLE-line DMA pattern.
+- [SPI](/docs/peripherals/spi/) — full-duplex TX/RX DMA.

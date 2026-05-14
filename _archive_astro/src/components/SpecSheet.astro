@@ -1,0 +1,32 @@
+---
+interface Spec {
+  label: string;
+  value: string;
+  link?: string;
+}
+interface Props {
+  title?: string;
+  specs: Spec[];
+  class?: string;
+}
+const { title = 'At a glance', specs, class: cls = '' } = Astro.props;
+---
+<figure class={`not-prose my-8 overflow-hidden rounded-xl border border-line bg-surface/70 shadow-card ${cls}`}>
+  <div class="border-b border-line bg-bg-subtle/70 px-4 py-2.5 font-mono text-xs uppercase tracking-wider text-ink-faint">
+    {title}
+  </div>
+  <dl class="divide-y divide-line-subtle">
+    {specs.map((s) => (
+      <div class="grid grid-cols-1 sm:grid-cols-[11rem_minmax(0,1fr)] md:grid-cols-[13rem_minmax(0,1fr)] gap-y-1 sm:gap-y-0 gap-x-3 px-4 py-3 sm:py-2.5">
+        <dt class="font-mono text-[0.65rem] sm:text-xs uppercase tracking-wider text-ink-faint sm:pt-0.5">{s.label}</dt>
+        <dd class="text-sm text-ink break-words">
+          {s.link ? (
+            <a href={s.link} class="text-brand hover:text-brand-soft underline decoration-brand/30 underline-offset-2">{s.value}</a>
+          ) : (
+            <Fragment set:html={s.value} />
+          )}
+        </dd>
+      </div>
+    ))}
+  </dl>
+</figure>

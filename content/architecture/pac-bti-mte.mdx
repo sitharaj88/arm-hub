@@ -1,0 +1,215 @@
+---
+title: PAC, BTI, and MTE
+description: The three modern ARM hardware-security extensions — Pointer Authentication (PAC) against ROP, Branch Target Identification (BTI) against JOP, and Memory Tagging Extension (MTE) against use-after-free and buffer overflows. What they cost, where they're deployed, and the threat model each one defeats.
+order: 18
+updated: 2026-05-13
+tags: [architecture, security, pac, bti, mte, exploit-mitigation, armv83a, armv85a]
+---
+
+Memory-safety vulnerabilities — buffer overflows, use-after-free, type confusion — are the dominant source of severe security bugs in C and C++ codebases. Software mitigations (ASLR, stack canaries, CFI) help but aren't free and aren't complete. ARM has added three architectural extensions over the past decade specifically to make these bug classes much harder to exploit: **PAC** (Pointer Authentication Code, ARMv8.3), **BTI** (Branch Target Identification, ARMv8.5), and **MTE** (Memory Tagging Extension, ARMv8.5). Each targets a specific exploit pattern; together they raise the cost of a working memory-corruption exploit by orders of magnitude.
+
+PAC defeats return-oriented programming (ROP). BTI defeats jump-oriented programming (JOP). MTE catches use-after-free and out-of-bounds heap access at the hardware level, with low enough overhead to run in production. Cortex-A from Apple, Qualcomm, MediaTek, and Samsung all ship PAC + BTI; MTE is rolling out on Pixel and Galaxy phones running Android 14+. Cortex-M85 brings PAC + BTI (collectively branded **PACBTI**) to the microcontroller world.
+
+<SpecSheet
+  title="PAC / BTI / MTE at a glance"
+  specs={[
+    { label: 'PAC introduced', value: 'ARMv8.3-A (2017). Optional on Cortex-A75+, A55+, A510+, A710+, etc. Required on ARMv8.6+.' },
+    { label: 'BTI introduced', value: 'ARMv8.5-A (2018). Optional. Required on ARMv9.x.' },
+    { label: 'MTE introduced', value: 'ARMv8.5-A (2018). Optional. Required on ARMv9.x.' },
+    { label: 'PACBTI on M-profile', value: 'ARMv8.1-M extension. Implemented in Cortex-M85.' },
+    { label: 'PAC threat model', value: 'Return-oriented programming (ROP) and forged function pointers. Sign on store, verify on use.' },
+    { label: 'BTI threat model', value: 'Jump-oriented programming (JOP). Requires landing-pad instructions at every indirect-branch target.' },
+    { label: 'MTE threat model', value: 'Use-after-free, linear buffer overflow on the heap (and stack with -fsanitize=memtag).' },
+    { label: 'MTE tag granule', value: '16 bytes (one 4-bit tag per 16-byte aligned chunk of memory).' },
+    { label: 'Performance impact', value: 'PAC: ~0.5–3% on typical workloads. BTI: &lt;1%. MTE in sync mode: 3–8%; async mode: &lt;2%.' },
+  ]}
+/>
+
+## PAC — Pointer Authentication Code
+
+PAC takes the unused **top bits** of a 64-bit pointer (on a system with 48-bit virtual addresses, the top 16 bits are normally unused or sign-extended) and uses them to store a **MAC** (Message Authentication Code) computed over the pointer's value and a secret key held in a system register. When code signs a pointer, the hardware writes the MAC into the top bits. When code uses the pointer (to call a function, return, or dereference), the hardware verifies the MAC; if it matches, the top bits are stripped and the bare pointer is used. If it doesn't match, the hardware corrupts the pointer (sets the top bit to an unmapped value), turning the next dereference into a fault.
+
+The signing key is held in **PAC key registers** (`APIAKey_EL1`, `APIBKey_EL1`, `APDAKey_EL1`, etc. — five keys total). The kernel sets these at boot from a CSPRNG; they're per-process on Linux (Android randomizes per app). The user has no access; the keys never leave the CPU.
+
+The PAC instructions:
+
+| Instruction | Action |
+|-------------|--------|
+| `PACIA Xd, Xn` | Sign Xd as instruction-address (return address) using key A and modifier Xn |
+| `PACIB Xd, Xn` | Sign with key B (Android uses A for return, B for indirect calls) |
+| `PACDA Xd, Xn` | Sign as data-address using key A |
+| `AUTIA Xd, Xn` | Verify Xd's PAC; if good, strip; if bad, corrupt to fault |
+| `AUTIB Xd, Xn` | Verify with key B |
+| `PACIASP` / `RETAA` | Short forms specifically for return addresses, modifier = SP |
+| `XPACI Xd` / `XPACD Xd` | Strip PAC bits without verification (for debugging/logging) |
+
+The compiler emits `PACIASP` at function entry and `RETAA` (return + authenticate) at function exit:
+
+```asm
+my_function:
+    pacisp                  @ sign LR using SP as modifier; LR's top bits = MAC(LR, SP, keyA)
+    stp  x29, x30, [sp, #-16]!    @ save signed LR to stack
+    ...
+    ldp  x29, x30, [sp], #16       @ load signed LR from stack
+    retaa                   @ verify + return; fault if MAC wrong
+```
+
+The threat model is precise: an attacker who corrupts the stack-resident LR can overwrite it with any value, but they cannot forge a valid MAC unless they know the key. The `RETAA` checks and either returns to the legitimate caller or corrupts the pointer and faults — never returns to attacker-controlled code. ROP chains, which rely on chaining together return-gadgets, are defeated outright.
+
+<ProtocolFrame title="PAC layout in a 64-bit pointer (48-bit VA)" fields={[
+  { name: 'PAC (signature)', bits: 15, tone: 'destructive' },
+  { name: 'T (TBI)', bits: 1, tone: 'warning' },
+  { name: 'Virtual address (48 bits)', bits: 48, tone: 'primary', flexible: true },
+]} caption="Because the virtual address space is only 48 bits, the upper 16 bits of every pointer are otherwise unused — PAC repurposes them as a MAC over (pointer, modifier, key). AUTIA validates and strips; on mismatch the pointer is corrupted to fault on next use." />
+
+<Callout type="warn">
+PAC's security depends on the keys staying secret. A read-anywhere primitive that lets the attacker read `APIAKey_EL1` defeats PAC. On Apple Silicon, the key registers are not accessible even to kernel mode in a normal way — the security is layered. On generic Linux ARM64 the kernel must protect against KASLR-defeating read primitives the way it always has.
+</Callout>
+
+The performance cost of PAC is small: PACIASP is 1 cycle in the typical front-end, RETAA is 1 cycle in the back-end (replacing a normal `ret`). Workloads measure 0.5–3% overhead; Apple's iOS sees about 1–2% on average across the system.
+
+## BTI — Branch Target Identification
+
+PAC protects return-style indirect branches. BTI protects forward indirect branches — function pointers, virtual calls, computed jumps. The mechanism is different: BTI requires every legitimate indirect-branch target to begin with a **BTI** instruction (encoded as a hint, so it's a NOP on older CPUs). An indirect branch lands somewhere; the CPU checks the very next instruction; if it's not the expected BTI variant, the CPU raises a Branch Target Exception.
+
+```asm
+my_indirect_target:
+    bti  j                  @ landing pad — required for any BR/BLR landing here
+    ...
+```
+
+BTI variants:
+
+- **`BTI`** — generic landing pad. Accepts all indirect branches.
+- **`BTI c`** — accepts indirect call (`BLR`). Used at function entry points exposed via function pointer.
+- **`BTI j`** — accepts indirect jump (`BR`). Used at jump-table targets.
+- **`BTI jc`** — accepts both.
+
+The compiler decides which form to emit based on how a function is reachable. `__attribute__((section(".text.func_called_via_ptr")))` plus `-mbranch-protection=bti` gets a `BTI c` at function entry. Switch-statement jump targets get `BTI j`.
+
+The threat model: a JOP attack chains together gadgets ending in indirect branches. The attacker corrupts function pointers and jumps the CPU to gadget addresses. With BTI, only addresses immediately preceded by a `BTI` are valid targets — and a useful gadget is unlikely to land at a `BTI`. The attack surface shrinks dramatically.
+
+Performance cost of BTI is essentially zero — landing-pad instructions are 1-cycle hints that fold into the front-end. The cost is in binary size: every function exposed via pointer needs a 4-byte BTI prologue.
+
+## MTE — Memory Tagging Extension
+
+MTE is the most ambitious of the three. It tags every 16-byte aligned chunk of memory with a 4-bit **tag** (held in metadata storage maintained by the CPU). It also tags every pointer with a 4-bit tag in the pointer's top bits. On every load and store, the hardware compares the pointer's tag against the memory's tag; if they don't match, the access faults (in **synchronous mode**) or records the mismatch for later reporting (in **asynchronous mode**).
+
+The expected use:
+
+1. `malloc(N)` returns a tagged pointer. The allocator picks a random 4-bit tag, writes it to the memory's tag store for the allocated region, and OR's it into the pointer's top bits.
+2. The application uses the tagged pointer for loads and stores. Every access checks: memory tag == pointer tag? OK. Mismatch? Fault.
+3. `free(p)` clears the memory's tag (or sets it to a new random value, depending on the implementation). Any later use of the original pointer fails — its top bits hold the old tag; the memory now has a different one. **Use-after-free caught.**
+4. A buffer overflow on the heap walks into the next allocation, which has a different tag. **Out-of-bounds heap access caught.**
+
+The MTE instructions for the allocator:
+
+| Instruction | Action |
+|-------------|--------|
+| `IRG Xd, Xn` | Insert random tag into Xd's top bits (used by allocator on alloc) |
+| `STG Xt, [Xn]` | Store tag — write Xt's tag bits as the memory tag at [Xn] |
+| `ST2G Xt, [Xn]` | Store tag, 32-byte version |
+| `STZG Xt, [Xn]` | Store tag + zero data |
+| `LDG Xt, [Xn]` | Load memory's current tag into Xt |
+| `SUBP Xd, Xn, Xm` | Subtract tagged pointers — strips tags before subtraction |
+
+The detection happens on ordinary loads and stores — no instrumentation in the inner loop, no software fast-path overhead. The 4-bit tag space means 1/16 chance of false negative (an attacker who guesses the right tag won't be caught), but that's a powerful filter for randomized bugs.
+
+### Sync vs async mode
+
+**Synchronous (sync) mode** — tag mismatch faults immediately, with the faulting PC pointing at the bad access. Slower (3–8%) because the CPU must check the tag in the critical path of the load. Used in development and high-assurance production.
+
+**Asynchronous (async) mode** — mismatches are recorded in a register but the access proceeds. Software polls the register periodically (or on context switch) to harvest detected mismatches. Faster (&lt;2% overhead) because tag checks happen out of the critical path. Used in production "sampling" deployments — catch most bugs, accept some delay in detection.
+
+Android's MTE rollout uses async mode for the kernel and sync mode for high-assurance apps; the user-space tagged-malloc (Scudo on Android) integrates with both. The kernel periodically rolls the per-allocation tag to make the detection probabilistic in time as well as space.
+
+<Callout type="tip">
+MTE is dramatically more effective than ASAN (Address Sanitizer) in production: ASAN has 2–3× runtime overhead and double the memory footprint, which is fine for testing but unshippable. MTE's overhead is small enough to ship — Pixel 8 ships MTE-enabled stock. The trade-off is the 4-bit tag space (1/16 false-negative rate); ASAN catches everything but you can't ship it.
+</Callout>
+
+## PACBTI on Cortex-M85
+
+The v8.1-M PACBTI extension brings PAC and BTI to M-profile. Cortex-M85 implements it; Cortex-M55 does not. The instructions are scaled down to 32-bit Thumb encodings but the semantics are the same as AArch64:
+
+```asm
+my_m85_function:
+    pac   r12, lr, sp           @ sign LR (with r12 scratch) using SP as modifier
+    push  {r4, lr}
+    ...
+    pop   {r4, lr}
+    aut   r12, lr, sp           @ authenticate LR
+    bx    lr                    @ return
+```
+
+On Cortex-M85, function prologue is `pac r12, lr, sp` (1 cycle) and epilogue gains an `aut r12, lr, sp` (1 cycle). BTI landing pads are 1-cycle hints. The combined cost on typical RTOS workloads is ~1–2%, much like Cortex-A.
+
+The key registers (`APIAKey_EL1` on AArch64) translate to Cortex-M85's `PAC_KEY_*` registers, accessed via `MRS`/`MSR`. The key is set by Secure-world boot code; Non-secure code reads its own keys (different from Secure's).
+
+For MTE, M-profile has nothing equivalent today — MTE is Cortex-A-only as of mid-2026.
+
+## Compiler enablement
+
+GCC and Clang both support these extensions via `-mbranch-protection`:
+
+```
+# AArch64 — Linux/Android typical
+-mbranch-protection=standard
+    # Equivalent to: pac-ret+leaf+bti
+
+# Cortex-M85
+-mbranch-protection=standard -mcpu=cortex-m85
+```
+
+The `standard` setting enables PAC on returns (`pac-ret`), PAC on leaf functions (`+leaf`), and BTI (`+bti`). Granular options:
+
+- `pac-ret` — sign return addresses
+- `pac-ret+leaf` — also sign leaf-function return addresses (extra protection)
+- `pac-ret+b-key` — use key B instead of A
+- `bti` — emit BTI landing pads at indirect-branch targets
+
+For MTE, the relevant compiler flags are part of HWASan / MTE-stack-tagging:
+
+```
+# Stack tagging (each stack frame gets its own tag)
+clang -fsanitize=memtag-stack
+
+# Heap tagging — paired with a tagged malloc (Scudo)
+clang -fsanitize=memtag-heap
+```
+
+## Adoption status (as of 2026)
+
+<CoreCompare
+  rows={[
+    { core: 'Apple A12+', notes: 'PAC since 2018. iOS heavily uses PAC for code-integrity, including signed-method-pointer Obj-C dispatch. Apple\'s pauth-key registers are extra-protected.' },
+    { core: 'Qualcomm Snapdragon 8 Gen 2+', notes: 'PAC + BTI. Android 14+ enables both by default for system libraries.' },
+    { core: 'Google Tensor G3+ (Pixel 8+)', notes: 'PAC + BTI + MTE. Pixel 8 ships MTE-enabled stock for system processes; apps can opt in.' },
+    { core: 'Samsung Exynos 2400', notes: 'PAC + BTI + MTE. Galaxy S24 Ultra has MTE on by default.' },
+    { core: 'Cortex-M85 (Renesas RA8, infineon, ST upcoming)', notes: 'PACBTI optional. Firmware vendors enabling progressively.' },
+    { core: 'Linux on AWS Graviton 3/4', notes: 'PAC + BTI in distro kernels (Amazon Linux 2023, Ubuntu 22.04+). MTE on Graviton 4.' },
+  ]}
+/>
+
+The general trajectory is clear: PAC + BTI is becoming default on new ARMv8.5+ silicon and new toolchains. MTE is ramping for production workloads now that the performance cost has come down on ARMv9 designs.
+
+## What these mitigations don't catch
+
+A short list of bugs not protected:
+
+- **Logic bugs** — wrong authorization check, mis-set permission flag. No memory-safety extension helps.
+- **Information disclosure** — reading memory you shouldn't, without corrupting anything. MTE catches OOB read; PAC and BTI don't.
+- **Side channels** — Spectre, Meltdown, cache-timing. These extensions don't change microarchitectural behavior.
+- **Crypto bugs** — weak random, key reuse, side-channel-leaking implementations. Different problem space.
+- **Use-after-free of stack pointers** — MTE-stack helps; without it, returned-pointer-to-local bugs are still exploitable.
+
+PAC + BTI + MTE shrink the attack surface for memory-corruption exploits dramatically but don't eliminate it. Defense in depth — sanitizers in CI, fuzzing, code review, ASLR + KASLR, plus these hardware extensions — is still the right model.
+
+## Cross-references
+
+- [ARMv8-M architecture](/docs/architecture/armv8m) — PACBTI on Cortex-M85
+- [TrustZone-M deep dive](/docs/architecture/trustzone-m) — orthogonal isolation primitive
+- [Exclusive monitors](/docs/architecture/exclusive-monitors) — concurrency primitives, complementary
+- ARMv8-A Architecture Reference Manual, sections D5 (PAC), D6 (BTI), D7 (MTE)
+- "Pointer Authentication on ARMv8.3" (ARM whitepaper, 2017)
+- "Memory Tagging Extension: Enhancing memory safety through architecture" (Cortex-A blog, 2019)
+- Linux kernel `Documentation/arm64/pointer-authentication.rst` and `memory-tagging-extension.rst`

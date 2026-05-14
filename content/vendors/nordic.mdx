@@ -1,0 +1,149 @@
+---
+title: Nordic Semiconductor (nRF52, nRF53, nRF54)
+description: The Bluetooth-first Cortex-M family — softdevice architecture, EasyDMA, the nRF Connect SDK / Zephyr migration.
+order: 3
+updated: 2026-05-12
+tags: [vendors, nordic, bluetooth, ble]
+---
+
+
+Nordic is *the* default for Bluetooth Low Energy. Their nRF52 and nRF53 families ship in essentially every BLE consumer device — earbuds, wearables, beacons, sensor tags. The hardware is excellent and uniquely BLE-oriented; the software story has gone through two generations (legacy "nRF5 SDK" → modern "nRF Connect SDK", aka Zephyr-based).
+
+## The chips
+
+| Family    | Application core    | Network core      | Notable                         |
+|-----------|---------------------|-------------------|---------------------------------|
+| **nRF52810/811** | Cortex-M4   | shared            | Entry BLE, no FPU               |
+| **nRF52832**     | Cortex-M4F  | shared            | Mainstream BLE 5 — most popular |
+| **nRF52833**     | Cortex-M4F  | shared            | + Bluetooth Mesh, 802.15.4      |
+| **nRF52840**     | Cortex-M4F  | shared            | Top of 52 line — BLE 5, USB, Thread/Zigbee |
+| **nRF5340**      | Cortex-M33  | Cortex-M33        | Dual-core, TrustZone, BLE 5.2  |
+| **nRF54L15/H20** | Cortex-M33  | RISC-V (54H) / shared (54L) | New gen, lower power, RF improvements |
+| **nRF9160 / nRF91**| Cortex-M33| modem (M33)       | Cellular LTE-M / NB-IoT         |
+| **nRF7002**      | (companion) | —                 | Wi-Fi 6 coprocessor             |
+
+The nRF52840 has been the dominant chip in connected consumer products for the last 5+ years. The nRF5340 is its successor for new designs (dual-core architecture isolates the application from the BLE stack).
+
+<BlockDiagram title="nRF52840-class SoC layout" width={780} height={340} nodes={[
+  { id: 'core',  x: 30,  y: 30,  w: 220, h: 70, kind: 'core',     label: 'Cortex-M4F', detail: '64 MHz · FPU · DSP' },
+  { id: 'sd',    x: 280, y: 30,  w: 220, h: 70, kind: 'security', label: 'Softdevice', detail: 'BLE stack, lowest flash + RAM partition' },
+  { id: 'radio', x: 530, y: 30,  w: 220, h: 70, kind: 'radio',    label: '2.4 GHz radio', detail: 'BLE 5 / 802.15.4 / Thread' },
+  { id: 'flash', x: 30,  y: 120, w: 220, h: 60, kind: 'storage',  label: 'Flash', detail: '1 MB (SD low, app above)' },
+  { id: 'ram',   x: 280, y: 120, w: 220, h: 60, kind: 'memory',   label: 'SRAM', detail: '256 KB (SD low, app above)' },
+  { id: 'easy',  x: 530, y: 120, w: 220, h: 60, kind: 'accel',    label: 'EasyDMA + PPI', detail: 'every peripheral does DMA' },
+  { id: 'usb',   x: 30,  y: 200, w: 220, h: 60, kind: 'io',       label: 'USB 2.0 FS', detail: 'native on nRF52840' },
+  { id: 'peri',  x: 280, y: 200, w: 220, h: 60, kind: 'periph',   label: 'UARTE / SPIM / TWIM', detail: 'EasyDMA endpoints' },
+  { id: 'sec',   x: 530, y: 200, w: 220, h: 60, kind: 'security', label: 'CryptoCell 310', detail: 'AES / ECC / SHA accelerator' },
+]} edges={[
+  { from: 'core', to: 'sd', label: 'SVCALL', tone: 'primary' },
+  { from: 'sd', to: 'radio', tone: 'accent' },
+  { from: 'core', to: 'flash', tone: 'default' },
+  { from: 'core', to: 'ram', tone: 'default' },
+  { from: 'peri', to: 'easy', tone: 'accent' },
+  { from: 'easy', to: 'ram', label: 'DMA', tone: 'success' },
+  { from: 'core', to: 'sec', tone: 'warning' },
+]} caption="The softdevice owns the lowest flash and RAM partition plus the highest-priority IRQs; your application runs above it and reaches the BLE stack only through the SVCALL ABI. EasyDMA and PPI let peripherals run autonomously while the M4F sleeps." />
+
+## The Softdevice — for nRF52
+
+Nordic's BLE stack runs as a **softdevice**: a precompiled binary that occupies the lower portion of flash and the lower portion of RAM. Your application links against an API but doesn't see the softdevice's source. The softdevice gets the highest interrupt priorities; your code must use lower priorities.
+
+```
+0x00000000 ┌───────────────────┐
+           │   Softdevice      │  ~150 KB BLE stack
+0x00027000 ├───────────────────┤
+           │   Your app code   │
+           │   Your app data   │
+0x20000000 ├───────────────────┤
+           │   Softdevice RAM  │  ~8 KB
+0x20002000 ├───────────────────┤
+           │   Your app RAM    │
+0x2003FFFF └───────────────────┘
+```
+
+It worked. It also tied every project tightly to Nordic's APIs.
+
+## nRF Connect SDK — the Zephyr migration
+
+Around 2019 Nordic pivoted to **Zephyr** as the canonical SDK for new chips (53, 54, 91). The nRF Connect SDK is essentially Zephyr + Nordic-specific drivers + a Bluetooth host stack (BLE controller in firmware for the nRF53/54 network core, software stack on the app core).
+
+For new designs:
+
+- **nRF52** — *still supported by the legacy nRF5 SDK*, but Nordic recommends nRF Connect SDK (Zephyr).
+- **nRF53 / nRF54 / nRF91** — nRF Connect SDK only.
+
+If you're starting fresh, learn the Zephyr way. The legacy SDK gets bug fixes but no new features.
+
+## EasyDMA — every peripheral does DMA
+
+Nordic's defining peripheral feature: every peripheral that benefits from DMA has DMA built in, not as a separate controller. You don't configure a DMA channel; you tell the peripheral the buffer address.
+
+```c
+// UARTE — UART with EasyDMA
+NRF_UARTE0->TXD.PTR = (uint32_t)tx_buf;
+NRF_UARTE0->TXD.MAXCNT = sizeof(tx_buf);
+NRF_UARTE0->TASKS_STARTTX = 1;
+// Done. UARTE will DMA the buffer out.
+```
+
+Same for SPIM, TWIM (I²C), SAADC, PWM, RADIO. Simplifies code dramatically — no DMA controller setup, no request mapping table.
+
+## PPI / DPPI — peripheral interconnect
+
+The **Programmable Peripheral Interconnect** lets you wire a peripheral *event* directly to another peripheral's *task*, with no CPU involvement:
+
+```c
+// When TIMER0 hits compare 0, trigger SAADC sample
+NRF_PPI->CH[0].EEP = (uint32_t)&NRF_TIMER0->EVENTS_COMPARE[0];
+NRF_PPI->CH[0].TEP = (uint32_t)&NRF_SAADC->TASKS_SAMPLE;
+NRF_PPI->CHENSET = (1 << 0);
+```
+
+CPU stays asleep. The timer fires the ADC sample. ADC's `EVENT_END` (via another PPI channel) triggers a UART transfer. Entire chains of behaviour without an ISR.
+
+The successor on nRF53/54 is **DPPI** (Distributed PPI), which works the same conceptually but separates the event matrix per power domain.
+
+## The 2.4 GHz radio
+
+A unique hardware block on every nRF52/53/54. Not just BLE — it can be configured for:
+
+- BLE 4.x and 5.x.
+- IEEE 802.15.4 (Thread, Zigbee, Matter).
+- Proprietary 2.4 GHz protocols (Nordic's Gazell / ESB).
+- Bluetooth Mesh.
+
+A single nRF52840 can host **Matter over Thread** (802.15.4) and **BLE provisioning** at the same time by time-multiplexing the radio. The softdevice / network-core firmware handles the multiplexing.
+
+## Power consumption
+
+Nordic chips are sold on low average power. Typical numbers (nRF52840):
+
+- **System OFF**: 0.3 µA — only retention RAM + RTC, full wake from RESET.
+- **System ON, idle**: 1.5 µA — RAM retained, RTC running.
+- **Radio TX at 0 dBm**: ~5 mA.
+- **Radio RX**: ~5 mA.
+- **CPU active at 64 MHz**: ~3 mA.
+
+A coin-cell-powered beacon advertising every second can run for **2+ years** on a CR2032. Sensor tags wake on accelerometer interrupts and stay below 10 µA average.
+
+<Callout type="tip" title="Don't disable the DC/DC regulator without reason">
+Every nRF chip has a built-in DC/DC buck regulator that cuts power consumption roughly in half compared to the LDO. Enable it in your application init — Nordic's examples sometimes forget. See `NRF_POWER->DCDCEN = 1` (nRF52) or the equivalent in Zephyr's device tree.
+</Callout>
+
+## Boot and bootloader
+
+Nordic's standard pattern:
+
+- **MBR** (Master Boot Record) — small immutable bootloader at flash start.
+- **Bootloader** — typically MCUboot (or Nordic's legacy DFU bootloader). Verifies signatures, swaps slots for A/B firmware update.
+- **Softdevice** (52-series) or **network core firmware** (53/54).
+- **Application**.
+
+OTA DFU over BLE is well-supported and standardised across Nordic chips.
+
+## See also
+
+- [Bluetooth Low Energy](/docs/peripherals/) (eventual deep-dive page — not yet written).
+- [Cortex-M4](/docs/cortex-m/m4/) — nRF52 core.
+- [Cortex-M33](/docs/cortex-m/m33-m23/) — nRF53, nRF54, nRF91 core.
+- [Zephyr](/docs/rtos/zephyr/) — the SDK foundation for new chips.

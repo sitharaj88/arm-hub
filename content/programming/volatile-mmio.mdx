@@ -1,0 +1,177 @@
+---
+title: volatile & memory-mapped IO
+description: What volatile actually guarantees, why MMIO without it is broken, read-modify-write hazards on peripheral registers, bit-banding on M3/M4, and the Cortex-M memory-ordering rules for device vs normal memory.
+order: 8
+updated: 2026-05-13
+tags: [programming, volatile, mmio, peripherals, memory-ordering, bit-banding]
+---
+
+Almost every bug a junior firmware engineer ships in their first year on a Cortex-M part traces back to the same three letters: `volatile`. Either it's missing where it should be there, or it's present where it shouldn't be, or it's there but the engineer thinks it does something it doesn't. The qualifier looks trivial — a one-word annotation, no runtime cost — but its semantics are precise, and the gap between "what `volatile` actually promises" and "what programmers assume it promises" is wide enough to fall through.
+
+This page nails down exactly what `volatile` means under the C and C++ standards, how it interacts with the Cortex-M memory model, why peripheral access without it is undefined-behaviour-flavoured nondeterminism, the read-modify-write hazard on shared registers, and the bit-banding trick that M3/M4 cores provide to sidestep that hazard for single-bit ops.
+
+<SpecSheet
+  title="volatile — what the standard says"
+  specs={[
+    { label: 'C11 §6.7.3', value: 'Every access (read or write) to a volatile-qualified object is an observable side effect. The implementation may not optimise these away or reorder them across sequence points.' },
+    { label: 'What it does NOT do', value: 'Does not imply atomicity. Does not synchronise across threads or ISRs. Does not insert memory barriers. Does not order accesses to non-volatile objects.' },
+    { label: 'Access width', value: 'A volatile access happens at exactly the size of the access expression — `*(volatile uint32_t*)addr` is one 32-bit load. The compiler may not split or merge it.' },
+    { label: 'Ordering between volatiles', value: 'Volatile accesses are ordered with respect to each other within a single thread, in program order. They are NOT ordered with respect to non-volatile accesses.' },
+    { label: 'CMSIS pattern', value: 'Every peripheral register in CMSIS headers is typed `__IO uint32_t` which expands to `volatile uint32_t`. Use the CMSIS structs, never raw addresses.' },
+    { label: 'Memory model on Cortex-M', value: 'Device-typed regions (peripherals) enforce ordering at the bus level. Normal memory may reorder. See MPU TEX/C/B / MAIR attributes.' },
+  ]}
+/>
+
+## What volatile actually guarantees
+
+Consider a status-register polling loop, written naively:
+
+```c
+#define UART_SR (*(uint32_t*)0x40004400)
+
+while ((UART_SR & 1) == 0) { /* wait for ready */ }
+```
+
+The compiler reads `UART_SR` once, sees the result has no dependency that changes, and rewrites the loop as:
+
+```c
+uint32_t tmp = UART_SR;
+while ((tmp & 1) == 0) { /* infinite */ }
+```
+
+That's not malicious — it's standard loop-invariant code motion, and it's *correct* under the abstract machine because nothing in the C source says `UART_SR` can change asynchronously. The fix is to tell the compiler that the address is special:
+
+```c
+#define UART_SR (*(volatile uint32_t*)0x40004400)
+```
+
+Now every read of `UART_SR` is an observable side effect. The compiler must emit a `ldr` instruction for each iteration — it can't hoist, fold, or fuse them. The loop polls the hardware on every iteration, as written.
+
+`volatile` is a contract: *every access expression that names a volatile-qualified object becomes a load or store at exactly that width, in program order with other volatile accesses, no more, no less*. The compiler is not allowed to add, remove, reorder (with respect to other volatiles), split, or coalesce these accesses.
+
+<Callout type="warn">
+`volatile` is necessary but not sufficient for hardware access. It controls what the compiler emits; it does not control what the bus, the cache, the write buffer, or the NVIC do. On a Cortex-M7 with caches enabled, a volatile write to a peripheral register can still sit in the write buffer for a few cycles before the peripheral sees it. If you need the peripheral to observe the write before the next instruction, you need a `__DSB()` — or you need the peripheral region to be marked Device memory in the MPU, which enforces ordering at the bus level.
+</Callout>
+
+## What volatile does NOT do
+
+Three common misconceptions, each of which has shipped in real firmware:
+
+**It does not imply atomicity.** A 32-bit volatile read is one `ldr` on ARM, which is naturally atomic. But `flags |= 0x10` on a volatile expands to `ldr; orr; str` — three instructions. An ISR firing between the `ldr` and the `str` and writing the same register loses its update. `volatile` makes the operations happen as written; it does not fuse them.
+
+**It does not insert barriers.** The compiler emits the loads and stores; the bus, cache, and write buffer decide when they're observable. On a Cortex-A or even Cortex-M7 with caches, volatile alone is not enough for cross-core or DMA-shared communication — you need explicit `__DMB`, `__DSB`, or `__ISB` instructions.
+
+**It does not synchronise with other code.** Two threads both reading and writing a volatile variable can still see each other's updates in any order. This is what `_Atomic`, `std::atomic`, or RTOS primitives are for. `volatile` is for hardware, not for inter-thread communication.
+
+The C++ committee made this explicit in C++20: `volatile` for shared variables (not memory-mapped IO) is largely deprecated. The standards body's position is "use `std::atomic` for inter-thread state; use `volatile` only for hardware."
+
+## Why MMIO without volatile is broken
+
+Three failure modes the compiler is allowed to introduce:
+
+1. **Caching a register in a CPU register.** As shown above — read once, reuse. Breaks polling, breaks any loop that depends on hardware changing a value.
+
+2. **Eliminating an "unused" write.** Some peripheral registers have side effects on write — clearing a status flag, triggering a state machine, kicking off a DMA descriptor. If the compiler sees no reader after the write, it can delete the write entirely. Volatile prevents this: even if no one reads the result, the write must happen.
+
+3. **Reordering across non-volatile operations.** Set up a DMA descriptor in normal RAM, then write the "GO" bit in a control register. Without volatile (and without barriers), the compiler may move the GO write before the descriptor setup. The DMA engine starts on a half-initialised descriptor and corrupts memory.
+
+A subtler case: writing the same value twice intentionally. Some peripherals require a write-twice unlock pattern (Watchdog, RCC on STM32, GPIO lock on Kinetis). Without volatile, the compiler treats the second write as redundant and elides it. The unlock never completes, and your "write to a locked register" silently fails.
+
+## Read-modify-write hazards
+
+Even with volatile, an expression like `REG |= MASK` is a hazard on shared registers. It compiles to:
+
+```
+ldr r1, [r0]      ; load REG
+orr r1, r1, #MASK ; set bit
+str r1, [r0]      ; store back
+```
+
+If something else (an ISR, another core, a DMA engine) modifies `REG` between the `ldr` and the `str`, those modifications are lost. The classic example: two ISRs at different priorities both set bits in `NVIC_ISER` (or any shared register). The lower-priority handler does `REG |= BIT_A`; the higher-priority handler preempts in the middle and does `REG |= BIT_B`; when control returns, the lower handler writes back its `ldr` result (which doesn't have BIT_B) and clobbers BIT_B. Mysterious lost interrupts result.
+
+| Mitigation | Cost | Notes |
+|------------|------|-------|
+| Disable IRQs around the RMW (`__disable_irq`) | A few cycles of jitter | Coarse but bulletproof. Works for ISR-vs-thread; not enough for multi-core |
+| Use BASEPRI to mask only kernel-level IRQs | Same | Lets ultra-fast IRQs preempt, at the cost of needing them not to touch the same register |
+| `LDREX`/`STREX` exclusive monitor | ~6 cycles for retry loop | Lock-free; works across cores on M7 dual-core or A-class. Requires the address be in a normal-memory region |
+| Bit-banding (M3/M4 only) | Single instruction, atomic | Per-bit alias region — see next section |
+| Set/clear-only registers (`NVIC_ISER` vs `NVIC_ICER`) | Free, when peripheral provides them | Many peripherals split set and clear into separate registers — writing a 1 sets, writing a 0 has no effect. Atomic by construction |
+
+The set/clear pattern is the cleanest when the peripheral provides it. `NVIC_ISER` writes a 1 to enable; writing 0 does nothing. `NVIC_ICER` writes a 1 to disable. There's no RMW because neither register reads the current state — each is a half of the abstract "enabled" bit, exposed as two write-only paths.
+
+## Bit-banding on Cortex-M3 / M4
+
+Cortex-M3 and M4 ship a clever trick for atomic single-bit access: the **bit-band alias region**. The architecture maps a 1 MB physical region (e.g., `0x20000000`–`0x200FFFFF` SRAM) onto a 32 MB alias region (`0x22000000`–`0x23FFFFFF`), where each 32-bit word in the alias corresponds to a single bit in the physical region. A 32-bit store to the alias rewrites the corresponding bit atomically — without an RMW cycle on the bus.
+
+The mapping formula:
+
+```
+alias_addr = alias_base + ((phys_addr - phys_base) * 32) + (bit * 4)
+```
+
+For SRAM bit-band: phys_base = `0x20000000`, alias_base = `0x22000000`. For peripheral bit-band: phys_base = `0x40000000`, alias_base = `0x42000000`.
+
+A helper:
+
+```c
+#define BITBAND_PERIPH(addr, bit) \
+    ((volatile uint32_t*)(0x42000000 + (((uint32_t)(addr) - 0x40000000) * 32) + ((bit) * 4)))
+
+// Set bit 3 of GPIOA->ODR atomically:
+*BITBAND_PERIPH(&GPIOA->ODR, 3) = 1;
+```
+
+The single store hits the alias, the bus fabric expands it to a hardware RMW on the underlying register, and the result is atomic from the CPU's perspective — no ISR can squeeze in between a "read" and a "write" because the CPU only issued one access.
+
+<Callout type="tip">
+Bit-banding was dropped on Cortex-M7 and never made it to Cortex-M33/M55/M85. The architectural reasoning: cache coherency on M7 made the bit-band alias awkward, and the M-Profile committee judged that the silicon area was better spent elsewhere. On those parts, use `LDREX/STREX` for atomic bit ops, or use peripherals that provide set/clear registers natively.
+</Callout>
+
+## Cortex-M memory model — device vs normal memory
+
+The MPU (and the architectural default memory map for un-MPU-protected addresses) tags each region with attributes. The two that matter for MMIO:
+
+- **Normal memory** — RAM, flash, anything the CPU treats as ordinary data storage. Accesses can be reordered, coalesced, and speculated. Cacheable depending on attributes.
+- **Device memory** — peripheral regions, system control space. Accesses cannot be reordered with respect to each other within the same region. Cannot be coalesced. Cannot be speculated (no prefetch). Not cacheable.
+
+The default memory map marks `0x40000000`–`0x5FFFFFFF` (peripheral space) as Device memory on every Cortex-M. This is why `*REG = 0x1; *REG = 0x2;` to a peripheral always produces two distinct bus writes in the right order — the bus fabric enforces it.
+
+But within a single function that mixes peripheral writes and normal-memory writes, ordering is *not* automatically preserved between them. Setting up a DMA descriptor in RAM (normal memory) and then writing the "go" bit in a peripheral register (device memory) requires a `__DSB()` between the descriptor setup and the trigger:
+
+```c
+dma_descriptor.src = &buf;
+dma_descriptor.dst = &PERIPH->TDR;
+dma_descriptor.count = 64;
+__DSB();                        // ensure descriptor is visible before trigger
+DMA->CHEN |= DMA_CHEN_CH3;      // start channel 3
+```
+
+Without the barrier, the write buffer can hold the RAM stores while the device write goes out — the DMA engine starts on stale or zero-initialised descriptor fields. `__DSB()` drains the write buffer and waits until all preceding memory accesses complete before the next instruction.
+
+## Practical patterns
+
+**Pattern: peripheral struct typed with `volatile`.** Use the CMSIS-supplied headers. Every register field is `__IO uint32_t` (`volatile uint32_t`). Never define your own `#define REG (*(uint32_t*)0x40004400)` — it's missing the qualifier and is a latent bug.
+
+**Pattern: barrier after writing to system control.** After writing `SCB->VTOR`, `SCB->AIRCR`, MPU registers, or NVIC priority/enable, follow with `__DSB(); __ISB();`. The `__ISB()` flushes the pipeline so the next instruction sees the new state.
+
+**Pattern: const-qualified read-only registers.** Some CMSIS headers declare read-only registers as `__I uint32_t` (`volatile const uint32_t`). The `const` prevents accidental writes; the `volatile` keeps each read distinct.
+
+**Pattern: full memory barrier in RMW critical sections.** When you must do a true RMW on a shared register:
+
+```c
+uint32_t primask = __get_PRIMASK();
+__disable_irq();
+REG |= MASK;
+__set_PRIMASK(primask);
+```
+
+The save-and-restore form is composable — a nested critical section won't accidentally re-enable IRQs when it exits.
+
+## Further reading
+
+- [CMSIS — the device abstraction](/docs/programming/cmsis) — how vendor headers declare peripheral registers
+- [Startup & vector table](/docs/programming/startup) — early-boot ordering and MMIO setup
+- [Embedded C patterns](/docs/programming/embedded-c) — the broader idiom set
+- [MPU on Cortex-M](/docs/cortex-m/mpu) — device vs normal memory attributes
+- [Cache coherency on Cortex-M7](/docs/cortex-m/caches) — what `__DSB` actually does in a cached system
+- ISO/IEC 9899:2011 §6.7.3, §5.1.2.3 (sequence points and volatile)

@@ -1,0 +1,148 @@
+---
+title: Infineon AURIX TC3xx and TC4xx
+description: Infineon AURIX — TriCore-based automotive microcontrollers (NOT ARM), ASIL-D capable lockstep, on-chip HSM, used in EV powertrain inverter control and ADAS sensor fusion. Why an ARM-focused reference covers AURIX, and how it pairs with Cortex cores in modern ECUs.
+order: 18
+updated: 2026-05-13
+tags: [vendors, infineon, aurix, tricore, automotive, asil-d, hsm]
+---
+
+AURIX is Infineon's automotive microcontroller line, and the elephant in the room: it is not based on an ARM core. AURIX runs **TriCore** — Infineon's own 32-bit DSP/MCU/RISC three-issue superscalar instruction set, evolved over more than two decades from the original TC1.0 architecture in the late 1990s. So why does an ARM reference site cover it? Because in modern automotive electronics, AURIX is almost always paired with one or more ARM cores — either inside the same ECU on a companion MCU (typically a Cortex-M for IO management or telematics), or directly inside the AURIX itself (the TC4xx integrates a Cortex-M33 next to the TriCore cores), or via inter-ECU communication where the AURIX talks to an ARM-based domain controller. Understanding the AURIX side of the architecture is part of understanding any modern automotive design.
+
+This page is the AURIX overview for ARM-side engineers — what TriCore is, what makes AURIX the dominant automotive safety MCU, where it sits in the topology, and how the ARM cores around it interface.
+
+<SpecSheet
+  title="AURIX at a glance"
+  specs={[
+    { label: 'Core', value: 'TriCore TC1.6.x (TC3xx) / TC1.8.x (TC4xx) — 32-bit, three-issue, fixed-point + floating-point + DSP, NOT an ARM core' },
+    { label: 'TC3xx clock', value: 'Up to 300 MHz; 2–6 TriCore cores per chip, some configurable as lockstep pairs' },
+    { label: 'TC4xx clock', value: 'Up to 500 MHz; 6 cores including a Cortex-M33 alongside TriCore for QM tasks' },
+    { label: 'Flash', value: 'Up to 16 MB Program Flash + 1 MB Data Flash (EEPROM emulation); ECC protected' },
+    { label: 'RAM', value: 'Up to 6 MB SRAM (PSRAM/DSRAM); ECC protected' },
+    { label: 'Functional safety', value: 'ASIL-D ready out of the box — lockstep cores, ECC everywhere, ESM (Error Signaling Module), Safety Manual' },
+    { label: 'HSM', value: 'On-chip Hardware Security Module: dedicated Cortex-M0 (TC3xx) or Cortex-M33 (TC4xx), AES-128, ECC P-256/384, SHA-256, secure key storage' },
+    { label: 'Peripherals', value: 'CAN-FD ×16+, FlexRay, LIN, Ethernet TSN, ADC 12-bit ×100 channels, GTM timer fabric for motor control' },
+    { label: 'Tools', value: 'AURIX Development Studio (Eclipse, free), TASKING VX-toolset, Wind River Diab, GreenHills MULTI' },
+  ]}
+/>
+
+## Why TriCore exists — and why it persists
+
+When Infineon designed TriCore in the late 1990s, the goal was a single ISA that could replace three different chips in a typical ECU: a microcontroller for control flow, a DSP for signal processing (filters, FFTs), and a RISC core for general-purpose code. TriCore's three-issue pipeline could simultaneously execute one MCU-style instruction (load/store/branch), one DSP-style instruction (multiply-accumulate, saturating arithmetic), and one general-purpose ALU instruction. For automotive workloads — engine control, ABS, transmission control — this efficiency was unmatched in 1999 and remained competitive into the 2010s.
+
+Why is TriCore still selling in 2026 when ARM dominates everywhere else? Three reasons:
+
+1. **Functional safety pedigree.** ASIL-D-certifiable hardware needs lockstep cores, ECC, BIST, fail-safe error reporting, and a documented safety manual. Infineon has invested decades in AURIX's safety architecture and the supporting tooling (Safety Manuals, hazard analysis, FMEDA reports). Replicating this on a new architecture is years of work.
+2. **Vehicle programs are long.** A new powertrain ECU enters development 4–6 years before SOP (Start of Production), then ships for 7–15 years. An OEM with AURIX-based ECU designs in their A-line, B-line, and C-line vehicles will not retool to ARM unless the silicon, tooling, and AUTOSAR support match what they have. Risk is enormous.
+3. **AURIX-specific peripherals.** The GTM (Generic Timer Module) is a programmable PWM/capture/output controller specialised for engine timing and motor control — generating crank-synchronous outputs, advanced motor PWM patterns, sensor capture with sub-CPU-clock resolution. The GTM is its own programmable engine, attached to TriCore via a peripheral bus. Migrating to an ARM-based MCU means losing the GTM and replicating its function in software or external silicon.
+
+## TriCore vs Cortex — a quick comparison
+
+| Aspect | TriCore (TC1.6.x) | Cortex-M7 |
+|--------|-------------------|-----------|
+| Width | 32-bit | 32-bit |
+| Pipeline | 3-issue superscalar in-order | 2-issue superscalar in-order |
+| Instructions per cycle (peak) | 3 | 2 |
+| FPU | Single + double precision | Single + (optional) double |
+| DSP | MAC + saturating arithmetic + zero-overhead loops | DSP ext (SIMD on 32-bit registers) |
+| Cache | L1 I+D, 32 KB typical | L1 I+D, configurable |
+| Tightly-coupled RAM | Yes (PSPR / DSPR) | Yes (ITCM / DTCM) |
+| Interrupts | 256 prio levels, fast context save (CSA) | 8/16 bits priority, automatic stacking |
+| Safety | Native lockstep | ARM offers v8-M lockstep on M7-lockstep variants |
+| ISA license | Infineon proprietary | ARM licensed |
+| Tooling | TASKING, GCC-tricore, Wind River, GreenHills | Vast: GCC, Keil, IAR, LLVM, vendor IDEs |
+| Workforce skill | Niche — TriCore-specific | Broad — Cortex-M skill is universal |
+
+The pipeline is where TriCore earns its keep on automotive workloads. A typical engine-control inner loop can execute one fixed-point multiply-accumulate (for the air-mass calculation), one load (next data sample), and one branch (loop control) in a single cycle. Cortex-M7 manages two of three. Over a 10 ms cycle on a 6-cylinder engine running at 6000 RPM, the difference adds up.
+
+<BlockDiagram title="AURIX TC3xx top-level layout" width={820} height={360} nodes={[
+  { id: 'tc0',  x: 30,  y: 30,  w: 200, h: 60, kind: 'core',     label: 'TriCore #0', detail: 'lockstep master · safety' },
+  { id: 'tc1',  x: 30,  y: 100, w: 200, h: 60, kind: 'core',     label: 'TriCore #1', detail: 'lockstep checker' },
+  { id: 'tc2',  x: 30,  y: 170, w: 200, h: 60, kind: 'core',     label: 'TriCore #2-5', detail: 'performance / QM' },
+  { id: 'lock', x: 260, y: 65,  w: 160, h: 60, kind: 'security', label: 'Lockstep checker', detail: 'mismatch -> fault' },
+  { id: 'hsm',  x: 260, y: 170, w: 160, h: 60, kind: 'security', label: 'HSM (Cortex-M0)', detail: 'AES, ECC, key store' },
+  { id: 'flash',x: 450, y: 30,  w: 170, h: 60, kind: 'storage',  label: 'PFlash 16 MB', detail: 'ECC + lifecycle' },
+  { id: 'ram',  x: 450, y: 100, w: 170, h: 60, kind: 'memory',   label: 'SRAM 6 MB', detail: 'ECC + parity' },
+  { id: 'gtm',  x: 450, y: 170, w: 170, h: 60, kind: 'accel',    label: 'GTM timer fabric', detail: 'crank-sync PWM, capture' },
+  { id: 'can',  x: 640, y: 30,  w: 150, h: 60, kind: 'io',       label: 'CAN-FD x16+', detail: 'plus FlexRay / LIN' },
+  { id: 'eth',  x: 640, y: 100, w: 150, h: 60, kind: 'io',       label: 'Ethernet TSN', detail: 'gateway role' },
+  { id: 'esm',  x: 640, y: 170, w: 150, h: 60, kind: 'security', label: 'ESM + wdg', detail: 'error signaling, BIST' },
+]} edges={[
+  { from: 'tc0', to: 'lock', tone: 'success' },
+  { from: 'tc1', to: 'lock', tone: 'success' },
+  { from: 'lock', to: 'esm', label: 'fault pin', tone: 'destructive' },
+  { from: 'tc0', to: 'flash', tone: 'primary' },
+  { from: 'tc2', to: 'gtm', label: 'motor / engine', tone: 'accent' },
+  { from: 'tc0', to: 'hsm', tone: 'warning' },
+  { from: 'tc2', to: 'can', tone: 'default' },
+  { from: 'tc2', to: 'eth', tone: 'default' },
+]} caption="AURIX pairs two TriCores in lockstep for ASIL-D control, leaves the other cores free for QM workloads, and exposes the GTM timer fabric plus a Cortex-M0 HSM all behind ECC-protected flash and SRAM — the combination is what kept TriCore selling against ARM in safety-critical powertrain." />
+
+## ASIL-D safety architecture
+
+The TC3xx and TC4xx are designed for ISO 26262 ASIL-D compliance at the chip level. The mechanisms:
+
+**Lockstep cores.** Two physical TriCore cores execute the same code in parallel with a few cycles of delay (delayed by the safety logic to break common-cause failures). Their results are compared cycle-by-cycle by an ESM (Error Signaling Module). Any mismatch raises a fault interrupt and (configurably) drives the safety output pins to a defined state.
+
+**ECC on all memory.** Single-bit errors corrected, double-bit errors raise faults. Flash, SRAM, cache, register file — all protected.
+
+**BIST.** Memory BIST and logic BIST run at startup; logic BIST is configurable to run periodically during operation (e.g. every 100 ms) without disrupting application execution.
+
+**Safety Manager.** A separate hardware block monitoring the cores, watchdogs, voltage supervisors, and clock monitors. If anything goes wrong, the Safety Manager takes the chip to a defined "safe state" (typically all outputs to a configured safe pattern, then halt or reset).
+
+**Documented diagnostic coverage.** The chip's safety manual quantifies, for each potential fault, the probability of detection. ASIL-D requires ≥99% single-point fault metric and ≥90% latent fault metric. AURIX hits both with the documented diagnostic measures enabled.
+
+For a vehicle program, this matters because the safety case can lean heavily on the chip's documented coverage. With a non-ASIL-D chip, the same coverage has to be demonstrated through software (running BIST yourself, parallel computations to compare, etc.), which costs MIPS and engineer-hours.
+
+## HSM — and the ARM core inside AURIX
+
+Every AURIX has an on-die **HSM (Hardware Security Module)** — a separate processor with its own Flash, RAM, and crypto accelerators, isolated from the application TriCore cores by a hardware firewall. On TC3xx the HSM is a Cortex-M0; on TC4xx it's been upgraded to a Cortex-M33.
+
+The HSM holds keys for:
+
+- **Secure boot** of the application TriCore image (signature verification before TriCore is released from reset).
+- **SecOC** (Secure Onboard Communication) — message authentication for AUTOSAR CAN/CAN-FD/Ethernet payloads. Every safety-relevant CAN message carries a 4-byte CMAC; HSM computes/verifies it line-rate.
+- **Diagnostic security** — UDS Security Access (Service 0x27) uses HSM-protected keys.
+- **OTA verification** — incoming firmware update images are signed; HSM verifies before authorising flash erase/program.
+- **Vehicle-to-X cryptography** — V2X messages signed with ECDSA-256; HSM does the signing per the IEEE 1609.2 standard.
+
+The HSM has its own firmware, supplied by Infineon (HSE / Crypto Driver). It is updateable over its own DFU mechanism. From the TriCore application perspective, you call HSM functions through a documented API (PSI5 / IPC); the HSM runs the crypto and returns results.
+
+This is the ARM-in-AURIX story: from 2024 onward (TC4xx generation), there is *always* a Cortex-M33 inside, running cryptographic services for the TriCore application cores around it. The two architectures coexist on one die.
+
+<Callout type="note">
+TC4xx goes further: alongside the lockstep TriCore safety cores and the Cortex-M33 HSM, it adds a non-safety Cortex-M33 application core for QM (Quality Managed, no ASIL) workloads — typically connectivity, OTA management, and diagnostics. The TriCore cores handle safety-critical control; the M33 handles everything else. This three-architecture chip (TriCore + M33 QM + M33 HSM) is the future direction of high-end automotive MCUs.
+</Callout>
+
+## Where AURIX lives in a modern vehicle
+
+Typical ECU populations using AURIX:
+
+- **EV traction inverter control** — controls the IGBT/SiC gate drivers, runs FOC for the traction motor at 10–20 kHz, manages battery interface. ASIL-D required because uncontrolled torque is a hazard. TC3xx with 2 TriCore cores in lockstep + HSM.
+- **Battery management system (HV BMS)** — manages cell balancing, contactor sequencing, thermal control. ASIL-C/D.
+- **Brake control / ABS / ESC** — ASIL-D, lockstep mandatory.
+- **EPS (Electric Power Steering)** — ASIL-D for the torque control loop.
+- **Domain controller / Vehicle Control Unit** — coordinates multiple subsystems, gateways CAN/Ethernet/SOME-IP. TC4xx with 4–6 cores.
+- **ADAS sensor fusion ECU** — combines radar, LiDAR, camera; runs object tracking and prediction. TC4xx + external NPU (Mobileye, NVIDIA Orin) for the AI inference part.
+
+A modern luxury car has 50–80 ECUs; AURIX-based ones occupy the safety-critical and powertrain niches. ARM-based ECUs (Renesas RH850, NXP S32K, ST SPC58) compete in body-control, telematics, and infotainment.
+
+## Toolchain
+
+AURIX is supported by:
+
+- **AURIX Development Studio** — Infineon's free Eclipse-based IDE. Bundles GCC-TriCore, OpenOCD, FreeRTOS examples.
+- **TASKING VX-toolset for TriCore** — the dominant commercial compiler, used in most production automotive programs. ASIL-D-qualified.
+- **HighTec free GCC-TriCore** — open-source compiler, comparable performance to TASKING for most workloads.
+- **Wind River Diab Compiler** — commercial, ASIL-D-qualified, used in some legacy programs.
+- **AUTOSAR Classic** stacks from Vector (MICROSAR), EB tresos, ETAS RTA-CAR — all support AURIX as a primary target. Most production AURIX firmware runs on AUTOSAR; see the [AUTOSAR page](/docs/systems/autosar) for the framework architecture.
+
+The TriCore knowledge is the barrier to entry. There aren't many engineers fluent in TriCore assembly, the CSA (Context Save Area) ISR mechanism, or the GTM programming model. Tier-1 suppliers staff teams that specialise in AURIX; for a startup or a non-traditional automotive player, the learning curve is steep enough that an ARM-based path (Renesas RH850 or NXP S32K with ASIL-D capability) may be the practical alternative.
+
+## Cross-references
+
+- [AUTOSAR](/docs/systems/autosar) — the software framework running on most AURIX ECUs.
+- [EV charger power](/docs/systems/ev-charger-power) — adjacent system where AURIX appears (DC-side ECU).
+- [Motor FOC](/docs/systems/motor-foc) — algorithm AURIX runs on the inverter.
+- [TI Sitara](/docs/vendors/ti-sitara) — alternative for non-safety industrial control.
+- Infineon AURIX TC3xx / TC4xx Family User Manuals (large multi-volume documents; start with the Safety Manual).
+- Infineon AP32260 — "Migration from TC2xx to TC3xx" application note.

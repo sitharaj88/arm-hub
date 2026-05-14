@@ -1,0 +1,235 @@
+---
+title: GIC — Generic Interrupt Controller
+description: How interrupts are routed on Cortex-A — GICv2 vs v3 vs v4, SGI/PPI/SPI/LPI classes, distributor + redistributor + CPU interface, affinity routing, priority/preemption rules, and the EOI/active-priority stack.
+order: 3
+updated: 2026-05-13
+tags: [cortex-a, gic, interrupts, irq, its, lpi]
+---
+
+Every Cortex-A SoC ships with a Generic Interrupt Controller (GIC) — the ARM-specified IP that aggregates interrupt sources from across the chip, prioritizes them, and routes them to one or more CPUs. The GIC is the Cortex-A counterpart of the Cortex-M NVIC, but its problem space is harder: many cores instead of one, virtualization that needs to inject interrupts directly into guests, and PCIe-style message-signaled interrupts that don't map cleanly to wired SPIs.
+
+This page covers the three GIC architecture revisions you'll meet in the field — v2, v3, and v4 — what each one adds, how the four interrupt classes (SGI, PPI, SPI, LPI) differ, and the register-level mechanics of priority, preemption, and end-of-interrupt.
+
+<SpecSheet
+  title="GIC architecture overview"
+  specs={[
+    { label: 'GICv2', value: 'Cortex-A7/A9/A15. Up to 8 CPUs, 1020 SPIs. Memory-mapped CPU interface. No LPI or ITS.' },
+    { label: 'GICv3', value: 'Cortex-A53/A57/A72/A76. Affinity routing (>8 CPUs), system-register CPU interface, LPIs + ITS for MSI-style interrupts.' },
+    { label: 'GICv4 / v4.1', value: 'Adds direct vLPI injection — interrupts delivered straight to a running guest VM without hypervisor trap.' },
+    { label: 'Interrupt ID space', value: 'SGI 0–15, PPI 16–31, SPI 32–1019, LPI ≥8192 (in v3+)' },
+    { label: 'Priority bits', value: 'Typically 5 or 7 implemented bits; lower numeric value = higher priority' },
+    { label: 'Components', value: 'Distributor (GICD), Redistributors (GICR, one per CPU in v3), CPU Interface (GICC v2 or system regs v3+), optional ITS' },
+    { label: 'Linux driver', value: 'irq-gic.c (v2), irq-gic-v3.c (v3/v4) — bound via device tree or ACPI MADT' },
+  ]}
+/>
+
+## The four interrupt classes
+
+GIC organizes interrupts into four classes, each with different routing rules:
+
+**SGI — Software Generated Interrupt (IDs 0–15).** Used for inter-processor interrupts. CPU A writes to a GIC register specifying "send SGI 5 to CPU B and CPU C," and the GIC pends SGI 5 on those CPUs. Linux uses SGIs for IPI (rescheduling, TLB shootdown, function-call invocation across cores) and KVM uses them for vCPU wakeups.
+
+**PPI — Private Peripheral Interrupt (IDs 16–31).** Per-CPU interrupts where each CPU has its own instance of the same logical IRQ. The generic timer, the per-CPU performance monitoring overflow, and the per-CPU watchdog all use PPIs. PPI 30 on CPU 0 and PPI 30 on CPU 1 are independent — different signal lines.
+
+**SPI — Shared Peripheral Interrupt (IDs 32–1019).** Wired interrupts from shared hardware — UART, Ethernet MAC, GPU, DMA controller. The distributor decides which CPU services each pending SPI based on `GICD_ITARGETSRn` (v2) or `GICD_IROUTERn` (v3, affinity-routed).
+
+**LPI — Locality-specific Peripheral Interrupt (v3+, IDs ≥8192).** Message-signaled interrupts. A PCIe device writes a 4-byte value to a GIC-defined doorbell address; the GIC's ITS (Interrupt Translation Service) looks up the (device, EventID) pair and translates it to an LPI for a specific CPU. LPIs are the GIC's answer to PCIe MSI/MSI-X.
+
+## The components
+
+A GIC implementation has three or four pieces:
+
+**Distributor (GICD)** — One per system. The "switch board" that sees all SPI interrupt sources, prioritizes them, and forwards the highest-priority pending one to the appropriate CPU interface. It also holds the enable, pending, active, and priority bits for every SPI and SGI.
+
+**Redistributor (GICR)** — One per CPU in v3+. Handles per-CPU state: PPIs, SGIs, LPI configuration tables, and the affinity-routing metadata. In GICv2 these per-CPU registers live in the Distributor instead.
+
+**CPU Interface (GICC v2, or system registers in v3+)** — One per CPU. The CPU reads pending interrupt IDs here and writes EOI here. In v2 it's a memory-mapped register block; in v3+ it moved to system registers (`ICC_IAR1_EL1`, `ICC_EOIR1_EL1`, etc.) to halve the read latency.
+
+**ITS — Interrupt Translation Service (v3+, optional)** — Translates a device's write to a doorbell + EventID into an LPI for a specific (Redistributor, ICID) pair. Holds device tables and interrupt translation tables in RAM.
+
+```
+   ┌──────────┐  ┌──────────┐
+   │  Device  │  │  Device  │  ... SPI lines
+   └────┬─────┘  └────┬─────┘
+        │             │
+        ▼             ▼
+   ┌─────────────────────────┐
+   │     Distributor         │  GICD — global state
+   └──┬──────────────┬───────┘
+      │              │
+      ▼              ▼
+ ┌─────────┐    ┌─────────┐
+ │ GICR 0  │    │ GICR 1  │   per-CPU
+ │ + LPI   │    │ + LPI   │
+ └────┬────┘    └────┬────┘
+      │              │
+      ▼              ▼
+ ┌─────────┐    ┌─────────┐
+ │ CPU 0   │    │ CPU 1   │   sysregs: ICC_*
+ └─────────┘    └─────────┘
+                              ┌───────────┐
+                              │   ITS     │ ← PCIe MSI writes
+                              │ (LPI xlt) │
+                              └─────────┘
+```
+
+<BlockDiagram
+  title="GICv3 topology — sources, distributor, redistributors, CPU interfaces"
+  width={780}
+  height={440}
+  nodes={[
+    { id: 'sgi',   x: 30,  y: 30,  w: 180, h: 50, kind: 'sensor',  label: 'SGI sources', detail: 'IPI from other CPUs (IDs 0–15)' },
+    { id: 'ppi',   x: 30,  y: 100, w: 180, h: 50, kind: 'sensor',  label: 'PPI sources', detail: 'per-CPU timer, PMU (16–31)' },
+    { id: 'spi',   x: 30,  y: 170, w: 180, h: 50, kind: 'sensor',  label: 'SPI sources', detail: 'wired peripherals (32–1019)' },
+    { id: 'lpi',   x: 30,  y: 240, w: 180, h: 50, kind: 'sensor',  label: 'LPI / MSI sources', detail: 'PCIe doorbell writes' },
+    { id: 'its',   x: 30,  y: 310, w: 180, h: 50, kind: 'periph',  label: 'ITS', detail: 'LPI translation tables' },
+    { id: 'gicd',  x: 280, y: 130, w: 220, h: 90, kind: 'core',    label: 'Distributor (GICD)', detail: 'priority, IRM, affinity routing' },
+    { id: 'gicr0', x: 560, y: 30,  w: 190, h: 50, kind: 'periph',  label: 'Redistributor 0', detail: 'PPIs, LPI tables' },
+    { id: 'gicr1', x: 560, y: 100, w: 190, h: 50, kind: 'periph',  label: 'Redistributor 1' },
+    { id: 'gicr2', x: 560, y: 170, w: 190, h: 50, kind: 'periph',  label: 'Redistributor 2' },
+    { id: 'gicr3', x: 560, y: 240, w: 190, h: 50, kind: 'periph',  label: 'Redistributor 3' },
+    { id: 'cpu0',  x: 560, y: 320, w: 40,  h: 50, kind: 'core',    label: 'C0' },
+    { id: 'cpu1',  x: 610, y: 320, w: 40,  h: 50, kind: 'core',    label: 'C1' },
+    { id: 'cpu2',  x: 660, y: 320, w: 40,  h: 50, kind: 'core',    label: 'C2' },
+    { id: 'cpu3',  x: 710, y: 320, w: 40,  h: 50, kind: 'core',    label: 'C3' },
+    { id: 'iface', x: 560, y: 385, w: 190, h: 40, kind: 'periph',  label: 'ICC_* sysreg interfaces' },
+  ]}
+  edges={[
+    { from: 'spi', to: 'gicd', label: 'wired' },
+    { from: 'sgi', to: 'gicd' },
+    { from: 'ppi', to: 'gicd' },
+    { from: 'lpi', to: 'its', label: 'MSI write' },
+    { from: 'its', to: 'gicr0', label: 'translated LPI', tone: 'accent' },
+    { from: 'its', to: 'gicr1', tone: 'accent' },
+    { from: 'gicd', to: 'gicr0', tone: 'primary' },
+    { from: 'gicd', to: 'gicr1', tone: 'primary' },
+    { from: 'gicd', to: 'gicr2', tone: 'primary' },
+    { from: 'gicd', to: 'gicr3', tone: 'primary' },
+    { from: 'gicr0', to: 'cpu0', tone: 'success', arrow: 'both' },
+    { from: 'gicr1', to: 'cpu1', tone: 'success', arrow: 'both' },
+    { from: 'gicr2', to: 'cpu2', tone: 'success', arrow: 'both' },
+    { from: 'gicr3', to: 'cpu3', tone: 'success', arrow: 'both' },
+    { from: 'cpu0', to: 'iface' }, { from: 'cpu1', to: 'iface' },
+    { from: 'cpu2', to: 'iface' }, { from: 'cpu3', to: 'iface' },
+  ]}
+  caption="SGI, PPI, SPI, and translated-LPI sources funnel through the Distributor; one Redistributor per core handles per-CPU state and presents the IRQ to the core via the ICC system-register CPU interface."
+/>
+
+## Affinity routing (v3+)
+
+GICv2 used an 8-bit CPU target mask in `GICD_ITARGETSR` — limited to 8 CPUs. GICv3 replaced this with **affinity routing**: each SPI's target is a hierarchical 4-level address `<Aff3>.<Aff2>.<Aff1>.<Aff0>` matching the MPIDR_EL1 affinity of the destination CPU. This scales to thousands of cores in principle.
+
+The router config is in `GICD_IROUTERn` (one register per SPI):
+
+| Bits | Field | Meaning |
+|------|-------|---------|
+| 63:40 | reserved | — |
+| 39:32 | Aff3 | Level-3 affinity (typically NUMA node or socket) |
+| 31:24 | Aff2 | Level-2 affinity (typically cluster) |
+| 23:16 | Aff1 | Level-1 affinity (typically core complex) |
+| 7:0 | Aff0 | Level-0 affinity (typically core within cluster) |
+| 31 | IRM | Interrupt Routing Mode: 0 = target specific CPU, 1 = any CPU |
+
+`IRM = 1` lets the distributor pick any CPU based on which is least busy or has the lowest priority — useful for high-throughput interrupts like network RX. `IRM = 0` pins the SPI to one specific CPU — useful for affinity-sensitive workloads.
+
+GICv2 systems boot Linux with a flat numbering scheme; GICv3 systems pass per-CPU `redistributor-stride` and affinity values via DT or ACPI.
+
+## Priority and preemption
+
+Each interrupt has a priority byte in `GICD_IPRIORITYRn` (similar to NVIC priority bytes on Cortex-M). The GIC implements typically 5 or 7 priority bits — vendor-defined — with 0 highest and 0xFF lowest. The unimplemented low bits are RAZ/WI.
+
+Two thresholds gate interrupt delivery:
+
+**Priority Mask (`ICC_PMR_EL1`)** — only interrupts with priority value strictly less than PMR are delivered. Linux sets PMR = 0xF0 by default (allowing all priorities < 0xF0). Setting PMR = 0 blocks everything.
+
+**Running Priority** — the priority of the currently-active interrupt. Only interrupts of strictly higher priority (lower numeric value) can preempt it. Stored in the GIC's internal "active priority register" stack.
+
+When a CPU has an active IRQ at priority 0x40 and SPI 50 at priority 0x30 becomes pending, the GIC signals the CPU; the CPU takes the new IRQ, pushes the old running priority (0x40) onto its active-priority stack, and runs the new handler at priority 0x30. On EOI, the popped value (0x40) becomes the new running priority. This gives proper LIFO nesting.
+
+The active-priority stack has limited depth (typically 8 or 16 entries — `ICC_AP1R0_EL1` etc.). Excessive nesting can overflow the stack and lose priority information; Linux uses 7 or so distinct priority levels for normal use to stay well below the limit.
+
+<Callout type="tip">
+The GIC's priority scheme is logically identical to NVIC's preempt/sub-priority split, but the GIC implements it differently: there's no `PRIGROUP`-style subdivision. All implemented bits are preempt bits. If you want "same priority, ordered by arrival" semantics, you just give two IRQs the exact same priority byte.
+</Callout>
+
+## End-of-interrupt — IAR and EOIR
+
+A typical handler entry sequence on GICv3:
+
+```asm
+    mrs x0, icc_iar1_el1     // read Interrupt Acknowledge — returns pending IRQ ID
+    cmp x0, #1023            // spurious if 1023
+    b.eq spurious
+    // ... dispatch by IRQ ID ...
+    msr icc_eoir1_el1, x0    // signal End of Interrupt
+```
+
+`IAR` reads pop the highest-priority pending IRQ, mark it as active, push the previous running priority onto the active-priority stack, and return the IRQ ID. If no IRQ is pending (shouldn't happen, but races allow it), `IAR` returns 1023 (the "spurious" ID).
+
+`EOIR` writes clear the active state and pop the priority stack. There's an alternative split mode (`EOImode=1`) where `EOIR1` only drops priority and a separate `ICC_DIR_EL1` write deactivates the IRQ — used by KVM so the hypervisor can deactivate after re-injecting to the guest.
+
+Mismatched IAR/EOIR pairs corrupt the priority stack. A handler that reads IAR twice without writing EOIR will push two priorities and pop none — bound to overflow eventually.
+
+## LPI and the ITS
+
+LPIs are how GICv3+ handles PCIe MSI/MSI-X. The flow:
+
+1. Driver allocates an MSI: kernel asks the ITS to allocate a (DeviceID, EventID) → (Redistributor, LPI-number) mapping.
+2. Driver configures the PCIe device with the doorbell address (`GITS_TRANSLATER` register MMIO address) and the EventID to write.
+3. Device generates an interrupt by writing EventID to the doorbell.
+4. ITS looks up the (DeviceID, EventID) in its tables (in DRAM), translates to a Redistributor + LPI ID, and signals the target CPU's Redistributor.
+5. Redistributor pends the LPI, and the CPU's GIC system registers see it on the next `IAR` read.
+
+The ITS tables — Device Table, Collection Table, Interrupt Translation Tables — are managed by Linux's `its-pci-msi` driver via ITS commands (`MAPD`, `MAPC`, `MAPTI`, `INV`, `SYNC`). Configuration changes go through the ITS command queue, a ring buffer in RAM that the ITS hardware polls.
+
+GICv4 extends this: the ITS can be told that a particular LPI is associated with a vGIC of a running VM, and the LPI is then **directly injected into the guest's vGIC** without trapping to the hypervisor. KVM uses this for PCIe pass-through devices in VMs.
+
+<Callout type="warn">
+ITS configuration is order-sensitive. You must `MAPD` (map device) before `MAPTI` (map translation), and any change to a Device Table entry needs `INV`+`SYNC` to invalidate caches. Driver bugs that skip the sync produce mysterious "interrupts to the wrong CPU" symptoms. The full sequence is in the ARM GICv3 specification appendix.
+</Callout>
+
+## Virtualization — vGIC
+
+For VMs, the GIC provides a virtual CPU interface (`ICH_*` system registers in v3) that lets the hypervisor inject virtual interrupts into the guest. The guest's IAR reads come from a *List Register* (`ICH_LR<n>_EL2`) — the hypervisor populates these before resuming the guest, and the guest sees them as real interrupts.
+
+For SGIs between vCPUs, the hypervisor traps the guest's `SGI1R_EL1` write, decides which vCPU to deliver to, and injects via a List Register. For SPI passthrough (a real PCIe device assigned to the VM), the GIC-ITS in GICv4 can short-circuit this and deliver directly.
+
+The performance difference between v3 and v4 for VMs with heavy I/O can be 2-3x, because every interrupt avoids two world switches.
+
+## Linux usage patterns
+
+Linux on AArch64 sets up the GIC during early boot via DT or ACPI:
+
+```dts
+gic: interrupt-controller@8000000 {
+    compatible = "arm,gic-v3";
+    #interrupt-cells = <3>;     // <type, id, flags>
+    #address-cells = <2>;
+    #size-cells = <2>;
+    interrupt-controller;
+    reg = <0x00 0x08000000 0 0x10000>,   // GICD
+          <0x00 0x080a0000 0 0xf60000>;  // GICR (stride per CPU)
+    interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH>;
+};
+```
+
+The `interrupts` triple in each device's DT node is `<type, id, flags>`: type 0 = SPI, 1 = PPI, 2 = SGI, 3 = extended. The driver framework converts to Linux IRQ numbers via `irq_domain`.
+
+`/proc/interrupts` on a typical server shows the breakdown:
+```
+           CPU0       CPU1       CPU2       CPU3
+ 27:    1052345     923456     891234     945123   GICv3  30 Level     arch_timer    (PPI)
+ 30:          0     123456          0          0   GICv3  47 Level     eth0          (SPI)
+ LOC:          0          0          0          0   Local timer interrupts
+ RES:    234567     245678     223456     267890   Rescheduling interrupts            (SGI)
+```
+
+PPIs show up on every CPU (one count per CPU), SPIs on whichever CPU was targeted, SGIs (RES, CAL, etc.) on every CPU as the IPI traffic dictates.
+
+## Cross-references
+
+- [SMP & cache coherency](/docs/cortex-a/smp) — IPI and TLB shootdown using SGIs
+- [Virtualization & EL2](/docs/cortex-a/virtualization) — vGIC and direct vLPI injection
+- [NVIC priority on Cortex-M](/docs/cortex-m/nvic-priority) — comparable priority model on a simpler scale
+- ARM GICv3/v4 Architecture Specification (IHI 0069)
+- Linux source: `drivers/irqchip/irq-gic-v3.c`, `irq-gic-v3-its.c`

@@ -1,0 +1,166 @@
+---
+title: TI Sitara — AM62x, AM64x, AM243x
+description: Texas Instruments Sitara processor family — Cortex-A53 / Cortex-R5F / Cortex-M4F heterogeneous SoCs. AM62x for HMI and edge AI, AM64x for industrial fieldbus, AM243x as full-R5 safety controller. PRU, Linux + RTOS split.
+order: 17
+updated: 2026-05-13
+tags: [vendors, ti, sitara, am62x, am64x, am243x, cortex-a53, cortex-r5f, ethercat, profinet]
+---
+
+TI's Sitara line is the heterogeneous-MCU answer for industrial control and edge computing — Cortex-A53 application processors running Linux paired with Cortex-R5F real-time cores running an RTOS, plus Cortex-M4F sub-systems for safety / IO management, plus the unique PRU (Programmable Real-time Unit) for hard real-time IO. The combination targets a niche STM32 and i.MX don't address well: products that need Linux for a user interface or cloud connectivity *and* hard real-time control of motors, fieldbus, or safety-critical IO, on a single SoC.
+
+AM62x (HMI / edge AI), AM64x (industrial communication), and AM243x (full real-time, no Linux) are the current generation. They replace the older AM335x ("BeagleBone") and AM437x families. This page covers the architecture, the role of each core, the industrial-communication advantages, and where Sitara wins versus a 2-chip Linux-SoC + MCU design.
+
+<SpecSheet
+  title="Sitara family at a glance"
+  specs={[
+    { label: 'AM62x', value: 'Up to 4× Cortex-A53 @ 1.4 GHz + Cortex-M4F @ 400 MHz; 3D GPU (Imagination IMG BXS-4-64), display, DSI/LVDS; LPDDR4 up to 4 GB' },
+    { label: 'AM64x', value: '2× Cortex-A53 @ 1 GHz + 4× Cortex-R5F @ 800 MHz + Cortex-M4F + 2× PRU subsystems; industrial Ethernet, EtherCAT, PROFINET' },
+    { label: 'AM243x', value: '4× Cortex-R5F @ 800 MHz + Cortex-M4F + 2× PRU; no Cortex-A; pure RTOS / functional-safety controller' },
+    { label: 'AM62A (AI variant)', value: 'AM62 with C7x DSP + MMA matrix accelerator for 8 TOPS edge inference' },
+    { label: 'Process', value: 'AM62x: 16 nm FinFET; AM64x/AM243x: 16 nm FinFET' },
+    { label: 'Power', value: 'AM62x: 1–3 W typical at full Linux; AM243x: ~500 mW typical' },
+    { label: 'Boot', value: 'ROM bootloader → SPL → U-Boot → Linux (AM62/AM64) or → R5 firmware (AM243); HSM verifies signed boot chain' },
+    { label: 'Functional safety', value: 'AM243x SafeTI ASIL-D-ready; lockstep R5F pairs, ECC on memory, BIST' },
+    { label: 'Tooling', value: 'Code Composer Studio (CCS) for R5/M4, Yocto / Buildroot for A53 Linux, MCU+ SDK, Processor SDK Linux' },
+  ]}
+/>
+
+## AM62x — HMI and edge AI
+
+AM62x is the Linux-application-class member. 4× Cortex-A53 at 1.4 GHz, an IMG GPU good for 720p / 1080p UI rendering, MIPI-DSI and LVDS display, dual MIPI-CSI camera input, gigabit Ethernet, USB 3.0, CAN-FD, and one Cortex-M4F sub-system for low-level IO and safety functions.
+
+The defining use case is a sub-$10 Linux SBC class chip that competes with Raspberry Pi RP1 / BCM2835 derivatives, with the advantage of TI's industrial-grade longevity (10+ year availability commitment) and proper functional-safety pedigree. Applications:
+
+- **Industrial HMI panels** — 7" to 15" touch panels running Qt-based UIs.
+- **Building automation gateways** — Modbus / BACnet / KNX bridge to MQTT / OPC UA cloud.
+- **Edge AI inference** (AM62A variant) — camera + matrix accelerator for vision inference at the edge.
+- **EV charge controllers** — HMI + PLC communication + cloud reporting.
+- **Medical imaging displays** — high-rel display panels for radiology / ultrasound carts.
+
+The M4F sub-system is what differentiates AM62 from a pure Linux SBC. Connected to the always-on power domain, the M4F runs IO management — debouncing buttons, reading the rotary encoder, controlling LEDs, watching the watchdog — while Linux is rebooting or upgrading. Linux talks to the M4F via shared memory + IPC. From the user's perspective, the UI never freezes during a software update because the M4F is keeping the system responsive.
+
+<BlockDiagram title="AM62x heterogeneous SoC" width={820} height={380} nodes={[
+  { id: 'a53',  x: 30,  y: 30,  w: 240, h: 80, kind: 'core',     label: 'Cortex-A53 x4', detail: '1.4 GHz · Linux · UI / cloud' },
+  { id: 'r5',   x: 300, y: 30,  w: 240, h: 80, kind: 'core',     label: 'Cortex-R5F', detail: '800 MHz · MCU+ SDK · real-time' },
+  { id: 'm4',   x: 570, y: 30,  w: 220, h: 80, kind: 'core',     label: 'Cortex-M4F', detail: '400 MHz · always-on IO / safety' },
+  { id: 'pru',  x: 30,  y: 130, w: 240, h: 70, kind: 'accel',    label: 'PRU subsystem', detail: '333 MHz · single-cycle GPIO' },
+  { id: 'gpu',  x: 300, y: 130, w: 240, h: 70, kind: 'accel',    label: 'IMG BXS-4-64 GPU', detail: '3D + UI rendering' },
+  { id: 'ddr',  x: 570, y: 130, w: 220, h: 70, kind: 'memory',   label: 'LPDDR4', detail: 'up to 4 GB shared' },
+  { id: 'sec',  x: 30,  y: 220, w: 240, h: 70, kind: 'security', label: 'DM + HSM', detail: 'signed boot · key store' },
+  { id: 'eth',  x: 300, y: 220, w: 240, h: 70, kind: 'io',       label: 'GbE TSN + CAN-FD', detail: 'industrial fieldbus' },
+  { id: 'disp', x: 570, y: 220, w: 220, h: 70, kind: 'periph',   label: 'DSI / LVDS / CSI', detail: 'panels + cameras' },
+  { id: 'ipc',  x: 300, y: 305, w: 240, h: 50, kind: 'security', label: 'IPC mailbox + shared RAM', detail: 'A53 <-> R5/M4' },
+]} edges={[
+  { from: 'a53', to: 'ddr', tone: 'primary' },
+  { from: 'r5', to: 'ddr', tone: 'accent' },
+  { from: 'm4', to: 'sec', tone: 'warning' },
+  { from: 'a53', to: 'ipc', tone: 'success' },
+  { from: 'r5', to: 'ipc', tone: 'success' },
+  { from: 'm4', to: 'ipc', tone: 'success' },
+  { from: 'r5', to: 'pru', label: 'fieldbus', tone: 'accent' },
+  { from: 'a53', to: 'gpu', tone: 'default' },
+  { from: 'a53', to: 'disp', tone: 'default' },
+  { from: 'r5', to: 'eth', tone: 'default' },
+]} caption="AM62x glues a Linux-class A53 cluster, an RTOS-class R5F, an always-on M4F, and a single-cycle PRU subsystem onto one die — IPC mailboxes plus shared DDR are what let the UI keep running while the M4F holds IO during a Linux update." />
+
+## AM64x — industrial communication
+
+AM64x drops some of the Linux UI capability (no GPU, simpler display) and adds industrial-fieldbus muscle: four Cortex-R5F cores at 800 MHz organised as two pairs that can run lockstep or split, two PRU sub-systems with hardware support for industrial Ethernet protocols, gigabit TSN switch, and CAN-FD.
+
+The PRU (Programmable Real-time Unit) is TI's secret weapon for industrial communication. Each PRU is a 32-bit RISC core running at 333 MHz with single-cycle GPIO access, no caches, no interrupts (it's polled-loop or event-driven), and direct access to a small block of shared RAM. PRUs run protocol stacks too time-sensitive for a general-purpose core:
+
+- **EtherCAT slave** — sub-microsecond response from PHY edge to acknowledgement, including the protocol state machine. The PRU implements the EtherCAT Slave Controller (ESC) in firmware; with the right PHY (DP83822) and PCB, AM64x is a fully compliant EtherCAT slave at $15.
+- **PROFINET IRT** — Isochronous Real-Time mode of PROFINET, where every PLC-to-IO cycle is bounded to microseconds. PRU runs the protocol-specific timing.
+- **EtherNet/IP with DLR** — Device-Level Ring, requiring sub-millisecond fault-recovery switching at the slave level.
+- **IO-Link master** — multiple IO-Link channels, each running the standard's UART-like serial protocol with strict frame timing.
+- **Custom serial protocols** — SPI variants, DSI link to camera, anything that needs deterministic IO.
+
+| Protocol | PRU role | A53 / R5 role |
+|----------|----------|---------------|
+| EtherCAT slave | Full ESC implementation | Application object dictionary |
+| PROFINET RT | TSN packet timestamping | RT/IRT protocol layer |
+| EtherNet/IP | DLR ring protocol | CIP application |
+| OPC UA Pub/Sub | Hardware timestamping | UA stack |
+| IO-Link master | UART per channel | IODD interpreter |
+
+TI provides the PRU firmware as binary blobs ("PRU Industrial Communication Subsystem") for the major protocols; you don't write PRU code unless you're doing a custom protocol. The Cortex-R5 runs the protocol-stack upper layers (TwinCAT for EtherCAT, the PROFINET driver, etc.); the Cortex-A53 runs Linux and the application.
+
+## AM243x — full-RTOS, no Linux
+
+AM243x is AM64x without the Cortex-A cores: 4× Cortex-R5F at 800 MHz, Cortex-M4F, 2× PRU. No Linux, no GPU, no display. RTOS only.
+
+This is the SafeTI-branded part — TI's functional-safety lineage. The R5F cores can be configured as two lockstep pairs (each pair runs the same code on two cores, hardware compares results, mismatch raises a fault). ECC on all internal memory. Built-in self-test (BIST) for the cores, memories, and peripherals at startup and periodically during operation. The result is an ASIL-D-capable controller for industrial functional safety (IEC 61508 SIL 3) or automotive (ISO 26262 ASIL-D, with appropriate FuSa kit and certifications).
+
+Applications:
+
+- **Programmable logic controllers (PLC)** — small/medium industrial PLCs running CODESYS or open-source IEC 61131 runtimes on R5.
+- **Motor drives** — variable-frequency drives, servo controllers. R5 runs the FOC loop at 10–20 kHz, PRU drives the gate driver, A53-equivalent (well — R5) runs the human interface.
+- **Battery management systems** — multi-cell BMS for grid-scale storage, EV pack-level management.
+- **Robot motion controllers** — multi-axis coordination, kinematic transforms, trajectory generation.
+
+Without Linux, the entire firmware fits the FreeRTOS / SafeRTOS / Zephyr model — a single privilege level, deterministic scheduling, no userspace. Easier to certify, lower memory footprint, sub-second boot.
+
+## Heterogeneous boot
+
+The Sitara boot flow is intricate:
+
+1. **ROM bootloader** runs on a tiny secure-only Cortex-M3 ("R5/M3 wakeup processor", depends on variant). Reads the boot mode pins, fetches the signed primary boot image from the configured medium (eMMC, OSPI, SD, UART, USB).
+2. **HSM (Hardware Security Module)** verifies the image signature. If invalid, halt.
+3. **SBL (Secondary Bootloader)** — loaded into on-chip SRAM, brings up DDR, programs PLLs, releases the first R5 from reset, and loads the R5 firmware.
+4. **R5 firmware** boots into RTOS (FreeRTOS / SafeRTOS / Zephyr / TI-RTOS), initialises the peripherals it owns.
+5. (AM62/AM64 only) **U-Boot** loaded on the A53, brings up Linux. The A53 sees the R5 as an "AMP" (asymmetric multi-processing) peer — they share DDR but each owns separate cores.
+6. **Linux** boots, mounts root filesystem, starts services. RemoteProc framework provides /dev nodes for the R5 firmware images; rpmsg-net provides a kernel-friendly IPC channel.
+
+Total boot from cold reset to Linux login: 8–15 seconds on AM62x. R5 firmware comes up in under a second (it doesn't wait for Linux).
+
+## Real-time and Linux on the same SoC
+
+The big architectural promise of Sitara is "hard real-time + Linux on one chip". Realising it requires care:
+
+**DDR partitioning.** DDR is shared. Linux uses most of it; R5 gets a partitioned region declared in the device tree (`reserved-memory`). The R5 firmware never touches Linux memory; Linux respects the R5 reservation. Boot-time configuration; if you get it wrong, you get either DDR contention slowing the R5 or a Linux OOM.
+
+**Interrupt routing.** Each core has its own GIC interrupt entry. Peripherals are assigned ownership at design time — the EtherCAT PRU's interrupt goes to the R5 that runs the EtherCAT stack; the camera interrupt goes to the A53 running Linux GStreamer.
+
+**IPC.** TI provides the RPMessage (rpmsg) protocol — a virtio-based mailbox-and-shared-ring-buffer transport between cores. Linux side is the standard kernel rpmsg API; R5 side is a TI library. Pass a struct, get a struct back. Throughput easily reaches 50+ MB/s; latency around 5 µs round-trip.
+
+<Callout type="warn">
+A common architectural error is putting time-critical loops on Linux with PREEMPT_RT and a high-priority thread. PREEMPT_RT can hit microsecond-class latency *most of the time*, but a 100 ms tail happens — caused by I/O sync, write-back, hugepage migration. For "must always be under 50 µs", the R5 is the only safe answer. PREEMPT_RT on Linux is for soft real-time at the millisecond scale.
+</Callout>
+
+## Tooling
+
+- **Code Composer Studio (CCS)** — Eclipse-based IDE for R5 and M4F firmware. Includes GCC-arm-none-eabi, TI Clang compiler, OpenOCD, XDS probe support.
+- **MCU+ SDK** — the R5/M4 SDK. Drivers, FreeRTOS, lwIP, USB stack, industrial communication blobs.
+- **Processor SDK Linux** — Yocto layer that builds a Linux distribution for AM62/AM64. Includes the BSP, U-Boot, kernel, and userspace.
+- **SysConfig** — graphical configurator for pinmux, peripheral init, IPC channels, interrupt routing.
+- **TI Resource Explorer** — searchable catalogue of examples and reference designs.
+
+For production, most teams move to Yocto / Buildroot for the A53 Linux side and a CCS or pure-CMake build for the R5/M4 firmware.
+
+## When Sitara wins
+
+Sitara is the answer when you need:
+
+- One SoC running Linux + hard real-time, with both certified for industrial/safety use.
+- Built-in support for industrial Ethernet protocols at the silicon level.
+- A 10–15 year longevity commitment (TI's industrial parts are guaranteed available for at least a decade).
+- Functional safety from one vendor with one DRM, one toolchain, one support contract.
+
+It loses against:
+
+- **NXP i.MX 8M Plus + Cortex-M7 inside** — similar pattern but stronger media (HDMI 2.0, 1080p60 video encode, NPU for vision AI).
+- **Renesas RZ/G + RA pair** — for designs that want Renesas's safety story.
+- **Pure Cortex-M33 + external bridge to a fieldbus chip** — cheaper for small projects that don't need Linux.
+
+<Callout type="tip">
+For evaluation, start with the AM62x SK-AM62B-P1 starter kit ($199 list, often discounted) — gives you HDMI display, USB-C power, headers exposing all the peripherals, and SD-boot. Get a working Yocto image up first, then layer your R5 firmware via remoteproc.
+</Callout>
+
+## Cross-references
+
+- [AUTOSAR](/docs/systems/autosar) — when Sitara is used in automotive ECUs.
+- [Industrial gateway](/docs/systems/industrial-gateway) — system architecture built on Sitara.
+- [Cortex-R5](/docs/cortex-r/r5) — the lockstep real-time core.
+- [Motor FOC](/docs/systems/motor-foc) — common R5 workload on AM243x.
+- TI TPR Sitara Processors website, datasheets for AM62x / AM64x / AM243x.
+- TI SPRUIM2 — "AM64x Technical Reference Manual"; SPRUIV7 — AM62x TRM.

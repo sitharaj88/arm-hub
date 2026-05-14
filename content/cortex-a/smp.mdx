@@ -1,0 +1,191 @@
+---
+title: SMP & cache coherency on Cortex-A
+description: Symmetric multiprocessing on Cortex-A clusters — CCI/CCN interconnect, MESI/MOESI cache coherency, LDXR/STXR spinlocks, inter-processor interrupts via SGIs, secondary CPU boot via PSCI, and the Linux scheduler's view.
+order: 5
+updated: 2026-05-13
+tags: [cortex-a, smp, coherency, mesi, ipi, psci, scheduler]
+---
+
+A modern Cortex-A SoC has anywhere from 2 to 192 cores arranged in clusters. Every load and store one of those cores executes is observed by every other core — that's the SMP contract. Behind it lies an elaborate cache-coherency network (CCI, CCN, or CMN), a software-visible atomic primitive (LDXR/STXR or the newer LSE atomics), and a boot sequence (PSCI) that brings secondary cores online without ad-hoc per-SoC code.
+
+This page walks through the hardware and the software that makes SMP work on Cortex-A, with a bias toward what a Linux kernel or RTOS engineer needs to know.
+
+<SpecSheet
+  title="SMP building blocks on Cortex-A"
+  specs={[
+    { label: 'Coherent interconnect', value: 'CCI-400/500/550 (≤16 cores), CCN-504/512 (≤48 cores, 5-level mesh), CMN-600/650/700 (≤256 cores)' },
+    { label: 'Coherency protocol', value: 'MOESI in Cortex-A75+; MESI in earlier cores. AMBA ACE / ACE-Lite protocol on the wire' },
+    { label: 'Atomic primitives (v8.0)', value: 'LDXR/STXR pair — load-linked + store-conditional. Local exclusive monitor + global monitor' },
+    { label: 'Atomic primitives (v8.1 LSE)', value: 'LDADD, SWP, CAS, STADD — single-instruction atomics, RMW visible at the interconnect' },
+    { label: 'Inter-processor IRQs', value: 'GIC SGIs (IDs 0–15). Linux uses IDs 0–6 for IPI_RESCHED, IPI_CALL_FUNC, IPI_CPU_STOP, etc.' },
+    { label: 'Secondary CPU bring-up', value: 'PSCI (Power State Coordination Interface, ARM DEN 0022) — CPU_ON, CPU_OFF, SYSTEM_RESET via SMC instruction' },
+    { label: 'Cache line size', value: '64 bytes (verifiable via CTR_EL0.DminLine/IminLine — implementation defined but always 64 on shipping Cortex-A parts)' },
+    { label: 'Linux scheduler', value: 'CFS + EAS for asymmetric clusters. CPU affinity via sched_setaffinity, cpusets, taskset' },
+  ]}
+/>
+
+## The coherent interconnect
+
+A Cortex-A cluster of 4 or 8 cores shares an L3 (or "DSU" Direct Streaming Unit cache in DynamIQ). Multiple clusters are connected by a coherent interconnect:
+
+- **CCI (Cache Coherent Interconnect)** — early designs (CCI-400 with Cortex-A15/A7), supports up to 4 ACE coherent masters. Crossbar topology.
+- **CCN (Cache Coherent Network)** — for 12-48 cores, ring-based topology, with an L3 system cache as part of the fabric. CCN-512 on early server SoCs.
+- **CMN (Coherent Mesh Network)** — current generation, scales to 256 cores in a 2D mesh, with optional system-level cache (SLC) banks distributed across the mesh.
+
+The interconnect uses the **AMBA ACE protocol** — Advanced eXtensible Interface Coherency Extensions. Each transaction includes a snoop request to peer caches; peers reply with snoop responses (HIT/HIT_M/MISS) and, if dirty, the line itself. The protocol implements MESI or MOESI:
+
+| State | Meaning |
+|-------|---------|
+| M (Modified) | Exclusive ownership, dirty (must writeback) |
+| O (Owned, MOESI only) | Shared by others but I'm the owner — responsible for memory writeback |
+| E (Exclusive) | Exclusive ownership, clean (matches memory) |
+| S (Shared) | Shared with others, clean |
+| I (Invalid) | Not present |
+
+MOESI's `O` state lets multiple cores share a *dirty* line without requiring writeback to DRAM — one core keeps the dirty copy, others have read-only shared copies, and the owner writes back when evicted. This saves a lot of DRAM bandwidth in producer-consumer workloads.
+
+## Coherency from the software side
+
+The CPU keeps coherency invariants automatically — software doesn't need to flush caches between cores for normal memory. But there are still cases where you need to think about cache state:
+
+1. **DMA buffers** — a DMA engine outside the coherent interconnect (legacy peripherals) sees physical memory directly. Before sending a buffer to such a device, you must invalidate or clean the cache for those lines. Coherent DMA (PCIe with ACE) bypasses this — the device participates in the coherency protocol.
+
+2. **JIT code / self-modifying** — when you write instruction bytes to a page, the data cache holds the new bytes but the instruction cache may still hold the old ones. Use `DC CVAU` (clean by VA to Point of Unification) + `IC IVAU` (invalidate I-cache by VA) + `DSB` + `ISB`. The kernel's `__flush_icache_range` does this.
+
+3. **Shared memory with non-coherent agents** — GPU, NPU, some DSPs. Use the `dma_*` APIs which insert the right barriers and cache ops.
+
+For *normal* code-to-code SMP — two threads sharing a variable — coherency is automatic. The only software cost is the memory barriers needed to enforce ordering, not coherency.
+
+## Atomic operations — LDXR/STXR
+
+ARMv8.0-A's atomic primitive is the **load-exclusive / store-exclusive** pair:
+
+```asm
+retry:
+    ldaxr   w0, [x1]            // load + acquire + mark address as monitored
+    add     w0, w0, #1          // modify
+    stlxr   w2, w0, [x1]        // store + release + return success in w2
+    cbnz    w2, retry           // retry if store-exclusive failed
+```
+
+The hardware maintains a **local monitor** per core: `LDXR` marks an address (or, more accurately, a cache line) as monitored. `STXR` succeeds only if the monitor is still set — meaning no other core (or this core's exception handlers) has written to that line in between. If any other write happens, the monitor clears and the next `STXR` fails (returns 1 in the result register).
+
+The **global monitor** synchronizes the local monitors across cores. On a shared-cache system the global monitor is implicit (the coherency protocol invalidates the local monitor when another core writes); on systems with non-coherent memory regions the global monitor is explicitly maintained.
+
+Live-lock avoidance is the implementation's responsibility — if two cores spin-loop on the same line, the hardware ensures *some* thread eventually makes progress. In practice, the loop above with 2-100 cores rarely livelocks because the cache coherency churn naturally serializes the writers.
+
+## Atomic operations — LSE (ARMv8.1)
+
+ARMv8.1-A added the **Large System Extensions**: single-instruction atomics that don't need a retry loop.
+
+```asm
+    // Atomic increment, LSE style
+    mov     w0, #1
+    ldadd   w0, w0, [x1]        // x1 += 1, w0 = old value
+```
+
+`LDADD`, `LDADDA`, `LDADDL`, `LDADDAL` — variants for acquire, release, both, or relaxed semantics. Similar instructions exist for OR (`LDSET`), AND (`LDCLR`), XOR (`LDEOR`), exchange (`SWP`), and compare-and-swap (`CAS`).
+
+LSE atomics scale better than LDXR/STXR on large systems because the read-modify-write happens at the interconnect, not the core. With 64+ cores, an LDXR/STXR retry loop can experience severe contention; an LDADD is one round-trip regardless of contention level.
+
+GCC's `__atomic_fetch_add` and `std::atomic::fetch_add` compile to LSE atomics when `-march=armv8.1-a` or higher is targeted. Linux kernel uses `CONFIG_ARM64_LSE_ATOMICS` to switch at boot via alternatives patching.
+
+<Callout type="tip">
+A practical concern: LSE atomics are mandatory in ARMv8.1+ but not in v8.0. If you're distributing binaries that might run on a Cortex-A53 (v8.0), the kernel's alternatives mechanism patches LDADD instructions back to LDXR/STXR loops at boot. The runtime cost is one branch on each atomic site.
+</Callout>
+
+## Inter-processor interrupts (IPIs)
+
+Linux uses GIC SGIs as IPIs. The kernel sends IPIs for:
+
+- **IPI_RESCHED (0)** — wake another CPU to run the scheduler.
+- **IPI_CALL_FUNC (1)** — call a function on another CPU (used by `on_each_cpu`, `smp_call_function_single`).
+- **IPI_CPU_STOP (2)** — halt another CPU (panic path).
+- **IPI_TIMER (3)** — broadcast tick.
+- **IPI_WAKEUP (4)** — wake from idle.
+- **IPI_IRQ_WORK (5)** — irq-context work queue.
+
+The SGI is written via `ICC_SGI1R_EL1` in GICv3:
+
+```c
+void send_ipi(unsigned int cpu, unsigned int sgi) {
+    u64 affinity = cpu_logical_map(cpu);
+    u64 val = (sgi << 24) |
+              ((affinity & 0xFF) << 0) |     // Aff0
+              (((affinity >> 8) & 0xFF) << 16) |    // Aff1
+              (((affinity >> 16) & 0xFF) << 32) |   // Aff2
+              (((affinity >> 24) & 0xFF) << 48);    // Aff3
+    write_sysreg(val, icc_sgi1r_el1);
+    isb();
+}
+```
+
+The destination CPU sees the SGI as an ordinary IRQ via the GIC `IAR` read. The handler dispatches based on SGI ID. On busy systems the IPI rate can reach tens of thousands per second per core — visible as the `RES:` (rescheduling) and `CAL:` (function-call) lines in `/proc/interrupts`.
+
+## TLB shootdown
+
+When the kernel changes a page-table entry on one CPU, every other CPU that might have cached the translation must invalidate its TLB. The Cortex-A approach uses **broadcast TLBI** — a single `TLBI VAE1IS, x0` instruction multicasts the invalidation to every CPU in the Inner Shareable domain.
+
+Compared to x86 (which requires the kernel to IPI each remote CPU explicitly and have it issue an INVLPG), the GIC-broadcast TLBI is hardware-accelerated. On a 64-core ARM server, broadcast TLBIs are completed in 1–3 microseconds; equivalent x86 IPI-shootdown is 5–10 microseconds.
+
+But the cost scales with system size: every TLBI on a 64-core box is observed and acknowledged by 64 cores. High-rate `munmap` workloads (some GC and JIT compilers) can saturate the snoop network with TLBI traffic.
+
+## Secondary CPU boot via PSCI
+
+When the system boots, only one CPU is running — the boot CPU. To bring up the rest, Linux uses **PSCI (Power State Coordination Interface)**, a standardized hypervisor/firmware ABI.
+
+A `CPU_ON` PSCI call:
+
+```c
+SMC #0 with x0 = 0xC4000003 (PSCI_CPU_ON_AARCH64)
+       x1 = MPIDR of target CPU
+       x2 = entry point physical address
+       x3 = context_id (passed in x0 of the target CPU at entry)
+```
+
+The SMC traps to EL3 firmware (typically ARM Trusted Firmware / TF-A). TF-A powers on the target CPU's voltage rail, releases its reset, and arranges for it to begin execution at the supplied entry point in EL2 (or EL1 if no hypervisor). The new CPU runs initial setup code, enables its MMU, switches to the kernel's mm, and joins the scheduler.
+
+The PSCI ABI also covers `CPU_OFF` (hotplug-out), `CPU_SUSPEND` (idle states), `SYSTEM_OFF`, and `SYSTEM_RESET`. Modern Linux kernels do hotplug via PSCI; bringing a CPU offline for power saving is `echo 0 > /sys/devices/system/cpu/cpuN/online`, which triggers `CPU_OFF`.
+
+<Callout type="warn">
+PSCI requires functional EL3 firmware. On platforms shipping without EL3 (rare, mostly developer boards in semihosted configurations) Linux falls back to legacy "spin-table" or "ePAPR" mechanisms. These are deprecated; any new SoC ships with PSCI.
+</Callout>
+
+## CPU affinity and scheduler decisions
+
+`MPIDR_EL1` exposes the CPU's affinity hierarchy. Linux reads it to populate `cpu_topology[]`, used by the scheduler to make placement decisions:
+
+- `package_id` — socket/cluster
+- `cluster_id` — sub-cluster within a socket
+- `core_id` — physical core
+- `thread_id` — SMT thread (Cortex-A doesn't use SMT; always 0)
+
+The scheduler tries to keep tasks on the same cluster (to preserve L2/L3 cache state) and balances load across clusters. On asymmetric systems (big.LITTLE), the **Energy Aware Scheduler (EAS)** also factors in the per-cluster power-performance curve — see the [big.LITTLE page](/docs/cortex-a/big-little).
+
+User-space affinity is set via `sched_setaffinity` or `taskset`:
+
+```sh
+taskset -c 4-7 ./latency-critical-app   # pin to CPUs 4-7
+```
+
+For real-time workloads, isolating CPUs from the scheduler (`isolcpus=4-7` kernel arg) plus pinning the workload gives near-deterministic latency.
+
+## Locking primitives
+
+Linux on AArch64 provides:
+
+- **`spinlock_t`** — ticket spinlocks using LDADD/CAS. Cache-line bouncing on contention but FIFO-fair.
+- **`qspinlock`** — MCS-style queued spinlock, used on >16-CPU systems. Each waiter spins on a per-CPU cache line, reducing inter-core traffic.
+- **`rwlock_t` / `rwsem`** — readers/writer locks.
+- **`mutex` / `rt_mutex`** — sleeping mutexes.
+
+Spinlock contention on Cortex-A is sensitive to cache-line layout. Pad shared structures to 64-byte (cache line) boundaries — packing two contended locks into one line halves the throughput. The kernel's `____cacheline_aligned` and `____cacheline_aligned_in_smp` macros enforce this.
+
+## Cross-references
+
+- [GIC interrupt controller](/docs/cortex-a/gic) — SGIs and affinity routing
+- [TLB and address translation](/docs/cortex-a/tlb) — broadcast TLBI in the inner-shareable domain
+- [Big.LITTLE & DynamIQ](/docs/cortex-a/big-little) — asymmetric clusters and EAS
+- [Virtualization & EL2](/docs/cortex-a/virtualization) — KVM's use of SGIs and PSCI
+- ARM ARM (DDI 0487), B2 (memory model), K1 (PSCI)
+- AMBA ACE Protocol Specification (IHI 0022)

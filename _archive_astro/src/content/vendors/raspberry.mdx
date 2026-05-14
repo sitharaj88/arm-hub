@@ -1,0 +1,106 @@
+---
+title: Raspberry Pi RP2040 / RP2350
+description: The hobbyist-friendly Cortex-M from Raspberry Pi — dual-core, PIO, excellent docs, and now the dual-Arm/RISC-V RP2350.
+order: 4
+updated: 2026-05-12
+tags: [vendors, raspberry, rp2040, rp2350]
+---
+
+import Callout from '~/components/Callout.astro';
+
+Raspberry Pi's RP-series chips have rapidly become the go-to for hobbyist and education — and increasingly for production. Open documentation, dual-core architecture, $1 BOM cost, and the **PIO** (Programmable I/O) peripheral that's like having a small FPGA built into the chip.
+
+## RP2040 (2021)
+
+- **Dual Cortex-M0+** at up to 133 MHz.
+- **264 KB SRAM**, **no internal flash** — external QSPI flash via memory-mapped XIP.
+- **Eight PIO state machines** — programmable hardware bit-bangers.
+- **30 GPIO**, 12-bit ADC, USB 1.1 device/host, 2× UART, 2× SPI, 2× I²C, 16 PWM channels.
+
+The lack of internal flash is unusual — every RP2040 board has an external QSPI flash chip (typically 2–16 MB Winbond). The chip's XIP cache makes this transparent for code execution.
+
+## RP2350 (2024)
+
+- **Dual-core, runtime-switchable between Cortex-M33 and Hazard3 (RISC-V)**.
+- 150 MHz, **520 KB SRAM** + **PSRAM support**.
+- **Twelve PIO state machines**.
+- **TrustZone**.
+- **PIO interpolator improvements** (HMC mode, etc.).
+
+The dual-architecture trick is real: each core can boot as M33 *or* as a RISC-V core, selectable in software. Useful for experimenting with RISC-V without changing hardware, or shipping an M33 product while keeping a RISC-V escape hatch.
+
+## PIO — the killer feature
+
+The PIO is **eight (RP2040) or twelve (RP2350) tiny state machines** that run a custom assembly language, each driving GPIO with single-cycle precision. They can implement:
+
+- A WS2812 (NeoPixel) driver (the canonical first example).
+- SPI / I²C / UART at non-standard speeds.
+- An HDMI / DVI signal generator.
+- A SDIO interface.
+- A custom serial protocol your sensor needs.
+
+```
+.program ws2812
+.side_set 1
+
+.wrap_target
+bitloop:
+    out x, 1       side 0 [2]
+    jmp !x do_zero side 1 [1]
+do_one:
+    jmp bitloop    side 1 [4]
+do_zero:
+    nop            side 0 [4]
+.wrap
+```
+
+Six instructions drive 800 kHz timing-perfect NeoPixel output, with the CPU streaming data via DMA. The PIO takes maybe a week to learn well and replaces a small FPGA for protocol bit-banging.
+
+## The SDK
+
+The official [pico-sdk](https://github.com/raspberrypi/pico-sdk) is **excellent**:
+
+- **Clean CMake build system** — modern, modular, well-documented.
+- **Comprehensive HAL** — every peripheral has typed APIs, examples.
+- **Multicore primitives** — mutexes, FIFOs, lockouts.
+- **TinyUSB** integrated for USB stacks.
+- **No vendor IDE required** — designed for VS Code or any editor.
+
+It's so well-designed that newcomers using it as their first Cortex-M project have a much smoother experience than someone hitting STM32CubeIDE for the first time.
+
+## Documentation
+
+Raspberry Pi's documentation game is unmatched:
+
+- **RP2040 datasheet** — 600+ pages, well-written, with circuit diagrams and PIO programs.
+- **"Getting started with Pico"** — a friendly book-length introduction.
+- **"Hardware design with RP2040"** — schematic-level guide, with copy-paste-able reference designs.
+- **"C/C++ SDK reference"** — every function documented.
+
+If you're teaching embedded, RP2040 is the recommended target. Everything is open, every API is documented, every example is buildable.
+
+## When NOT to pick RP2040
+
+- **Very low power**. RP2040 is "good enough" but not great at deep sleep. Nordic, STMicro L-series, and Silicon Labs do significantly better. RP2350 improves this but is still not the best low-power choice.
+- **High analog performance**. Only one 12-bit ADC, no DAC. STM32G4 or NXP Kinetis are better for analog-heavy designs.
+- **Mass production cost optimisation**. The required external flash adds BOM. STM32C0 or NXP LPC8xx have internal flash at a similar net cost.
+- **Mature certifications**. RP2040 is too new for many automotive / medical / aerospace certification paths.
+
+## Production lessons
+
+The RP2040 has been used in real products: keyboards (lots of these), education kits, audio gear, scientific instruments, IoT gateways. Things to know:
+
+- **Reset is via BOOTSEL + USB**. Holding BOOTSEL while plugging in USB exposes a UF2-format mass-storage device for drag-and-drop firmware updates. Convenient for users; ensure your bootloader path handles it.
+- **The dual Cortex-M0+** cores **share** flash and most peripherals. You'll spend more time on coordination than on actually leveraging the second core for most applications.
+- **The on-chip 3.3 V regulator** is buck-mode and reasonable, but for low-noise analog designs, an external LDO is preferred.
+
+<Callout type="tip" title="If you've never used PIO, start with the WS2812 example">
+The pico-examples repo has a WS2812 PIO program that's annotated line-by-line. Read it, change one delay value, observe the effect on a logic analyser. It's the gentlest possible introduction to PIO and pays off for the rest of your time on the chip.
+</Callout>
+
+## See also
+
+- [Cortex-M0+](/docs/cortex-m/m0-m0plus/) — RP2040 core.
+- [Cortex-M33](/docs/cortex-m/m33-m23/) — RP2350 core.
+- [Raspberry Pi documentation](https://www.raspberrypi.com/documentation/microcontrollers/) (external).
+- [pico-sdk on GitHub](https://github.com/raspberrypi/pico-sdk) (external).

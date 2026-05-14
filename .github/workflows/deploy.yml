@@ -1,0 +1,62 @@
+name: Deploy to GitHub Pages
+
+# Manual trigger only — run this workflow from the GitHub Actions UI
+# (Actions tab → "Deploy to GitHub Pages" → "Run workflow") whenever you
+# want to publish. No automatic deploys on push.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Site is hosted at https://sitharaj88.github.io/arm-hub/ — every link
+      # and asset must be prefixed with the repo name. Drop this line if you
+      # ever wire a custom domain (e.g. armhub.dev) so paths resolve at root.
+      NEXT_PUBLIC_BASE_PATH: /arm-hub
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build site
+        run: npm run build
+
+      - name: Add .nojekyll
+        run: touch out/.nojekyll
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

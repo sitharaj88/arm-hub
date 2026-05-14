@@ -1,0 +1,161 @@
+---
+title: Nordic nRF91 series
+description: Nordic's nRF9160 and nRF9151 — single Cortex-M33 with integrated LTE-M, NB-IoT, and GPS modem. Modem firmware, AT commands, trace-and-test split, nRF Connect SDK on Zephyr, and real-world cellular IoT design.
+order: 16
+updated: 2026-05-13
+tags: [vendors, nordic, nrf91, nrf9160, lte-m, nb-iot, cellular, gps, zephyr]
+---
+
+The nRF91 family is Nordic's cellular IoT SoC line — a single Cortex-M33 application processor co-packaged with an LTE Cat-M1 / NB-IoT modem and an L1/L5 GPS receiver, all in a 10 × 16 mm BGA. It replaces the traditional "MCU + cellular module" two-chip design (host MCU + uBlox / Quectel / Sierra modem) with one device that holds Nordic's certified PSA-protected modem firmware in a hardware-isolated security domain, exposes the modem to application code via AT commands or a socket API, and runs on Zephyr.
+
+nRF9160 launched in 2018 as the first commercial single-die LTE-M / NB-IoT MCU; nRF9151 (2024) is the smaller, lower-power successor. Both are aimed at battery-powered cellular IoT — asset trackers, agtech sensors, smart meters, fleet telematics — where the alternative is a discrete modem with ten times the BOM cost and several times the power consumption.
+
+<SpecSheet
+  title="Nordic nRF91 at a glance"
+  specs={[
+    { label: 'nRF9160', value: 'Cortex-M33 @ 64 MHz, 1 MB Flash, 256 KB RAM; integrated LTE Cat-M1 + NB-IoT modem; GPS receiver' },
+    { label: 'nRF9151', value: 'Cortex-M33 @ 64 MHz, 1 MB Flash, 256 KB RAM; smaller package, ~50% lower TX current, support for 23 LTE bands' },
+    { label: 'Cellular modes', value: 'LTE-M (Cat-M1) up to 1.2 Mbps DL / 0.4 Mbps UL; NB-IoT (Cat-NB2) ~62 kbps DL / 30 kbps UL' },
+    { label: 'GNSS', value: 'Multi-constellation GPS / GLONASS / Galileo / BeiDou (nRF9151), L1 single-band' },
+    { label: 'Cellular bands (nRF9160)', value: 'B1, B2, B3, B4, B5, B8, B12, B13, B17, B19, B20, B25, B26, B28, B66 — 17 bands' },
+    { label: 'Cellular bands (nRF9151)', value: '23 bands incl. B14, B85, EU/US/JP/AU regional sets' },
+    { label: 'TX power', value: '+23 dBm (Class 3) LTE; +23 dBm NB-IoT' },
+    { label: 'Sleep current (PSM)', value: '~2 µA in Power Saving Mode with modem context retained' },
+    { label: 'Certifications', value: 'GCF, PTCRB, FCC, CE, Verizon, AT&T, T-Mobile, Deutsche Telekom; eDRX, PSM, Release 14 cellular features' },
+  ]}
+/>
+
+## Architectural split — application core, modem, secure domain
+
+The nRF91 has three execution domains, isolated by TrustZone and the SPU:
+
+**Application core** (non-secure) — runs the customer's Zephyr application. Talks to the modem via the nrf-modem library (AT commands or BSD-socket API), to the GNSS receiver via the same library, to peripherals (SPI, I2C, UART, ADC) directly.
+
+**Secure firmware** (secure non-modem) — typically TF-M. Manages keys (LTE PSK, customer credentials), provides PSA Crypto API, runs secure boot. Sits between the application and the modem at trust-boundary crossings.
+
+**Modem firmware** (Nordic-supplied binary, runs in a separate isolated context) — the LTE physical, MAC, RRC, NAS layers, plus the GPS receiver. This is Nordic's certified, signed, encrypted firmware blob that comes preflashed on every chip. It's updateable over the air via a special "modem DFU" mechanism but cannot be inspected or modified by the customer.
+
+This split has a regulatory rationale. Cellular modems require operator certification (Verizon, AT&T, NTT Docomo etc.) — passing the certification is a multi-million-dollar exercise per band-and-operator combination. Nordic's modem firmware ships with the certifications already done; you inherit them as long as the modem firmware is unaltered. If a customer's application could change modem behaviour, certifications would have to be redone. The TrustZone partition is what makes the inheritance defensible — even an exploited application cannot reach modem registers.
+
+## Talking to the modem
+
+Two APIs sit in front of the modem:
+
+**AT commands** — the classic interface inherited from 1980s Hayes modems. Each command is a string sent to the modem; the modem replies with a string. Examples:
+
+```
+AT+CFUN=1                    # power up radio
+AT+CGDCONT=1,"IP","internet" # set APN
+AT+CFUN=4                    # offline mode for GPS
+AT+CEREG=2                   # request registration notifications
++CEREG: 1,"4F12","00012345",7   # async event: registered, home network
+AT+CGNSSCFG=1                # configure GNSS
+```
+
+The Zephyr `modem_at` API wraps this with a callback registration system — register interest in `+CEREG`, get a callback when registration state changes.
+
+**Socket API** — a BSD-sockets-compatible interface for direct TCP/UDP/TLS/DTLS sockets. The modem terminates the LTE stack, exposes Layer-4 sockets to the application:
+
+```c
+int sock = socket(AF_INET, SOCK_STREAM | SOCK_NATIVE_TLS, IPPROTO_TLS_1_2);
+connect(sock, (struct sockaddr *)&server, sizeof(server));
+send(sock, "GET / HTTP/1.1\r\n\r\n", 19, 0);
+recv(sock, buf, sizeof(buf), 0);
+```
+
+The socket API is the recommended path for new application development — it hides AT-command syntax, manages context activation transparently, supports up to 8 simultaneous sockets, and handles TLS termination inside the modem (the modem has its own crypto engine; TLS computations don't burn application-core cycles).
+
+## Power saving modes
+
+Cellular standards define two power-saving features that the nRF91 supports natively:
+
+**PSM (Power Saving Mode).** After idle the modem enters a deep sleep where the LTE context is retained but the RF is off. Wakeups are timer-driven (T3324 timer) — the network knows the device is asleep and queues downlink data; the device wakes periodically (every few minutes to many hours, configurable) to drain the queue. Sleep current is ~2 µA on nRF9160, ~1.6 µA on nRF9151.
+
+**eDRX (extended Discontinuous Reception).** The modem listens for downlink at long intervals (up to ~44 minutes for LTE-M, ~3 hours for NB-IoT). Faster wake than PSM but higher average current.
+
+A typical asset-tracker design uses PSM: wake every 15 minutes, take a GPS fix (10–60 s of GNSS active power), upload one MQTT message (~1 s of LTE TX), sleep. Average current ~50 µA on a multi-year battery design.
+
+| State | Current | Notes |
+|-------|---------|-------|
+| LTE-M transmitting | 200–230 mA peak, 60–90 mA average | Class 3, +23 dBm |
+| NB-IoT transmitting | 150–200 mA peak | Coverage-enhancement modes use more |
+| Modem RX listening | 30–50 mA | Inside reception window |
+| GNSS acquiring | 30 mA | Cold start ~60 s |
+| GNSS tracking | 10–20 mA | After fix |
+| CPU idle, modem RRC-idle | 1.5 mA | Listening for paging |
+| PSM | ~2 µA | Modem context preserved |
+| Off | ~0.5 µA | Cold start required |
+
+## Modem firmware updates
+
+The modem firmware updates separately from the application firmware. Nordic releases new modem versions periodically (~quarterly) with cellular protocol fixes, operator-specific tweaks, and feature additions (e.g. Release 14 PUR support, LwM2M improvements). The application flashes a new modem image via a special DFU path; the modem verifies signature, installs, and reboots.
+
+```
+$ nrfjprog --program nrf9160_modem_firmware_v1.3.5.zip --modemfw
+```
+
+In a deployed fleet, modem updates ride over the cellular link itself — the application downloads a delta image (Nordic publishes deltas to keep transfer size manageable, typically 100–500 KB), hands it to the modem DFU subsystem, and the modem reboots.
+
+<Callout type="warn">
+Modem firmware versions are mutually exclusive with certifications. Some operators require a specific minimum modem firmware version for their network; using an older version may cause connection failures or — worse — silent rate-limiting. Maintain a modem-version policy in your fleet management.
+</Callout>
+
+## GNSS receiver
+
+The integrated GNSS receiver shares the same antenna and front-end as the LTE radio. It can operate in three modes:
+
+- **Continuous tracking** — receiver always on, fix updated every second. Highest power (~10 mA), used for active navigation.
+- **Single-shot** — request one fix, receiver wakes, acquires (cold ~30 s, warm ~5 s), returns position, sleeps. Used for asset tracking.
+- **Assisted GPS (A-GPS / P-GPS)** — application downloads ephemeris and almanac data over cellular, hands to the receiver, dramatically shortens acquisition. P-GPS (Predicted) covers up to 14 days offline; A-GPS is real-time-ish (valid 1–4 hours).
+
+A-GPS/P-GPS reduce a cold start from 30+ seconds to ~5 seconds, which is the difference between draining the battery on every fix and lasting years on a small cell.
+
+## Practical use cases
+
+**Asset tracker.** nRF9160 + LIS2DH motion sensor + 1000 mAh Li-Po. Sleeps until motion, takes a GNSS fix, uploads location via MQTT-over-LTE-M, sleeps. ~6 months on a charge.
+
+**Smart water meter.** nRF9160 (NB-IoT) + flow sensor + 7 Ah primary lithium pack. One report per day via NB-IoT (well-suited to deep building penetration). 10-15 year designed lifetime.
+
+**Agtech sensor.** nRF9160 + soil moisture / leaf wetness / temperature. Solar harvesting + small Li-Po. Reports every 15 minutes during day, hourly at night.
+
+**Bike GPS tracker / anti-theft.** nRF9160 + GNSS + IMU + buzzer. Active tracking when armed; PSM when at rest. SIM card (or, increasingly, eSIM / iSIM) for cellular service.
+
+**Health monitor (cellular).** nRF9160 + medical AFE + cellular. Submits patient data to a clinical platform without dependency on a paired phone — useful for elderly users.
+
+## eSIM and iSIM
+
+Traditional SIM cards are large, physical, and operator-locked. Modern nRF91 designs use:
+
+- **eSIM (eUICC)** — a soldered MFF2 chip, supports remote provisioning (download an operator profile over the air). Smaller, ruggedised, allows operator switching without hardware change.
+- **iSIM (Integrated SIM)** — the SIM functionality is implemented inside the SoC, in the secure domain. nRF9160 supports iSIM via Onomondo, Wirepas Connect, and other iSIM providers' applets running on TF-M. Zero board area for SIM, lower BOM, longer hardware life.
+
+iSIM is the inflection point that lets cellular IoT compete with LoRaWAN on device cost in 2026 — when there's no physical SIM card and no module mark-up, the cellular hardware is comparable in cost to LoRa hardware.
+
+## nRF Connect SDK
+
+The same Zephyr-based SDK as nRF53, with nRF91-specific subsystems:
+
+- **modem library** (`nrf_modem`) — handles AT and socket APIs.
+- **LwM2M Carrier library** — pre-integrated cellular-carrier device-management protocols (Verizon ThingSpace, AT&T M2X, etc.). Used when shipping into specific operator ecosystems.
+- **nrf_cloud library** — connects to Nordic's nRF Cloud (A-GPS / P-GPS assistance data, location services, fleet management, FOTA distribution). Optional but useful for prototyping.
+- **MCUboot bootloader** — second-stage bootloader with image swap and rollback. Required for safe FOTA.
+
+```
+$ west build -b nrf9160dk_nrf9160_ns samples/cellular/at_client
+```
+
+The `_ns` suffix denotes the non-secure variant — TF-M runs in secure, application in non-secure. This is the recommended configuration.
+
+<Callout type="tip">
+Run "AT client" first when bringing up a new design. It exposes the modem's AT interface over the development kit's USB UART; you can verify network registration, signal strength, and APN configuration by typing AT commands directly, before writing any application code. Most network issues — wrong APN, bad antenna, weak signal location — are far easier to diagnose this way.
+</Callout>
+
+## Cross-references
+
+- [Nordic nRF53](/docs/vendors/nordic-nrf53) — 2.4 GHz sibling with the same Zephyr SDK.
+- [STM32 wireless WL](/docs/vendors/stm32-wireless) — alternative LPWAN (LoRa instead of cellular).
+- [Cortex-M33](/docs/cortex-m/m33) — the application core.
+- [TrustZone-M](/docs/security/trustzone-m) — the partitioning that isolates the modem.
+- [IoT sensor node](/docs/systems/iot-sensor-node) — system architecture using cellular nodes.
+- Nordic Product Specification "nRF9160" and "nRF9151" (latest revisions).
+- 3GPP TS 36.331 (LTE RRC) and TS 36.300 (architecture) — background on cellular protocols.

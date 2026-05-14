@@ -1,0 +1,81 @@
+---
+title: Cortex-M3
+description: The original mainstream Cortex-M. Full Thumb-2, hardware divide, bit-banding — still everywhere despite being twenty years old.
+order: 3
+updated: 2026-05-12
+tags: [cortex-m, m3, armv7-m]
+---
+
+The Cortex-M3 shipped in 2004 and effectively invented the modern microcontroller market. It introduced the Thumb-2 ISA, the NVIC, the bit-band alias, and the deterministic exception model that defines every Cortex-M today.
+
+## At a glance
+
+- **ISA**: ARMv7-M (full Thumb-2)
+- **Pipeline**: 3-stage in-order with branch speculation
+- **Performance**: 1.25 DMIPS/MHz
+- **MPU**: optional, 8 regions
+- **NVIC**: up to 240 IRQs, 256 priority levels
+- **Bit-banding**: 1 MB SRAM + 1 MB peripheral alias
+- **No FPU, no DSP** (those are M4)
+
+## What it added over M0+
+
+Every M3 feature *missing* on the M0/M0+:
+
+- **Hardware divide** (`SDIV`, `UDIV`) — 2–12 cycles vs. ~30+ for the library call.
+- **Bit-field instructions** — `BFI`, `BFC`, `UBFX`, `SBFX`.
+- **Conditional execution via `IT`** — `IT` block lets up to four instructions execute conditionally without branches.
+- **`LDREX`/`STREX`** — exclusive monitor for lock-free atomics.
+- **`BASEPRI`** — priority-threshold interrupt masking.
+- **Bit-banding** — single-cycle atomic bit set/clear.
+
+## Pipeline and branch speculation
+
+Three stages, in-order, but the M3 *does* speculatively fetch both targets of a branch:
+
+```
+Fetch ─┬─▶ Decode ─▶ Execute     (taken path: 1 bubble)
+       └─▶ Fetch alt target
+```
+
+Most taken branches cost 1 cycle (the bubble) instead of 2; not-taken branches are free. This is a real speedup on tight loops, and one reason the M3 hits 1.25 DMIPS/MHz vs. the M0+'s 0.95.
+
+## Bit-banding
+
+Two alias regions on the M3:
+
+| Original region                      | Alias region                          |
+|--------------------------------------|---------------------------------------|
+| SRAM `0x2000_0000` – `0x200F_FFFF` (1 MB) | `0x2200_0000` – `0x23FF_FFFF` (32 MB) |
+| Peripheral `0x4000_0000` – `0x400F_FFFF` (1 MB) | `0x4200_0000` – `0x43FF_FFFF` (32 MB) |
+
+Each bit in the original region maps to a word in the alias. The hardware translates `alias_word_address` into `original_word_address + (bit_index)` and operates on a single bit:
+
+```c
+#define BITBAND_PERIPH(addr, bit) \
+    (*(volatile uint32_t *)(0x42000000 + (((uintptr_t)(addr) - 0x40000000) << 5) + ((bit) << 2)))
+
+// Atomic set of GPIOA->ODR bit 5
+BITBAND_PERIPH(&GPIOA->ODR, 5) = 1;
+```
+
+The hardware turns this into a read-modify-write on the underlying word, but it's done **atomically** by the bus — no interrupt can land in between.
+
+**The catch**: bit-banding was removed in ARMv8-M. The Cortex-M7 doesn't have it (single-cycle accesses to the bit-band alias would have complicated the cache topology). Most modern peripheral drivers avoid it for portability. Use `LDREX`/`STREX` or peripheral-side atomic registers (e.g. STM32 `BSRR` for GPIO set-and-reset) instead.
+
+## Still everywhere
+
+Despite being 20 years old, Cortex-M3 ships in volumes that dwarf every newer Cortex-M:
+
+- **STM32F1** — still the highest-volume STM32 line; cheap, well-understood, eight bazillion designs.
+- **STM32F2** — higher clock M3, 120 MHz.
+- **NXP LPC1700** — classic M3 with Ethernet and CAN.
+- **TI Stellaris / Tiva (older C series)** — pre-M4 Stellaris LM3S parts.
+
+For greenfield designs, the Cortex-M4 has mostly displaced it — same pipeline, same MPU, same NVIC, but with DSP and FPU options for the same price. Cortex-M3 makes sense when you don't need either and want to optimise BOM cost.
+
+## See also
+
+- [Cortex-M4](/docs/cortex-m/m4/) — the M3 with DSP and FPU.
+- [Cortex-M lineup](/docs/cortex-m/lineup/) — picking between cores.
+- [Memory model](/docs/architecture/memory-model/) — bit-banding caveats.

@@ -1,0 +1,98 @@
+---
+title: Cortex-M0 / M0+
+description: The smallest Cortex-M cores — when you'd pick them, where they pinch, and how to write code that fits.
+order: 2
+updated: 2026-05-12
+tags: [cortex-m, m0, m0plus, armv6-m]
+---
+
+import Callout from '~/components/Callout.astro';
+
+The Cortex-M0 and M0+ are the smallest Cortex-M cores — ~12k–16k gates, designed to be cheap, low-power, and easy to integrate into mixed-signal SoCs. Almost every "8-bit MCU killer" launched after 2010 is a Cortex-M0 underneath.
+
+## M0 vs M0+
+
+| Feature        | Cortex-M0     | Cortex-M0+    |
+|----------------|---------------|---------------|
+| ISA            | ARMv6-M       | ARMv6-M       |
+| Pipeline       | 3-stage       | 2-stage       |
+| DMIPS/MHz      | 0.84          | 0.95          |
+| MPU            | —             | optional, 8-region |
+| Single-cycle I/O port | —     | optional      |
+| Vector Table Offset Register | — | optional (most vendors include it) |
+| Branch shadow  | 2 cycles      | 1 cycle       |
+| Power          | ~16 µW/MHz    | ~9 µW/MHz     |
+
+The **shorter pipeline** is the structural change that drives almost everything else. A taken branch costs one fewer cycle. Sleep/wake transitions are quicker. The energy per instruction is lower. The M0+ has effectively obsoleted the original M0 for new designs.
+
+## ARMv6-M — the cut-down ISA
+
+ARMv6-M is a **subset of Thumb-2**, deliberately shrunken to keep the decode logic small. You lose:
+
+- **Hardware divide** — `SDIV`/`UDIV` don't exist; the compiler emits a `__aeabi_idiv` call into the standard library.
+- **Bit-banding** — no alias region.
+- **Most conditional instructions** — only branches are conditional; `IT` blocks are gone.
+- **`BFI`/`BFC`/`UBFX`** — no bit-field insert/extract; you write the masks by hand.
+- **`LDREX`/`STREX`** — no exclusive monitors. Atomics need critical sections.
+- **`BASEPRI`** — only `PRIMASK` is available, so masking is all-or-nothing.
+
+You keep: load/store, all the basic ALU ops, branches, `BX`/`BLX`, `WFI`/`WFE`, `MRS`/`MSR` for special registers, and the standard exception entry.
+
+<Callout type="warn" title="No BASEPRI = different RTOS rules">
+A FreeRTOS port for Cortex-M0+ uses `__disable_irq()` / `__enable_irq()` for critical sections — *all* interrupts off, including high-priority ones. On M3/M4 the port uses `BASEPRI` so high-priority FreeRTOS-unaware interrupts keep running. If you're moving code between M0+ and M4, your critical sections are protecting *different things*.
+</Callout>
+
+## NVIC differences
+
+The M0/M0+ NVIC is a slimmed-down version:
+
+- **Up to 32 IRQs**, not 240.
+- **4 priority levels** (2 bits implemented), not 16 or 256.
+- No subpriority grouping — `PRIGROUP` doesn't exist.
+- No `STIR` (software trigger interrupt). You can still set the pending bit manually via `NVIC_ISPR`.
+
+This affects scheduling. With only 4 priority levels and no `BASEPRI`, your design choices are simpler — usually: NMI for safety-critical, level 0 for one or two ultra-fast ISRs, level 3 for everything else, and the rest of your interrupts un-prioritised serialise behind each other.
+
+## Single-cycle I/O port (M0+ only)
+
+Some M0+ implementations include a dedicated **I/O port** in the system bus that bypasses the AHB matrix entirely. GPIO set/clear takes a single cycle, vs. ~2 cycles via the regular peripheral bus. NXP's LPC8xx family is the canonical example.
+
+```c
+// NXP LPC8xx fast I/O — single-cycle bit set
+LPC_GPIO_PORT->SET[0] = (1u << 5);
+```
+
+## Power budget — why M0+ exists
+
+A Cortex-M0+ running at 24 MHz with everything off except the core typically draws **150–400 µA**. Add a low-power 32 kHz RTC oscillator and you can sleep at **&lt;2 µA** with state retention. This is why almost every Bluetooth LE SoC, every connected sensor, every wearable, has an M0+ somewhere — often as a power-domain "always-on" companion to a bigger core.
+
+The arithmetic that matters:
+
+```
+1× CR2032 coin cell  ≈ 230 mAh
+Average draw of 2 µA ⇒ 11.5 years runtime
+Average draw of 200 µA (always-on M0+ @ 24 MHz) ⇒ 47 days
+```
+
+You don't run an M0+ flat-out. You wake it for 10 ms every 10 seconds and put it back to sleep. The 99.9% sleep duty cycle is the whole point.
+
+## Coding for M0+ — what to remember
+
+- **Use 16-bit operations where you can** — Thumb-1 16-bit encodings are denser, so flash is smaller and the prefetch buffer wins more often.
+- **Avoid 32-bit-divides** — `__aeabi_idiv` is ~30+ cycles. Use shifts and pre-scaled fixed-point where possible.
+- **Inline ASM atomicity primitives are rare** — wrap shared state with `__disable_irq()`/`__enable_irq()` or a vendor mailbox.
+- **The MPU (when present) is your friend** — guard pages around stack, RO sections, prevent NULL dereferences. Costs nothing at runtime once configured.
+
+## Where you'll find them
+
+- **Raspberry Pi Pico (RP2040)** — dual Cortex-M0+ at 133 MHz.
+- **STM32C0 / STM32G0 / STM32L0** — STM's M0+ families. C0 = ultra low cost, G0 = mainstream, L0 = ultra low power.
+- **Nordic nRF52805 / nRF54L** — Bluetooth + M0+ companion cores.
+- **NXP LPC800 / LPC1100** — the original M0+ pioneer.
+- **Silicon Labs EFM32 Zero/Happy/Tiny Gecko** — energy-first M0+.
+
+## See also
+
+- [Cortex-M lineup](/docs/cortex-m/lineup/) — picking between cores.
+- [NVIC deep dive](/docs/cortex-m/nvic/) — the registers in detail.
+- [Memory model](/docs/architecture/memory-model/) — barriers still apply on M0+.

@@ -1,0 +1,118 @@
+---
+title: Memory model & barriers
+description: How loads and stores are ordered on ARM — relaxed by default, with explicit barriers (DMB, DSB, ISB) where you need them. Plus the Cortex-M memory map.
+order: 3
+updated: 2026-05-12
+tags: [architecture, memory, barriers, concurrency]
+---
+
+import Callout from '~/components/Callout.astro';
+import MemoryMap from '~/components/MemoryMap.astro';
+
+ARM is a **weakly ordered** architecture. The CPU and the bus are free to reorder loads and stores as long as single-threaded program semantics are preserved. Most of the time you don't notice. The moment you start touching memory-mapped peripherals or doing lock-free inter-core communication, you notice *hard*.
+
+## The Cortex-M address space
+
+Every Cortex-M divides its 4 GB address space into eight 512 MB regions with fixed default attributes:
+
+<MemoryMap
+  title="Cortex-M default memory map (ARMv7-M ARM §B3.1)"
+  regions={[
+    { start: '0xE010_0000', end: '0xFFFF_FFFF', name: 'Vendor / system',         detail: 'Implementation-defined system region.',         kind: 'system' },
+    { start: '0xE000_0000', end: '0xE00F_FFFF', name: 'Private Peripheral Bus',  detail: 'NVIC, SCB, SysTick, MPU, ITM, DWT, TPIU, FPB.', kind: 'system' },
+    { start: '0xA000_0000', end: '0xDFFF_FFFF', name: 'External device',         detail: 'Shareable, non-cacheable, ordered.',            kind: 'external' },
+    { start: '0x6000_0000', end: '0x9FFF_FFFF', name: 'External RAM',            detail: 'FMC / FSMC / OSPI / QSPI — vendor wiring.',     kind: 'external' },
+    { start: '0x4000_0000', end: '0x5FFF_FFFF', name: 'Peripheral',              detail: 'Device-type. GPIO, UART, SPI, I²C, timers, DMA, USB…', kind: 'periph' },
+    { start: '0x2000_0000', end: '0x3FFF_FFFF', name: 'SRAM',                    detail: 'Normal memory. Bit-banded on M3/M4 (low 1 MB).', kind: 'sram' },
+    { start: '0x0000_0000', end: '0x1FFF_FFFF', name: 'Code',                    detail: 'Flash, system memory, bootloader.',             kind: 'code' },
+  ]}
+/>
+
+The regions default to specific **memory types** (Normal, Device, Strongly-ordered) which dictate what reordering and caching the bus is allowed to do. An MPU can override these.
+
+| Type             | Reordered? | Cacheable? | Example region |
+|------------------|------------|------------|----------------|
+| Normal           | yes        | yes        | Flash, SRAM    |
+| Device           | no         | no         | Peripherals    |
+| Strongly-ordered | no         | no         | PPB, SO regions |
+
+<Callout type="warn" title="Peripheral writes can still be posted">
+Even "Device" memory accesses are **posted** — your `STR` to a UART data register returns to the next instruction before the peripheral has actually received the write. If the next instruction depends on the side effect (e.g. you wrote to disable an interrupt and now expect it not to fire), you need a `DSB`.
+</Callout>
+
+## The three barriers
+
+ARM has exactly three memory barriers, and the names tell you what they do.
+
+### DMB — Data Memory Barrier
+
+All explicit memory accesses **before** the DMB complete (from the observer's point of view) before any explicit memory accesses **after** the DMB are observed. It's the cheapest barrier — it doesn't stall the pipeline, it just constrains the bus.
+
+Use DMB when:
+- Two cores or a core + DMA are sharing a buffer.
+- You're implementing a software mutex or producer/consumer queue.
+- You hand a pointer to a peripheral that will then read the memory it points to.
+
+```c
+// Producer
+buffer[head] = item;       // store data
+__DMB();                   // ensure data is visible before head update
+head_index = (head + 1);   // store updated index — consumer can now see item
+```
+
+### DSB — Data Synchronisation Barrier
+
+A DMB **plus** the processor stalls until the prior accesses have completed. Stronger and more expensive.
+
+Use DSB when:
+- You wrote to a peripheral register and the *next instruction* depends on the write having taken effect (e.g. enabling an interrupt and immediately executing `WFI`, disabling an interrupt and immediately returning from a handler).
+- You need to flush the write buffer before sleeping.
+
+```c
+NVIC_DisableIRQ(SOME_IRQ);
+__DSB();                    // make sure the disable is observed
+__ISB();                    // and that pending instructions are flushed
+// safe to assume IRQ won't fire from here
+```
+
+### ISB — Instruction Synchronisation Barrier
+
+Flushes the instruction pipeline. The processor refetches all instructions after the ISB. Cheap from a bus perspective but expensive in pipeline terms (~5–10 cycles).
+
+Use ISB when:
+- You just modified a system register that changes how subsequent instructions execute (e.g. `CONTROL`, `VTOR`, MPU region settings, `FAULTMASK`).
+- You self-modified code or remapped memory.
+
+```c
+SCB->VTOR = new_table_address;
+__DSB();   // make sure the write to VTOR completes
+__ISB();   // flush prefetch — next IRQ uses new vector table
+```
+
+## Putting it together
+
+The classic three-barrier dance after enabling a peripheral clock or modifying the MPU:
+
+```c
+MPU->RNR  = region;
+MPU->RBAR = base;
+MPU->RASR = attr | MPU_RASR_ENABLE_Msk;
+__DSB();    // make sure the MPU writes have completed
+__ISB();    // flush any prefetched instructions executed with old config
+```
+
+<Callout type="tip" title="When you don't need barriers">
+CMSIS NVIC functions, `__set_PRIMASK()`, and the ARM C compiler intrinsics already emit the right barriers internally. You almost never need to add a `__DSB()` after `NVIC_EnableIRQ()` — it's already there.
+</Callout>
+
+## Atomics on Cortex-M
+
+- **Cortex-M0/M0+/M23**: no exclusive load/store. The standard pattern is to disable interrupts (`__disable_irq()` or a critical section macro) around the read-modify-write.
+- **Cortex-M3 and up**: have `LDREX`/`STREX` exclusive monitors. C11 `<stdatomic.h>` and C++11 `<atomic>` will use them when targeting ARMv7-M or later.
+- **Multi-master systems** (e.g. M0+ core + a DMA controller): the exclusive monitor only covers the CPU. You still need software protocols (or a vendor-provided hardware semaphore — STM32 HSEM, NXP SEMA42) to coordinate.
+
+## See also
+
+- [Exception model](/docs/architecture/exception-model/) — barriers in interrupt entry/exit.
+- [NVIC deep dive](/docs/cortex-m/nvic/) — when you need DSB+ISB and when CMSIS does it for you.
+- [DMA](/docs/peripherals/dma/) — the most common source of "I forgot a barrier" bugs.

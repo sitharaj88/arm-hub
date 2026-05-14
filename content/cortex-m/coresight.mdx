@@ -1,0 +1,184 @@
+---
+title: Coresight architecture
+description: TPIU, ETM, ITM, DWT, FPB, AHB-AP, DAP, SWJ-DP. How a debug probe reaches the core, ROM tables, DWT cycle counting accuracy, the JTAG vs SWD trade-off.
+order: 23
+updated: 2026-05-13
+tags: [cortex-m, coresight, debug, swd, jtag, dap, rom-table]
+---
+
+Coresight is ARM's umbrella name for the debug and trace infrastructure that ships alongside every Cortex-M, Cortex-A, and Cortex-R core. It's not a single block — it's a *framework* defining how trace sources (the core, the DWT, the ITM, the ETM) connect to trace sinks (the TPIU pin output, an embedded ETB SRAM buffer), and how a debug host (a probe like J-Link or ST-Link) accesses the core's state through a chain of bridges (SWJ-DP → DAP → AHB-AP → core).
+
+Understanding the layout is essential for two situations: debug probe bring-up on a custom board (where you have to wire SWDIO/SWCLK/SWO yourself) and trace bring-up on parts with multiple cores or unusual debug topologies. For most day-to-day debugging it's enough to know "the probe talks to the core somehow" — but when something doesn't work, knowing what's in between SWDIO and `r0` saves hours.
+
+<SpecSheet
+  title="Coresight at a glance"
+  specs={[
+    { label: 'Spec', value: 'CoreSight Architecture Specification (IHI 0029) — public ARM document' },
+    { label: 'Debug ports', value: 'SWJ-DP (combined SWD + JTAG), JTAG-DP (legacy), SW-DP (SWD only)' },
+    { label: 'Probe wire count', value: 'SWD: 2 pins (SWDIO, SWCLK) + optional SWO. JTAG: 4 pins (TCK, TMS, TDO, TDI)' },
+    { label: 'Access protocol', value: 'AP (Access Port) over DP (Debug Port). AHB-AP is the most common AP for Cortex-M.' },
+    { label: 'ROM table', value: 'Read-only block at known address (0xE00FF000 on Cortex-M) that lists every Coresight component on the part' },
+    { label: 'Trace sinks', value: 'TPIU (off-chip via SWO or parallel), ETB (on-chip SRAM buffer), STM (system trace)' },
+    { label: 'Authentication', value: 'Some parts gate debug access via DBGEN, NIDEN, SPIDEN, SPNIDEN signals — physical OTP fuses or secure boot can lock down debug' },
+  ]}
+/>
+
+## The chain from probe to core
+
+A debug probe accessing a Cortex-M part traverses several layers:
+
+```
+[Probe USB] → [Probe firmware]
+            → [SWD/JTAG physical layer]
+            → [SWJ-DP (Debug Port)]
+            → [DAP (Debug Access Port)]
+            → [AHB-AP (Access Port for AHB bus)]
+            → [AHB bus matrix]
+            → [Core's debug registers / DWT / ITM / SCB / NVIC / MPU]
+```
+
+Each layer adds latency and abstraction. The probe firmware turns USB commands into SWD or JTAG bit-level transactions. The SWJ-DP turns those into MMIO reads/writes on an internal "AP bus." The AHB-AP sits on the AP bus and issues AHB master transactions to the part's main bus matrix. The core's debug logic (or any other Coresight component) sits on the AHB bus and responds.
+
+<BlockDiagram title="CoreSight infrastructure on a Cortex-M" width={820} height={400} nodes={[
+  { id: 'probe', x: 20,  y: 30,  w: 130, h: 60, kind: 'external', label: 'Probe', detail: 'SWD/JTAG' },
+  { id: 'swj',   x: 170, y: 30,  w: 120, h: 60, kind: 'io',       label: 'SWJ-DP', detail: 'pin entry' },
+  { id: 'dap',   x: 310, y: 30,  w: 140, h: 60, kind: 'security', label: 'DAP', detail: 'AP fan-out' },
+  { id: 'rom',   x: 470, y: 30,  w: 160, h: 60, kind: 'storage',  label: 'ROM table', detail: '0xE00FF000' },
+  { id: 'ahb',   x: 310, y: 120, w: 140, h: 60, kind: 'security', label: 'AHB-AP', detail: 'CSW / TAR / DRW' },
+  { id: 'core',  x: 30,  y: 220, w: 160, h: 60, kind: 'core',     label: 'Core / SCS', detail: 'DHCSR, DCRSR' },
+  { id: 'dwt',   x: 210, y: 220, w: 130, h: 60, kind: 'periph',   label: 'DWT', detail: 'PC sample, watchpoints' },
+  { id: 'itm',   x: 360, y: 220, w: 130, h: 60, kind: 'periph',   label: 'ITM', detail: 'printf stimulus ports' },
+  { id: 'etm',   x: 510, y: 220, w: 130, h: 60, kind: 'periph',   label: 'ETM', detail: 'program flow trace' },
+  { id: 'tpiu',  x: 660, y: 220, w: 130, h: 60, kind: 'io',       label: 'TPIU', detail: 'SWO / TRACE pins' },
+  { id: 'etb',   x: 510, y: 320, w: 280, h: 60, kind: 'memory',   label: 'ETB / on-chip trace SRAM', detail: 'circular buffer' },
+]} edges={[
+  { from: 'probe', to: 'swj', tone: 'primary' },
+  { from: 'swj', to: 'dap', tone: 'primary' },
+  { from: 'dap', to: 'rom', label: 'discover', tone: 'muted' },
+  { from: 'dap', to: 'ahb', tone: 'accent' },
+  { from: 'ahb', to: 'core', label: 'r/w', tone: 'success' },
+  { from: 'ahb', to: 'dwt', tone: 'accent' },
+  { from: 'ahb', to: 'itm', tone: 'accent' },
+  { from: 'ahb', to: 'etm', tone: 'accent' },
+  { from: 'etm', to: 'tpiu', label: 'ATB', tone: 'warning' },
+  { from: 'itm', to: 'tpiu', tone: 'warning' },
+  { from: 'etm', to: 'etb', tone: 'default' },
+]} caption="The probe enters through SWJ-DP and lands on the DAP, which fans out to the ROM table for discovery and the AHB-AP for everything else; trace sources (DWT/ITM/ETM) push packets through TPIU or buffer them in the on-chip ETB." />
+
+### SWJ-DP — the entry point
+
+Every Cortex-M part has either an SWJ-DP (supports both SWD and JTAG) or a SW-DP (SWD only) at the pin boundary. SWJ-DP is the more flexible — at reset, the part listens on the SWD/JTAG pins for a "switch sequence" that selects which protocol to use. Once selected, the part responds to that protocol's transactions.
+
+**SWD (Serial Wire Debug)** uses two pins: SWDIO (bidirectional data) and SWCLK (clock from probe). Transactions are 33–46 bits. Typical clock 1–10 MHz; max ~50 MHz on modern probes. The simplest, lowest-pin-count option — used for every modern Cortex-M debug session.
+
+**JTAG (IEEE 1149.1)** uses four pins: TCK (clock), TMS (mode select), TDO (out), TDI (in). Multi-drop — multiple devices can share the TCK/TMS lines, with TDO of one chip feeding TDI of the next. Useful for boundary-scan testing and for multi-core SoCs where one debug port reaches several cores. Largely deprecated on single-core Cortex-M boards; standard on multi-core SoCs and on parts that ship with both for legacy reasons.
+
+| Feature | SWD | JTAG |
+|---|---|---|
+| Pin count | 2 (+1 for SWO) | 4 (+1 for SWO, +1 reset) |
+| Bandwidth | Equivalent ~equiv to JTAG | Slightly higher |
+| Chain multiple devices | Direct multi-drop available (rare) | Native daisy-chain |
+| Boundary scan | No | Yes (IEEE 1149.1) |
+| Power-on protocol | Switch sequence required | Native at reset |
+
+For new designs, use SWD unless you have a specific reason for JTAG (boundary scan, multi-drop, or legacy probe).
+
+### DP → AP — the bridge
+
+Inside the chip, the DP exposes an internal "AP bus" with up to 256 AP slots. Each slot can hold a different access port. The most common is **AHB-AP** — translates AP-bus accesses into AHB master transactions on the main bus matrix. That's how the probe reads `r0` (read DCRSR, then DCRDR), reads memory (just an AHB read), or writes the NVIC enable register.
+
+Other APs you may see:
+
+- **APB-AP** — bridges to an APB bus for low-bandwidth peripherals.
+- **JTAG-AP** — bridges to a JTAG chain for legacy boundary-scan or for cores that don't speak AHB.
+- **AXI-AP** — for Cortex-A SoCs where the main bus is AXI.
+
+Cortex-M parts almost always expose one AHB-AP, sometimes a second one for ROM-table access or for secure-state separation.
+
+### AHB-AP transactions
+
+The probe issues reads and writes by manipulating three AHB-AP registers:
+
+| Register | Function |
+|---|---|
+| CSW | Control/Status Word — auto-increment, transfer size |
+| TAR | Transfer Address Register — the AHB address to access |
+| DRW | Data Read/Write — the value being read or written |
+
+A typical "read 32 bits from 0xE000_E100" sequence:
+
+1. Probe sends an AP write to CSW with `Size=4, AddrInc=Increment-by-size`.
+2. Probe sends an AP write to TAR with `0xE000_E100`.
+3. Probe sends an AP read to DRW; the AHB-AP performs the actual AHB read and returns the value to the probe.
+
+The whole transaction is 4–5 SWD packets, ~100 SWCLK cycles, ~10 µs at 10 MHz SWCLK. Bursts (reading 1024 consecutive words) are efficient because AddrInc auto-increments TAR — the probe only issues DRW reads.
+
+## ROM tables — discovering components
+
+The ROM table is a read-only data structure at a well-known address (`0xE00F_F000` on standard Cortex-M parts) that lists every Coresight component on the part: where it is, what it is, and what version. A debug probe walks the ROM table at connect time to discover the topology — "this part has DWT at 0xE000_1000, ITM at 0xE000_0000, ETM at 0xE004_1000, TPIU at 0xE004_0000."
+
+The format is a series of 32-bit entries, each pointing to a Coresight component:
+
+```
+Offset 0x000: Component 0 entry (pointer to first component) | flags
+Offset 0x004: Component 1 entry
+Offset 0x008: Component 2 entry
+...
+Offset 0xFFC: End-of-table marker (0)
+```
+
+Each pointed-to component starts with a "peripheral ID" block (PID0..7) and "component ID" block (CID0..3) at fixed offsets, telling the probe what kind of component it is. The Coresight spec defines the PID/CID format and reserves PID values for standard ARM components.
+
+Once the probe has walked the ROM table, it knows where each block is and configures them through their own MMIO registers. This is why connecting a J-Link to a new part "just works" — the probe doesn't need a hand-written description of the part's topology; the ROM table tells it.
+
+## Trace path
+
+Trace sources (DWT, ITM, ETM) emit packets through an on-chip trace bus to one or more sinks:
+
+- **TPIU** — formats packets and drives them out a physical pin (SWO or parallel trace port).
+- **ETB (Embedded Trace Buffer)** — captures packets into a small on-chip SRAM (typically 4–16 KB). The probe reads the ETB out over the AHB-AP later. Useful when SWO bandwidth is too low.
+- **STM (System Trace Macrocell)** — newer trace fabric for multi-source SoCs. Mostly on Cortex-A.
+
+On Cortex-M, the typical topology is DWT/ITM → TPIU → SWO pin. ETB is rare on M-class parts. ETM, when present, goes through TPIU to a parallel trace port.
+
+### SWO bandwidth and the prescaler
+
+SWO is a serial NRZ stream (UART-like, no start bit, no stop bit, no parity — just data). The rate is `core_clock / TPI->ACPR`. On a 168 MHz STM32F4 with ACPR=83, the SWO baud is ~2 Mbit/s.
+
+The probe samples SWO at a baud rate it negotiates with the target's TPIU. Get the baud wrong and you see corrupted ITM data — characters with bit errors, jumbled exception events. Auto-baud-detect probes (J-Link) handle this; less-smart probes need a hand-set baud in the IDE.
+
+<Callout type="warn" title="SWO at high clocks">
+At core clocks above ~400 MHz, SWO bandwidth starts to bottleneck. A single ITM port streaming text at 2 Mbit/s is fine, but adding exception trace + DWT periodic sampling can overflow the SWO FIFO, causing packet drops. You'll see "missed packets" warnings in the probe-side log. Either reduce DWT sampling rate, drop ITM ports, or move to a parallel trace port + ETM if available.
+</Callout>
+
+## DWT cycle counting — what's actually measured
+
+A common question: how accurate is `DWT->CYCCNT`?
+
+The answer: **exact, in core clock cycles**. The counter increments on every core clock edge while the core is running (not while halted). It does not skip cycles during stalls — pipeline bubbles, cache misses, flash wait states all count.
+
+But "core cycles" is not the same as "wall-clock time" if the core clock is dynamic. PLL frequency changes, power-mode transitions, and low-power sleep states all alter the cycles-per-second ratio. For benchmarks at a fixed clock, CYCCNT is the gold standard. For end-to-end latency in a system with dynamic clocking, prefer the SysTick counter or a free-running hardware timer driven by a stable reference.
+
+CYCCNT is 32-bit. At 200 MHz, it wraps every `2^32 / 200e6 = 21.47 seconds`. For longer measurements, sample CYCCNT periodically (faster than every 20 s) and accumulate into a 64-bit software counter.
+
+## Authentication — debug lockout
+
+Many security-graded parts gate debug access via the `DBGEN` signal. If the OTP fuses say "debug disabled," the chip's debug port ignores all SWD/JTAG transactions or returns zeros. This is the standard lockout for production silicon — once shipped, the part can't be probed without physically reflashing the fuse (impossible) or finding an exploit (the goal of secure boot).
+
+Some parts have multi-level authentication:
+
+- **DBGEN** — main debug (invasive access).
+- **NIDEN** — non-invasive debug (trace only, no halt).
+- **SPIDEN** — secure-state invasive debug (TrustZone-protected).
+- **SPNIDEN** — secure-state non-invasive.
+
+Each gate is independent. A part shipped with `DBGEN=0, NIDEN=1` allows trace (ITM/ETM/SWO output) but not halt-mode debug — useful for production diagnostics without compromising firmware confidentiality.
+
+## Cross-references
+
+- [DWT/ITM/ETM](/docs/cortex-m/dwt-itm-etm) — the trace blocks in detail
+- [SCB](/docs/cortex-m/scb) — debug-related SCB bits (DEMCR)
+- [GDB](/docs/tools/gdb) — talking to the probe from a debugger
+- [OpenOCD](/docs/tools/openocd) — open-source probe driver
+- ARM CoreSight Architecture Specification (IHI 0029)
+- ARMv7-M ARM section C1 (Debug)

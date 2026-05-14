@@ -1,0 +1,176 @@
+---
+title: ARMv6-M architecture
+description: The minimal M-profile ISA — what's in ARMv6-M (Cortex-M0, M0+, M1), what's missing compared to v7-M, and the design decisions that drop the gate count to under 12k while still running C code.
+order: 10
+updated: 2026-05-13
+tags: [architecture, armv6m, cortex-m0, cortex-m0plus, isa]
+---
+
+ARMv6-M is the smallest, cheapest, lowest-power member of the M-profile family. It was designed to compete with 8-bit and 16-bit microcontrollers on cost and current consumption, while still running a real C toolchain and the same vector-table, NVIC, and exception model as its bigger siblings. The trade-off is a deliberately stripped instruction set: most of Thumb-2 is gone, the conditional-execution machinery is reduced to plain `B` instructions, the data path is narrower in places, and several "convenience" instructions you'd reach for on a Cortex-M3 simply aren't encoded.
+
+Understanding what's *not* in ARMv6-M is just as important as understanding what is. A driver written for a Cortex-M4 will not assemble for a Cortex-M0 without changes — and the cost model of the missing instructions (multi-instruction emulation of a single 32-bit divide, for example) decides whether your tight loop meets timing.
+
+<SpecSheet
+  title="ARMv6-M at a glance"
+  specs={[
+    { label: 'Cores using it', value: 'Cortex-M0, Cortex-M0+, Cortex-M1 (FPGA-targeted)' },
+    { label: 'Instruction set', value: 'Thumb (16-bit) plus a tiny Thumb-2 subset: BL, MRS, MSR, ISB, DSB, DMB' },
+    { label: 'Register file', value: 'r0..r12, sp, lr, pc — 16 general; low (r0..r7) vs high (r8..r12) split in most encodings' },
+    { label: 'Data path', value: '32-bit; some operations restricted to low registers (r0..r7)' },
+    { label: 'Conditional execution', value: 'Only via conditional B (branch). No IT block, no conditional ADDS/MOVS etc.' },
+    { label: 'Exception model', value: 'Same vector table + NVIC as v7-M; 32 IRQ lines on M0/M0+, 2-bit priority typical' },
+    { label: 'MPU', value: 'Optional on M0+ (8 regions, v7-M-style descriptors); never present on M0' },
+    { label: 'Privilege levels', value: 'Two (privileged/unprivileged) on M0+; single privilege on M0' },
+    { label: 'Atomic primitives', value: 'No LDREX/STREX. Atomicity by disabling interrupts (PRIMASK) or bus-master arbitration only.' },
+    { label: 'Typical gate count', value: '~12k gates (Cortex-M0), ~12k–15k (M0+)' },
+  ]}
+/>
+
+## The shape of the instruction set
+
+ARMv6-M's instruction set is almost entirely 16-bit Thumb encodings, with a small handful of 32-bit Thumb-2 instructions admitted for tasks that can't be done in 16 bits. The 32-bit instructions are:
+
+- **`BL imm`** — long branch with link. The 16-bit `B` only reaches ±2 KB; `BL` needs 32 bits to encode the ±16 MB offset for any non-trivial program.
+- **`MRS` / `MSR`** — read/write the special-purpose registers (APSR, IPSR, EPSR, PRIMASK, CONTROL, MSP, PSP). These need wider encoding to address the special registers by name.
+- **`DSB` / `DMB` / `ISB`** — memory barriers. Same semantics as on v7-M but with limited utility because v6-M has no caches and no out-of-order execution.
+
+Everything else — arithmetic, loads, stores, branches — is plain 16-bit Thumb. That gives ARMv6-M extremely good code density (often 30–40% smaller than equivalent ARMv7-M code, paradoxically, because v7-M emits a lot of 32-bit Thumb-2 mid-function).
+
+<ProtocolFrame title="Thumb 16-bit encoding families (top 6 bits)" fields={[
+  { name: '000xxx — shift / mov imm', bits: 3, tone: 'primary' },
+  { name: '001xxx — ADD/SUB/CMP/MOV imm8', bits: 3, tone: 'accent' },
+  { name: '0100xx — data-proc + special', bits: 3, tone: 'highlight' },
+  { name: '0101xx / 011 / 100 — load/store', bits: 3, tone: 'success' },
+  { name: '1010xx — ADR / ADD SP', bits: 3, tone: 'warning' },
+  { name: '1011xx — misc + push/pop', bits: 3, tone: 'muted' },
+  { name: '1101xx — Bcond / SVC', bits: 3, tone: 'destructive' },
+  { name: '11100x — B imm11', bits: 3, tone: 'primary' },
+]} caption="ARMv6-M's 16-bit Thumb opcodes split into eight major families decoded from the top three bits; the remaining 13 bits encode operands. Code density comes from never spending bits on a feature that isn't there (no IT, no LDREX, no divide)." />
+
+| Feature | ARMv6-M | ARMv7-M | Why removed |
+|---------|---------|---------|-------------|
+| IT block (`IT EQ`, etc.) | No | Yes | Decoder complexity; conditional execution gives marginal benefit at this scale |
+| LDREX / STREX | No | Yes | Exclusive-monitor logic adds area; M0+ added `LDREX`/`STREX` *byte* variants in some impls |
+| UDIV / SDIV | No | Yes | A 32×32 divide unit is hundreds of gates; emulated in libgcc |
+| Bit-banding | No | Yes (M3/M4) | Requires extra bus decoder hardware |
+| MUL — multi-cycle? | 1- or 32-cycle (impl-defined) | 1-cycle | M0 lets the vendor choose between fast-mul (1 cycle, more gates) and small-mul (32 cycles, fewer gates) |
+| Saturating math (QADD etc.) | No | Yes | DSP-style — not the v6-M target |
+| Unaligned access | Faults | Allowed | Hardware unaligned support is gate-expensive |
+| Coprocessor space | No | Yes (CP10/11 = FPU) | No FPU on any v6-M core |
+
+The `MUL` instruction's variable timing is worth pausing on. Cortex-M0 silicon ships in two configurations: **fast multiplier** (single-cycle 32×32 → 32 multiply, ~500 more gates) and **slow multiplier** (32-cycle iterative, smaller area). The vendor picks at synthesis time and you cannot tell from software — only from cycle-counting under a logic analyzer or vendor errata. Cortex-M0+ usually ships fast-mul. Cortex-M0 in deep-sub-threshold variants often ships slow-mul.
+
+## The register file and addressing quirks
+
+ARMv6-M splits the 16 general-purpose registers into "low" (r0..r7) and "high" (r8..r12, plus sp, lr, pc). Most 16-bit Thumb encodings can only operate on low registers. To touch r8..r12 you need the high-register variants of `MOV`, `ADD`, and `CMP`, each of which is a separate encoding with restricted operand combinations.
+
+```asm
+@ Move r0 into r8 — legal high-reg form of MOV
+mov r8, r0
+
+@ But this won't assemble — ADDS with destination r8 is not encoded:
+@ adds r8, r8, r0      @ error: bad instruction
+
+@ Use the high-reg ADD instead (no flag update; APSR not affected):
+add r8, r0
+```
+
+This restriction means a function that uses r8..r12 for locals burns instructions on shuttling values to/from low registers. AAPCS preserves r4..r11; on a Cortex-M0 a leaf function with five live locals will spill more than the equivalent Cortex-M3 function — code is often noticeably larger when generated for v6-M, despite the denser instruction encoding, because of these forced moves.
+
+The constant pool also matters. ARMv6-M cannot embed 32-bit immediates the way Thumb-2 can (`MOVW`/`MOVT` pair). The only way to materialize a 32-bit constant is `LDR Rd, =const` — the assembler emits a PC-relative load from a literal pool the linker places at the end of the function. This burns a load and consumes 4 bytes of `.text` per unique constant. Compiler optimization passes go to some lengths to share literal pools across functions.
+
+## The exception model — same shape, smaller knobs
+
+ARMv6-M shares the M-profile exception model with v7-M: a vector table at the base of memory (or wherever `VTOR` points, on M0+), 16 system exceptions plus up to 32 NVIC IRQs, automatic stacking of `r0..r3, r12, lr, pc, xPSR` on entry, automatic unstacking on return via the magic `EXC_RETURN` value in `lr`.
+
+What's different:
+
+- **Priority bits**: only **2 bits** of priority are implementable on Cortex-M0 (4 levels). Cortex-M0+ allows 2 or 3 bits in the architecture but most vendors ship 2 bits. There is **no BASEPRI register** — you have only PRIMASK (block-everything) for masking. Granular masking by priority threshold is not possible.
+- **No FAULTMASK** either. The full set of mask registers is: PRIMASK (1 bit, blocks all configurable IRQs), CONTROL (privilege + SP selection bits). That's it.
+- **No usage/bus/memmanage faults as distinct vectors**. Every fault escalates straight to HardFault. Decoding what actually happened means inspecting the saved frame and the few status bits that *are* available. There's no SCB->CFSR.
+- **VTOR is optional on M0** (most M0 implementations have a fixed vector table at 0x00000000; M0+ adds VTOR).
+- **No vector-table relocation needed for bootloaders on M0** — you live with whatever the silicon fixed at the base. M0+ added VTOR partly because bootloader use was demanding it.
+
+The stacking sequence and exception-return mechanics are bit-for-bit identical to v7-M, so a stack-frame decoder written for one works for the other. The `EXC_RETURN` magic values (0xFFFFFFF1 → returning to handler mode using MSP, etc.) are the same.
+
+<Callout type="warn">
+The absence of CFSR means you cannot tell a precise data abort from a usage fault from an instruction-fetch abort programmatically. On an M0 HardFault you have the stacked PC (instruction that faulted) and SHCSR's HARDFAULTPENDED bit — that's it. Reach for the [fault decoder tool](/tools/fault-decoder) to inspect the frame, then for the disassembly to recognise the instruction kind. Bring up your driver carefully because there's no "BFAR with a faulting address" to lean on.
+</Callout>
+
+## What's missing — and the cost
+
+The instructions absent from ARMv6-M turn into multi-instruction sequences (or library calls), and these costs compound in performance-sensitive code:
+
+| Operation | v7-M cost | v6-M cost (typical) | Notes |
+|-----------|-----------|---------------------|-------|
+| `udiv r0, r1, r2` | 2–12 cycles (single instruction) | ~100+ cycles (`__aeabi_uidiv`) | Library call; full software loop |
+| 32-bit immediate load | 2 cycles (`movw`+`movt`) | 2 cycles (`ldr =const`) | Equivalent, but burns 4 bytes of literal pool |
+| Conditional add (`addne r0, r1`) | 1 cycle in IT block | 3 cycles (branch over) | `B`-skip is the only conditional |
+| Unaligned `ldr` | 2 cycles (allowed) | 4 instr (`ldrb`+`ldrb`+`ldrb`+`ldrb` + assembly) | Faults if hardware doesn't trap-and-emulate |
+| Saturating `qadd` | 1 cycle | many (manual saturate) | Not in v6-M |
+| Atomic increment | 6 cycles (LDREX/ADD/STREX/CBZ) | ~20 cycles (PRIMASK on/off bracket) | See [exclusive monitors](/docs/architecture/exclusive-monitors) |
+
+For atomic-update sequences, the v6-M idiom is "disable interrupts, read-modify-write, re-enable":
+
+```c
+uint32_t prim = __get_PRIMASK();
+__disable_irq();
+counter++;          // safe — IRQs cannot preempt
+if (!prim) __enable_irq();
+```
+
+This works but has two downsides. First, it raises latency for **every** IRQ during the critical section, even unrelated ones. Second, it doesn't compose with multi-core systems — RP2040 (dual M0+) has *bus-level* spinlocks (the SIO block's hardware spinlocks) precisely to make up for v6-M's missing atomic primitives. Code targeting both M0 and M3 typically wraps the atomic in a macro that uses `LDREX`/`STREX` on v7-M and PRIMASK on v6-M.
+
+## Cortex-M0 vs Cortex-M0+
+
+Both implement ARMv6-M, but with different microarchitectures and slightly different option lists:
+
+<CoreCompare
+  rows={[
+    { core: 'Cortex-M0', notes: 'Original 2009 release. 3-stage pipeline. No VTOR (fixed 0x00000000). Optional SWD/JTAG. Up to 4 watchpoint comparators. Found in nRF51, STM32F0, LPC11xx, KL series.' },
+    { core: 'Cortex-M0+', notes: '2012 refresh. 2-stage pipeline (vs M0\'s 3) — better branch performance, lower per-MHz power. VTOR present. Optional MPU. Optional fast-IO single-cycle GPIO. Found in nRF52810, STM32G0, RP2040, SAMD21, KL series (newer).' },
+    { core: 'Cortex-M1', notes: 'FPGA-targeted variant. Same ISA, optimized for synthesis into Altera/Xilinx fabric. Rare in production silicon.' },
+  ]}
+/>
+
+The Cortex-M0+ pipeline change is the headline performance improvement: the shorter pipeline gives a 1-cycle branch instead of M0's 2-cycle branch, which roughly translates to 8–10% higher Dhrystone at the same clock. The single-cycle GPIO option on M0+ matters for bit-banging — you can toggle a pin every cycle, where M0 needs 2 cycles per toggle.
+
+## Performance characteristics
+
+A back-of-envelope cycles-per-instruction picture for v6-M:
+
+- **Most ALU ops**: 1 cycle.
+- **Branches**: 1 cycle if not taken, 2 cycles if taken (Cortex-M0+); M0 always 2.
+- **Loads from SRAM**: 2 cycles (M0), 2 cycles (M0+).
+- **Loads from flash**: depends on the flash controller and prefetch buffer. Typical STM32G0 with prefetch: 1–2 cycles; without: 3+.
+- **MUL**: 1 cycle (fast-mul) or 32 cycles (small-mul).
+- **No divide**: 30–100+ cycles via library.
+
+Total Dhrystone DMIPS/MHz is reported as **0.84** for Cortex-M0 and **0.95** for Cortex-M0+. Cortex-M3 by comparison is 1.25. The roughly 25% Dhrystone gap reflects the missing instructions plus the narrower instruction stream.
+
+<Callout type="tip">
+If you're moving code from Cortex-M3/M4 to Cortex-M0/M0+, profile early. Things that look identical in C source — `a / b`, `if (x) y++`, `uint64_t` arithmetic, unaligned struct access — generate dramatically different code on v6-M. The compiler will not warn you. A function that took 200 cycles on M4 may take 800 on M0+.
+</Callout>
+
+## Toolchain flags
+
+Compiling for v6-M:
+
+```
+arm-none-eabi-gcc -mcpu=cortex-m0plus -mthumb -mfloat-abi=soft ...
+```
+
+Notes:
+- `-mthumb` is required (and implied by `-mcpu=cortex-m0`/`m0plus`). v6-M cannot execute ARM-mode instructions; there is no ARM mode.
+- `-mfloat-abi=soft` is the only valid float ABI. There is no FPU. Even with `softfp` GCC will emit calls to `__aeabi_fadd` etc.
+- `-O2` or `-Os` — code density matters more than micro-optimization at this scale.
+- `--specs=nano.specs` strips down newlib's printf / malloc to the small footprint that fits in M0+ flash budgets.
+
+## Cross-references
+
+- [ARM ISA family](/docs/architecture/isa-family) — where v6-M sits in the broader ARM lineup
+- [ARMv7-M architecture](/docs/architecture/armv7m) — what you get when you step up
+- [Exception model](/docs/architecture/exception-model) — vector table, stacking, exception return
+- [Exclusive monitors](/docs/architecture/exclusive-monitors) — what v6-M lacks and how to work around it
+- [Startup & vector table](/docs/programming/startup) — boot considerations specific to fixed-VTOR M0 parts
+- ARMv6-M Architecture Reference Manual (ARM DDI 0419) — the canonical spec

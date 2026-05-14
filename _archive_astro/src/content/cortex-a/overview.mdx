@@ -1,0 +1,88 @@
+---
+title: Cortex-A overview
+description: ARM's applications-class cores — what makes them different from Cortex-M, and what a firmware engineer needs to know when stepping up to A-profile.
+order: 1
+updated: 2026-05-12
+tags: [cortex-a, fundamentals]
+---
+
+import Callout from '~/components/Callout.astro';
+
+Cortex-A cores are designed to run **rich operating systems** — Linux, Android, QNX, FreeBSD. The whole machinery (MMU, multi-level caches, large register files, multi-issue out-of-order pipelines on bigger cores) exists to make virtual memory and multi-tenant workloads fast. As a result, an A-profile chip looks more like a small SoC than a microcontroller.
+
+## What's different from Cortex-M
+
+| Feature                | Cortex-M                  | Cortex-A                          |
+|------------------------|---------------------------|-----------------------------------|
+| Memory protection      | MPU (region-based)        | MMU (paged virtual memory)        |
+| Caches                 | optional, small, no coherency | always present, multi-level, coherent across cores |
+| Interrupt controller   | NVIC                      | GIC (Generic Interrupt Controller) |
+| Privilege levels       | 2 (thread/handler × priv/unpriv) | 4 EL levels (EL0 user → EL3 monitor) |
+| Boot                   | flat — from address 0     | multi-stage — BL1 → BL2 → BL31 → OS |
+| Floating point         | optional, single-precision typical | always present, double-precision, NEON SIMD |
+| Time-of-day            | external RTC chip         | on-chip generic timer + RTC       |
+| Typical core count     | 1 (sometimes 2 hetero)    | 4–8+ (often big.LITTLE)           |
+
+If you're coming from Cortex-M, the mental shift is: **you no longer own the whole chip**. You write code that runs on top of an operating system, in a virtual address space, scheduled by a kernel you don't control. The good news: most of the firmware-engineer instincts (DMA coherency, interrupt latency, bit-twiddling registers) still apply — just one layer deeper.
+
+## The Cortex-A family
+
+Modern Cortex-A cores split into three performance tiers:
+
+- **Efficiency cores** — Cortex-A55, A510, A520. In-order or simple OoO, low-power, big.LITTLE little-cluster role.
+- **Mid cores** — Cortex-A75, A77, A715. Performance-oriented, balanced area/power.
+- **Big cores** — Cortex-A78, A720, X1/X2/X3/X4. High-IPC OoO, large reorder buffer, the "performance cluster" in phones.
+
+Older ARMv7-A cores (Cortex-A7, A8, A9, A15, A17) are still everywhere in industrial — Raspberry Pi 3, 4, 5; embedded SBCs; legacy automotive.
+
+## Exception levels
+
+A-profile has four EL levels:
+
+```
+EL0   ── user space (applications)
+EL1   ── kernel (Linux)
+EL2   ── hypervisor (KVM, Xen, Hyper-V)
+EL3   ── secure monitor (TF-A) — gates secure-world entry/exit
+```
+
+Each level has its own SP, PC, and most system registers. Higher EL can read/write lower-EL state; lower EL can only enter higher EL via a trap (SVC, HVC, SMC).
+
+## The GIC
+
+A-profile interrupts go through the **Generic Interrupt Controller**, which is much more sophisticated than the NVIC:
+
+- Routes interrupts to specific cores (per-PE routing).
+- Distinguishes SGI (software-generated, used for inter-core messaging), PPI (per-PE peripheral), and SPI (shared peripheral).
+- Supports message-signaled interrupts (MSI) via the ITS in GICv3.
+- Has its own priority encoding, distinct from EL priorities.
+
+A Linux driver doesn't touch the GIC directly — it goes through `request_irq()`. But the GIC is where the kernel-level interrupt plumbing lives, and you'll see references to GIC distributor / redistributor / CPU interface registers when reading kernel source.
+
+## MMU in one paragraph
+
+Every memory access goes through a page table walk: virtual address → page table → physical address. The translation result is cached in TLBs. Page tables can be multi-level (typically 4 levels for AArch64 with 4 KB pages), and the cost of a TLB miss is a page-table walk in physical memory — fast but not free. The MMU also enforces access permissions (RWX per page) and memory type (Normal/Device/Strongly-ordered) — same vocabulary as Cortex-M, broader configuration.
+
+## Boot in one paragraph
+
+A typical ARMv8-A boot chain:
+
+```
+ROM → BL1 → BL2 → BL31 (TF-A runtime) ──── BL32 (optional: OP-TEE)
+                                       └─── BL33 (U-Boot or UEFI)
+                                                  │
+                                                  ▼
+                                                Linux kernel
+```
+
+Each stage validates the next via signed images. By the time Linux runs, you're in EL1, in MMU-on virtual memory, with TF-A providing PSCI services (CPU on/off, system reset) and OP-TEE providing TrustZone services. See [boot flow & EL levels](/docs/cortex-a/boot-and-exception-levels/).
+
+<Callout type="note" title="Why armhub covers Cortex-A">
+Most embedded engineers don't *only* write Cortex-M firmware. You'll hit Cortex-A when you bring up a Raspberry Pi, port a vendor BSP, or debug a TF-A boot failure. Knowing one layer above is often what makes you the engineer who can actually ship the product.
+</Callout>
+
+## See also
+
+- [Boot flow & EL levels](/docs/cortex-a/boot-and-exception-levels/) — the full chain.
+- [MMU & paging](/docs/cortex-a/mmu/) — page tables in detail.
+- [Caches & coherency](/docs/cortex-a/caches/) — multi-level cache hierarchies.

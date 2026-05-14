@@ -1,0 +1,199 @@
+---
+title: EV charger (Level 2 home)
+description: Inside a 7.2–11.5 kW home EV charger — Cortex-M7 control, Wi-Fi MCU, the J1772 control-pilot dance, residual-current protection, and OCPP cloud comms.
+order: 4
+updated: 2026-05-12
+tags: [systems, ev, charger, cortex-m7, safety]
+---
+
+
+A home EV charger looks like a cable in a box. It's actually a high-current AC switching device with strict safety certifications, a real-time control protocol with the car, ground-fault protection that has milliseconds to act, and a cloud connection so the utility can throttle you. There's a Cortex-M7 (or two) in the middle making sure none of those things kill anybody.
+
+## At a glance
+
+<SpecSheet specs={[
+  { label: 'Product class', value: 'IEC 61851 Mode 3 / SAE J1772 Level 2 home/light-commercial' },
+  { label: 'Output', value: 'AC 230 V (EU) / 240 V (US) · 32 A typical · 7.2 / 11.5 / 22 kW' },
+  { label: 'Control MCU', value: 'Cortex-M7 (STM32H7) or Cortex-M4 (STM32G4/F4)' },
+  { label: 'Connectivity MCU', value: 'ESP32-S3 / NXP RT1062 — Wi-Fi + BLE provisioning' },
+  { label: 'Protocol with car', value: 'CP (control pilot) ±12 V PWM, PP (proximity pilot) resistor' },
+  { label: 'Cloud protocol', value: 'OCPP 1.6J / 2.0.1 over WebSocket TLS' },
+  { label: 'Safety', value: 'Type B RCD (residual current device), welded-contact detection, over-temp' },
+  { label: 'Certifications', value: 'UL 2594 (US), IEC 61851-1, IEC 62752 (IC-CPD), CE LVD/EMC' },
+  { label: 'RTOS', value: 'FreeRTOS typical; safety-rated firmware uses ThreadX or qualified port', link: '/docs/rtos/landscape/' },
+  { label: 'Power consumption (idle)', value: '3–8 W standby (the chip + Wi-Fi)' },
+]} />
+
+## What the charger actually does
+
+A common misconception is that the charger lives **inside the wall box**. It doesn't — the AC-to-DC converter and battery management both live **in the car**. The wall box is technically called **EVSE** (Electric Vehicle Supply Equipment) and its job is:
+
+1. **Authenticate** that a car is plugged in (resistor in the connector).
+2. **Negotiate the maximum current** via a 1 kHz PWM signal (Control Pilot).
+3. **Close the AC contactor** when the car requests power.
+4. **Continuously monitor** ground fault, contactor weld, over-current, over-temp.
+5. **Open the contactor immediately** on any fault (&lt;100 ms).
+6. **Bill, schedule, throttle** — cloud-side stuff over OCPP.
+
+The Cortex-M is doing all of (2)–(5) in real time, and a separate Wi-Fi MCU is doing (6).
+
+## The Control Pilot protocol
+
+This is the elegant 1-wire dance that defines J1772 / IEC 61851:
+
+```
+   EVSE side                            Car side
+   ┌─────────────┐    Control Pilot      ┌─────────────┐
+   │  +12V       │←────────wire──────────→│             │
+   │   │         │                        │  R1 = 2.74k │
+   │ 1 kHz PWM   │                        │ + diode     │
+   │ generator   │                        │             │
+   │   │         │     V_CP measured      │             │
+   │  GND        │                        │             │
+   └─────────────┘                        └─────────────┘
+
+   V_CP idle    : +12 V       → State A (no car)
+   V_CP at +9 V : car detected → State B (plugged, not charging)
+   V_CP at +6 V : car wants    → State C (charging — close contactor!)
+   V_CP at +3 V : ventilation  → State D (rare, ICE-vented charging)
+   V_CP at -12V : full negative → State E (error)
+   
+   PWM duty cycle (when in state B/C):
+     6 µs / 1000 µs (0.6%)  → "use digital comm" (DC fast charging signaling)
+     10% duty               → up to 6 A
+     duty × 0.6 A           → 6 to 51 A
+     duty × 2.5 A − 64      → 51 to 80 A (high-current US)
+```
+
+The EVSE generates the PWM and **simultaneously** measures the voltage at the same pin (via a divider). The car shorts a known resistor across CP, which loads the EVSE's voltage. Reading the loaded voltage tells the EVSE what state the car is in.
+
+Implementation-wise this is one of the more sophisticated mixed-signal peripherals: a timer generates the PWM, an ADC (synchronized to the *positive* phase of the PWM, never the negative phase) reads V_CP, and an analog comparator triggers an interrupt on the negative excursion to validate the car's diode (otherwise you'd be charging into a short).
+
+## Block diagram
+
+<BlockDiagram
+  title="Level 2 EV charger — full system"
+  width={860}
+  height={540}
+  minWidth={760}
+  nodes={[
+    { id: 'grid',    x: 40,  y: 58,  w: 190, h: 56, kind: 'power',    label: 'AC mains', detail: '230/240 V · 32 A' },
+    { id: 'rcd',     x: 40,  y: 154, w: 190, h: 56, kind: 'security', label: 'Type B RCD', detail: 'AC + DC fault sense' },
+    { id: 'contact', x: 40,  y: 250, w: 190, h: 56, kind: 'security', label: 'AC contactor', detail: 'relay coil' },
+    { id: 'vehicle', x: 40,  y: 346, w: 190, h: 72, kind: 'external', label: 'Vehicle inlet', detail: 'L/N/PE · CP · PP' },
+    { id: 'm7',      x: 310, y: 130, w: 240, h: 76, kind: 'core',     label: 'Cortex-M7 safety MCU', detail: 'STM32H7 / NXP RT · lockable IO' },
+    { id: 'mem',     x: 310, y: 44,  w: 240, h: 52, kind: 'memory',   label: 'Flash + SRAM', detail: 'dual-bank firmware' },
+    { id: 'cpgen',   x: 310, y: 244, w: 240, h: 56, kind: 'periph',   label: 'Control Pilot engine', detail: 'TIM1 PWM + ±12 V driver' },
+    { id: 'sense',   x: 310, y: 336, w: 240, h: 56, kind: 'sensor',   label: 'Safety sensing', detail: 'CP/PP ADC · CT clamps · NTCs' },
+    { id: 'wdog',    x: 310, y: 428, w: 240, h: 52, kind: 'security', label: 'Windowed watchdog', detail: 'hardware-only reset path' },
+    { id: 'wifi',    x: 620, y: 58,  w: 190, h: 64, kind: 'core',     label: 'Wi-Fi MCU', detail: 'ESP32-S3 · BLE provision' },
+    { id: 'cloud',   x: 620, y: 162, w: 190, h: 64, kind: 'cloud',    label: 'CSMS cloud', detail: 'OCPP WSS' },
+    { id: 'app',     x: 620, y: 260, w: 190, h: 56, kind: 'cloud',    label: 'Mobile app', detail: 'BLE commissioning' },
+    { id: 'load',    x: 620, y: 372, w: 190, h: 56, kind: 'periph',   label: 'Load management', detail: 'CAN / RS-485' },
+  ]}
+  edges={[
+    { from: 'grid',    to: 'rcd',     label: 'AC',  tone: 'warning', arrow: 'forward' },
+    { from: 'rcd',     to: 'contact', tone: 'warning', arrow: 'forward' },
+    { from: 'contact', to: 'vehicle', label: 'AC',  tone: 'warning', arrow: 'forward' },
+    { from: 'rcd',     to: 'm7',      label: 'GFCI trip', tone: 'destructive' },
+    { from: 'm7',      to: 'contact', label: 'close/open', tone: 'destructive' },
+    { from: 'm7',      to: 'mem' },
+    { from: 'm7',      to: 'cpgen' },
+    { from: 'cpgen',   to: 'vehicle', label: 'CP PWM', tone: 'primary', arrow: 'forward' },
+    { from: 'vehicle', to: 'sense',   label: 'CP/PP sample', tone: 'primary' },
+    { from: 'sense',   to: 'm7',      label: 'fault + current', tone: 'primary' },
+    { from: 'wdog',    to: 'm7',      tone: 'destructive', style: 'dashed' },
+    { from: 'm7',      to: 'wifi',    label: 'UART (RPC)', tone: 'accent', arrow: 'both' },
+    { from: 'wifi',    to: 'cloud',   label: 'OCPP TLS', tone: 'accent', arrow: 'both' },
+    { from: 'wifi',    to: 'app',     label: 'BLE',     tone: 'accent', arrow: 'both' },
+    { from: 'load',    to: 'm7',      arrow: 'both' },
+  ]}
+  caption="Two MCUs, two trust zones: the M7 owns everything safety-critical (CP signal, contactor, RCD) and never touches the cloud. The Wi-Fi MCU runs OCPP and BLE provisioning; a UART/RPC link is the only bridge between them."
+/>
+
+## The safety case
+
+This is what makes EV chargers different from "just another IoT device". The standard requires:
+
+- **Type B RCD** — detects ground fault including DC residual currents (cars can fail in ways that inject DC into the AC ground). 30 mA threshold, trip in &lt;300 ms.
+- **Contactor weld detection** — after every charging session, verify the contactor reopens. If you measure AC on the output with the contactor commanded open, the contactor welded; declare permanent fault, refuse further charging.
+- **Over-temperature** — multiple NTC sensors on the contactor, PCB, and cable connector. Reduce current or shut down.
+- **CP integrity** — if the CP signal goes out of valid range for more than ~50 ms, open the contactor.
+- **Watchdog** — independent hardware watchdog. If the firmware loop doesn't pet it every 100 ms, the system enters fault and contactors open.
+
+```c
+// Top-level safety loop, runs at 100 Hz, highest non-NMI priority
+void safety_loop(void) {
+    if (cp_state_invalid_ms > 50)       fault(FAULT_CP_LOSS);
+    if (rcd_tripped)                    fault(FAULT_GFCI);
+    if (contactor_welded)               fault(FAULT_WELD);
+    if (ntc_temp_c > 90)                fault(FAULT_OVERTEMP);
+    if (output_current_a > limit + 5)   fault(FAULT_OVERCURRENT);
+
+    if (no_fault) {
+        watchdog_feed();
+        state_machine_tick();
+    }
+}
+
+void fault(enum fault_code c) {
+    contactor_open();      // FIRST — fail safe
+    log_event(c);
+    led_set(RED, BLINK);
+    state = STATE_FAULT;
+    // Recovery requires unplug + re-plug, or for some faults: power cycle.
+}
+```
+
+`contactor_open()` must execute even if the firmware is otherwise broken. Many designs put a hardware comparator in front: if CP shows a fault state, a flip-flop opens the contactor in hardware regardless of CPU state.
+
+## OCPP — the cloud protocol
+
+**OCPP** (Open Charge Point Protocol) is the JSON-over-WebSocket-TLS API every commercial charger speaks. Typical message flow on plug-in:
+
+```
+Charger → Cloud: BootNotification (model, fw version, IMEI)
+Charger → Cloud: StatusNotification (Available)
+... car plugs in ...
+Charger → Cloud: Authorize (RFID tag UID or plug-and-charge cert)
+Cloud   → Charger: Authorize Accepted (or Rejected)
+Charger → Cloud: StartTransaction
+... charging ...
+Charger → Cloud: MeterValues (energy_Wh, current_A, voltage_V, temp_C) every 60 s
+Cloud   → Charger: SetChargingProfile (throttle to 16 A for peak hours)
+... unplug ...
+Charger → Cloud: StopTransaction (final meter reading)
+```
+
+The cloud side (CSMS — Charging Station Management System) is the operator's backend (ChargePoint, Shell Recharge, EVgo, etc.). OCPP 2.0.1 adds Plug-and-Charge (ISO 15118 cert-based auth), smart-charging contracts, and richer firmware management.
+
+This entire layer runs on the **Wi-Fi MCU**, not the safety M7 — a deliberate separation. A bug in OCPP TLS parsing should not be able to compromise the safety controller.
+
+## Real products
+
+| Product | Control MCU | Wireless MCU | Notes |
+|---|---|---|---|
+| **ChargePoint Home Flex** | STM32H7-class | unspecified | 50 A capable, OCPP capable in commercial models |
+| **Wallbox Pulsar Plus** | unspecified Cortex-M7 | ESP32 | EU 22 kW 3-phase variant; "MyWallbox" cloud |
+| **Tesla Wall Connector Gen 3** | TI Hercules (Cortex-R class) | Wi-Fi module | TI's automotive MCU for safety |
+| **EVBox Elvi** | Cortex-M class | LTE-M modem | Cellular-connected for commercial use |
+| **emporia EV Charger** | STM32 + ESP32 | ESP32 | Open-design hobbyist-friendly |
+| **OpenEVSE (DIY)** | ATmega328 / STM32 | ESP32 | Open-source — great for understanding the protocol |
+
+For learning, **OpenEVSE** is gold — the entire firmware is on GitHub, the schematics are open, and the safety logic is the same as commercial units, just simpler.
+
+## What goes wrong
+
+- **Contactor wear** — the AC contactor is a mechanical part that closes thousands of times. Vendors use NTC sensors and current monitors to detect early degradation.
+- **Weather/temperature** — outdoor units must work at -25 °C to +50 °C. Component selection (capacitors, especially) is non-trivial.
+- **Plug-and-charge edge cases** — older cars don't speak ISO 15118; firmware must support legacy J1772 and modern fancy auth flows simultaneously.
+- **Utility throttling** — when the cloud says "throttle to 6 A", the firmware must reduce the CP PWM duty smoothly so the car doesn't see a glitch and abort.
+
+## See also
+
+- [Cortex-M7](/docs/cortex-m/m7/) — the safety MCU class.
+- [STM32 family](/docs/vendors/stm32/) — STM32H7 + STM32G4 are common picks.
+- [Timers & PWM](/docs/peripherals/timers/) — for CP signal generation.
+- [ADC / DAC](/docs/peripherals/adc/) — synchronized CP voltage sampling.
+- [CAN](/docs/peripherals/can/) — for load-management buses in multi-charger installs.
+- [OpenEVSE project](https://github.com/openenergymonitor/openevse_esp_wifi_v2) (external) — reference open-source EVSE design.

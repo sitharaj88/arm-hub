@@ -1,0 +1,81 @@
+---
+title: The ARM ISA family
+description: A field guide to ARM's instruction set architectures — from ARMv6-M on tiny microcontrollers to ARMv9-A on flagship phones — and how the modern Cortex lineup maps onto them.
+order: 1
+updated: 2026-05-12
+tags: [architecture, isa, fundamentals]
+---
+
+import Callout from '~/components/Callout.astro';
+import CoreCompare from '~/components/CoreCompare.astro';
+
+ARM doesn't sell one ISA — it sells a *family* of them, each tuned for a different power/performance/safety profile. If you've ever wondered why a Cortex-M0 can't run Linux but a Cortex-A53 can, or why Cortex-R cores have lockstep but Cortex-M cores have NVIC, this is the page.
+
+## The three profiles
+
+Modern ARM cores are partitioned into three application profiles, each with its own ISA:
+
+| Profile  | ISA family       | What it targets                              | Examples                       |
+|----------|------------------|----------------------------------------------|--------------------------------|
+| **M** (Microcontroller) | ARMv6-M, ARMv7-M, ARMv8-M, ARMv8.1-M | Real-time, deterministic, deeply embedded | Cortex-M0 through M85          |
+| **A** (Applications)    | ARMv7-A, ARMv8-A, ARMv9-A          | Rich OS, MMU, SMP, virtualisation        | Cortex-A53, A78, A720, X4      |
+| **R** (Real-time)       | ARMv7-R, ARMv8-R                   | Hard real-time, safety-critical          | Cortex-R5, R52                 |
+
+<Callout type="note" title="A quick mnemonic">
+**M** for *micro* — kilobytes of RAM, single chip, no MMU.
+**A** for *applications* — gigabytes of RAM, runs Linux/Android.
+**R** for *real-time* — predictable latency, often lockstep for ASIL-D.
+</Callout>
+
+## The M-profile family tree
+
+Almost everyone reading this is here for Cortex-M. The lineage:
+
+```
+ARMv6-M ──── Cortex-M0   (2009, smallest)
+        └─── Cortex-M0+  (2012, 2-stage pipe, MPU optional)
+        └─── Cortex-M1   (FPGA-targeted)
+
+ARMv7-M ──── Cortex-M3   (2004, the classic)
+ARMv7E-M ─── Cortex-M4   (2010, +DSP, optional FPU)
+        └─── Cortex-M7   (2014, superscalar, caches)
+
+ARMv8-M Baseline ── Cortex-M23  (2016, M0+ class + TrustZone)
+ARMv8-M Mainline ── Cortex-M33  (2016, M4 class + TrustZone)
+              └─── Cortex-M35P (M33 + tamper resistance)
+
+ARMv8.1-M ─────── Cortex-M55  (2020, Helium / MVE)
+              └── Cortex-M85  (2022, highest perf Cortex-M, PACBTI)
+              └── Cortex-M52  (2023, M55 little-sibling)
+```
+
+<CoreCompare />
+
+## Thumb, Thumb-2, and why your code is 16/32-bit mixed
+
+A defining feature of M-profile is that it runs **only Thumb code** — the compact 16-bit instruction encoding (with Thumb-2 mixing 16- and 32-bit instructions for full coverage). There is no "ARM mode" on Cortex-M.
+
+- **ARMv6-M** (Cortex-M0/M0+): a *subset* of Thumb-2. ~56 instructions. No hardware divide on M0.
+- **ARMv7-M** (Cortex-M3): full Thumb-2, hardware divide, bit-banding, `WFI`/`WFE`.
+- **ARMv7E-M** (Cortex-M4/M7): adds **DSP** instructions (SIMD on 16/8-bit lanes packed into 32-bit registers) and **optional FPU** (single-precision on M4, single+double on M7).
+- **ARMv8-M Baseline / Mainline**: adds **TrustZone-M**, stack limit registers, and the new `BLXNS`/`BXNS` non-secure-call instructions.
+- **ARMv8.1-M**: adds **Helium / MVE** (M-profile Vector Extension — 128-bit vector ops over the FPU register file), **PACBTI** (pointer auth + branch target ID), and low-overhead loop instructions.
+
+<Callout type="tip" title="Why this matters in practice">
+When you set `-mcpu=cortex-m4`, the compiler enables the ARMv7E-M ISA and DSP intrinsics. Add `-mfpu=fpv4-sp-d16 -mfloat-abi=hard` and it generates VFP instructions; omit it and floats are emulated via soft-float helpers, costing ~50× the cycles.
+</Callout>
+
+## A-profile in one paragraph
+
+Cortex-A cores implement ARMv7-A or ARMv8/9-A. They have **MMUs** (paging, virtual memory), large **L1/L2/L3 caches**, and run rich operating systems. They have multiple **exception levels** (EL0 user → EL1 kernel → EL2 hypervisor → EL3 secure monitor), not the NVIC. They're what's in your phone, your Raspberry Pi, your AWS Graviton instance. armhub covers them under [Cortex-A](/docs/cortex-a/overview/), but most of this site lives in the M-profile.
+
+## R-profile in one paragraph
+
+Cortex-R cores look superficially like A-profile (they used to use the A32/T32 ISA, now ARMv8-R has its own) but trade the MMU for an **MPU**, add **tightly coupled memories** (TCMs) for predictable access latency, and often run in **lockstep** (two cores executing the same instructions; a checker compares results cycle-by-cycle). They're the cores you'll find in automotive ECUs, hard drives, and 5G baseband. See [Cortex-R](/docs/cortex-r/overview/).
+
+## Where to go from here
+
+- The [exception model](/docs/architecture/exception-model/) — how interrupts, faults, and supervisor calls actually work.
+- The [memory model](/docs/architecture/memory-model/) — ordering, barriers, and why `dmb` exists.
+- [TrustZone](/docs/architecture/trustzone/) — secure/non-secure worlds on M-profile and A-profile.
+- Or jump straight into a core: [Cortex-M4](/docs/cortex-m/m4/), [Cortex-M33](/docs/cortex-m/m33-m23/), [Cortex-M85](/docs/cortex-m/m55-m85/).

@@ -1,0 +1,194 @@
+---
+title: Smartwatch / fitness tracker
+description: How a wearable runs 5–15 days on a 200 mAh battery — Cortex-M33 + BLE radio, sensor fusion, AMOLED, GATT services, and where Wear OS departs from this entirely.
+order: 2
+updated: 2026-05-12
+tags: [systems, wearable, ble, cortex-m33, low-power]
+---
+
+
+The interesting wearable is *not* an Apple Watch Ultra (Cortex-A class, runs a real OS, 1-day battery). It's the **week-long-battery** segment: Garmin Forerunner, Fitbit Charge, Whoop, low-end Amazfit, Polar — devices that run for a week or more on a tiny battery by being *aggressively* power-managed Cortex-M designs.
+
+## At a glance
+
+<SpecSheet specs={[
+  { label: 'Product class', value: 'Multi-day fitness tracker / connected watch' },
+  { label: 'Typical SoC', value: 'Nordic nRF53/nRF54, NXP K32W, Apollo4 (Ambiq)' },
+  { label: 'Application core', value: 'Cortex-M33F @ 64–128 MHz', link: '/docs/cortex-m/m33-m23/' },
+  { label: 'Network core (separate)', value: 'Cortex-M33 (in nRF5340) or RISC-V (nRF54H)' },
+  { label: 'RAM', value: '256 KB – 1 MB SRAM' },
+  { label: 'Flash', value: '1 MB – 4 MB internal + external QSPI for assets' },
+  { label: 'Wireless', value: 'BLE 5.x, optionally ANT+, occasionally Wi-Fi for sync' },
+  { label: 'Display', value: 'AMOLED 1.3–1.7"" 320×320 or e-Paper / transflective LCD' },
+  { label: 'Sensors', value: 'Accelerometer, gyro, optical heart rate, SpO2, skin temp' },
+  { label: 'Battery', value: '150–300 mAh Li-Po · 5–15 days runtime' },
+  { label: 'OS', value: 'Zephyr or FreeRTOS or vendor (Garmin ConnectIQ on top)', link: '/docs/rtos/zephyr/' },
+  { label: 'Certifications', value: 'Bluetooth SIG, FCC, optional FDA Class II (medical)' },
+]} />
+
+## The dual-core architecture that makes this work
+
+The defining trick of modern wearable SoCs is **two Cortex-M33 cores in one chip**, with separate flash/RAM and a hardware mailbox between them:
+
+<BlockDiagram
+  title="Nordic nRF5340-class wearable — full system"
+  width={860}
+  height={520}
+  minWidth={760}
+  nodes={[
+    { id: 'app',     x: 40,  y: 42,  w: 230, h: 72, kind: 'core',     label: 'App Cortex-M33F', detail: '128 MHz · TZ · FPU · DSP' },
+    { id: 'net',     x: 330, y: 42,  w: 220, h: 72, kind: 'core',     label: 'Network Cortex-M33', detail: '64 MHz · BLE controller' },
+    { id: 'radio',   x: 620, y: 42,  w: 190, h: 72, kind: 'radio',    label: '2.4 GHz radio', detail: 'BLE 5.4 · Thread · 802.15.4' },
+    { id: 'ipc',     x: 290, y: 146, w: 140, h: 54, kind: 'security', label: 'IPC mailbox', detail: 'shared memory' },
+    { id: 'memapp',  x: 40,  y: 146, w: 220, h: 54, kind: 'memory',   label: 'App memory', detail: '512 KB SRAM · 1 MB flash' },
+    { id: 'memnet',  x: 460, y: 146, w: 170, h: 54, kind: 'memory',   label: 'Net memory', detail: '64 KB RAM · softdevice' },
+    { id: 'ant',     x: 660, y: 146, w: 150, h: 54, kind: 'external', label: 'Chip antenna', detail: 'matching network' },
+    { id: 'sec',     x: 40,  y: 238, w: 220, h: 64, kind: 'security', label: 'KMU + CryptoCell', detail: 'ECC · AES · key store' },
+    { id: 'ui',      x: 310, y: 250, w: 220, h: 64, kind: 'periph',   label: 'UI + audio', detail: 'AMOLED · touch · PDM/I²S' },
+    { id: 'sensors', x: 590, y: 250, w: 220, h: 64, kind: 'sensor',   label: 'Motion + health sensors', detail: 'IMU · PPG · skin temp' },
+    { id: 'pmic',    x: 40,  y: 424, w: 220, h: 54, kind: 'power',    label: 'PMIC', detail: 'DC/DC · LDO · charger' },
+    { id: 'batt',    x: 310, y: 424, w: 180, h: 54, kind: 'external', label: 'Li-Po battery', detail: '200 mAh typical' },
+  ]}
+  edges={[
+    { from: 'app',    to: 'net',    label: 'IPC IRQ', tone: 'primary', arrow: 'both' },
+    { from: 'app',    to: 'ipc' },
+    { from: 'net',    to: 'ipc' },
+    { from: 'app',    to: 'memapp' },
+    { from: 'net',    to: 'memnet' },
+    { from: 'app',    to: 'sec',    label: 'TZ' },
+    { from: 'net',    to: 'radio',  label: 'TX/RX', tone: 'accent', arrow: 'both' },
+    { from: 'radio',  to: 'ant',    tone: 'accent', arrow: 'both' },
+    { from: 'app',    to: 'ui',      label: 'SPI / I²C / I²S' },
+    { from: 'app',    to: 'sensors', label: 'EasyDMA / I²C' },
+    { from: 'pmic',   to: 'app',    tone: 'warning', style: 'dashed' },
+    { from: 'batt',   to: 'pmic',   tone: 'warning' },
+  ]}
+  caption="Two M33 cores share a 2.4 GHz radio via an IPC mailbox. The network core's softdevice handles all timing-critical BLE work in microseconds; the app core never sees the radio directly."
+/>
+
+The application core runs your firmware. The network core runs the BLE controller as a precompiled binary (Nordic ships it as `nrf5340_netcore_softdevice.hex`). Inter-core communication uses **IPC** (a shared-memory mailbox) — your app pushes a "send packet" request, the network core handles all the timing-critical BLE link-layer work, and the radio gets serviced with microsecond latency that would never survive an RTOS context switch on a single core.
+
+This is the same architectural pattern as a [Wi-Fi router](/docs/systems/wifi-router/) (control plane on Linux, MAC plane on dedicated MCU) but at a fraction of the size and power.
+
+## The power story
+
+A 200 mAh Li-Po battery has ~0.7 Wh of energy. To last 14 days, the average power draw must be:
+
+```
+0.7 Wh × 3600 s/Wh = 2520 J
+2520 J / (14 days × 86400 s/day) = 2.08 mW average
+```
+
+At 3.0 V, that's **0.7 mA average**. Yet the SoC alone draws 5+ mA in active mode. The math only works because the SoC sleeps **99%+ of the time**.
+
+Typical duty cycle:
+
+```
+Wake every 1 second for HR sample:
+   200 µs wake-up
+   2 ms ADC + HR algorithm
+   500 µs back to sleep
+   ── 2.7 ms active per second = 0.27% duty cycle
+
+Wake on motion (acceleration > threshold) every ~30 s:
+   adds ~5 ms × ~2× per minute = trivial
+
+BLE advertising every 1 s:
+   ~3 ms radio TX at 4 mA
+   ── ~12 µC per second
+
+Sleep current: ~3 µA (RAM retained, RTC running, SOC in System ON)
+```
+
+Average: ~30 µA × 95% sleep + 5 mA × 5% wake ≈ 0.28 mA. Within budget. Add a 5-minute workout once a day with continuous HR + accelerometer at 25 Hz and BLE streaming → ~10 mA average for that 5 minutes → still under budget for 14 days.
+
+<Callout type="tip" title="Where the power budget goes wrong">
+The single biggest power destroyer is **always-on display**. A 320×320 AMOLED at minimum brightness draws ~3 mA. A transflective MIP display (used by Garmin) draws ~30 µA — *one hundred times less*. If you see a wearable claiming 30-day battery, look at the display: it's MIP, not OLED.
+</Callout>
+
+## Sensor stack
+
+The "smart" in smartwatch is mostly sensor fusion:
+
+```
+   ┌─────────────────┐
+   │ Accelerometer   │   3-axis, ±16g, 25-200 Hz
+   │ (LSM6DSO, etc.) │   I²C/SPI
+   └────────┬────────┘
+   ┌────────┴────────┐
+   │ Gyroscope       │   3-axis, ±2000 dps
+   └────────┬────────┘
+            │
+   ┌────────┴────────┐
+   │ Magnetometer    │   compass heading
+   │ (LIS3MDL, etc.) │
+   └────────┬────────┘
+            ▼
+   ┌─────────────────┐
+   │ Sensor fusion   │   typically a Mahony or Madgwick filter
+   │ (on Cortex-M33) │   running at 50–200 Hz on the app core
+   └────────┬────────┘
+            ▼
+   ┌─────────────────┐
+   │ Activity classifier ──→ "walking", "running", "cycling", ...
+   │ (often DSP+ML)   │
+   └─────────────────┘
+```
+
+The fusion typically lives in a periodically-scheduled task that grabs raw IMU data via DMA, runs ~50 multiplies of a Mahony filter, updates orientation/heading state, and re-sleeps. Total CPU cost: < 1% of the M33 at 64 MHz.
+
+Optical heart rate (PPG) is its own little world: a green LED pulses at the wrist, a photodiode reads the reflected light, signal processing extracts the AC component (blood flow) from the much-larger DC component (tissue reflectance). Vendors keep this code proprietary because it's the dominant feature differentiator.
+
+## Software stack
+
+Most non-Apple/Google wearables use **Zephyr** (Nordic-pushed) or **FreeRTOS** (everyone else). Lifecycle:
+
+```
+power on → bootloader (MCUboot) → app image → main()
+                                                │
+                                                ▼
+                                  ┌───────────────────────────┐
+                                  │ Init Zephyr / FreeRTOS    │
+                                  │ Start BLE host stack       │
+                                  │ Start IMU sensor thread    │
+                                  │ Start UI thread            │
+                                  │ Start sync thread          │
+                                  │ Start sensor-fusion task   │
+                                  └───────────────────────────┘
+                                                │
+                                                ▼
+                                       Run forever in tickless idle
+                                       with WFI between events
+```
+
+**MCUboot** is the standard secondary bootloader. It supports A/B image slots, signed updates, swap-on-test rollback. Critical for OTA firmware updates pushed via BLE.
+
+**BLE GATT services** are the wire protocol your phone talks. A typical fitness tracker exposes:
+
+- Heart Rate Service (0x180D) — standard SIG profile
+- Battery Service (0x180F) — standard SIG
+- Device Information Service (0x180A) — model, serial, firmware
+- Current Time Service (0x1805) — phone sets the watch's clock
+- Vendor service (random UUID) — proprietary data sync, raw sensor streaming
+
+When you pair via the manufacturer's app, the app discovers these services and reads/writes characteristics. No mystical magic — just BLE.
+
+## Real products
+
+| Product | SoC | Notes |
+|---|---|---|
+| **Garmin Forerunner 55 / 245** | Garmin proprietary + Cortex-M | MIP display, week+ battery, ConnectIQ apps |
+| **Fitbit Charge 6** | Cortex-M class + sensor coprocessor | Linux-style sync over BLE |
+| **Whoop 4.0** | Cortex-M33 (vendor unspecified) | No display — BLE-only with phone app |
+| **Amazfit GTR Mini** | Apollo4 (Ambiq) Cortex-M4F | Sub-µA sleep is Ambiq's claim to fame |
+| **Pebble (legacy)** | STM32F2 (Cortex-M3) | Original 2013 device; archetype of the M-class smartwatch |
+
+Apple Watch (S9 SoC = Cortex-A class), most Wear OS watches (Snapdragon W5 = Cortex-A7), and Galaxy Watch (Exynos W930) are a different category — they run a real OS, recharge daily, and don't belong in this analysis.
+
+## See also
+
+- [Cortex-M33 / M23](/docs/cortex-m/m33-m23/) — the application core.
+- [TrustZone](/docs/architecture/trustzone/) — used for secure boot + key storage in wearables.
+- [Nordic Semiconductor](/docs/vendors/nordic/) — the dominant SoC vendor in this segment.
+- [Zephyr](/docs/rtos/zephyr/) — the typical RTOS choice.
+- [USB](/docs/peripherals/usb/) — for charging cradles and sync.

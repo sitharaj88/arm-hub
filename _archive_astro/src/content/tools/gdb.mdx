@@ -1,0 +1,171 @@
+---
+title: GDB & on-chip debug
+description: Using GDB with Cortex-M — connecting to a probe, set/load, breakpoints, watchpoints, peripheral views, and the .gdbinit that saves you 50% of bring-up time.
+order: 2
+updated: 2026-05-12
+tags: [tools, gdb, debug, swd]
+---
+
+import Callout from '~/components/Callout.astro';
+
+GDB on Cortex-M is the same GDB you use on Linux, but pointed at a debug probe instead of a process. It speaks the GDB Remote Serial Protocol to a stub (`openocd`, `JLinkGDBServer`, `pyocd`, `probe-rs gdb`) that translates GDB commands into SWD or JTAG transactions to your chip.
+
+```
+   gdb ───[RSP over TCP:3333]─── openocd ───[USB]─── probe ───[SWD]─── target
+```
+
+## The minimum command sequence
+
+```bash
+# Terminal 1: start the GDB server
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg
+
+# Terminal 2: connect GDB
+arm-none-eabi-gdb firmware.elf
+(gdb) target extended-remote :3333
+(gdb) monitor reset halt
+(gdb) load
+(gdb) break main
+(gdb) continue
+```
+
+`load` reads the ELF, flashes it onto the chip via the probe, and updates GDB's symbol/PC state. `monitor reset halt` issues a chip reset and halts immediately — so you can start from a known state.
+
+## A useful .gdbinit
+
+```
+# .gdbinit — put in your project root, or `gdb -x .gdbinit`
+target extended-remote :3333
+
+# Reset and flash on every start
+define reload
+  monitor reset halt
+  load
+  monitor reset halt
+end
+
+# Show registers + disasm on each stop
+set pagination off
+set print pretty on
+set print array on
+set print array-indexes on
+set confirm off
+
+# More useful prompt
+set prompt (\033[35mgdb\033[0m) 
+
+# Convenience: re-run with reset
+define rr
+  monitor reset halt
+  continue
+end
+
+document rr
+  reset target and continue running
+end
+```
+
+Save in `~/.gdbinit` (global) or `<project>/.gdbinit` (local — needs `set auto-load safe-path /` to allow). Loading on connection saves you typing the same setup commands every session.
+
+## Connecting to specific probes
+
+```bash
+# ST-LINK
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg
+
+# J-Link
+JLinkGDBServer -device STM32F407VG -if SWD -speed 4000
+
+# Black Magic Probe — built-in GDB server (no openocd)
+arm-none-eabi-gdb firmware.elf
+(gdb) target extended-remote /dev/cu.usbmodemDEADBEEF1
+(gdb) monitor swdp_scan
+(gdb) attach 1
+(gdb) load
+
+# probe-rs (Rust ecosystem but works for C)
+probe-rs gdb --chip STM32F407VGTx
+```
+
+Each probe stack has small protocol differences in `monitor` commands. The general flow is identical.
+
+## Breakpoints
+
+```
+(gdb) break main                       # by function
+(gdb) break src/uart.c:42              # by file:line
+(gdb) break uart.c:42 if c == 'q'      # conditional
+(gdb) watch counter                    # break on write to `counter`
+(gdb) watch counter if counter > 100   # conditional watch
+(gdb) rwatch reg                       # break on read of `reg`
+(gdb) awatch reg                       # break on any access
+```
+
+The Cortex-M FPB (Flash Patch and Breakpoint) provides **6–8 hardware breakpoints** plus 4 literal patches. GDB uses these for code in flash; for code in RAM, it can use software breakpoints (overwriting an instruction with `BKPT`). Watchpoints use the DWT, which supports **4 hardware watchpoints**.
+
+If you hit "*no more hardware breakpoints*", you've exhausted the FPB. Delete some.
+
+## Peripheral views with SVD
+
+GDB can be taught to display peripheral registers symbolically using the chip's SVD file. The [PyCortexMDebug](https://github.com/bnahill/PyCortexMDebug) plugin or the modern `cortex-debug` VS Code extension parse the SVD and provide:
+
+```
+(gdb) svd GPIOA
+GPIOA @ 0x40020000
+  MODER     = 0x00000280 (PA5 = 01 = output, PA4 = 00, ...)
+  OTYPER    = 0x00000000
+  OSPEEDR   = 0x00000000
+  ...
+```
+
+For a chip with hundreds of peripherals, this is a game-changer — you stop hand-decoding register bits.
+
+## TUI mode
+
+```
+(gdb) layout split
+```
+
+Splits the terminal into source, assembly, and command panes. Run `tui reg general` to add a register pane. With a good terminal width, this beats anything most IDEs offer.
+
+Keyboard shortcuts in TUI: `C-x C-a` toggle TUI on/off, `C-l` redraw (often needed after the target produces output), `up/down` scroll source, `C-p`/`C-n` previous/next command.
+
+## RTT — Real-Time Transfer
+
+RTT is SEGGER's protocol for streaming arbitrary data over the SWD link with **zero CPU overhead** (a non-blocking ring buffer in RAM, polled by the probe). It's faster than UART, doesn't tie up a pin, and works in real-time without slowing the application.
+
+```c
+// SEGGER's library or any RTT implementation
+SEGGER_RTT_printf(0, "value = %d\n", value);
+```
+
+```bash
+JLinkRTTViewer    # or `JLinkRTTLogger`
+# probe-rs supports RTT natively:
+probe-rs attach --chip STM32F407VGTx --rtt-port 1
+```
+
+For Rust embedded, **defmt** uses RTT as transport with deferred binary formatting — log structured data at near-zero cost.
+
+## The post-mortem dump
+
+When a system crashes in the field, you don't have a probe attached. The standard pattern: have your fault handler dump key state to a known RAM region (CFSR, MMFAR, BFAR, the stacked PC and LR, the current task name), set a magic value, and reset. On the next boot, before clearing RAM, copy the dump to flash and clear the magic.
+
+When you can reproduce the crash on the bench, point GDB at the dump and `set $pc = stacked_pc; set $sp = stacked_sp; bt` to reconstruct the call stack.
+
+<Callout type="tip" title="cortex-debug in VS Code is the easy on-ramp">
+If you don't already love command-line GDB, install [cortex-debug](https://github.com/Marus/cortex-debug) for VS Code. It runs OpenOCD/J-Link/pyOCD for you, parses the SVD, and gives you breakpoints, registers, peripherals, and RTT in a UI. Underneath, it's all GDB — you can drop to the gdb console for power-user commands.
+</Callout>
+
+## Common gotchas
+
+- **"Could not load section" on load** — your linker script has sections marked AT > FLASH whose flash addresses overlap. Or you're trying to flash to a region the probe can't write (peripheral memory).
+- **GDB sees the function but can't step** — code was inlined or LTO'd away. `-O0` or `-Og` keeps line-correspondence; `-O2 -flto` does not.
+- **Variables show `<optimised out>`** — same. Use `-Og` for debug builds.
+- **Probe disconnects randomly** — usually a power issue. SWD signals are 3.3V; if your target's VTREF isn't properly sensed, the probe gets confused. Wire VTREF.
+
+## See also
+
+- [OpenOCD & probes](/docs/tools/openocd/) — the GDB server side.
+- [Build systems](/docs/tools/build/) — getting ELFs that GDB can use.
+- [Cortex-M NVIC](/docs/cortex-m/nvic/) — debugging fault state.

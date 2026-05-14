@@ -1,0 +1,261 @@
+---
+title: IPC primitives
+description: RTOS inter-task communication — semaphores, mutexes, queues, event groups, stream and message buffers, task notifications. Latency, memory cost, and the right tool for each problem.
+order: 4
+updated: 2026-05-13
+tags: [rtos, ipc, semaphore, mutex, queue, notification, event-flags]
+---
+
+Real-time tasks don't run in isolation — they wait for events, share data, signal completions, coordinate handoffs. The RTOS gives you a collection of primitives for this: semaphores, mutexes, queues, event groups, stream buffers, message buffers, task notifications, and various combinations. Each has its own latency, memory cost, multi-producer/multi-consumer behaviour, and idiomatic use. Choosing badly costs you cycles, RAM, and sometimes correctness.
+
+This page covers the full primitive set with the same treatment for each: what it is, when to use it, what it costs in flash and RAM, what the typical latency is, and a quick example. The examples use FreeRTOS, but every primitive maps to the equivalent in Zephyr, ThreadX, RT-Thread, etc.
+
+<SpecSheet
+  title="IPC primitives — pick the right one"
+  specs={[
+    { label: 'Binary semaphore', value: 'ISR-to-task signal, "event happened" notification. No data, no priority inheritance.' },
+    { label: 'Counting semaphore', value: 'Resource pool counter. ISR can give multiple times; task counts them.' },
+    { label: 'Mutex', value: 'Mutual exclusion with priority inheritance. Owner-tracked. Task-only (never from ISR).' },
+    { label: 'Recursive mutex', value: 'Mutex that the same task can lock multiple times. Cost: counter overhead.' },
+    { label: 'Queue', value: 'FIFO of fixed-size items. Multi-producer/multi-consumer safe. Item copied on send and receive.' },
+    { label: 'Event group', value: '24-bit (FreeRTOS) flag word. Tasks wait on AND/OR combinations of bits. Multi-condition signaling.' },
+    { label: 'Stream buffer', value: 'Byte stream, single-producer/single-consumer. Lock-free where possible. UART / SPI rx ideal use.' },
+    { label: 'Message buffer', value: 'Like stream buffer but preserves message boundaries. Variable-length packets.' },
+    { label: 'Task notification', value: 'Per-task 32-bit value + 1-bit pending flag. Fastest IPC in FreeRTOS — ~45 cycles each direction.' },
+  ]}
+/>
+
+## Binary and counting semaphores
+
+A **binary semaphore** has two states: available or not. `xSemaphoreGive` makes it available; `xSemaphoreTake` consumes it (blocks if not available). The classic use case is ISR-to-task signalling: an ISR gives the semaphore when an event arrives, the waiting task wakes and processes the event.
+
+```c
+SemaphoreHandle_t rx_sem = xSemaphoreCreateBinary();
+
+void USART1_IRQHandler(void) {
+    if (USART1->ISR & USART_ISR_RXNE) {
+        rx_byte = USART1->RDR;
+        BaseType_t hpw = pdFALSE;
+        xSemaphoreGiveFromISR(rx_sem, &hpw);
+        portYIELD_FROM_ISR(hpw);
+    }
+}
+
+void rx_task(void *arg) {
+    while (1) {
+        xSemaphoreTake(rx_sem, portMAX_DELAY);
+        process(rx_byte);
+    }
+}
+```
+
+A **counting semaphore** is the same but with a counter. `Give` increments, `Take` decrements (blocks at zero). Used for resource pools — five DMA channels available, tasks `Take` one and `Give` it back when done. Also for "ISR gave the semaphore five times while the task was busy" — the counting semaphore preserves the count where binary would lose them.
+
+Neither has priority inheritance. **Never use a semaphore for mutual exclusion** in a priority-preemptive system; use a mutex.
+
+## Mutex
+
+A mutex has an owner. Only the locking task can unlock it. Priority inheritance is automatic (see [priority inversion](/docs/rtos/priority-inversion)). Cannot be given from an ISR.
+
+```c
+SemaphoreHandle_t mtx = xSemaphoreCreateMutex();
+
+void writer(void *arg) {
+    while (1) {
+        xSemaphoreTake(mtx, portMAX_DELAY);
+        shared_buffer[i++] = read_sensor();
+        xSemaphoreGive(mtx);
+        vTaskDelay(10);
+    }
+}
+```
+
+A **recursive mutex** lets the same task lock it multiple times — useful when a function locks the mutex and calls another function that also locks. Each `Give` decrements the count; only the final `Give` releases the mutex.
+
+Mutex memory cost in FreeRTOS: ~80 bytes per mutex (TCB-like structure with waiter list, owner pointer, recursion count). Use them sparingly — keep critical sections short, and prefer message-passing over shared state when possible.
+
+## Queues
+
+A queue is a FIFO of fixed-size items. `Send` copies the item in; `Receive` copies it out. Multi-producer and multi-consumer safe. Both Send and Receive can block with a timeout.
+
+<TimingDiagram title="Producer / consumer queue handoff" signals={[
+  { name: 'Producer', wave: '11001100', tone: 'primary' },
+  { name: 'Queue',    wave: '00110011', tone: 'accent' },
+  { name: 'Consumer', wave: '00011001', tone: 'success' },
+]} markers={[
+  { x: 1, label: 'send' },
+  { x: 3, label: 'receive' },
+  { x: 5, label: 'send' },
+  { x: 6, label: 'receive' },
+]} caption="The producer running and the queue holding a pending item overlap by exactly one cycle — the moment the kernel copies the item into the FIFO. The consumer wakes from xQueueReceive and runs in the next slot." />
+
+```c
+typedef struct { uint16_t adc; uint32_t timestamp; } sample_t;
+QueueHandle_t samples = xQueueCreate(8 /* depth */, sizeof(sample_t));
+
+void adc_isr(void) {
+    sample_t s = { .adc = ADC1->DR, .timestamp = HAL_GetTick() };
+    BaseType_t hpw = pdFALSE;
+    xQueueSendFromISR(samples, &s, &hpw);
+    portYIELD_FROM_ISR(hpw);
+}
+
+void filter_task(void *arg) {
+    sample_t s;
+    while (xQueueReceive(samples, &s, portMAX_DELAY) == pdTRUE) {
+        run_filter(s.adc, s.timestamp);
+    }
+}
+```
+
+Memory cost: `depth × itemSize + ~80 bytes` overhead. Latency: ~3 µs per send or receive on Cortex-M4 @ 100 MHz, dominated by the memcpy of the item.
+
+Queues are the workhorse — most task-to-task communication in a typical RTOS app goes through queues. The data copy is the cost; for large items, pass a pointer instead of the item itself (but then you own the lifetime of the pointed-to data).
+
+## Event groups
+
+An **event group** is a bitfield (24 bits in FreeRTOS, 32 bits in Zephyr `k_event`) where each bit represents a signal. Tasks wait on combinations: "wait until bit 0 AND bit 3 are set" or "wait until bit 1 OR bit 5 is set." Useful for multi-condition synchronisation:
+
+```c
+#define EV_WIFI_READY   (1<<0)
+#define EV_CONFIG_LOADED (1<<1)
+#define EV_TIME_SYNCED   (1<<2)
+
+EventGroupHandle_t ev = xEventGroupCreate();
+
+void wifi_task(void *arg) {
+    /* ... connect ... */
+    xEventGroupSetBits(ev, EV_WIFI_READY);
+}
+
+void mqtt_task(void *arg) {
+    EventBits_t need = EV_WIFI_READY | EV_CONFIG_LOADED | EV_TIME_SYNCED;
+    xEventGroupWaitBits(ev, need, pdFALSE /* don't clear */, pdTRUE /* AND */, portMAX_DELAY);
+    /* now safe to connect to broker */
+}
+```
+
+Use event groups when several independent producers each set a flag and one consumer needs the conjunction. Without event groups, you'd need a semaphore per condition plus your own state machine — event groups bake the AND/OR logic into the wait call.
+
+Memory: ~32 bytes per group. Latency: ~2 µs per set or wait.
+
+## Stream buffers and message buffers
+
+These are FreeRTOS additions (since v10) optimised for **single-producer / single-consumer** scenarios. The classic use case: a UART RX ISR pushes bytes; one task consumes them. With a queue, every byte costs a memcpy and a critical section. Stream buffers are lock-free for the SPSC case — the producer and consumer access independent ends of a circular buffer.
+
+```c
+StreamBufferHandle_t rx_stream = xStreamBufferCreate(256 /* size */, 1 /* trigger level */);
+
+void USART1_IRQHandler(void) {
+    uint8_t b = USART1->RDR;
+    BaseType_t hpw = pdFALSE;
+    xStreamBufferSendFromISR(rx_stream, &b, 1, &hpw);
+    portYIELD_FROM_ISR(hpw);
+}
+
+void parser_task(void *arg) {
+    uint8_t buf[64];
+    while (1) {
+        size_t n = xStreamBufferReceive(rx_stream, buf, sizeof(buf), portMAX_DELAY);
+        parse(buf, n);
+    }
+}
+```
+
+The **trigger level** sets how many bytes must be in the buffer before a waiting receiver is unblocked. Larger trigger level = fewer wakeups, more latency.
+
+**Message buffers** are stream buffers that preserve message boundaries. Each send is a discrete message (length-prefixed in the buffer); each receive returns one message. Useful when packets have variable size and you don't want to manually frame them.
+
+Both are restricted to single-producer / single-consumer. For multi-producer or multi-consumer, fall back to a queue.
+
+## Task notifications — the fast path
+
+FreeRTOS task notifications are a per-task 32-bit value + a "pending" flag. Any sender (task or ISR) can write the value and set pending; the target task waits for pending and reads the value. No queue, no semaphore, no allocation — the storage is part of the target task's TCB.
+
+```c
+TaskHandle_t parser_handle;
+
+void USART1_IRQHandler(void) {
+    BaseType_t hpw = pdFALSE;
+    xTaskNotifyFromISR(parser_handle, USART1->RDR, eSetValueWithOverwrite, &hpw);
+    portYIELD_FROM_ISR(hpw);
+}
+
+void parser_task(void *arg) {
+    uint32_t value;
+    while (1) {
+        xTaskNotifyWait(0, 0, &value, portMAX_DELAY);
+        process(value & 0xFF);
+    }
+}
+```
+
+Latency: ~45 cycles on Cortex-M4 — about 3× faster than a queue. Memory: zero per-notification cost (uses the task's existing TCB slot). The trade-off: each task has only **one** notification slot. If you need multiple independent notification streams, you need multiple tasks (or fall back to other primitives).
+
+Five notification "actions" in FreeRTOS:
+
+- `eNoAction` — just mark pending, don't change value
+- `eSetBits` — OR new bits into the value
+- `eIncrement` — increment value (counting-semaphore-like)
+- `eSetValueWithOverwrite` — replace value unconditionally
+- `eSetValueWithoutOverwrite` — replace only if no pending value (else return fail)
+
+Task notifications also support "indexed" notifications in FreeRTOS v10.4+, giving each task several independent slots. This makes them usable for more complex patterns at the cost of a few bytes per slot.
+
+## Latency comparison
+
+A back-of-envelope comparison on Cortex-M4 @ 100 MHz, FreeRTOS v10:
+
+| Primitive | Send/give cycles | Receive/take cycles | Memory (handle + buffer) |
+|-----------|------------------|---------------------|--------------------------|
+| Task notification (direct) | ~45 | ~50 | 0 (in TCB) |
+| Binary semaphore | ~150 | ~200 | ~80 B |
+| Counting semaphore | ~160 | ~200 | ~80 B |
+| Mutex | ~250 | ~300 | ~80 B + waiter list |
+| Queue (4-byte item) | ~400 | ~450 | depth×4 + 80 B |
+| Queue (32-byte item) | ~700 | ~750 | depth×32 + 80 B |
+| Event group | ~200 | ~250 | ~32 B |
+| Stream buffer (1 byte) | ~120 | ~140 | size + 40 B |
+
+Task notifications dominate for one-to-one ISR-to-task signalling. Queues dominate for general N-to-M communication with data. Mutexes are necessary for shared-state protection; everything else is a sub-case.
+
+<Callout type="tip">
+A common modernisation: replace "binary semaphore from ISR signaling a task" with "task notification from ISR." The notification is faster, uses less memory, and has the same semantics for one-to-one signaling. The only reasons to keep the binary semaphore are if multiple tasks wait on the same event (notifications are one-target) or if you need the OS-level semaphore primitive for portability.
+</Callout>
+
+## When to use what
+
+A decision matrix:
+
+| Problem | Use |
+|---------|-----|
+| ISR tells one task "event happened" | Task notification (or binary semaphore) |
+| ISR tells one task "N events happened" | Counting semaphore or notification with eIncrement |
+| One task hands typed data to another | Queue (small items) or pointer-passing via queue/notification (large items) |
+| Many tasks share one resource | Mutex |
+| Same task may lock a resource recursively | Recursive mutex |
+| Wait for several conditions to all be true | Event group |
+| ISR streams bytes to one parser task | Stream buffer |
+| ISR sends variable-length packets to one task | Message buffer |
+| Wait for any of N events | Event group (OR wait) or queue of event IDs |
+| Multi-producer multi-consumer queue | Queue |
+| Cross-core (multi-core M7 / A-class) | Hardware-supported queue with cache management, or lock-free SPSC ring |
+
+## Pitfalls
+
+**Calling task-only APIs from an ISR.** All "FromISR" variants exist for a reason — they avoid taking kernel mutexes. Calling `xSemaphoreGive` (not `FromISR`) from an interrupt will deadlock or assert.
+
+**Forgetting `portYIELD_FROM_ISR`.** When an ISR unblocks a task higher-priority than the interrupted one, the scheduler must run at ISR exit to switch to it. Without the yield, the higher-priority task waits until the next tick or the next preemption — adding up to 1 ms of latency unnecessarily.
+
+**Static vs dynamic allocation.** All FreeRTOS primitives have `xCreate` (heap-allocated) and `xCreateStatic` (caller-provided storage) variants. For safety-critical builds, use the static variants exclusively — no malloc means no fragmentation and the worst-case memory footprint is known at link time.
+
+**Queue overflow.** When a sender's queue is full and timeout is short, the send returns failure and the sender must decide what to do. Production code typically logs and drops; debugging code often hangs. Pick deliberately.
+
+## Further reading
+
+- [RTOS scheduling](/docs/rtos/scheduling) — context for why these primitives exist
+- [Priority inversion](/docs/rtos/priority-inversion) — mutex internals
+- [FreeRTOS](/docs/rtos/freertos) — API reference
+- [Zephyr](/docs/rtos/zephyr) — k_sem, k_msgq, k_event equivalents
+- [ThreadX](/docs/rtos/threadx) — tx_queue, tx_event_flags_group, tx_mutex
+- FreeRTOS book, Barry: freertos.org/Documentation/RTOS_book.html

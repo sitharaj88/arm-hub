@@ -1,0 +1,271 @@
+---
+title: Exclusive monitors (LDREX/STREX)
+description: The atomic primitive that builds every lock on ARM — the LDREX/STREX exclusive monitor. How it works, when it clears, how to layer spinlocks and lock-free counters on top, and the ARMv8.1 CAS instruction that supersedes it on Cortex-A.
+order: 14
+updated: 2026-05-13
+tags: [architecture, atomics, ldrex, strex, concurrency, lock-free, cas]
+---
+
+Every mutex, semaphore, spinlock, and lock-free queue on a modern ARM chip is built on a single architectural primitive: the **exclusive monitor**. The primitive itself is small — a pair of instructions, `LDREX` and `STREX`, plus a piece of hardware state that tracks whether you have an "exclusive reservation" on a memory location. Build on top of it and you get every higher-level synchronization construct in CMSIS, FreeRTOS, the Linux kernel, and your favorite lock-free queue paper.
+
+This page covers the mechanism end-to-end: the LDREX/STREX instruction pair, the byte/halfword/word/doubleword variants, the rules for when the reservation clears, how DMB and DSB fit in, and the higher-level idioms — spinlock, atomic increment, mutex acquire/release, compare-and-swap — that you build by composing the primitive. It also covers the ARMv8.1 `CASA` / `CASAL` instruction that replaces the LDREX/STREX loop with a single atomic on newer Cortex-A.
+
+<SpecSheet
+  title="Exclusive monitor at a glance"
+  specs={[
+    { label: 'Instructions', value: 'LDREX, STREX (32-bit); LDREXB, LDREXH, LDREXD; STREXB, STREXH, STREXD; CLREX (clear)' },
+    { label: 'Variants', value: 'Byte (B), halfword (H), word (no suffix), doubleword (D = 64-bit pair)' },
+    { label: 'Availability', value: 'ARMv7-M Mainline, ARMv7-A, ARMv7-R, ARMv8-M Mainline (M33+), ARMv8-A, ARMv8-R. Not on v6-M (Cortex-M0/M0+) — use PRIMASK or bus spinlocks.' },
+    { label: 'STREX return value', value: 'r0 = 0 on success (write succeeded, reservation held), r0 = 1 on failure (reservation broken — retry)' },
+    { label: 'Reservation granule', value: 'Implementation-defined: typically 8 or 16 bytes. Reservation covers a granule, not just the LDREX address.' },
+    { label: 'Reservation clearance', value: 'Context switch (any exception entry/return), STREX (success or fail), CLREX, store to the granule from any master.' },
+    { label: 'Required barriers', value: 'DMB before STREX of release-store; DMB after LDREX of acquire-load. Or use LDAEX / STLEX (v8) for built-in ordering.' },
+    { label: 'ARMv8.1 alternative', value: 'CAS, CASA, CASAL, CASB, CASH variants — single-instruction compare-and-swap on Cortex-A75+. Not on M-profile.' },
+  ]}
+/>
+
+## How the monitor works
+
+The exclusive monitor is a tiny piece of hardware (literally a few registers) that tracks whether a given CPU has the right to perform an "exclusive" store to a given address range. The lifecycle is simple:
+
+1. **LDREX address** — the load returns the value at `address` AND sets the monitor to "exclusive on the granule containing `address`."
+2. **STREX value, address** — if the monitor is still in "exclusive" state for this granule, the store succeeds and returns 0; otherwise it fails (no store happens) and returns 1.
+3. **The monitor clears** under various conditions: another store to the granule from any master (another CPU, DMA, peripheral), a context switch (exception entry or return), an explicit `CLREX`, or any other STREX (even to a different address).
+
+The "granule" is implementation-defined — typically 8 bytes, sometimes 16, occasionally 32. The architecture guarantees a granule is at least one word. You cannot rely on byte-granularity: an LDREX/STREX pair targeting the same word but at different byte offsets may interfere with each other if they fall in the same granule. In practice this rarely matters because the patterns you build (spinlocks, counters) target a single word each.
+
+<StateDiagram
+  title="Exclusive monitor lifecycle"
+  width={780}
+  height={300}
+  states={[
+    { id: 'open',  label: 'Open',      x: 40,  y: 120, w: 180, h: 64, tone: 'muted',   initial: true },
+    { id: 'excl',  label: 'Exclusive', x: 300, y: 120, w: 180, h: 64, tone: 'primary' },
+    { id: 'clr',   label: 'Cleared',   x: 560, y: 120, w: 180, h: 64, tone: 'warning' },
+  ]}
+  transitions={[
+    { from: 'open', to: 'excl', label: 'LDREX (set reservation)' },
+    { from: 'excl', to: 'open', label: 'STREX success (r0=0)', curve: 60 },
+    { from: 'excl', to: 'clr',  label: 'exception / other STREX / external store' },
+    { from: 'clr',  to: 'open', label: 'CLREX or next LDREX', curve: -50 },
+    { from: 'excl', to: 'excl', label: 'STREX fail (r0=1)', curve: -60 },
+  ]}
+  caption="LDREX moves the monitor into Exclusive; a successful STREX commits and returns to Open. Any context switch, other STREX, or external store to the granule kicks it to Cleared, where the next STREX is guaranteed to fail until a fresh LDREX restarts the cycle."
+/>
+
+```asm
+@ Atomic increment of a uint32_t at [r0]
+retry:
+    ldrex   r1, [r0]            @ load + set monitor
+    adds    r1, r1, #1          @ compute new value
+    strex   r2, r1, [r0]        @ attempt to store; r2 = 0 on success
+    cbnz    r2, retry           @ if r2 != 0, monitor was broken — retry
+    @ dmb here if release semantics needed
+```
+
+This is the canonical RMW loop. If any other context (interrupt, another core, DMA write) touches the granule between `LDREX` and `STREX`, the `STREX` fails, `r2 = 1`, and we loop. Eventually we succeed — there's no theoretical upper bound on retries, but in practice the loop runs once for uncontended cases and a few times under contention.
+
+## Variant table
+
+| Mnemonic | Width | Use |
+|----------|-------|-----|
+| `LDREXB` / `STREXB` | 8-bit | Byte-granular counters, byte flags |
+| `LDREXH` / `STREXH` | 16-bit | Halfword counters |
+| `LDREX` / `STREX` | 32-bit | The workhorse — pointers, ints, most atomics |
+| `LDREXD` / `STREXD` | 64-bit (pair) | Tagged pointers, 64-bit counters on 32-bit cores |
+| `CLREX` | — | Explicitly clear the monitor (no memory access) |
+
+The doubleword variants (`LDREXD`, `STREXD`) take a register pair and operate on a 64-bit aligned 8-byte location. They are essential for implementing **double-width compare-and-swap** (CAS2 or DWCAS), which lets you atomically swap a `(pointer, version)` pair to defeat the ABA problem in lock-free data structures.
+
+```asm
+@ LDREXD reads 64 bits into r2:r3 (low:high)
+ldrexd  r2, r3, [r0]
+@ ... modify r2:r3 ...
+strexd  r4, r2, r3, [r0]    @ r4 = success flag
+```
+
+## When the monitor clears
+
+This is where engineers most commonly trip up. The architecture lists several conditions:
+
+1. **A successful STREX** — the monitor clears as part of the success.
+2. **A failed STREX** — also clears (idempotent: the next LDREX must set it again).
+3. **A CLREX instruction** — explicit clear.
+4. **Any STREX, anywhere in the CPU** — even to a different address.
+5. **An exception entry or exception return** — this is the big one.
+6. **A store to the granule from any other master** (another CPU, a DMA engine, a debugger pre-empting).
+
+Condition 5 is critical: **any exception entry clears the local monitor.** That means an ISR cannot use LDREX/STREX to read-modify-write the same location an interrupted task was working on, because the task's STREX (on return) will fail. The compiler-generated retry handles this: the task's loop just runs once more. But it also means you should not rely on LDREX/STREX being atomic with respect to interrupts in the way you might initially assume. The atomicity comes from the *retry loop*, not from a single atomic instruction.
+
+<Callout type="warn">
+A common bug: holding a reservation across a function call. If you do `LDREX`, then call a non-leaf function, then `STREX`, the call sequence may include exception entries (in unhelpful timing) or other STREX uses inside the callee. Always do LDREX and STREX in the same basic block, ideally in the same assembler function. The CMSIS atomic intrinsics enforce this.
+</Callout>
+
+## Memory barriers — DMB before/after
+
+The exclusive monitor gives you **atomicity** but not **ordering**. Two questions:
+
+1. Are the read-modify-write operation's stores visible to other observers in the same order they appeared in program order?
+2. Are loads that *preceded* the RMW observed before the RMW by another CPU?
+
+The answer is: the architecture is weakly ordered, and you need explicit memory barriers to enforce either. The general rule is:
+
+- **Acquire** semantics (lock take, atomic load that gates further reads): place a `DMB` *after* the LDREX/STREX loop.
+- **Release** semantics (lock release, atomic store that publishes prior writes): place a `DMB` *before* the STREX.
+
+```asm
+@ Acquire: take lock at [r0], then access protected data
+retry:
+    ldrex   r1, [r0]
+    cmp     r1, #0
+    bne     retry           @ lock held — spin
+    strex   r2, r3, [r0]    @ r3 = 1, take it
+    cbnz    r2, retry
+    dmb                     @ Acquire barrier — no later loads bypass this point
+    @ ... protected access ...
+```
+
+```asm
+@ Release: publish [r4] then release lock at [r0]
+    @ ... protected writes go here ...
+    dmb                     @ Release barrier — all prior stores complete first
+    mov     r3, #0
+    str     r3, [r0]        @ plain store is fine; we're releasing
+```
+
+On ARMv8-M Mainline and ARMv8-A you can use the **acquire/release exclusive variants** — `LDAEX`/`STLEX` — that bundle the barrier into the load/store. This is cheaper than separate `DMB` + `LDREX`. The intrinsics in CMSIS-Core 5+ select these on v8 targets automatically.
+
+## Building spinlock
+
+A complete spinlock using LDREX/STREX:
+
+```c
+typedef volatile uint32_t spinlock_t;
+
+static inline void spin_lock(spinlock_t *lock) {
+    uint32_t status, value;
+    do {
+        __asm volatile (
+            "ldrex %0, [%2]       \n"
+            "cmp   %0, #0         \n"
+            "bne   1f             \n"   // already locked — fail
+            "mov   %0, #1         \n"
+            "strex %1, %0, [%2]   \n"
+            "1:                   \n"
+            : "=&r"(value), "=&r"(status)
+            : "r"(lock)
+            : "cc", "memory"
+        );
+    } while (status != 0 || value != 1);
+    __DMB();
+}
+
+static inline void spin_unlock(spinlock_t *lock) {
+    __DMB();
+    *lock = 0;
+}
+```
+
+This is correct, portable, and reasonably efficient. The CMSIS `__LDREXW` / `__STREXW` intrinsics let you write it without inline assembly — slightly less efficient code generation but vastly more readable.
+
+## Atomic increment
+
+The most common atomic in firmware:
+
+```c
+static inline uint32_t atomic_inc(volatile uint32_t *p) {
+    uint32_t old, new, status;
+    do {
+        old = __LDREXW(p);
+        new = old + 1;
+        status = __STREXW(new, p);
+    } while (status != 0);
+    return new;
+}
+```
+
+Three to four instructions per iteration on Cortex-M4; usually one iteration suffices.
+
+## Mutex acquire / release pseudocode
+
+A full priority-inheritance mutex would track the owner, recursive count, and waiter list. The atomic primitive at the bottom of the implementation is just compare-and-swap. Pseudocode:
+
+```c
+int mutex_try_lock(mutex_t *m, task_t *self) {
+    task_t *expected = NULL;
+    do {
+        task_t *cur = (task_t *)__LDREX(&m->owner);
+        if (cur != NULL) {
+            __CLREX();
+            return 0;   // already locked
+        }
+        if (__STREX((uint32_t)self, &m->owner) == 0) {
+            __DMB();
+            return 1;   // acquired
+        }
+    } while (1);
+}
+```
+
+The full mutex adds owner priority boosting, waiter queues, kernel signaling for `mutex_lock` (block on contention), etc. All of that is layered on top of the primitive shown.
+
+## Compare-and-swap (CAS) idiom
+
+LDREX/STREX is essentially "the bottom half of CAS." A textbook CAS — `bool CAS(p, expected, desired)` returns true if `*p == expected` and atomically swaps in `desired` — is built like this:
+
+```c
+bool atomic_cas(volatile uint32_t *p, uint32_t expected, uint32_t desired) {
+    uint32_t cur, status;
+    do {
+        cur = __LDREXW(p);
+        if (cur != expected) {
+            __CLREX();
+            return false;
+        }
+        status = __STREXW(desired, p);
+    } while (status != 0);
+    return true;
+}
+```
+
+This is how CMSIS-Core implements `__atomic_compare_exchange_weak` under the hood on M-profile. The standard C11 `<stdatomic.h>` interface compiles down to exactly this pattern on Cortex-M3/M4/M7/M33.
+
+## ARMv8.1 CAS — single-instruction atomic
+
+ARMv8.1-A added a family of true single-instruction CAS operations: `CAS`, `CASA` (acquire), `CASL` (release), `CASAL` (acquire + release), and byte/halfword/word/doubleword variants. They live in the LSE (Large System Extensions) feature set and are required by ARMv8.4 and later. They are present on Cortex-A75+, Cortex-A55+, Cortex-A510, Cortex-A710, etc.
+
+```asm
+@ ARMv8.1 CAS: r1 = current; if r1 == r2, swap r3 in; r1 = previous value
+cas     w1, w3, [x0]            @ relaxed
+casa    w1, w3, [x0]            @ acquire
+casl    w1, w3, [x0]            @ release
+casal   w1, w3, [x0]            @ acquire+release
+```
+
+The advantage versus LDREX/STREX:
+- **No retry loop** — the instruction is atomic; if contention prevents the swap, you get the new value and decide what to do next.
+- **Forward-progress guarantee** — under contention, LDREX/STREX can in pathological cases livelock; CAS cannot.
+- **Bus-level optimization** — coherent interconnects (AMBA CHI) implement CAS as a single transaction, where LDREX/STREX is two transactions plus monitor coherency.
+
+CAS is **not present on M-profile**. Cortex-M33, M55, M85 all use LDREX/STREX. If you're writing portable code that runs on both M-profile and modern A-profile, use the C11 atomic intrinsics — the compiler emits LDREX/STREX on M, CAS on A.
+
+## When LDREX/STREX is the wrong tool
+
+Three situations where you should reach for a different primitive:
+
+1. **You're on ARMv6-M (Cortex-M0/M0+).** No exclusive monitor exists. Use PRIMASK on/off, or — on multi-core like RP2040 — the hardware bus spinlocks in the SIO block.
+2. **You need atomicity across a DMA engine, not another CPU.** The monitor is CPU-local; a DMA write to the same address breaks the reservation, which is good for correctness but means your atomic dance against DMA is just busy-waiting. Use a DMA-completion flag or a doorbell instead.
+3. **You're doing a single-bit set/clear and you have bit-banding.** On Cortex-M3/M4 a single-bit set via bit-banding is one cycle and atomic at the bus level. No LDREX/STREX needed.
+
+<Callout type="tip">
+For lock-free programming on Cortex-M, the practical rule is: use C11 `<stdatomic.h>` with `memory_order_acquire` / `memory_order_release` semantics. The compiler picks the right LDREX/STREX/DMB sequence. Hand-rolled inline assembly is rarely worth the risk — getting the barrier placement subtly wrong is the most common source of "works on the bench, fails in the field" concurrency bugs.
+</Callout>
+
+## Cross-references
+
+- [Memory model & barriers](/docs/architecture/memory-model) — DMB, DSB, ISB and what they actually enforce
+- [ARMv6-M architecture](/docs/architecture/armv6m) — why v6-M lacks the monitor and how to work around it
+- [ARMv8-M architecture](/docs/architecture/armv8m) — LDAEX/STLEX and the v8.1-M acquire/release semantics
+- [NVIC priority](/docs/cortex-m/nvic-priority) — BASEPRI as a critical-section primitive on v7-M
+- ARMv7-M Architecture Reference Manual section A3.4 — synchronization and semaphores
+- ARMv8-A Architecture Reference Manual section B2.10 — exclusive access instructions

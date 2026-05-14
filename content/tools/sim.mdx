@@ -1,0 +1,229 @@
+---
+title: QEMU & Renode
+description: Simulating Cortex-M without hardware — when emulation actually works, and when you should just buy the dev board.
+order: 5
+updated: 2026-05-12
+tags: [tools, qemu, renode, simulation]
+---
+
+
+Simulating an MCU sounds great until you discover the simulator doesn't model the peripherals you care about. Neither **QEMU** nor **Renode** can perfectly model an STM32H7, but both are useful in narrow ways — running CPU-only code, exercising application logic, hosting CI tests for code that doesn't need real-world hardware.
+
+<SpecSheet
+  title="Simulators and emulators — at a glance"
+  specs={[
+    { label: 'QEMU', value: 'Open-source system emulator. Models Cortex-M0/M3/M4/M7/M33 cores plus a handful of canned boards (mps2-an385, lm3s, virt). Decoupled simulated time.' },
+    { label: 'Renode', value: 'Open-source cycle-accurate-ish simulator from Antmicro. Models full chips with peripherals; supports multi-node and HW co-sim. Decoupled simulated time, configurable.' },
+    { label: 'Unicorn', value: 'CPU-only emulation library (libc-style API). No peripherals, no IRQs by default. Used inside fuzzers and decompilers (Ghidra Emulator, angr).' },
+    { label: 'Keil µVision Simulator', value: 'Vendor simulator for ARM Compiler. Models Cortex-M cores + a small peripheral set; integrates with µVision debugger.' },
+    { label: 'TRACE32 Instruction-Set Simulator', value: 'Lauterbach commercial. Cycle-accurate, supports full TRACE32 scripting and trace replay.' },
+    { label: 'Hardware-in-the-loop', value: 'PEEDI, Lauterbach PowerDebug, Segger J-Trace — real silicon under host-driven test harness. Closest to production.' },
+    { label: 'When sim wins', value: 'CI, fault injection, multi-node networks, pre-silicon, regression sweeps, fuzzing' },
+    { label: 'When sim loses', value: 'Real-time validation, peripheral bring-up, EMC / signal integrity, cache + DMA timing' },
+  ]}
+/>
+
+## QEMU for Cortex-M
+
+QEMU's `arm-system-emulation` targets include a few canned Cortex-M boards:
+
+- `mps2-an385` (Cortex-M3)
+- `mps2-an386` (Cortex-M4)
+- `mps2-an500`, `an505`, `an521`, `an524` (Cortex-M7, M33 variants)
+- `lm3s6965evb` (TI Stellaris — old but well-supported)
+- `microbit` (Nordic nRF51)
+
+To run a binary:
+
+```bash
+qemu-system-arm \
+  -machine mps2-an385 \
+  -cpu cortex-m3 \
+  -nographic \
+  -kernel firmware.elf
+```
+
+`-nographic` redirects the emulated UART to your terminal. `-s -S` adds a GDB server at port 1234, halted, so you can attach a debugger.
+
+### What works in QEMU
+
+- The **core**: every Thumb-2 instruction, the NVIC, SysTick, exception entry/exit, MPU, FPU.
+- A **standard UART** model on each board.
+- **Memory layout** matching the modelled board.
+
+### What doesn't
+
+- **Real chip peripherals.** QEMU doesn't model STM32 RCC, GPIO, USB, SPI, I²C — only the generic mps2 peripherals. If your code touches `RCC->AHB1ENR`, it'll read 0 or worse, panic.
+- **Timing.** QEMU's clock is decoupled from real time. A loop that takes 1 ms on hardware takes ~unrelated time in QEMU.
+- **Power modes.** `WFI` returns immediately.
+
+So QEMU is great for **CPU-bound algorithm testing** — unit tests for a CRC routine, a state machine, a parser — where you don't need the hardware peripherals. It's terrible as a soft-replacement for the dev board.
+
+## Renode — the more ambitious simulator
+
+[Renode](https://renode.io/) is an open-source simulator from Antmicro that tries harder than QEMU to model real peripherals. It has board files for STM32F4, F7, H7, nRF52, MIMXRT, LPC, SAMD, and many others.
+
+```bash
+renode
+(monitor) machine LoadPlatformDescription @platforms/boards/stm32f4_discovery.repl
+(monitor) sysbus LoadELF @firmware.elf
+(monitor) start
+```
+
+Renode can also:
+
+- **Co-simulate** with Verilator (for FPGA designs).
+- **Model networks** — multiple Renode instances connected over emulated Ethernet/BLE/CAN, useful for testing multi-node systems.
+- **Run robot framework tests** — high-level scripted scenarios with assertions about peripheral state, GPIO levels, register values.
+
+### What works in Renode
+
+- Many of the **peripherals you'd expect on supported boards** — basic GPIO, UART, SPI, I²C, sometimes DMA, sometimes USB.
+- **Multi-MCU and network scenarios** — Renode's strongest feature.
+- **CI integration** — supports running headless from scripts.
+
+### What doesn't
+
+- **Vendor-specific peripheral quirks.** Renode models the documented behaviour, not the silicon errata.
+- **Bit-perfect timing.** Like QEMU, simulated time is decoupled.
+- **Newer chips.** Each chip model is hand-written; coverage trails the market.
+
+For **integration testing** of code that runs on a supported chip family, Renode is genuinely useful. For chip bring-up or peripheral-specific work, the dev board is faster.
+
+## When simulation is the right call
+
+**Yes**:
+- CI tests for pure-logic code (parsers, state machines, math).
+- Reproducing a crash in a portable, captureable environment.
+- Teaching/training without buying dev kits.
+- Pre-silicon software development (when the silicon doesn't exist yet, Renode is sometimes the *only* option).
+
+**No**:
+- Real-time-sensitive code (sub-millisecond timing).
+- Driver development for peripherals not yet modelled.
+- Performance work that depends on cache, pipeline, branch prediction.
+
+## Running unit tests on the host instead
+
+A different approach: don't simulate the chip at all. Compile your business logic for the host (x86_64 Linux/Mac) and run it under native unit tests. Stub out the hardware-touching layer.
+
+```c
+// In production
+#ifdef PRODUCTION
+  #include "stm32f4xx.h"
+  #define LED_ON()  GPIOA->BSRR = (1 << 5)
+#else
+  #include "test_stubs.h"
+  #define LED_ON()  test_record("LED_ON")
+#endif
+```
+
+The pure-logic code (CRC, parser, state machine) builds natively and runs under `pytest`, `Catch2`, `gtest`, whatever. You get fast iteration, full coverage analysis, sanitizers — *and* you sidestep the simulation question.
+
+This is the pattern most production firmware shops use. Simulation is reserved for the cases where the hardware genuinely matters.
+
+<Callout type="tip" title="Test pure logic on the host; test hardware integration on real hardware">
+Don't try to test everything via simulation. The 80% that's pure logic — run it natively, get all the testing tools your host platform offers. The 20% that touches hardware — run it on the dev board, with a HIL fixture if your team is mature enough.
+</Callout>
+
+## Unicorn — CPU-only emulation as a library
+
+[Unicorn](https://www.unicorn-engine.org/) is a fork of QEMU's TCG (Tiny Code Generator) packaged as a C/Python library. It emulates the *CPU* — instruction decode, register state, MMU/MPU enforcement — and nothing else. No timers, no UART, no NVIC; if your code reads from a memory-mapped peripheral, Unicorn returns whatever you've written into that address through the host-side API. The model is deliberately bare: you, the host program, provide every peripheral by intercepting memory accesses.
+
+This sounds limiting until you realise what it enables. Unicorn is the engine behind:
+
+- **angr** — symbolic execution of binaries; Unicorn runs concrete branches when the symbolic engine wants to short-circuit them.
+- **AFL++ qemu_mode** for embedded — fuzz a Cortex-M firmware image by running just the parser function under Unicorn with AFL's coverage instrumentation.
+- **Ghidra emulator** — step through a binary inside Ghidra without real hardware.
+- **CTF / reverse-engineering tooling** — solve embedded-firmware challenges by emulating just the algorithm under inspection.
+
+For firmware engineering proper, Unicorn shines when you want to **unit-test a piece of bare-metal code that you can't easily lift out of the binary**. Wrap the binary, set up the entry state, run, assert on register values. Coverage and timing are not the goal; correctness in isolation is.
+
+```python
+# Minimal Unicorn run of a Thumb-mode crc32() function
+from unicorn import Uc, UC_ARCH_ARM, UC_MODE_THUMB
+from unicorn.arm_const import UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_LR
+
+mu = Uc(UC_ARCH_ARM, UC_MODE_THUMB)
+mu.mem_map(0x08000000, 64 * 1024)
+mu.mem_write(0x08000000, open('firmware.bin', 'rb').read())
+mu.reg_write(UC_ARM_REG_R0, buffer_addr)
+mu.reg_write(UC_ARM_REG_R1, length)
+mu.reg_write(UC_ARM_REG_LR, 0x0)
+mu.emu_start(crc32_entry | 1, 0x0)  # Thumb bit
+print(hex(mu.reg_read(UC_ARM_REG_R0)))
+```
+
+## VS Code Cortex-Debug with QEMU as the gdbserver
+
+A clean development loop for the cases QEMU handles well: run QEMU with `-s -S` (gdbserver on port 1234, halted at reset), and configure VS Code's Cortex-Debug extension to attach instead of launching a real probe. Your unit-test binary boots in QEMU, breakpoints work, single-step works, watch expressions work — entirely on your laptop, with no hardware connected.
+
+```json
+// .vscode/launch.json
+{
+  "type": "cortex-debug",
+  "request": "attach",
+  "name": "QEMU mps2-an385",
+  "executable": "build/firmware.elf",
+  "servertype": "external",
+  "gdbTarget": "localhost:1234",
+  "runToEntryPoint": "main"
+}
+```
+
+```bash
+qemu-system-arm -machine mps2-an385 -cpu cortex-m3 -nographic \
+                -kernel build/firmware.elf -s -S
+```
+
+This pattern is the lightest-weight CI debug loop available. CI jobs can launch QEMU headless, run a test binary that exits via the `semihosting:exit` operation, and check the exit code. No board, no probe, no flash wear.
+
+## Renode at the next level — multi-node and co-simulation
+
+Renode's strongest feature is **multi-node**. You can boot N copies of a chip platform, wire their UARTs to a virtual hub, connect their Ethernet MACs to a virtual switch, and run a network-level test from a single Python script. This is exactly what you want for:
+
+- Testing a Thread / Zigbee mesh formation across 20 nodes.
+- Validating a CAN-bus arbitration scheme.
+- Reproducing a multi-MCU coherency bug between an i.MX RT and an attached LPC55 secure element.
+- Pre-silicon software development where you need to simulate the entire system before any board exists.
+
+Renode also supports **Verilator co-simulation**. You can simulate a real Cortex-M chip in Renode while simulating a custom FPGA design (a peripheral you're prototyping) in Verilator, with the two connected through a memory-mapped bus model. The simulated time clocks are synchronised. This is the same pattern Antmicro uses internally for pre-silicon SoC validation.
+
+```bash
+# Renode multi-node CAN scenario
+renode --console
+(monitor) using sysbus
+(monitor) include @scripts/multi-node-can.resc
+(monitor) start
+(monitor) emulation RunFor "10s"
+(monitor) sysbus.uart1 ReadLine  # capture log lines
+```
+
+## Hardware-in-the-loop — the bridge to real silicon
+
+When simulation isn't enough but you still want CI automation, hardware-in-the-loop (HIL) is the answer. The setup: a small farm of real dev boards connected to the CI runner via debug probes (J-Link, PEEDI, Lauterbach PowerDebug). The runner flashes, runs the test, captures output and pin states via a logic analyser, and resets the board between tests.
+
+| Approach | Coverage of real silicon | CI cost | Setup effort |
+|----------|--------------------------|---------|--------------|
+| Host unit tests | none (logic only) | free | low |
+| Unicorn | CPU only | free | low (per function) |
+| QEMU | CPU + simple UART | free | low |
+| Renode | CPU + most peripherals | free | medium (model files) |
+| HIL (single board) | full | medium (board + probe + power) | medium |
+| HIL (board farm) | full | high (rack + relays + power switching) | high |
+
+The pragmatic mix most production teams adopt: **host unit tests** for pure logic (parsers, state machines, math), **QEMU** for CPU-bound code that runs as part of fast CI, **Renode** for integration tests that exercise peripheral interactions, **HIL** for the small set of tests that genuinely require real silicon. Pick the level that matches what you're verifying; don't simulate what doesn't need simulating.
+
+<Callout type="warn" title="Decoupled time is a hidden trap">
+Both QEMU and Renode run on virtual time that's not synchronised with wall-clock time. `WFI` in QEMU returns immediately; a `delay_ms(100)` loop runs as fast as the host can JIT it. Code that depends on real-time behaviour (timeout-driven state machines, ISR-vs-main-loop races, DMA completion ordering) will not behave the same under simulation as on hardware. If your code is sensitive to these, do not rely on simulation alone for verification — use HIL.
+</Callout>
+
+- [Build systems](/docs/tools/build/) — running CI tests in CMake/Make.
+- [Toolchains](/docs/tools/toolchains/) — cross-compiling for the test target.
+- [Cortex-M lineup](/docs/cortex-m/lineup/) — which core QEMU and Renode actually model.
+- [NVIC priority](/docs/cortex-m/nvic-priority/) — what QEMU's NVIC model gets right.
+- [MPU on Cortex-M](/docs/cortex-m/mpu/) — supported by QEMU on v7-M and v8-M boards.
+- [TrustZone](/docs/architecture/trustzone/) — supported on Renode v8-M models.
+- [CMSIS](/docs/programming/cmsis/) — semihosting interface used to emit results from QEMU.
+- [STMicro](/docs/vendors/stm/), [NXP](/docs/vendors/nxp/), [Renesas](/docs/vendors/renesas/) — chip-level Renode coverage notes.
+- [Interrupt latency tool](/tools/interrupt-latency) — companion calculator for validating simulator timing.

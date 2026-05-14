@@ -1,0 +1,164 @@
+---
+title: TLB & address translation
+description: How Cortex-A cores translate virtual to physical addresses — split L1 TLBs, unified L2 TLB, ASIDs and VMIDs, page-walk caches, the TTL hint, and the real cost of a TLB miss in a modern OoO core.
+order: 2
+updated: 2026-05-13
+tags: [cortex-a, tlb, mmu, address-translation, asid, page-walk]
+---
+
+A Cortex-A core spends a surprising fraction of its cycles translating virtual addresses to physical ones. Every load, store, and instruction fetch generates a virtual address; every one of those must resolve to a physical address before the cache or memory controller can respond. The Translation Lookaside Buffer (TLB) is the hardware shortcut that makes this practical — without it, every memory access would walk the page tables, which is four DRAM round-trips on a 48-bit VA AArch64 system.
+
+This page is about how Cortex-A TLBs are structured, how the OS keeps them coherent across context switches and shootdowns, and why a TLB miss in a busy server workload costs more cycles than the cache miss it's often confused with.
+
+<SpecSheet
+  title="TLB hierarchy on a typical Cortex-A core"
+  specs={[
+    { label: 'L1 instruction TLB', value: '32–64 entries, fully associative, single-cycle hit (e.g. A76: 48 entries)' },
+    { label: 'L1 data TLB', value: '32–64 entries, fully associative, single-cycle hit (e.g. A76: 48 entries)' },
+    { label: 'L2 unified TLB', value: '512–2048 entries, set-associative, 3–7 cycle hit (e.g. A76: 1280 entries, 4-way)' },
+    { label: 'Page sizes supported', value: '4 KB, 16 KB, 64 KB granules (AArch64) — chosen at OS boot via TCR_EL1.TG0/TG1' },
+    { label: 'Huge page sizes (4 KB granule)', value: '4 KB, 2 MB, 1 GB — block descriptors at level 1 and level 2' },
+    { label: 'Address Space ID (ASID)', value: '8 or 16 bits — tags TLB entries per process; size set by TCR_EL1.AS' },
+    { label: 'VM ID (VMID)', value: '8 or 16 bits — tags TLB entries per VM (stage-2); set by VTCR_EL2.VS' },
+    { label: 'Page-walk depth', value: '4 levels for 48-bit VA / 4 KB granule (L0→L1→L2→L3)' },
+  ]}
+/>
+
+## The two-level TLB
+
+Cortex-A cores from A72 onward use a **two-level TLB hierarchy**, mirroring the two-level cache structure. The L1 TLBs are split between instruction (ITLB) and data (DTLB) — separate physical structures, because the instruction fetch unit and the load/store unit access them in parallel and a unified L1 would create a port-contention nightmare. Each L1 TLB is small (32–64 entries) and fully associative, hit time one cycle. The L2 TLB is unified (one structure shared by I-side and D-side), 512–2048 entries, set-associative with 4–8 ways, hit time 3–7 cycles.
+
+```
+   CPU front-end                            CPU load-store unit
+       |                                            |
+   [ ITLB 48ent ]                              [ DTLB 48ent ]    <- L1, 1-cycle hit
+       |                                            |
+       +--------------+----------------------------+
+                      |
+                 [ L2 TLB 1280ent ]                            <- 3–7 cycle hit
+                      |
+              [ Page-walk caches ]   walk caches per level
+                      |
+                  page-table walker  -> DRAM
+```
+
+Each L1 TLB entry stores the full translation: virtual page → physical page, permissions, memory type, ASID, VMID, contiguous-hint bit, dirty-bit-modifier state. On a hit, the physical address is available in the same cycle the access dispatches — fully overlapped with cache tag lookup.
+
+An L1 miss queries the L2 TLB. An L2 miss triggers a **page-table walk**.
+
+## Page-table walks
+
+For a 48-bit VA with 4 KB granule (the Linux default on Cortex-A server), the walker traverses four levels:
+
+| Level | VA bits used | Descriptor type | Entry covers |
+|-------|--------------|-----------------|--------------|
+| 0     | [47:39]      | Table descriptor | 512 GB |
+| 1     | [38:30]      | Table or block (1 GB block) | 1 GB |
+| 2     | [29:21]      | Table or block (2 MB block) | 2 MB |
+| 3     | [20:12]      | Page descriptor | 4 KB |
+
+`TTBR0_EL1` (for user, low VA) and `TTBR1_EL1` (for kernel, high VA) hold the level-0 table base. The walker reads one 8-byte descriptor per level. Each descriptor either points to the next-level table or terminates the walk as a **block descriptor** — a huge page that covers more VA at once.
+
+A cold walk does four sequential memory reads, each potentially missing in the L1/L2 data caches and going to DRAM. On a system with 80 ns DRAM, that's 320 ns per TLB miss — vastly more than the ~10 ns of the cache miss it triggered.
+
+This is why every Cortex-A core has **walk caches**: small structures that cache the intermediate-level descriptors. A76, for example, has dedicated walk caches for L0/L1 entries — so once the kernel's L0 entry is cached, every page walk in the kernel half of VA hits the walk cache for L0 and only needs to read L1/L2/L3. After a few seconds of steady-state operation the walk caches absorb most of the cost, and a TLB miss becomes a single-level DRAM read.
+
+<Callout type="tip">
+Huge pages eliminate walk levels. A 2 MB page (block descriptor at level 2) means level-3 lookup is skipped entirely — one fewer memory access. A 1 GB page (block descriptor at level 1) skips two levels. On databases and JVM heaps with large working sets, transparent huge pages (`/sys/kernel/mm/transparent_hugepage/enabled = always`) often deliver 5–15% wall-clock speedup just from TLB miss reduction.
+</Callout>
+
+## ASIDs — tagged TLB entries per process
+
+Without ASIDs, every context switch would have to flush the TLB — the next process would otherwise see stale translations from the previous one. Flushing 1280 L2 TLB entries plus walk caches is expensive (microseconds of cold cache reload after the switch). ASIDs avoid this.
+
+An ASID is an 8-bit or 16-bit tag (configurable via `TCR_EL1.AS`) carried in every TLB entry. The CPU compares the access's current ASID (stored in `TTBR0_EL1` bits [63:48] for AArch64) against the entry's tag — only matching entries are considered for a hit. So entries from process A and process B coexist in the TLB, and context switching is just a `TTBR0_EL1` swap with a new ASID.
+
+Linux uses a "rolling ASID" scheme: there are only 256 (or 65536) ASIDs, but typically tens of thousands of processes. The kernel hands out ASIDs from a rotating pool; when it wraps, it does a global TLB flush and restarts the pool. On a busy system this happens every few seconds — still vastly cheaper than per-switch flushes.
+
+Some translations are **global** (typically the kernel half of VA) — `nG = 0` in the descriptor. Global entries match regardless of ASID; the kernel doesn't need a separate ASID per process for kernel-space translations.
+
+## VMIDs — tagged TLB entries per VM
+
+Under virtualization (EL2 hypervisor active), each VM has its own ASID space — but two VMs could collide on the same ASID. VMIDs solve this: an 8-bit or 16-bit tag (configurable via `VTCR_EL2.VS`) in every stage-2-translated TLB entry, set from `VTTBR_EL2.VMID`. The CPU effectively keys TLB lookups on `(VA, ASID, VMID)`.
+
+Combined with the dual-stage translation (guest VA → guest PA via stage-1, guest PA → host PA via stage-2), this lets a single TLB hold translations for many VMs simultaneously, without flushes on VM switch.
+
+## TLB invalidation — TLBI instructions
+
+When the OS changes a page-table entry — `munmap`, COW, swap-out, demand-paging — the corresponding TLB entries must be invalidated. AArch64 has a rich family of `TLBI` instructions:
+
+| Instruction | What it invalidates |
+|-------------|---------------------|
+| `TLBI VAE1, x0` | One VA in EL1, current ASID |
+| `TLBI VALE1, x0` | One VA in EL1, last-level translation only |
+| `TLBI ASIDE1, x0` | All entries for a given ASID |
+| `TLBI VMALLE1` | All entries in EL1 (current VMID) |
+| `TLBI ALLE1` | All EL1 entries (all ASIDs) |
+| `TLBI VMALLS12E1` | All stage 1 and stage 2 (VMID-tagged) |
+
+The `IS` variant (`TLBI VAE1IS`) broadcasts the invalidation to all CPUs in the **Inner Shareable** domain — typically all cores in the system. Without `IS`, the invalidation is local to the issuing CPU. Linux always uses `IS` variants for shared mappings; for private (per-process) mappings, local invalidation is enough.
+
+A sequence of TLBI's must be followed by `DSB ISH` and `ISB`:
+
+```asm
+    tlbi vae1is, x0       // invalidate one VA, inner shareable
+    dsb ish               // wait for the broadcast to complete
+    isb                   // synchronize the local pipeline
+```
+
+Without these barriers, the issuing CPU may keep using a stale translation in its pipeline (instruction fetch happens speculatively past the TLBI), and remote CPUs may not see the invalidation until later.
+
+<Callout type="warn">
+TLBI cost scales with system size. On a 64-core Neoverse server, a single `TLBI ASIDE1IS` is a multicast that every CPU acknowledges — tens of microseconds end-to-end. High-throughput servers measure TLBI traffic as a first-class performance variable. Workloads with frequent `munmap` (some JIT compilers, garbage collectors) can saturate the snoop network. Mitigations include batching invalidations and using ASID-replacement instead of per-page TLBI on context-heavy churn.
+</Callout>
+
+## The TTL hint (ARMv8.4)
+
+ARMv8.4-A added the **TTL** (Translation Table Level) hint to TLBI instructions. The OS can tell the hardware "this invalidation is for a level-3 entry only" via the TLBI operand's `TTL` field. The hardware then only invalidates TLB entries that were translated through that level — entries for 2 MB or 1 GB block descriptors are left alone.
+
+For a workload that's mostly 2 MB pages but occasionally remaps a 4 KB sub-region, TTL avoids flushing the surrounding huge-page entries unnecessarily. Linux ≥5.10 issues TTL-aware TLBIs when the kernel knows the granularity of the change.
+
+## Practical performance impact
+
+Measuring TLB pressure on real workloads:
+
+- **Cycles per TLB miss** — typically 20–40 cycles on a warm walk-cache, 200+ cycles on a cold one (full DRAM walk). Capture via `perf stat -e dtlb_walk` or PMU event 0x34 on most Cortex-A cores.
+- **Working set vs reach** — TLB *reach* = entries × page size. 1280-entry L2 TLB × 4 KB = 5 MB reach. Working sets larger than that thrash the TLB regardless of cache behaviour. 2 MB pages bump reach to 2.5 GB.
+- **Latency-sensitive code** — every chained pointer load (linked-list traversal, hash-table probe) is a TLB lookup. List-walking code with poor locality stresses both the data cache and the data TLB.
+
+A typical server profile after switching `malloc` arenas to `MAP_HUGETLB`:
+- DTLB miss rate: 4.2% → 0.3%
+- IPC: 1.85 → 2.10
+- Wall-clock latency p99: -8%
+
+The IPC boost is "free" — same code, same compiler flags, just different memory layout.
+
+## Linux's TLB management
+
+Linux on AArch64 uses several mechanisms to minimize TLB pressure:
+
+1. **ASID recycling** — described above.
+2. **mm_users counting** — when no thread has a given mm active, the kernel can defer flushes.
+3. **Lazy TLB** — kernel threads borrow the previous user mm's ASID; no flush on entry/exit.
+4. **mmu_gather** — batches up to ~10K invalidations into one TLBI batch per `munmap`.
+5. **Transparent huge pages** — kernel automatically promotes regions of 4 KB pages to 2 MB pages when alignment and contiguity allow.
+
+The kernel also has explicit support for ARMv8.4 TTL hints (see `flush_tlb_kernel_range` and the `level` parameter in newer kernels).
+
+## Tuning checklist for TLB-bound code
+
+If `perf stat` shows >2% dtlb-load-misses or >1% itlb-load-misses:
+
+- **Enable transparent huge pages.** `echo always > /sys/kernel/mm/transparent_hugepage/enabled`. Verify via `cat /proc/meminfo | grep AnonHuge`.
+- **Use `madvise(MADV_HUGEPAGE)`** on large mmap regions where you control the code.
+- **Reduce working-set size.** Process data in tiles smaller than 4 MB (the typical L2 TLB reach with 4 KB pages).
+- **Increase page granule at boot.** Linux can use 16 KB or 64 KB granules — larger pages = larger TLB reach, but more internal fragmentation. Most distros ship 4 KB; Android often uses 16 KB on newer chips.
+- **Watch for COW storms.** Every fork+exec sequence creates COW pages that fault, which TLBI; high fork-rate workloads thrash.
+
+## Cross-references
+
+- [SMP & cache coherency](/docs/cortex-a/smp) — the inner-shareable domain and snoop traffic
+- [Virtualization & EL2](/docs/cortex-a/virtualization) — stage-2 translation and VMIDs
+- [Big.LITTLE & DynamIQ](/docs/cortex-a/big-little) — TLB sizing differences between A55 and A76
+- [Performance Monitoring Unit](/docs/cortex-a/pmu) — TLB miss events and the SPE profiler
+- ARM ARM (DDI 0487), section D5 (VMSAv8-64 translation system)

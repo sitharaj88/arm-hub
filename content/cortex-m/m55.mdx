@@ -1,0 +1,142 @@
+---
+title: Cortex-M55
+description: ARMv8.1-M with Helium (M-profile Vector Extension). Scalar+vector core for ML inference and DSP, optimized for pairing with Ethos-U NPUs.
+order: 5
+updated: 2026-05-13
+tags: [cortex-m, cortex-m55, helium, mve, armv8.1-m, ml]
+---
+
+The Cortex-M55 was ARM's first M-profile core with **Helium**, also known as the M-profile Vector Extension (MVE). It's a single core that can also act as a 128-bit SIMD engine — without the area and power cost of a separate DSP block. The target workloads are machine-learning inference (keyword spotting, image classification, sensor fusion), classical DSP (FIR, IIR, FFT, MFCC), and any code where you can amortize a small overhead across vectors of 4 to 16 elements.
+
+The M55's other strategic role is as the host processor next to an **Ethos-U** microNPU. The Ethos-U55 and U65 are dedicated neural-network accelerators that share memory with the Cortex-M; the M55 handles the scalar parts of the inference pipeline, the Ethos-U handles the dense convolutions, and the two communicate through a small set of MMIO registers and shared TCM. This pairing — M55 + Ethos-U — is the canonical ARM "TinyML" platform.
+
+<SpecSheet
+  title="Cortex-M55 at a glance"
+  specs={[
+    { label: 'Architecture', value: 'ARMv8.1-M Mainline' },
+    { label: 'Pipeline', value: '4-stage in-order, dual-issue scalar+vector' },
+    { label: 'Helium MVE', value: 'Optional, 128-bit vectors, int8/16/32 and fp16/fp32, vectorized load/store with strided and gather/scatter forms' },
+    { label: 'FPU', value: 'FPv5-SP and optional FPv5-DP (double-precision)' },
+    { label: 'TrustZone-M', value: 'Optional, same model as M33' },
+    { label: 'MPU', value: 'Optional, up to 16 regions per state' },
+    { label: 'Cache', value: 'Optional I-cache (4–64 KB) and D-cache (4–64 KB), 32-byte lines, write-back / write-through configurable' },
+    { label: 'TCM', value: 'Optional ITCM and DTCM (each up to 16 MB), single-cycle access' },
+    { label: 'DMIPS/MHz', value: '1.6 (Dhrystone 2.1)' },
+    { label: 'CoreMark/MHz', value: '~4.5 (scalar) — orders of magnitude higher for vector-friendly kernels' },
+    { label: 'Typical clock', value: '300–500 MHz silicon' },
+    { label: 'Typical parts', value: 'Alif Ensemble (M55 + Ethos-U55), Himax WE2, Renesas RA8 series' },
+  ]}
+/>
+
+## Helium — what it actually is
+
+Helium (MVE) is ARM's way of bolting a SIMD engine onto an M-profile core without paying the area cost of NEON (which is what Cortex-A and Cortex-R cores use). The core trick: Helium re-uses the FPU register file. Instead of adding 32 dedicated vector registers, MVE treats the 32 single-precision FPU registers (s0..s31) as **eight 128-bit vector registers Q0..Q7** (each Q is four 32-bit lanes, or eight 16-bit, or sixteen 8-bit). This gives you 1 KiB of SIMD register file in the same silicon area as the FPU you already have.
+
+The MVE encoding is also clever. Most MVE instructions take **two cycles** but operate on a full vector. The first cycle issues the instruction; the second cycle, the *next* instruction can issue in parallel — vector-on-cycle-0, scalar-on-cycle-1. This is called "vector beat" issuing and it means a well-scheduled inner loop can sustain near-1.5 instructions/cycle on average.
+
+```c
+// FIR filter — 32 taps, 16-bit samples, 16-bit coefficients
+// Scalar version: ~32 MACs/sample
+// Helium version with int16 MVE: 8 taps per cycle in the inner MAC vector
+//   → 4 cycles per output sample for the MAC loop, plus a few overhead cycles
+```
+
+### Data types
+
+Helium supports a wide matrix of types:
+
+| Lane size | Lanes per vector | Use case |
+|---|---|---|
+| int8  | 16 | Quantized NN inference (per Google MobileNet, INT8 is standard) |
+| uint8 | 16 | Image pixels, byte streams |
+| int16 | 8  | Classical DSP (audio, IIR/FIR with Q15 coefficients) |
+| int32 | 4  | Wide-precision accumulators, 32-bit DSP |
+| fp16  | 8  | Half-precision floats — common in modern ML (BF16-like accuracy) |
+| fp32  | 4  | Full single-precision SIMD |
+
+The combination of int8 SIMD (×16 lanes) and dual-issue makes the M55 the smallest Cortex that can run real ML models — a 250 KB MobileNet variant at ~10 inferences per second on a 300 MHz part.
+
+<Callout type="tip" title="CMSIS-NN and CMSIS-DSP are MVE-aware">
+CMSIS-NN and CMSIS-DSP both have Helium-optimized backends. Compiling against them with `-mcpu=cortex-m55+mve.fp` gives you orders-of-magnitude speedup on convolutions and filters without writing any intrinsics. For most ML-inference work, this is the right starting point — only drop to intrinsics when profiling shows the library kernel is in the hot path.
+</Callout>
+
+### Loop-end instructions
+
+Helium adds **low-overhead loops** via `WLS` (while-loop start), `DLS` (do-loop start), and `LE` (loop-end). These are explicit hints to the core that this is a counted loop — no compare-and-branch needed at the bottom, the LE instruction takes care of the branch and saves a cycle. Combined with the **tail-predication** feature (LE TP), the core also masks off the unused vector lanes on the last iteration if the count isn't a multiple of vector width.
+
+```asm
+    DLS lr, r0          // r0 = element count
+loop:
+    VLDR.s16 q0, [r1]   // load 8 int16 samples
+    VADD.s16 q0, q0, q1 // add coefficient vector
+    VSTR.s16 q0, [r2], #16
+    LETP lr, loop       // branch if more, tail-predicated
+```
+
+LETP cleanly handles 47 elements with vector width 8 — the last iteration processes 7 lanes and masks off the 8th — without any scalar fixup loop. This is a big deal for code generation; auto-vectorizing compilers no longer have to emit cleanup tails.
+
+## Caches and TCM
+
+The M55 is the first ARMv8.x-M core with **optional caches** in the same vein as the M7. I-cache and D-cache are both optional, configurable from 4 KB to 64 KB, with 32-byte lines. The D-cache supports write-back or write-through; write-back is default for normal cacheable memory.
+
+DMA coherency is **not automatic**. If a DMA writes to a buffer that's in the D-cache, the cache holds the stale CPU view. Either (a) invalidate the D-cache region after DMA completes, (b) mark the DMA region as non-cacheable in the MPU, or (c) use the TCM. See the [cache & TCM page](/docs/cortex-m/cache-tcm) for the full story.
+
+TCM (tightly-coupled memory) is single-cycle SRAM directly attached to the core, bypassing the cache and bus matrix. ITCM and DTCM are separate; both can be up to 16 MB in the architecture (typical silicon is 64–256 KB each). TCM is where you put performance-critical inner loops — they get cache-grade access latency without cache management overhead.
+
+## Pairing with Ethos-U
+
+The Ethos-U55 and U65 are ARM-designed microNPUs (neural processing units) that share memory with the host Cortex-M. The wiring is straightforward: the Ethos-U is an AHB-Lite master that reads weights and writes activations to shared SRAM (typically the M55's DTCM or a dedicated SRAM block). A small command stream — generated offline by the Vela compiler from a TensorFlow Lite model — drives the U through its inference. The M55 dispatches by writing to a few registers and waits on a completion interrupt.
+
+A typical inference flow:
+
+1. M55 (or DMA) loads input tensor into shared SRAM.
+2. M55 writes the command-stream pointer to Ethos-U's MMIO.
+3. Ethos-U begins, reads commands, reads weights from SRAM, computes layer by layer, writes activations back.
+4. On completion, Ethos-U raises an interrupt.
+5. M55 reads the output tensor and runs the scalar post-processing (softmax, top-K, classification).
+
+For a typical 250 KB MobileNet, the Ethos-U55 (256-MAC variant) does inference in ~10 ms at 400 MHz. The M55 alone with Helium would take 80–100 ms — fine for low-rate use, but the U makes 100+ Hz inference rates feasible.
+
+## Microarchitecture details
+
+- **4-stage pipeline**: F1, F2, D, E. Fetch is double-stage to hide flash latency.
+- **Dual-issue**: one scalar + one vector per cycle, or two scalars if both are simple.
+- **Branch predictor**: 4-entry BTB, gshare-style direction predictor. Hits the typical control loop accurately.
+- **Load latency**: 2 cycles from D-cache, 1 cycle from DTCM, more from main SRAM (depends on bus matrix).
+- **MVE issue rate**: most MVE ops issue every 2 cycles (vector beat), with scalar slots filling the gap.
+
+## NVIC and security
+
+Same as M33: up to 480 IRQs, 8 priority bits, TrustZone-M optional, banked NVIC and SysTick under TZ. The MVE state is part of the FPU state for context-switch and TrustZone purposes — `FPCCR.LSPEN` covers the Q registers as well.
+
+For TZ-aware RTOSes, the per-state extended stack frame on cross-state exceptions is even larger when MVE is in use: up to 40+8 vector words = ~72 words total. Plan handler stacks accordingly.
+
+## Representative parts
+
+| Part | Vendor | NPU? | Notes |
+|---|---|---|---|
+| Alif Ensemble E1/E3 | Alif | Yes — Ethos-U55 | First commercial M55 + Ethos-U combo, broad portfolio |
+| Himax WE2 | Himax | Yes — Ethos-U55 | Always-on vision, image-sensor-side ML |
+| Renesas RA8M1 | Renesas | No | M55 at 480 MHz, broad peripherals, no NPU |
+| HPM6E80 | HPMicro | No | M55-class core, 600 MHz claimed |
+
+The M55 + Ethos-U combo is still finding its product-market fit. Audio always-on (keyword spotting), low-rate vision (presence detection), and predictive maintenance (vibration-based anomaly detection) are the established niches.
+
+## When to choose Cortex-M55
+
+The M55 is right when you have:
+
+- A workload that benefits from SIMD (DSP filters, classical signal processing, ML inference)
+- A power envelope under ~150 mW (above that, a Cortex-A is usually cheaper per-op)
+- A need for deterministic, no-cache-miss-storm execution — TCM saves you here
+
+Choose the M85 instead if you don't need SIMD but do need raw single-thread throughput, or if you need branch prediction with deeper history. Choose the M33 if you don't need SIMD at all.
+
+## Cross-references
+
+- [Cortex-M85](/docs/cortex-m/m85) — non-MVE counterpart, higher scalar perf
+- [Cortex-M33](/docs/cortex-m/m33) — without MVE, smaller silicon
+- [Cache and TCM](/docs/cortex-m/cache-tcm) — D-cache coherency, ITCM/DTCM bring-up
+- [Architecture comparison](/docs/cortex-m/architecture-compare)
+- [FPU](/docs/cortex-m/fpu) — FPv5-DP and shared MVE register file
+- ARMv8.1-M Architecture Reference Manual (DDI 0553B)

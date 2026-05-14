@@ -1,0 +1,200 @@
+---
+title: ARMv8-M architecture
+description: The current M-profile generation — Baseline and Mainline, TrustZone-M security extension, improved MPU, stack-limit registers, and the v8.1-M Helium MVE that lights up Cortex-M55 and M85.
+order: 12
+updated: 2026-05-13
+tags: [architecture, armv8m, trustzone, helium, mve, cortex-m23, cortex-m33, cortex-m55, cortex-m85]
+---
+
+ARMv8-M is the first ground-up redesign of the M-profile in over a decade. It came in two flavors — **Baseline** (a v6-M-style minimal ISA, used by Cortex-M23) and **Mainline** (a v7-M-style full Thumb-2 ISA, used by Cortex-M33, M35P, M55, M85) — plus a security extension called **TrustZone-M** that's optional on both. The v8.1-M revision adds the **Helium** vector extension (also called MVE — M-profile Vector Extension), which lights up the Cortex-M55 and M85 for ML inference and dense DSP workloads.
+
+ARMv8-M also reworks the MPU to remove the power-of-two-and-aligned restriction, adds **stack pointer limit registers** for hardware stack-overflow detection that doesn't require an MPU region, and introduces a richer set of debug and trace features. For any new design starting in 2024 or later, ARMv8-M is the architectural target.
+
+<SpecSheet
+  title="ARMv8-M at a glance"
+  specs={[
+    { label: 'Profiles', value: 'Baseline (M23) — v6-M-like minimal ISA. Mainline (M33/M35P/M55/M85) — v7-M-like full ISA.' },
+    { label: 'TrustZone-M', value: 'Optional security extension. Partitions memory + execution into Secure and Non-secure worlds via SAU/IDAU.' },
+    { label: 'MPU', value: 'New register layout. No power-of-two-and-aligned constraint — any 32-byte aligned start/limit. MAIR for attribute indirection.' },
+    { label: 'Stack pointer limits', value: 'MSPLIM, PSPLIM (and Secure variants) — hardware checks against limit on every push.' },
+    { label: 'New instructions', value: 'SG (Secure Gateway), TT/TTT (TT-Test), BXNS / BLXNS (non-secure call/return), CSEL (conditional select).' },
+    { label: 'v8.1-M additions', value: 'Helium MVE — 128-bit vector ISA. Pointer Authentication (PACBTI). Low-overhead loop. Half-precision FP.' },
+    { label: 'Cores', value: 'Cortex-M23 (Baseline), Cortex-M33 (Mainline), Cortex-M35P (Mainline + tamper resistance), Cortex-M55 (Mainline + Helium), Cortex-M85 (Mainline + Helium + PACBTI)' },
+    { label: 'Pipeline', value: '2-stage (M23), 3-stage (M33/M35P), 4-stage dual-beat Helium (M55), 6-stage dual-issue (M85)' },
+  ]}
+/>
+
+## Baseline vs Mainline — two ISAs under one roof
+
+ARMv8-M splits the architecture into two profiles. Baseline is roughly a v6-M ISA with TrustZone bolted on; Mainline is v7-M with TrustZone, plus a few new instructions and a refined exception model. The split lets vendors pick the gate budget — Cortex-M23 is the cheapest TrustZone-capable core; Cortex-M33 is the entry-level full ISA.
+
+<CoreCompare
+  rows={[
+    { core: 'ARMv8-M Baseline (Cortex-M23)', notes: 'Thumb subset like v6-M. No IT block. No LDREX/STREX (but adds LDA/STL for limited acquire/release). No DSP. No FPU. Optional TrustZone, optional MPU.' },
+    { core: 'ARMv8-M Mainline (Cortex-M33)', notes: 'Full Thumb-2. IT block. LDREX/STREX. Optional SP FPU (FPv5-SP). Optional DSP. Optional TrustZone, optional MPU.' },
+    { core: 'ARMv8.1-M Mainline (Cortex-M55, M85)', notes: 'Adds Helium MVE (128-bit vector), low-overhead loops, half-precision FP, optional PACBTI. M85 also has branch prediction and dual-issue.' },
+  ]}
+/>
+
+### Baseline-specific notes
+
+Cortex-M23 looks superficially like a Cortex-M0+ with TrustZone. The key Baseline-only details:
+
+- **No IT block** — same conditional-execution story as v6-M. Use `CSEL` (conditional select) for simple two-way picks; otherwise branch.
+- **LDA / STL** — acquire-load and release-store. These are 1-cycle, non-exclusive ordered loads/stores. They are not full LDREX/STREX, but they let Baseline implement message-passing patterns safely without disabling interrupts.
+- **No exclusive monitor** — Baseline cannot do true read-modify-write atomics. For RMW you still need PRIMASK on/off or a bus-level spinlock.
+- **3-bit priority typical** — Cortex-M23 usually ships with 2 or 3 priority bits. No BASEPRI.
+
+### Mainline-specific notes
+
+Cortex-M33 (and its descendants) has everything v7-M had, plus the v8 additions. The biggest non-security improvements you'll touch in everyday code are the new MPU layout (next section) and the stack-pointer limit registers.
+
+<StateDiagram title="v8-M Secure / Non-secure state transitions" width={760} height={260} states={[
+  { id: 's',    label: 'Secure', x: 60,  y: 90, w: 200, h: 80, tone: 'success', initial: true },
+  { id: 'ns',   label: 'Non-secure', x: 500, y: 90, w: 200, h: 80, tone: 'accent' },
+  { id: 'fault', label: 'SecureFault', x: 280, y: 30, w: 200, h: 60, tone: 'destructive' },
+]} transitions={[
+  { from: 's', to: 'ns', label: 'BLXNS / BXNS' },
+  { from: 'ns', to: 's', label: 'SG at NSC entry', curve: -50 },
+  { from: 'ns', to: 'fault', label: 'NS branch into S', curve: 40 },
+  { from: 'fault', to: 's', label: 'fault handler' },
+]} caption="An NS thread can only enter Secure state through an SG instruction placed in a Non-Secure-Callable region; any other crossing raises a SecureFault. The reverse (Secure to NS) goes through BLXNS / BXNS." />
+
+## The new MPU
+
+ARMv8-M abandons the v7-M MPU's power-of-two-and-aligned constraint. A region is now defined by an explicit **base** and **limit** address, both 32-byte aligned. Permission bits move into the base register; cacheability is indirected through MAIR0/MAIR1 (Memory Attribute Indirection Register).
+
+| v7-M MPU | ARMv8-M MPU |
+|----------|--------------|
+| Region size = power of two | Region size = any (32-byte granularity) |
+| Region start = multiple of size | Region start = 32-byte aligned |
+| TEX/C/B bits per region | Index into MAIR (8 attribute sets) |
+| Subregions (8 per region) | Removed — no longer needed |
+| Up to 16 regions | Up to 16 regions (typically 8 or 16) |
+
+The wins are practical: you can carve a 13 KB stack region in one MPU slot (instead of two on v7-M with sub-region disable hackery). DMA buffer regions no longer need to be sized up to the next power of two. RTOS context-switch code is simpler — fewer regions, fewer indirections.
+
+The cost is a slightly larger register-block footprint and a touch more software complexity for the MAIR indirection. See [MPU on Cortex-M](/docs/cortex-m/mpu) for the full register description.
+
+## Stack pointer limit registers
+
+ARMv8-M adds **MSPLIM** and **PSPLIM** (and their Secure counterparts MSPLIM_S, PSPLIM_S when TrustZone is present). These are 32-bit registers that hold a lower-bound address. Every push (or any SP-relative store at a lower address) compares against the limit; if SP would drop below the limit, the hardware raises a **stack-overflow UsageFault**, synchronously, before any memory is corrupted.
+
+```c
+extern uint32_t _estack_top;
+extern uint32_t _estack_bottom;
+
+void main(void) {
+    __set_MSPLIM((uint32_t)&_estack_bottom);   // protect MSP
+    // ...
+}
+```
+
+This is dramatically better than the v7-M MPU-guard-region pattern: no MPU region consumed, no alignment dance, the check is part of the SP write itself. The fault frame's stacked PC points to the instruction that tried to overflow the stack, which is exactly the function you want to blame.
+
+PSPLIM is per-task: every RTOS task switch reprograms PSPLIM to match the new task's stack lower bound. FreeRTOS v10.4+ and Zephyr 3.x both support PSPLIM on v8-M.
+
+<Callout type="tip">
+PSPLIM is the single biggest reliability improvement v8-M brings to typical RTOS firmware. If you're moving from a Cortex-M4 to a Cortex-M33, retire the MPU stack-guard regions and switch to PSPLIM — fewer regions burned, lower context-switch cost, more precise faults.
+</Callout>
+
+## TrustZone-M — a quick summary
+
+TrustZone-M partitions the entire memory map (and execution state) into **Secure** and **Non-secure** worlds. Transitions between worlds happen only at architecturally defined gates (`SG` instruction for entering Secure, `BXNS`/`BLXNS` for returning to Non-secure). The Security Attribution Unit (SAU) and Implementation-Defined AU (IDAU) classify every address as Secure, Non-secure-Callable (NSC), or Non-secure.
+
+The use case is classic platform-security: put your root-of-trust, key storage, secure boot, and cryptographic primitives in the Secure world; run the application (with all its bugs) in the Non-secure world. A compromised Non-secure application cannot read Secure memory or jump into arbitrary Secure code.
+
+ARM Platform Security Architecture (PSA) and Trusted Firmware for M (TF-M) build on this primitive. For the full mechanics, see [TrustZone-M deep dive](/docs/architecture/trustzone-m).
+
+## New instructions in v8-M
+
+A handful of instructions unique to ARMv8-M:
+
+| Instruction | Purpose | Profile |
+|-------------|---------|---------|
+| `SG` | Secure Gateway — only valid entry to Secure code from Non-secure | Mainline + Baseline (with TZ) |
+| `BXNS Rn`, `BLXNS Rn` | Branch (with link) to non-secure address | Mainline + Baseline (with TZ) |
+| `TT`, `TTT`, `TTA`, `TTAT` | TT-Test — query SAU/MPU permissions for a given address | Mainline + Baseline (with TZ) |
+| `CSEL Rd, Rn, Rm, cond` | Conditional select (no flag update) | Baseline (M23 uses heavily; Mainline already had IT block alternatives) |
+| `LDA`, `STL`, `LDAEX`, `STLEX` | Acquire load, release store, acquire-exclusive, release-exclusive | Mainline (Baseline gets LDA/STL only) |
+
+The `LDA`/`STL` pair is worth highlighting: even outside TrustZone, they provide ordered (acquire/release) semantics, which is exactly what lock-free message passing needs. The CMSIS atomics use these on v8-M to avoid the heavier DMB barriers required around plain LDR/STR.
+
+## Helium / MVE — the v8.1-M vector extension
+
+ARMv8.1-M's headline feature is **MVE**, the M-profile Vector Extension, branded as Helium. It's a 128-bit SIMD architecture sharing the FPU register file (s0..s31 alias to q0..q7) and designed to operate as a **dual-beat** unit: an instruction issues over two cycles, processing 64 bits per cycle. This keeps the gate count modest while delivering 4× the throughput of scalar code on suitable workloads.
+
+Helium targets:
+
+- **ML inference** — int8 quantized neural-network kernels, particularly convolution and matrix-multiply.
+- **DSP** — FIR/IIR filters, FFT, complex math at 4× the scalar rate.
+- **Image processing** — pixel-wise byte operations, color-space conversion.
+
+Helium instructions include the usual SIMD arithmetic plus **lane predication** (each beat can be predicated independently), **scatter-gather** (load/store from non-contiguous addresses via base + index vector), and **complex-number** primitives (interleaved real/imag operations in a single instruction).
+
+The Cortex-M55 and Cortex-M85 are the production cores with Helium. CMSIS-NN and CMSIS-DSP both have Helium-accelerated paths; an int8 conv2d kernel on M55 runs roughly 4–6× faster than scalar.
+
+```c
+// CMSIS-NN dispatches to Helium when compiled with -mcpu=cortex-m55:
+arm_convolve_s8(&ctx, &conv_params, &quant_params,
+                &input_dims, input_data,
+                &filter_dims, filter_data,
+                &bias_dims, bias_data,
+                &output_dims, output_data);
+// Internally: vldrb.s8 q0, [r1], #16 ; vmlav.s8 ...
+```
+
+<Callout type="warn">
+Helium is **not** the same as Cortex-A NEON. They look similar but use different register encodings, different intrinsic names (Helium uses `__arm_vmlavq_s8` etc., NEON uses `vmlavq_s8`), and different instruction mnemonics. Code from a NEON-targeted library will not compile for Helium without porting.
+</Callout>
+
+## Pointer Authentication and BTI (v8.1-M)
+
+ARMv8.1-M also adds the **PACBTI** extension — Pointer Authentication Code and Branch Target Identification — borrowed from ARMv8.3-A. This is a security-hardening feature that defeats ROP (Return-Oriented Programming) and JOP (Jump-Oriented Programming) exploits. Cortex-M85 supports PACBTI; Cortex-M55 does not. See the [PAC/BTI/MTE](/docs/architecture/pac-bti-mte) page for the full mechanism.
+
+## Low-overhead loops (v8.1-M)
+
+A small but lovely v8.1-M addition: the `DLS` / `WLS` / `LE` instructions encode a counted loop with **zero per-iteration branch overhead**. The CPU records the loop-end address and the trip count in a hidden register; iteration goes straight from the loop body's last instruction back to the start with no branch taken (and no branch mispredict).
+
+```asm
+    wls     lr, r0, end_loop    @ while-loop start, r0 = trip count
+loop_top:
+    vldrb.s8 q0, [r1], #16
+    vmlav.s8 r2, q0, q1
+    le      lr, loop_top        @ loop end — zero-overhead back-branch
+end_loop:
+```
+
+For a 4-instruction inner loop running for 100 iterations, this saves 100 branch cycles versus the equivalent v7-M `subs`/`bne` pattern — about 25% throughput improvement on a tight kernel.
+
+## Toolchain flags
+
+```
+# Cortex-M23 (Baseline)
+arm-none-eabi-gcc -mcpu=cortex-m23 -mthumb -mfloat-abi=soft
+
+# Cortex-M33 with FPU (Mainline, no TZ build)
+arm-none-eabi-gcc -mcpu=cortex-m33 -mthumb -mfpu=fpv5-sp-d16 -mfloat-abi=hard
+
+# Cortex-M33 secure-world (build for Secure)
+arm-none-eabi-gcc -mcpu=cortex-m33 -mthumb -mcmse -mfloat-abi=hard
+# -mcmse enables Cortex-M Security Extensions intrinsics:
+#   __attribute__((cmse_nonsecure_entry)), cmse_check_address_range, etc.
+
+# Cortex-M55 with Helium
+arm-none-eabi-gcc -mcpu=cortex-m55 -mthumb -mfpu=auto -mfloat-abi=hard
+
+# Cortex-M85 with Helium + PACBTI
+arm-none-eabi-gcc -mcpu=cortex-m85 -mthumb -mfpu=auto -mfloat-abi=hard -mbranch-protection=standard
+```
+
+The `-mcmse` flag is the gate for compiling Secure-world code that exposes Non-secure-callable entry points. `-mbranch-protection=standard` enables PAC and BTI on M85.
+
+## Cross-references
+
+- [ARMv7-M architecture](/docs/architecture/armv7m) — the predecessor ISA
+- [TrustZone-M deep dive](/docs/architecture/trustzone-m) — the security extension in detail
+- [MPU on Cortex-M](/docs/cortex-m/mpu) — the v8-M MPU register layout
+- [PAC, BTI, MTE](/docs/architecture/pac-bti-mte) — pointer authentication and BTI on Cortex-M85
+- [Exception model](/docs/architecture/exception-model) — exception entry/exit with security states
+- ARMv8-M Architecture Reference Manual (ARM DDI 0553)

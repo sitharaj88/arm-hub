@@ -1,0 +1,233 @@
+---
+title: Bootloaders
+description: Bootloader architecture for Cortex-M. ROM vs flash bootloaders, vector-table relocation, dual-bank fail-safe update, signed and encrypted firmware, MCUboot, STM32 system bootloader, USB DFU.
+order: 11
+updated: 2026-05-13
+tags: [programming, bootloader, mcuboot, dfu, secure-boot, ota]
+---
+
+A bootloader is the small, trusted, slow-changing program that runs first on a Cortex-M part and decides what to run next. On a finished product it might check a signature, verify a slot, swap an image, and then jump to the application. On a developer board it might also expose a USB DFU port, a UART menu, or a network listener so you can push new firmware without a JTAG probe. Either way, the bootloader is the piece of code most likely to brick the device if it's wrong — so it's worth designing carefully and changing rarely.
+
+This page is a tour of bootloader architecture on modern Cortex-M parts: where the bootloader lives, how it hands off to the application via `SCB->VTOR`, how dual-bank layouts give you fail-safe field update, the cryptographic primitives that make secure boot real, and the major prebuilt bootloaders (MCUboot, the ST system bootloader, RP2040 picoboot, USB DFU class).
+
+<SpecSheet
+  title="Bootloader essentials"
+  specs={[
+    { label: 'Where it lives', value: 'ROM-resident (built into silicon), or flash-resident (first sector of flash). Vendors usually ship both: a small immutable ROM bootloader plus an optional flash bootloader.' },
+    { label: 'Typical size', value: '4 KB (minimal jump-to-app) to 64 KB (full MCUboot with crypto). 16-32 KB is the common range for production secure boot.' },
+    { label: 'Vector table relocation', value: 'SCB->VTOR = APP_BASE; then load SP from APP_BASE[0], PC from APP_BASE[1]' },
+    { label: 'Signature schemes', value: 'RSA-2048/3072/4096, ECDSA P-256/P-384, ED25519. ED25519 most modern (fast, deterministic, small keys)' },
+    { label: 'Encryption', value: 'AES-CTR or AES-CBC for image confidentiality. Key wrapped by device root key or PUF.' },
+    { label: 'Update strategy', value: 'A/B (dual-bank), single-bank-with-staging, overwrite (no rollback)' },
+    { label: 'Anti-rollback', value: 'Monotonic counter in OTP or one-shot flash sector, checked against image version' },
+  ]}
+/>
+
+## What a bootloader does
+
+In its simplest form a bootloader is a five-line program: load the stack pointer from the application's vector table, jump to the application's reset handler. Everything else — verification, update, recovery, communication — is policy you build on top of that primitive.
+
+The minimal hand-off:
+
+```c
+typedef void (*reset_handler_t)(void);
+
+void boot_to_app(uint32_t app_base) {
+    uint32_t app_sp     = *(uint32_t *)(app_base + 0);
+    uint32_t app_reset  = *(uint32_t *)(app_base + 4);
+
+    SCB->VTOR = app_base;                // re-point vector table
+    __set_MSP(app_sp);                   // load main stack pointer
+    __DSB();
+    __ISB();
+    ((reset_handler_t)app_reset)();      // jump to reset_Handler
+}
+```
+
+This works because every Cortex-M vector table starts with `[SP_initial, Reset_Handler, NMI_Handler, ...]`. The application linker script places its vector table at `APP_BASE` (commonly `0x08008000` or `0x08010000` on STM32, `0x10000400` on RP2040). The bootloader loads those two words, sets `VTOR`, and jumps. After the jump, every subsequent interrupt finds its handler via the new `VTOR`, and the application takes over completely.
+
+The hard part isn't the jump; it's deciding *which* application to jump to, after *what* checks.
+
+## ROM vs flash bootloaders
+
+Almost every modern Cortex-M part ships with two layers of bootloader.
+
+**ROM bootloader**: tiny program in mask ROM, immutable, runs from `0x00000000` on the first cycle out of reset. It checks a few pins (BOOT0/BOOT1 on STM32, BOOTSEL on RP2040) and a few flash bytes to decide whether to jump to the flash bootloader, enter DFU/USB mass-storage mode, or jump straight to the application. The ROM bootloader is what makes the part "always recoverable" — even if you completely corrupt flash, the ROM mode is available.
+
+**Flash bootloader**: optional, lives at the start of flash, mutable (you wrote it). Does the project-specific update, signature check, recovery menu. This is what most "bootloader" discussions mean.
+
+| Part | ROM bootloader features |
+|------|-------------------------|
+| STM32F4/F7/H7 | UART, USB DFU, I²C, SPI, CAN. Triggered by BOOT0=1. |
+| STM32U5/H5 | RSS (Root Secure Services) — secure ROM that does signature verification before handing off |
+| RP2040 | BOOTSEL pin enters USB MSC mode — drag-and-drop UF2 files |
+| nRF52/53 | MBR (Master Boot Record) provides SoftDevice services; SDK ships a separate flash bootloader |
+| NXP MIMXRT | FlexSPI ROM that can boot directly from external QSPI flash |
+| ATSAM | SAM-BA bootloader over UART/USB, factory-programmed in ROM |
+
+Knowing the ROM features matters because it tells you what your recovery path is if your flash bootloader bricks the device. Always test ROM-mode recovery before deploying.
+
+## Application slot layout
+
+A typical dual-bank Cortex-M flash, 1 MB part:
+
+```
+0x08000000 +-----------------------------------+
+           | Bootloader (32 KB)                |
+0x08008000 +-----------------------------------+
+           | Slot A header (image metadata)    |
+0x08008100 |                                   |
+           | Slot A image (480 KB)             |
+           |                                   |
+0x08080000 +-----------------------------------+
+           | Slot B header                     |
+0x08080100 |                                   |
+           | Slot B image (480 KB)             |
+           |                                   |
+0x080F8000 +-----------------------------------+
+           | Scratch / metadata (32 KB)        |
+0x08100000 +-----------------------------------+
+```
+
+The bootloader inspects both slot headers, decides which to boot (newest valid version, or "test image" if one is pending), and jumps to that slot's reset vector. Slot A and slot B are *interchangeable* — either can boot. This is what makes A/B updates safe: you write the new image into the *other* slot while the current slot keeps running, and on the next reboot the bootloader picks the new one if it's valid.
+
+<BlockDiagram title="Dual-bank flash layout (1 MB STM32)" width={760} height={320} nodes={[
+  { id: 'bl',     x: 30,  y: 30,  w: 220, h: 70, kind: 'security', label: 'Bootloader', detail: '0x0800_0000  32 KB  signed, locked' },
+  { id: 'meta',   x: 30,  y: 120, w: 220, h: 70, kind: 'storage',  label: 'Metadata + scratch', detail: 'seq counter + CRC, A/B trailers' },
+  { id: 'slotA',  x: 290, y: 30,  w: 220, h: 110, kind: 'storage', label: 'Slot A', detail: '0x0800_8000  480 KB  active v1.2.3' },
+  { id: 'slotB',  x: 290, y: 170, w: 220, h: 110, kind: 'storage', label: 'Slot B', detail: '0x0808_0000  480 KB  staged v1.2.4' },
+  { id: 'hdr',    x: 550, y: 100, w: 180, h: 110, kind: 'security', label: 'Image header', detail: 'magic + version + ED25519 sig + test flag' },
+]} edges={[
+  { from: 'bl', to: 'slotA', label: 'verify + jump', tone: 'success' },
+  { from: 'bl', to: 'slotB', label: 'test next boot', tone: 'warning' },
+  { from: 'slotB', to: 'hdr', label: 'inspect', tone: 'primary' },
+  { from: 'meta', to: 'bl', label: 'rollback on fail', tone: 'destructive' },
+]} caption="Slot A keeps running while the new image lands in slot B; the bootloader picks slot B on next boot only after signature and header checks pass." />
+
+<StateDiagram title="Test-and-confirm boot with rollback" width={760} height={260} states={[
+  { id: 'idle',   label: 'Slot A confirmed', x: 30,  y: 30,  w: 180, h: 56, tone: 'success', initial: true },
+  { id: 'pend',   label: 'Slot B pending test', x: 290, y: 30, w: 180, h: 56, tone: 'warning' },
+  { id: 'boot',   label: 'Booted Slot B (test)', x: 550, y: 30, w: 180, h: 56, tone: 'accent' },
+  { id: 'conf',   label: 'Slot B confirmed', x: 550, y: 150, w: 180, h: 56, tone: 'success' },
+  { id: 'revert', label: 'Revert to Slot A', x: 30,  y: 150, w: 180, h: 56, tone: 'destructive' },
+]} transitions={[
+  { from: 'idle', to: 'pend', label: 'OTA writes B' },
+  { from: 'pend', to: 'boot', label: 'reset' },
+  { from: 'boot', to: 'conf', label: 'self-check ok' },
+  { from: 'boot', to: 'revert', label: 'watchdog / crash', curve: 60 },
+  { from: 'revert', to: 'idle', label: 'next boot' },
+  { from: 'conf', to: 'idle', label: 'becomes new baseline', curve: -60 },
+]} caption="The test flag and confirm call are the only things separating a fail-safe bootloader from one that bricks the fleet on a bad update." />
+
+The header carries:
+
+- Magic value (so the bootloader can detect "no image present")
+- Version number (monotonically increasing — see anti-rollback)
+- Image size and load address
+- Signature (RSA/ECDSA/ED25519)
+- Optional encryption key wrap
+- A flag indicating "this is a test image — confirm or revert"
+
+<Callout type="warn">
+The "test image" flag is what separates a fail-safe bootloader from a vulnerable one. After a swap, the bootloader marks the new image as "test" and reboots into it. The new image must explicitly call a "confirm" syscall (writing a flag back to flash) within some watchdog window. If it crashes before confirming, the bootloader detects it on next boot and reverts to the previous slot. Skipping this step means a buggy update can permanently brick the field fleet.
+</Callout>
+
+## Signature verification
+
+For a non-trivial product, you must sign the image and verify the signature before booting it. The threat model: an attacker can write to flash (via JTAG, DFU, OTA, or physical reflashing) and substitute a malicious image. Signature verification ensures the bootloader only runs images authored with the private key you keep on a build server.
+
+Three commonly used schemes:
+
+| Scheme | Key size | Sig size | Verify cycles (M4F @ 100 MHz) |
+|--------|----------|----------|-------------------------------|
+| RSA-2048 | 2048-bit modulus | 256 B | ~50 M cycles (~500 ms) |
+| ECDSA P-256 | 32-byte priv / 64-byte pub | 64 B | ~20 M cycles (~200 ms) |
+| ED25519 | 32 B priv / 32 B pub | 64 B | ~10 M cycles (~100 ms) |
+
+ED25519 is the modern choice — small keys, small signatures, fast verification, deterministic (no random nonce needed at sign time). The Mbed TLS, TinyCrypt, and BearSSL libraries all support all three.
+
+The public key is embedded in the bootloader's flash, ideally in a region marked read-only by the MPU. The private key never leaves the build server (or, better, a hardware HSM). For products that need multiple-vendor signing or revocation, store a *root* public key, and authenticate intermediate keys via a chain.
+
+## Image encryption
+
+Signing proves authenticity; encryption protects confidentiality. If you need to keep firmware secrets (algorithm IP, customer-specific keys) out of the hands of someone reading flash, encrypt the image.
+
+Common pattern: AES-256-CTR with a per-device key. The key is derived from a chip-unique identifier (the STM32 96-bit UID, for example) plus a manufacturer secret, or from a PUF (Physically Unclonable Function) where the silicon provides the entropy. The bootloader decrypts the image on the fly into RAM, or decrypts each flash sector as it's read.
+
+STM32H5 / U5 introduced **on-the-fly decryption** (OTFDEC) — a hardware block that decrypts flash as the CPU fetches instructions, with no software overhead. NXP iMX RT has a similar feature (BEE — Bus Encryption Engine).
+
+<Callout type="note">
+Anti-rollback is as important as signing. Without it, an attacker can install a *legitimately signed* old version of your firmware that has a known vulnerability you patched in v2. Store the lowest acceptable version in a monotonic counter (OTP or one-shot flash) and reject images below it. Incrementing the counter is one-way: you cannot revert.
+</Callout>
+
+## MCUboot — the open-source standard
+
+[MCUboot](https://www.mcuboot.com) is the de facto bootloader for Cortex-M secure boot in non-vendor-locked designs. Started at Apache Mynewt, now used by Zephyr, Nordic Connect SDK, Espressif IDF, and many custom builds. Apache 2.0 license.
+
+What it gives you out of the box:
+
+- Slot-based image layout (single-image, dual-bank, multi-image)
+- ED25519, ECDSA-P256, and RSA signature verification (build-time choice)
+- Optional AES-CTR encryption
+- Swap-using-scratch or overwrite-only update modes
+- Test+confirm boot flow with revert
+- Anti-rollback via image version
+- Hooks for hardware crypto accelerators
+
+Configuring MCUboot is largely about laying out flash and picking crypto. The image format (the "image trailer") is documented and stable; tools like `imgtool.py` produce signed images that drop into the slot.
+
+A minimal MCUboot config for an STM32H7:
+
+```
+CONFIG_BOOT_SIGNATURE_TYPE_ED25519=y
+CONFIG_BOOT_BOOTSTRAP=n
+CONFIG_BOOT_SWAP_USING_SCRATCH=y
+CONFIG_BOOT_MAX_IMG_SECTORS=512
+CONFIG_BOOT_ENCRYPT_EC256=y
+CONFIG_BOOT_VALIDATE_SLOT0=y
+```
+
+Build it once with the public key embedded, flash to the boot region, and use `imgtool sign --key ed25519.pem --version 1.2.3 app.bin app.signed.bin` to produce updates.
+
+## STM32 system bootloader
+
+ST's mask-ROM bootloader on every STM32 is a useful fallback. Triggered by holding BOOT0 high at reset (or BOOT1=0 + BOOT0=1 on some parts). Once active, it listens for commands on:
+
+- UART1 (USART1 typically, at 115200 8N1)
+- USB DFU (vendor 0x0483, product 0xDF11)
+- I²C, SPI, CAN on parts that support them
+- USB MSC (drag-and-drop .bin) on newer H5/U5 parts
+
+The protocol is documented in AN3155 (UART), AN3156 (USB DFU), AN4221 (I²C), AN4286 (SPI), AN3154 (CAN). The host-side tool is `STM32CubeProgrammer` or open-source `stm32flash` / `dfu-util`.
+
+This bootloader is **always available** — you can recover any STM32 via BOOT0 even if flash is completely corrupted. Build that into your factory test and field-recovery procedures.
+
+## RP2040 picoboot
+
+The RP2040 ROM bootloader (entered by holding BOOTSEL at power-on) exposes a USB endpoint that appears as a mass-storage device. Drop a `.uf2` file onto it and the ROM programs the external QSPI flash. There's also a vendor-class endpoint (picoboot) for tooling like `picotool`.
+
+UF2 is a simple format: a sequence of 512-byte blocks, each with a magic header, a target address, and 256 bytes of payload. Trivial to generate. The combination of UF2 + USB MSC is the easiest reflash story in the industry — anyone with a USB cable can update firmware, no driver install, no Zadig dance.
+
+## USB DFU class
+
+If you need standardised in-application firmware update, the **USB Device Firmware Upgrade (DFU)** class is the industry standard. Defined in USB DFU 1.1, supported by `dfu-util` on every host OS, no custom driver required.
+
+The flow:
+1. App advertises DFU runtime interface alongside its normal endpoints
+2. Host sends `DFU_DETACH`; app reboots into DFU mode (or stays in app and listens on DFU interface)
+3. Host sends image in chunks via `DFU_DNLOAD`
+4. Device computes signature / writes to flash
+5. `DFU_GETSTATUS` reports progress
+6. Final `DFU_DNLOAD` of zero bytes commits; device reboots
+
+ST, NXP, and Nordic all ship DFU implementations as part of their USB middleware. MCUboot has a DFU front-end for Zephyr.
+
+## Further reading
+
+- [OTA update flow](/docs/programming/ota) — over-the-air variants, delta updates, rollback
+- [Startup & vector table](/docs/programming/startup) — what the application sees on boot
+- [Linker scripts](/docs/programming/linker-scripts) — splitting flash into bootloader and application regions
+- [TrustZone-M deep dive](/docs/architecture/trustzone-m) — secure boot leveraging hardware partitioning
+- MCUboot documentation: docs.mcuboot.com
+- ST AN3155, AN3156 (system bootloader protocols)
+- USB.org DFU 1.1 specification

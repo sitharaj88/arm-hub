@@ -1,0 +1,145 @@
+---
+title: Cortex-M7
+description: The first superscalar Cortex-M. Caches, TCMs, double-precision FPU, six-stage dual-issue pipeline. Real performance, real complexity.
+order: 5
+updated: 2026-05-12
+tags: [cortex-m, m7]
+---
+
+
+The Cortex-M7 is what happens when you take a Cortex-M4 and add everything from the apps-class playbook: caches, separate instruction/data buses, tightly coupled memories, superscalar issue. It hits ~2.14 DMIPS/MHz and clocks past 500 MHz on some silicon — and brings cache coherency problems with DMA right along with it.
+
+## At a glance
+
+- **ISA**: ARMv7E-M
+- **Pipeline**: 6-stage dual-issue in-order
+- **Performance**: 2.14 DMIPS/MHz · 5.0 CoreMark/MHz
+- **Caches**: optional 4–64 KB L1-I, 4–64 KB L1-D (write-back, write-through configurable)
+- **TCM**: optional ITCM (up to 16 MB) and DTCM (up to 16 MB)
+- **FPU**: optional, single-precision or single+double precision VFPv5
+- **NVIC**: up to 240 IRQs, 256 priority levels
+- **Branch prediction**: yes — 2K-entry BTB
+
+## The bus structure
+
+```
+                     ┌───────────────────────────────────┐
+                     │            Cortex-M7              │
+                     │                                   │
+   AXI master ◀──────│  AXI-M  ◀── L1 caches             │
+                     │                                   │
+   AHB master ◀──────│  AHB-S                            │
+                     │                                   │
+   ITCM (TCM-I) ◀────│  Single-cycle instruction TCM     │
+   DTCM (TCM-D) ◀────│  Single-cycle data TCM (dual port)│
+                     └───────────────────────────────────┘
+```
+
+This is the big structural change from M4. Instead of one AHB-Lite, the M7 has:
+
+- **AXI master** — for cached memory (typically external flash/SDRAM via the cache).
+- **AHB master** — for peripherals and uncached system regions.
+- **ITCM / DTCM** — single-cycle memories directly attached to the core. Critical ISRs and DMA buffers live here.
+
+Result: the core can fetch an instruction from ITCM, load data from DTCM, and stream a DMA buffer through the cache all in the same cycle.
+
+## Caches and DMA — the coherency problem
+
+The M7 caches are **not coherent with DMA**. If you DMA into a buffer the CPU has cached, you get stale data. If you DMA out of a buffer you just wrote to, the peripheral may see stale data because your write is still in the cache.
+
+The three correct patterns:
+
+### 1. Mark the DMA region as non-cacheable
+
+Cleanest. Use the MPU to set a sub-region of SRAM as non-cacheable (Normal, non-cacheable, shareable):
+
+```c
+MPU->RNR  = 0;
+MPU->RBAR = 0x2400_0000;    // your DMA SRAM
+MPU->RASR = (REGION_SIZE_64K << MPU_RASR_SIZE_Pos)
+          | (MPU_AP_FULL    << MPU_RASR_AP_Pos)
+          | (0b001          << MPU_RASR_TEX_Pos)   // TEX=001, C=0, B=0 → non-cacheable
+          | MPU_RASR_S_Msk                          // shareable
+          | MPU_RASR_ENABLE_Msk;
+```
+
+### 2. Clean before DMA-out, invalidate after DMA-in
+
+Bracket every DMA transaction:
+
+```c
+// Peripheral DMA reading from CPU memory
+SCB_CleanDCache_by_Addr((uint32_t *)tx_buf, tx_len);   // flush cache to RAM
+hal_start_dma_tx(tx_buf, tx_len);
+
+// Peripheral DMA writing to CPU memory
+SCB_InvalidateDCache_by_Addr((uint32_t *)rx_buf, rx_len);  // discard stale cache
+hal_start_dma_rx(rx_buf, rx_len);
+// ... after DMA completes, the cache reload will fetch fresh data
+```
+
+Buffer addresses **must be 32-byte aligned** (cache line size) and lengths **must be multiples of 32 bytes** — otherwise the clean/invalidate will affect neighbouring data.
+
+### 3. Put DMA buffers in DTCM
+
+DTCM isn't behind the cache. CPU and DMA (if the DMA controller can reach DTCM — vendor-specific) both see the latest data with no coherency dance. Faster than approach #1 because DTCM is single-cycle from the CPU.
+
+<Callout type="warn" title="Default linker scripts put .bss in SRAM, which is behind the cache">
+On STM32H7, the default `.bss` lives at `0x2400_0000` (SRAM-AXI), which is cacheable. If you declared a buffer with `static uint8_t dma_buf[1024];` and pointed a DMA at it, you have a coherency bug. Move it explicitly: `__attribute__((section(".dma_buffer")))` and place the section in non-cacheable RAM in the linker script.
+</Callout>
+
+## TCM — the secret weapon
+
+TCM (Tightly Coupled Memory) is single-cycle SRAM directly attached to the core's instruction/data ports. No bus arbitration, no cache, no jitter.
+
+- **ITCM** — for code that needs deterministic latency. Copy your fastest ISRs here from flash at boot.
+- **DTCM** — for stacks, scratch buffers, hot data structures. STM32H7 puts the system stack here by default.
+
+```c
+// Marking a function as ITCM-resident
+__attribute__((section(".itcm.text")))
+void my_fast_isr(void) { /* runs at deterministic 1-cycle fetch latency */ }
+```
+
+The TCM access path is **separate from the AXI bus**, so it doesn't compete with cached fetches. A Cortex-M7 with hot code in ITCM and hot data in DTCM can sustain its peak DMIPS while a DMA controller hammers external SDRAM.
+
+## Dual-issue pipeline
+
+Two instructions can issue per cycle if they're in different pipes — typically one memory access + one ALU op, or two independent ALU ops. The compiler does the scheduling; you don't write to it directly. But you can defeat it: a long dependency chain forces single-issue.
+
+```
+Cycle 1:  LDR r0, [r1]      ALU pipe: ADD r2, r2, #1     ← both issue
+Cycle 2:  ADD r0, r0, #1    -- depends on r0 from cycle 1 -- stall
+```
+
+Tight loops with independent operations (e.g. dual-MAC DSP code) sustain close to 2 IPC. Tightly-dependent code (linked-list traversal) hits ~1 IPC. The CMSIS-DSP library is hand-tuned to maximise the M7's dual-issue.
+
+<PipelineDiagram
+  title="Cortex-M7 6-stage dual-issue pipeline"
+  stages={['F1', 'F2', 'D', 'IS', 'EX1', 'EX2']}
+  instructions={[
+    { name: 'LDR r0, [r1]   (pipe A)', stages: ['F1', 'F2', 'D', 'IS', 'EX1', 'EX2'] },
+    { name: 'ADD r4, r5, #1 (pipe B)', stages: ['F1', 'F2', 'D', 'IS', 'EX1', 'EX2'] },
+    { name: 'MUL r6, r4, r7 (pipe A)', stages: ['', 'F1', 'F2', 'D', 'IS', 'EX1', 'EX2'] },
+    { name: 'EOR r8, r9, r10 (pipe B)', stages: ['', 'F1', 'F2', 'D', 'IS', 'EX1', 'EX2'] },
+    { name: 'ADD r0, r0, #1 (RAW on r0)', stages: ['', '', 'F1', 'F2', 'D', '', 'IS', 'EX1', 'EX2'] },
+  ]}
+  caption="Two instructions issue per cycle when independent and in different pipes — typically one memory + one ALU op. A RAW dependency (last row) forces a single-issue stall while the producer drains EX2."
+/>
+
+## Branch prediction
+
+The Cortex-M7 has a 2K-entry branch target buffer. Correctly predicted branches are essentially free; mispredicted ones cost ~5 cycles to refill the pipeline. The biggest practical effect: **avoid switch statements with sparse cases**. The compiler often emits a table-jump that the BTB can't predict; an if-else chain on predictable inputs is faster.
+
+## Where you'll find them
+
+- **STMicroelectronics STM32H7 / H5** — the highest-volume Cortex-M7. 480 MHz, big caches, dual-core variants (M7 + M4 companion).
+- **NXP i.MX RT** — "crossover MCU" running M7 at 1 GHz with external flash/SDRAM behind the cache.
+- **Renesas RA8** — newer M85 lineup, but the RA6 line uses M4 and the previous-gen RZ uses M7.
+- **TI MSP432P4 / Hercules R5** — Hercules is M-class but ASIL'd; not pure M7.
+
+## See also
+
+- [Cortex-M4](/docs/cortex-m/m4/) — what the M7 inherits and adds.
+- [DMA](/docs/peripherals/dma/) — coherent buffers in depth.
+- [Linker scripts](/docs/programming/linker-scripts/) — placing code in ITCM/DTCM.

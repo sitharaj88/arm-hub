@@ -1,0 +1,257 @@
+---
+title: Vector table & VTOR
+description: Vector table layout, VTOR register, relocating to RAM for bootloader splits and dynamic dispatch, alignment requirements, and the bring-up gotchas.
+order: 17
+updated: 2026-05-13
+tags: [cortex-m, vector-table, vtor, bootloader, startup]
+---
+
+The vector table is the first thing the Cortex-M reads at boot. Word 0 is the initial stack pointer; word 1 is the address of the Reset handler. Words 2..15 are the architectural exception handlers (NMI, HardFault, SVCall, PendSV, SysTick, plus a handful of reserved slots), and word 16 onward are the IRQ handlers — one slot per IRQ, up to the architectural maximum.
+
+The table sits at address 0x0000_0000 by default. Modern Cortex-M parts (everything except M0) include a **Vector Table Offset Register** (VTOR) that lets software relocate the table at runtime. This is essential for bootloader-application splits, for swapping vector tables between secure and non-secure worlds under TrustZone, and for any design that wants to install IRQ handlers in RAM instead of flash.
+
+<SpecSheet
+  title="Vector table at a glance"
+  specs={[
+    { label: 'Default base address', value: '0x0000_0000 on every Cortex-M at reset' },
+    { label: 'Slot 0', value: 'Initial Main Stack Pointer (MSP) — loaded into MSP at reset' },
+    { label: 'Slot 1', value: 'Reset handler address (bit 0 must be 1 — Thumb)' },
+    { label: 'Slots 2-15', value: 'Architectural exception handlers (NMI, HardFault, MemMgmt, BusFault, UsageFault, SVCall, DebugMon, PendSV, SysTick, reserved)' },
+    { label: 'Slot 16+', value: 'IRQ handlers — one per NVIC IRQ, ordered by IRQ number' },
+    { label: 'Slot size', value: '4 bytes (32-bit handler address) — all slots word-aligned' },
+    { label: 'VTOR', value: 'SCB->VTOR — base address register. Not present on Cortex-M0; present on M0+ and all later cores' },
+    { label: 'Alignment for relocated table', value: 'Next power of 2 above (table size in bytes), minimum 128 bytes (32 entries × 4)' },
+  ]}
+/>
+
+## Layout
+
+<ProtocolFrame
+  title="Vector table — first 16 architectural slots (offsets 0x00..0x3C)"
+  fields={[
+    { name: 'Initial MSP @0x00', bits: 32, tone: 'highlight' },
+    { name: 'Reset @0x04', bits: 32, tone: 'primary' },
+    { name: 'NMI @0x08', bits: 32, tone: 'destructive' },
+    { name: 'HardFault @0x0C', bits: 32, tone: 'destructive' },
+    { name: 'MemMgmt @0x10', bits: 32, tone: 'warning' },
+    { name: 'BusFault @0x14', bits: 32, tone: 'warning' },
+    { name: 'UsageFault @0x18', bits: 32, tone: 'warning' },
+    { name: 'SecureFault / Rsvd @0x1C', bits: 32, tone: 'muted' },
+    { name: 'Reserved 0x20..0x28', bits: 96, tone: 'muted' },
+    { name: 'SVC @0x2C', bits: 32, tone: 'accent' },
+    { name: 'DebugMon @0x30', bits: 32, tone: 'accent' },
+    { name: 'Rsvd @0x34', bits: 32, tone: 'muted' },
+    { name: 'PendSV @0x38', bits: 32, tone: 'accent' },
+    { name: 'SysTick @0x3C', bits: 32, tone: 'accent' },
+  ]}
+  caption="Word 0 is the initial MSP, loaded into r13 at reset. Word 1 holds the Reset handler address — its low bit must be 1 (Thumb). IRQ handlers start at offset 0x40 and continue one slot per NVIC IRQ."
+/>
+
+```
+Offset    Contents
+0x000     Initial MSP            (loaded into r13 at reset)
+0x004     Reset_Handler          (PC at reset, bit 0 = 1)
+0x008     NMI_Handler            (exception 2)
+0x00C     HardFault_Handler      (exception 3)
+0x010     MemManage_Handler      (exception 4, v7-M+ — was reserved on v6-M)
+0x014     BusFault_Handler       (exception 5, v7-M+)
+0x018     UsageFault_Handler     (exception 6, v7-M+)
+0x01C     SecureFault_Handler    (exception 7, v8-M only)
+0x020     Reserved
+0x024     Reserved
+0x028     Reserved
+0x02C     SVC_Handler            (exception 11)
+0x030     DebugMon_Handler       (exception 12, v7-M+)
+0x034     Reserved
+0x038     PendSV_Handler         (exception 14)
+0x03C     SysTick_Handler        (exception 15)
+0x040     IRQ0_Handler           (NVIC IRQ 0)
+0x044     IRQ1_Handler
+...       ...
+0x040+4N  IRQN_Handler
+```
+
+The exception numbers (2..15) are fixed by the architecture. The IRQ numbers (16+) are vendor-defined — STM32F4's `USART1_IRQHandler` is at vector index 37 + 16 = 53, i.e., offset 0x040 + 37*4 = 0x0D4.
+
+## The startup file
+
+Every CMSIS startup file builds the vector table as a static array of function pointers. Here's the canonical shape (GCC syntax):
+
+```c
+extern uint32_t _estack;      /* defined by linker — top of stack */
+
+extern void Reset_Handler(void);
+void NMI_Handler(void)         __attribute__((weak, alias("Default_Handler")));
+void HardFault_Handler(void)   __attribute__((weak, alias("Default_Handler")));
+/* ... other exceptions and IRQs ... */
+
+__attribute__((section(".isr_vector"))) const uint32_t isr_vector[] = {
+    (uint32_t)&_estack,                    /* 0: initial MSP */
+    (uint32_t)Reset_Handler,               /* 1: reset */
+    (uint32_t)NMI_Handler,                 /* 2: NMI */
+    (uint32_t)HardFault_Handler,           /* 3: HardFault */
+    (uint32_t)MemManage_Handler,           /* 4 */
+    (uint32_t)BusFault_Handler,            /* 5 */
+    (uint32_t)UsageFault_Handler,          /* 6 */
+    0, 0, 0, 0,                            /* 7-10 reserved */
+    (uint32_t)SVC_Handler,                 /* 11 */
+    (uint32_t)DebugMon_Handler,            /* 12 */
+    0,                                     /* 13 reserved */
+    (uint32_t)PendSV_Handler,              /* 14 */
+    (uint32_t)SysTick_Handler,             /* 15 */
+    /* IRQ 0..N */
+    (uint32_t)WWDG_IRQHandler,
+    (uint32_t)PVD_IRQHandler,
+    /* ... */
+};
+```
+
+The `.isr_vector` section is placed at the start of flash by the linker script:
+
+```
+.isr_vector :
+{
+    KEEP(*(.isr_vector))
+} >FLASH
+```
+
+`KEEP` is mandatory — without it, link-time garbage collection removes the table because nothing references it.
+
+## VTOR — relocating the table
+
+The Vector Table Offset Register lives at `0xE000_ED08` inside the SCB:
+
+| Bits | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| 31:7 | TBLOFF | RW | 0 | Vector table base offset (must be aligned per the alignment rule below) |
+| 6:0 | - | RO | 0 | Reserved (zero — table is at least 128-byte aligned) |
+
+Writing to VTOR is straightforward:
+
+```c
+SCB->VTOR = 0x0801_0000;     // table is now at 0x0801_0000
+__DSB();
+__ISB();
+```
+
+The DSB+ISB barrier matters. Without them, the next exception might be dispatched using the old vector table because the change hadn't propagated through the pipeline. ARM mandates both barriers in the architecture reference.
+
+### Alignment rule
+
+The vector table must be aligned to **the next power of two ≥ the table size**, with a minimum alignment of **128 bytes** (32 entries × 4 bytes). For 96 IRQs (so 96 + 16 = 112 entries × 4 = 448 bytes), the table size rounds up to 512 bytes, and VTOR must be 512-byte aligned. The low bits of VTOR are read-only-zero for whatever alignment the implementation enforces.
+
+A common pitfall: a small relocated table (say 64 IRQs → 320 bytes) needs 512-byte alignment, not 256. Always check the architecturally-required alignment; CMSIS doesn't enforce it.
+
+In the linker script, force alignment:
+
+```
+.relocated_isr_vector (NOLOAD) :
+{
+    . = ALIGN(512);
+    KEEP(*(.relocated_isr_vector))
+} >RAM
+```
+
+## Bootloader-application split
+
+The most common use of VTOR. A bootloader lives at the start of flash, holds its own vector table at 0x0000_0000, and runs first. After validating an application image (signature check, version check, etc.) the bootloader jumps to the application:
+
+```c
+void jump_to_app(uint32_t app_flash_base) {
+    /* Disable IRQs and clear pending — clean slate for the app */
+    __disable_irq();
+    for (int i = 0; i < 8; i++) {
+        NVIC->ICER[i] = 0xFFFFFFFFu;
+        NVIC->ICPR[i] = 0xFFFFFFFFu;
+    }
+
+    /* Update VTOR to point to the application's vector table */
+    SCB->VTOR = app_flash_base;
+    __DSB();
+    __ISB();
+
+    /* Load the app's initial stack pointer */
+    uint32_t app_sp = *(uint32_t *)app_flash_base;
+    __set_MSP(app_sp);
+
+    /* Branch to the app's reset handler */
+    void (*app_reset)(void) = (void(*)(void))(*(uint32_t *)(app_flash_base + 4));
+    app_reset();
+}
+```
+
+A few subtle points:
+
+- The application's vector table must be linker-scripted at `app_flash_base`, not at 0.
+- The application's startup code should **not** re-set VTOR back to 0 — the bootloader has already pointed it correctly.
+- If the bootloader installed any peripheral state (PLLs, clock dividers, MPU regions), the app inherits them. Either fully de-initialise in the bootloader or let the app reset clocks itself.
+
+<Callout type="warn">
+If the application's startup `SystemInit()` writes `SCB->VTOR = (uint32_t)&isr_vector;` (where `isr_vector` is a symbol at the app's flash base), that's fine — it confirms the value but doesn't break anything. If the app instead writes `SCB->VTOR = 0;` (a common bug in copy-pasted code), every IRQ goes through the bootloader's table and into the wrong handler.
+</Callout>
+
+## Relocating to RAM
+
+Some designs put the vector table in RAM, either for dynamic IRQ registration or for slightly faster vector fetch (single-cycle SRAM vs flash-with-wait-states). The pattern:
+
+```c
+__attribute__((section(".ramvectors"), aligned(512)))
+uint32_t ram_isr_vector[112];
+
+void relocate_vectors_to_ram(void) {
+    /* Copy the flash table to RAM */
+    extern const uint32_t isr_vector[];
+    for (size_t i = 0; i < 112; i++) {
+        ram_isr_vector[i] = isr_vector[i];
+    }
+    SCB->VTOR = (uint32_t)ram_isr_vector;
+    __DSB();
+    __ISB();
+}
+
+/* Install a new handler at runtime */
+void install_handler(IRQn_Type irq, void (*handler)(void)) {
+    uint32_t idx = (uint32_t)irq + 16;
+    ram_isr_vector[idx] = (uint32_t)handler;
+    __DSB();
+}
+```
+
+After this runs, any subsequent exception fetches its vector from RAM. Installing a new handler is a single word write — much faster than reprogramming flash.
+
+The trade-off: a RAM-resident table is vulnerable to corruption. A wild pointer that overwrites the table can redirect every IRQ to attacker-controlled addresses. Pair RAM vectors with the [MPU](/docs/cortex-m/mpu) marking the RAM table region as privileged-only RW.
+
+## TrustZone-M vector tables
+
+On v8-M parts with TrustZone, there are **two VTOR registers** — `VTOR_S` (secure) and `VTOR_NS` (non-secure). Each security state has its own vector table. When an IRQ is targeted to the secure state (via NVIC->ITNS), the secure vector table provides the handler; non-secure IRQs use the non-secure table.
+
+The secure boot code typically:
+
+1. Sets `VTOR_S` to the secure-side table (often at the start of secure flash).
+2. Sets `VTOR_NS` to the non-secure table (start of non-secure flash).
+3. Branches to non-secure code, which runs with its own vectors.
+
+## Default handler and weak symbols
+
+CMSIS uses weak symbols so that user code can override any handler by simply defining a same-named function:
+
+```c
+void Default_Handler(void) {
+    while (1) { /* spin so debugger can break here */ }
+}
+
+void NMI_Handler(void) __attribute__((weak, alias("Default_Handler")));
+```
+
+If user code defines `void NMI_Handler(void)`, the linker uses that. Otherwise, the weak alias resolves to `Default_Handler`, which traps in an infinite loop. The infinite loop is intentional — it leaves the call stack intact for the debugger to inspect.
+
+## Cross-references
+
+- [NVIC overview](/docs/cortex-m/nvic) — the exception entry path that uses the table
+- [NVIC priority](/docs/cortex-m/nvic-priority) — VTOR doesn't change priority but affects which handler runs
+- [SCB](/docs/cortex-m/scb) — VTOR lives in the SCB register block
+- [Exception model](/docs/architecture/exception-model) — what happens on exception entry
+- [Startup code](/docs/programming/startup) — the .isr_vector section in detail
+- [Linker scripts](/docs/programming/linker-scripts) — placing the table at the right address
+- [Linker script editor](/tools/linker-script) — visual tool for memory layout
+- ARMv7-M ARM section B3.2.5 (VTOR); ARMv8-M ARM section D1.2.231

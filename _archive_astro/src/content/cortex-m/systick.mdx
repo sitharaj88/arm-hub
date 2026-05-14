@@ -1,0 +1,127 @@
+---
+title: SysTick & timing
+description: The universal Cortex-M 24-bit downcounter — how it works, how to use it for an RTOS tick or a delay, and what its limits are.
+order: 9
+updated: 2026-05-12
+tags: [cortex-m, systick, timing]
+---
+
+import Callout from '~/components/Callout.astro';
+import RegisterMap from '~/components/RegisterMap.astro';
+
+Every Cortex-M has a SysTick — a 24-bit downcounter mapped into the Private Peripheral Bus. It's there specifically so OS ports can have a portable tick source that exists on **every** Cortex-M, regardless of vendor. Even the smallest M0 has one.
+
+## The registers
+
+Four registers at `0xE000_E010`:
+
+| Offset | Name        | Purpose                                |
+|--------|-------------|----------------------------------------|
+| 0x00   | SYST_CSR    | Control and Status — enable, clksource |
+| 0x04   | SYST_RVR    | Reload Value (the period - 1)          |
+| 0x08   | SYST_CVR    | Current Value (counting down)          |
+| 0x0C   | SYST_CALIB  | Calibration — vendor-defined           |
+
+<RegisterMap
+  name="SYST_CSR"
+  address="0xE000_E010"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:17', name: 'reserved', access: 'RES', description: 'Reserved.' },
+    { bits: '16',    name: 'COUNTFLAG', access: 'R',  reset: 0, description: 'Reads 1 if the counter reached 0 since last read. Reading clears it.' },
+    { bits: '15:3',  name: 'reserved', access: 'RES', description: 'Reserved.' },
+    { bits: '2',     name: 'CLKSOURCE', access: 'RW', reset: 0, description: '0 = external reference (vendor wires this — often CPU/8); 1 = processor clock.' },
+    { bits: '1',     name: 'TICKINT',   access: 'RW', reset: 0, description: '1 = SysTick exception fires when counter reaches 0.' },
+    { bits: '0',     name: 'ENABLE',    access: 'RW', reset: 0, description: 'Counter enable.' },
+  ]}
+  caption="SysTick Control and Status Register."
+/>
+
+## A 1 ms tick
+
+The standard incantation:
+
+```c
+#include "cmsis_gcc.h"
+
+void SystemInit_Tick_1ms(void) {
+    SysTick->LOAD = (SystemCoreClock / 1000) - 1;   // 1 ms reload
+    SysTick->VAL  = 0;                               // clear current
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk      // processor clock
+                  | SysTick_CTRL_TICKINT_Msk        // enable IRQ
+                  | SysTick_CTRL_ENABLE_Msk;        // start counting
+
+    NVIC_SetPriority(SysTick_IRQn, 0xF);            // lowest priority
+}
+
+volatile uint32_t ticks;
+
+void SysTick_Handler(void) {
+    ticks++;
+}
+```
+
+`SystemCoreClock` is a CMSIS-provided variable set during clock tree initialisation. At 168 MHz, `(168000000 / 1000) - 1 = 167999`, well below the 24-bit limit of `16777215`.
+
+<Callout type="warn" title="The 24-bit limit bites at very long periods">
+At a 480 MHz core (STM32H7), the max SysTick period is `(2^24 - 1) / 480e6 ≈ 35 ms`. If you need a slower base tick, use the external reference (often CPU/8) or fall back to a 32-bit hardware timer.
+</Callout>
+
+## A precise microsecond delay (no interrupt)
+
+For short blocking delays without committing to an ISR:
+
+```c
+void delay_us(uint32_t us) {
+    uint32_t start = SysTick->VAL;
+    uint32_t reload = SysTick->LOAD + 1;
+    uint32_t ticks_per_us = SystemCoreClock / 1000000;
+    uint32_t total = us * ticks_per_us;
+
+    uint32_t elapsed = 0;
+    uint32_t prev = start;
+    while (elapsed < total) {
+        uint32_t now = SysTick->VAL;
+        uint32_t delta = (prev >= now) ? (prev - now) : (prev + reload - now);
+        elapsed += delta;
+        prev = now;
+    }
+}
+```
+
+The downcounter direction means current value *decreases*. The wrap handling (`prev + reload - now`) covers the case where the counter rolls over while we're polling.
+
+For sub-microsecond resolution at high core clocks, the DWT cycle counter is better — see below.
+
+## The DWT cycle counter
+
+The Data Watchpoint and Trace unit at `0xE000_1000` includes a 32-bit free-running cycle counter, useful for precise profiling:
+
+```c
+void dwt_enable(void) {
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;  // enable DWT
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;              // start counting
+}
+
+uint32_t start = DWT->CYCCNT;
+// ... do work ...
+uint32_t cycles = DWT->CYCCNT - start;
+```
+
+32-bit wide, increments every CPU cycle. At 168 MHz it wraps every ~25 seconds. For longer measurements, sample the counter periodically and accumulate.
+
+<Callout type="note" title="DWT isn't on Cortex-M0">
+Cortex-M0/M0+ has no DWT (it's optional and most M0+ implementations omit it). On M0+ you fall back to SysTick or a hardware timer for profiling.
+</Callout>
+
+## TrustZone considerations
+
+On ARMv8-M, SysTick is duplicated: there's a Secure SysTick and a Non-secure SysTick at the same address range, each visible only from their respective state. RTOSes in both partitions can have independent ticks.
+
+## See also
+
+- [NVIC deep dive](/docs/cortex-m/nvic/) — SysTick priority and the broader exception model.
+- [Timers & PWM](/docs/peripherals/timers/) — vendor hardware timers when SysTick isn't enough.
+- [FreeRTOS](/docs/rtos/freertos/) — what the FreeRTOS port does with SysTick.

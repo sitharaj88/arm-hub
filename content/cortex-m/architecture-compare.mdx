@@ -1,0 +1,205 @@
+---
+title: Cortex-M architecture comparison
+description: Every Cortex-M core side by side — pipeline depth, DMIPS/MHz, ISA profile, MPU, FPU, cache, TCM, TrustZone, vector ops, and typical silicon clocks. The single reference table.
+order: 7
+updated: 2026-05-13
+tags: [cortex-m, comparison, architecture, reference]
+---
+
+There are now nine commercially relevant Cortex-M cores, spanning three architecture profiles (ARMv6-M, ARMv7-M, ARMv8-M) and four generations of microarchitecture. Picking the right one for a new design is most of the work of picking an MCU — and it's harder than it sounds because vendors mix-and-match optional features. An M33 from STM might have FPU+DSP+TrustZone; an M33 from a low-cost competitor might have only the base feature set. This page is the single reference for what each core *can* do, not what any specific part *does*.
+
+The table below covers the architectural envelope. For per-vendor option choices, you have to read the datasheet — there is no shortcut.
+
+<SpecSheet
+  title="At-a-glance summary"
+  specs={[
+    { label: 'Smallest', value: 'Cortex-M0 — ~12k gates, no MPU, no divide' },
+    { label: 'Lowest-power for new designs', value: 'Cortex-M0+ — 2-stage pipeline, optional MPU, MTB trace' },
+    { label: 'Smallest with TrustZone-M', value: 'Cortex-M23 — v8-M Baseline' },
+    { label: 'Default mid-tier', value: 'Cortex-M33 — TrustZone, optional FPU+DSP, replaces M3 and M4 for new work' },
+    { label: 'Highest-performance', value: 'Cortex-M85 — 3.0 CoreMark/MHz, branch prediction, PAC/BTI' },
+    { label: 'Best for ML inference', value: 'Cortex-M55 + Ethos-U — Helium MVE plus dedicated NPU' },
+    { label: 'Highest-clocked legacy', value: 'Cortex-M7 — still shipping at 400–550 MHz, no TrustZone' },
+  ]}
+/>
+
+## The master comparison table
+
+<CoreCompare
+  rows={[
+    { core: 'Cortex-M0', notes: 'v6-M, 3-stage, 0.84 DMIPS/MHz, no MPU, no FPU, no TZ. Thumb subset. Cheapest, simplest, smallest gate count.' },
+    { core: 'Cortex-M0+', notes: 'v6-M, 2-stage, 0.95 DMIPS/MHz, optional MPU and MTB. Single-cycle I/O port. Default low-end pick.' },
+    { core: 'Cortex-M1', notes: 'v6-M, FPGA-only soft core. Not used in volume silicon. Listed for completeness.' },
+    { core: 'Cortex-M3', notes: 'v7-M, 3-stage, 1.25 DMIPS/MHz, MPU, no FPU, no TZ. Bit-banding, hardware divide, full Thumb-2. Legacy mainstream.' },
+    { core: 'Cortex-M4', notes: 'v7E-M, 3-stage, 1.25 DMIPS/MHz, MPU, optional FPv4-SP FPU, DSP saturating extensions. The classic DSP-capable Cortex-M.' },
+    { core: 'Cortex-M7', notes: 'v7E-M, 6-stage, 2.14 DMIPS/MHz, dual-issue, I/D-cache, ITCM/DTCM, optional FPv5-SP/DP. Top legacy performance core.' },
+    { core: 'Cortex-M23', notes: 'v8-M Baseline, 2-stage, 0.99 DMIPS/MHz, optional MPU, optional TrustZone-M. M0+ successor for secure designs.' },
+    { core: 'Cortex-M33', notes: 'v8-M Mainline, 3-stage, 1.50 DMIPS/MHz, MPU, optional FPU, optional DSP, optional TrustZone-M. Default mid-tier.' },
+    { core: 'Cortex-M35P', notes: 'v8-M Mainline with anti-tamper features. Specialty SE-tier part. Limited vendor adoption.' },
+    { core: 'Cortex-M52', notes: 'v8.1-M, Helium MVE, scalar similar to M33. 2024 ARM announcement, early silicon. Targets mid-range ML.' },
+    { core: 'Cortex-M55', notes: 'v8.1-M Mainline, 4-stage, dual-issue, Helium MVE, optional cache and TCM. ML-inference focus, pairs with Ethos-U.' },
+    { core: 'Cortex-M85', notes: 'v8.1-M Mainline, 7-stage, dual-issue, branch prediction, optional Helium, PAC/BTI, cache and TCM. Highest perf.' },
+  ]}
+/>
+
+## Pipeline depth and IPC
+
+Pipeline depth is a rough proxy for clock-frequency headroom — deeper pipelines mean smaller per-stage logic and faster clocks, at the cost of larger mispredict penalties.
+
+| Core | Pipeline | Branch mispredict | Typical max silicon clock |
+|---|---|---|---|
+| M0  | 3 | 2 cycles  | ~50 MHz (mainstream), 100 MHz (aggressive) |
+| M0+ | 2 | 1 cycle   | ~50 MHz (mainstream), 133 MHz (RP2040) |
+| M23 | 2 | 1 cycle   | ~32–48 MHz typical |
+| M3  | 3 | 2 cycles  | ~72–168 MHz |
+| M4  | 3 | 2 cycles  | ~80–180 MHz |
+| M33 | 3 | 2 cycles  | ~64–250 MHz |
+| M55 | 4 | 3 cycles  | ~300–500 MHz |
+| M7  | 6 | 5–7 cycles | ~400–550 MHz |
+| M85 | 7 | 5–7 cycles | ~400–750 MHz |
+
+Note the M85's deeper pipeline doesn't kill perf because of branch prediction — a correctly predicted branch is zero penalty. The M7, with weaker prediction, eats its 5–7 cycle penalty on every mispredicted branch.
+
+<PipelineDiagram
+  title="Cortex-M0 (3-stage, single-issue) processing four instructions"
+  stages={['F', 'D', 'EX']}
+  instructions={[
+    { name: 'LDR r0, [r1]', stages: ['F', 'D', 'EX'] },
+    { name: 'ADD r2, r0, #1', stages: ['', 'F', 'D', 'EX'] },
+    { name: 'MUL r3, r2, r4', stages: ['', '', 'F', 'D', 'EX'] },
+    { name: 'STR r3, [r5]', stages: ['', '', '', 'F', 'D', 'EX'] },
+  ]}
+  caption="M0 retires roughly one instruction per cycle through a 3-stage in-order pipe — simple, deterministic, ~0.84 DMIPS/MHz."
+/>
+
+<PipelineDiagram
+  title="Cortex-M7 (6-stage, dual-issue) processing the same workload"
+  stages={['F1', 'F2', 'D', 'IS', 'EX1', 'EX2']}
+  instructions={[
+    { name: 'LDR r0, [r1]   (A)', stages: ['F1', 'F2', 'D', 'IS', 'EX1', 'EX2'] },
+    { name: 'ADD r2, r6, #1 (B)', stages: ['F1', 'F2', 'D', 'IS', 'EX1', 'EX2'] },
+    { name: 'MUL r3, r2, r4 (A)', stages: ['', 'F1', 'F2', 'D', 'IS', 'EX1', 'EX2'] },
+    { name: 'STR r3, [r5]   (B)', stages: ['', 'F1', 'F2', 'D', 'IS', 'EX1', 'EX2'] },
+  ]}
+  caption="M7 issues two independent instructions per cycle through a deeper 6-stage pipe — ~2.14 DMIPS/MHz on cache-friendly code. The cost is a 5–7 cycle mispredict penalty and the cache/DMA coherency burden."
+/>
+
+## ISA features
+
+What instructions you actually have, by core:
+
+| ISA feature | M0/M0+ | M23 | M3/M4/M7 | M33 | M55/M85 |
+|---|---|---|---|---|---|
+| Thumb-2 (full) | no | no | yes | yes | yes |
+| UDIV / SDIV | no | yes | yes | yes | yes |
+| CBZ / CBNZ | no | yes | yes | yes | yes |
+| IT blocks | no | no | yes | yes | yes |
+| DSP saturating (QADD etc.) | no | no | M4/M7 yes | optional | yes |
+| Bit-band | no | no | M3/M4 yes (M7 no) | no | no |
+| LDREX / STREX | no | LDA/STL (v8) | yes | LDA/STL | LDA/STL |
+| CLZ | no | yes | yes | yes | yes |
+| Helium MVE | no | no | no | no | yes |
+| PAC / BTI | no | no | no | no | M85 only |
+
+Bit-banding (the M3/M4-only feature that aliases each bit of a register region to a word at a different address) is dead in v8-M. Don't write portable code that depends on it.
+
+## Memory and bus
+
+| Core | Bus type | I-cache | D-cache | ITCM | DTCM |
+|---|---|---|---|---|---|
+| M0 | von Neumann, single AHB | no | no | no | no |
+| M0+ | von Neumann (+ optional SIO) | no | no | no | no |
+| M23 | von Neumann, single AHB | no | no | no | no |
+| M3  | Harvard (I/D/S buses) | no | no | no | no |
+| M4  | Harvard | no | no | no | no |
+| M33 | Harvard | no | no | no (vendor SRAM may emulate) | no |
+| M55 | Harvard | optional 4–64 KB | optional 4–64 KB | optional ≤16 MB | optional ≤16 MB |
+| M7  | Harvard, multiple AHB | yes 4–64 KB | yes 4–64 KB | yes ≤16 MB | yes ≤16 MB |
+| M85 | Harvard | optional 4–64 KB | optional 4–64 KB | optional ≤16 MB | optional ≤16 MB |
+
+Cache and TCM are big lever points. Cached cores get high mean throughput from flash but require DMA coherency management. TCM gets deterministic single-cycle latency without cache management — the right place for ISRs and DMA buffers.
+
+## Security: MPU, TrustZone, PAC/BTI
+
+| Core | MPU | TrustZone-M | PAC | BTI |
+|---|---|---|---|---|
+| M0  | no | no | no | no |
+| M0+ | optional (v6-M MPU, 8 regions) | no | no | no |
+| M23 | optional (v8-M MPU, 8 or 16 regions) | optional | no | no |
+| M3  | optional (v7-M MPU, 8 regions) | no | no | no |
+| M4  | optional (v7-M MPU, 8 regions) | no | no | no |
+| M33 | optional (v8-M MPU, 8 or 16 regions per state) | optional | no | no |
+| M55 | optional (v8-M MPU, 16 regions per state) | optional | no | no |
+| M7  | optional (v7-M MPU, 8 or 16 regions) | no | no | no |
+| M85 | optional (v8-M MPU, 16 regions per state) | optional | yes | yes |
+
+The M85 stands alone with PAC and BTI. For products that need certified control-flow integrity, this is currently the only Cortex-M option.
+
+## Floating-point
+
+| Core | FPU | Precision | Lazy stacking |
+|---|---|---|---|
+| M0/M0+ | none | software only | n/a |
+| M23 | none | software only | n/a |
+| M3 | none | software only | n/a |
+| M4 | optional FPv4-SP | single | yes |
+| M7 | optional FPv5-SP, FPv5-DP | single or double | yes |
+| M33 | optional FPv5-SP | single only | yes |
+| M55 | FPv5-SP, optional FPv5-DP, MVE shares regs | single + double + vector | yes |
+| M85 | FPv5-SP, FPv5-DP, optional MVE | single + double + vector | yes |
+
+If you need double precision, your only choices are M7, M55, or M85. The M33 is single-precision only; double-precision FP on M33 goes through software helpers and is roughly 100× slower than single-precision native.
+
+## NVIC priorities and IRQ count
+
+| Core | Max IRQs | Priority bits | BASEPRI | FAULTMASK |
+|---|---|---|---|---|
+| M0/M0+ | 32 | 2 | no | no |
+| M23 | 240 | up to 4 | no | no |
+| M3/M4 | 240 | up to 8 | yes | yes |
+| M33 | 480 | up to 8 | yes | yes |
+| M55/M85 | 480 | up to 8 | yes | yes |
+| M7 | 240 | up to 8 | yes | yes |
+
+Most actual silicon ships with **3 or 4 priority bits** regardless of architectural maximum. Vendors trim NVIC area aggressively.
+
+## DMIPS and CoreMark
+
+| Core | DMIPS/MHz | CoreMark/MHz |
+|---|---|---|
+| M0  | 0.84 | 2.33 |
+| M0+ | 0.95 | 2.46 |
+| M23 | 0.99 | 2.50 |
+| M3  | 1.25 | 3.32 |
+| M4  | 1.25 | 3.40 |
+| M33 | 1.50 | 4.02 |
+| M55 | 1.60 | 4.50 (scalar) |
+| M7  | 2.14 | 5.04 |
+| M85 | 3.13 | 6.30 |
+
+Numbers are ARM-published reference benchmarks. Real silicon varies — memory latency, flash wait states, and cache hit rates all skew real-world results by 10–30%.
+
+<Callout type="warn" title="Benchmark caveats">
+DMIPS and CoreMark measure scalar, single-thread performance only. Helium MVE on M55/M85 can give 8–16× speedup on vectorizable kernels — but these benchmarks don't capture it. For ML or DSP work, measure your actual kernel; for general control code, the table above is a reasonable rank ordering.
+</Callout>
+
+## Choosing a core for a new design
+
+A reasonable decision tree:
+
+1. **Need security partition (TrustZone-M)?** → M23, M33, M55, or M85. Skip M0/M0+/M3/M4/M7.
+2. **Need ML inference at low power?** → M55 + Ethos-U. M85 if no NPU is available.
+3. **Need maximum single-thread perf?** → M85 (new design) or M7 (legacy / cheaper silicon today).
+4. **Need DSP/SIMD without ML?** → M33+DSP, M55, or M85. M4 if cost dominates.
+5. **Need FPU?** → M4, M7, M33+FPU, M55, or M85.
+6. **Just need a small low-power core?** → M0+ first, M23 if security is required.
+
+Treat M0, M3, and M4 as legacy for new designs — they're fine in established product families but offer nothing v8-M alternatives don't. M7 is the exception: still has the highest deployed install base for high-perf MCU work, and the SP/DP FPU is sometimes cheaper than M85.
+
+## Cross-references
+
+- [Cortex-M0](/docs/cortex-m/m0) · [M0+](/docs/cortex-m/m0plus) · [M3](/docs/cortex-m/m3) · [M4](/docs/cortex-m/m4) · [M7](/docs/cortex-m/m7) · [M23](/docs/cortex-m/m23) · [M33](/docs/cortex-m/m33) · [M55](/docs/cortex-m/m55) · [M85](/docs/cortex-m/m85)
+- [The Cortex-M lineup overview](/docs/cortex-m/lineup)
+- [ARMv7-M vs ARMv8-M](/docs/architecture/memory-model)
+- [ISA families](/docs/architecture/isa-family)
+- ARM TRMs for each core (DDI series)

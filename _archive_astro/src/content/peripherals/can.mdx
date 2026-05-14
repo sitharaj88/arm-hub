@@ -1,0 +1,109 @@
+---
+title: CAN
+description: Controller Area Network — bit timing, arbitration, message filtering, CAN-FD, and why the network length actually matters.
+order: 5
+updated: 2026-05-12
+tags: [peripherals, can, automotive]
+---
+
+CAN is the bus that runs vehicles. Differential pair, multi-master, arbitration by message ID, robust against electrical noise. Every modern Cortex-M targeting automotive or industrial has at least one CAN controller; many have multiple, and modern ones support CAN-FD (Flexible Data rate, up to 8 Mbps).
+
+## Electrical & physical
+
+- **CANH** and **CANL** — differential pair, terminated 120 Ω on each end of the bus.
+- **Dominant** (logical 0): CANH high, CANL low.
+- **Recessive** (logical 1): both at ~2.5 V (no drive).
+- Wired-AND: if any node drives dominant, the bus is dominant. This is what enables arbitration.
+
+The MCU doesn't drive the bus directly — it uses a **CAN transceiver** (TJA1051, MCP2551, etc.) that converts the MCU's TX/RX logic-level signals to the differential pair. Most transceivers have a "silent mode" pin you assert during bring-up debugging to prevent your prototype from corrupting a live network.
+
+## Bit rate, segments, and sample point
+
+Each bit is divided into **time quanta** (TQ), the smallest scheduler unit of the CAN controller. A bit is composed of:
+
+```
+| SyncSeg | Prop + Phase1 | Phase2 |
+|   1 TQ  |     1..8 TQ   | 1..8 TQ |
+                            ▲
+                           sample point
+```
+
+Standard practice: sample point at **75–87.5%** of the bit. This gives the receiver time to detect bit changes after propagation delay. The exact numbers are dictated by:
+
+- Bit rate (typically 125 kbps, 250 kbps, 500 kbps, 1 Mbps).
+- Cable length (longer = need a higher Phase1 to absorb propagation).
+- Number of nodes.
+
+CiA (CAN in Automation) publishes a recommended table. For 500 kbps on 100 m of twisted pair, a typical setup is 80 MHz / 10 = 8 MHz / 16 TQ = 500 kHz bit rate, with the sample point at 87.5% (14 TQ after start, 2 TQ to finish).
+
+```c
+// STM32 CAN bit timing register
+CAN1->BTR = (1 - 1) << 24      // SJW = 1
+          | (2 - 1) << 20      // BS2 = 2 TQ
+          | (13 - 1) << 16     // BS1 = 13 TQ
+          | (10 - 1);          // prescaler — 80 MHz / 10 = 8 MHz → 8 MHz / 16 = 500 kHz
+```
+
+## Arbitration and message ID
+
+When two nodes start transmitting simultaneously, they both monitor the bus during the arbitration field (the 11-bit or 29-bit ID). The first node to drive a recessive bit while seeing dominant on the bus *loses arbitration* and backs off. The lower-ID frame wins.
+
+This means:
+
+- **Lower IDs = higher priority**. The most urgent message in your system should have the lowest CAN ID.
+- **No collision destroys data** — the losing node just retries after the bus is free.
+- **You can compute worst-case latency** for any given message given the IDs of all higher-priority messages. This is why CAN is favoured in real-time systems.
+
+## Message format
+
+Standard frame:
+
+```
+| SOF | ID (11 bits) | RTR | IDE | r0 | DLC (4) | data 0..8 bytes | CRC | ACK | EOF |
+```
+
+Extended frame: 29-bit ID. CAN-FD adds extra bits for the data-phase bit-rate switch (BRS) and the error-state indicator (ESI), plus a data length up to 64 bytes.
+
+## Filtering — hardware mailboxes
+
+Every CAN controller has hardware **filters** that match incoming IDs against masks and route matching frames to specific receive FIFOs. This is critical because at high bus loads, doing software ID filtering on every frame would overwhelm the CPU.
+
+```c
+// Accept only IDs 0x100 - 0x1FF
+CAN_FilterTypeDef f = {0};
+f.FilterIdHigh = 0x100 << 5;
+f.FilterMaskIdHigh = 0xFFE0;          // mask = upper 7 bits must match
+f.FilterFIFOAssignment = CAN_RX_FIFO0;
+f.FilterMode = CAN_FILTERMODE_IDMASK;
+f.FilterActivation = ENABLE;
+HAL_CAN_ConfigFilter(&hcan1, &f);
+```
+
+STM32's bxCAN has 14–28 filter banks shared across all CAN instances. Modern FDCAN has more flexible filtering with up to 128 standard ID filters and 64 extended ID filters per instance.
+
+## CAN-FD — the modern upgrade
+
+CAN Flexible Data rate:
+
+- Same arbitration phase (bit rate fixed by network constraints).
+- **Higher data-phase bit rate** — typical 2 Mbps to 8 Mbps for the payload portion of the frame.
+- **Up to 64 bytes payload** vs. 8 in classic CAN.
+- Backward-compatible: a classic CAN node will see FD frames as errored, but bus traffic doesn't corrupt.
+
+In a modern vehicle you'll see classic CAN at 500 kbps on body networks, CAN-FD at 2 Mbps on powertrain and ADAS, and CAN-XL (10 Mbps+) starting to appear on flagship platforms.
+
+## CAN error states
+
+Every node tracks **TEC** (Transmit Error Counter) and **REC** (Receive Error Counter). Each error increments the appropriate counter; each successful frame decrements. States:
+
+- **Error Active** — TEC < 128, REC < 128. Normal. Can transmit dominant error flags.
+- **Error Passive** — TEC ≥ 128 or REC ≥ 128. Can only transmit recessive error flags (doesn't disturb the bus).
+- **Bus Off** — TEC ≥ 256. Node disconnects from the bus, requires reset.
+
+If your node keeps going bus-off, that's the message: *one* of \{your transceiver, the bus termination, the bus wiring, your bit timing\} is wrong.
+
+## See also
+
+- [GPIO](/docs/peripherals/gpio/) — TX/RX pin AF configuration.
+- [DMA](/docs/peripherals/dma/) — for high-rate CAN logging.
+- [NVIC](/docs/cortex-m/nvic/) — CAN IRQ priorities.

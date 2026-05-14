@@ -1,0 +1,86 @@
+---
+title: ARMv7-M & ARMv8-M
+description: What changed between ARMv7-M and ARMv8-M — TrustZone, stack limits, security states — and what stayed the same.
+order: 4
+updated: 2026-05-12
+tags: [architecture, armv8m, trustzone]
+---
+
+import Callout from '~/components/Callout.astro';
+
+ARMv8-M is the first major M-profile revision since ARMv7E-M in 2007. The headline feature is **TrustZone for ARMv8-M**, but a handful of smaller additions matter too.
+
+## ARMv8-M variants
+
+There are two flavours:
+
+| Variant            | Companion cores      | Roughly equivalent to | Key omission |
+|--------------------|----------------------|-----------------------|--------------|
+| ARMv8-M **Baseline** | Cortex-M23           | ARMv6-M (M0+) + TrustZone | No DSP, no Helium, limited Thumb-2 |
+| ARMv8-M **Mainline** | Cortex-M33, M35P, M52, M55, M85 | ARMv7E-M (M4) + TrustZone | None — full Thumb-2, FPU, DSP optional |
+
+ARMv8.1-M (Cortex-M55 / M85) extends Mainline with **Helium** (MVE), low-overhead loops, **PACBTI**, and unprivileged Helium support.
+
+## TrustZone-M in one paragraph
+
+The processor adds a **security state** — Secure (S) or Non-secure (NS) — orthogonal to handler/thread mode. Memory and peripherals are partitioned at boot time by the **SAU** (Secure Attribution Unit). Non-secure code can only call Secure functions through dedicated **secure gateway veneers** marked with the `SG` instruction. Non-secure code can't observe Secure stacks, registers, or memory; faults in Non-secure code can't bring down the Secure side.
+
+This is *very* different from A-profile TrustZone (which gates whole memory regions per CPU mode). On M-profile, *every* memory access is checked per-region, per-state, on every cycle.
+
+<Callout type="spec" title="The SAU and IDAU">
+The **SAU** is the processor-internal attribution unit (up to 8 regions, you configure it). The **IDAU** (Implementation-Defined Attribution Unit) is vendor silicon — e.g. on STM32L5, the IDAU statically maps `0x0C00_0000` as Secure flash and `0x0800_0000` as Non-secure flash. The final attribution is the *intersection* of SAU and IDAU.
+</Callout>
+
+## New ARMv8-M instructions
+
+- **SG** — Secure Gateway. The only legal way for NS code to call into S. Must be the first instruction of a Secure entry-point veneer.
+- **BXNS / BLXNS** — branch / branch-with-link to Non-secure. Used by Secure code to return to NS.
+- **TT, TTT, TTA, TTAT** — Test Target. Queries the SAU/MPU/IDAU about an address without faulting — useful inside Secure code that needs to validate NS-supplied pointers.
+- **CSDB, SSBB, PSSBB** — speculation barriers. Mitigate side-channel attacks on speculation.
+- **VLLDM / VLSTM** — lazy-stacking helpers for the FPU across security boundaries.
+
+## Stack limit registers
+
+ARMv8-M Mainline adds **MSPLIM** and **PSPLIM** — explicit stack-limit registers. If the stack pointer crosses the limit, you get a UsageFault instead of a stack overflow into adjacent data.
+
+```c
+extern uint32_t _stack_limit;
+__set_PSPLIM((uint32_t)&_stack_limit);
+```
+
+Cortex-M23 (Baseline) has *only* MSPLIM (no PSPLIM); Mainline has both, and TrustZone splits them into Secure and Non-secure variants (MSPLIM_S/NS, PSPLIM_S/NS).
+
+## Combined exception model
+
+The exception model gains a security dimension. Some highlights:
+
+- The vector table is duplicated: **VTOR_S** and **VTOR_NS**. Each security state has its own table.
+- Faults that originate in Secure code are taken to Secure; faults from NS to NS — *unless* you escalate them to Secure with `AIRCR.BFHFNMINS`.
+- **SecureFault** is a new exception (#7, previously reserved) for SAU/IDAU violations.
+- Exception entry pushes an extended frame that includes the security state; exception exit `EXC_RETURN` encodes which state to return to.
+
+## Helium / MVE — ARMv8.1-M only
+
+The M-profile Vector Extension repurposes the FPU's 32 × 32-bit registers as 8 × 128-bit vectors. It supports:
+
+- Integer SIMD on 8/16/32-bit lanes.
+- Single-precision floating-point SIMD.
+- **Predicated** (masked) execution — replaces scalar loop tails.
+- **Tail predication** + low-overhead loops — `DLSTP`/`LETP` instructions remove the typical loop overhead entirely.
+
+On Cortex-M55, a 4-tap FIR filter runs ~4× faster than the same loop on a Cortex-M4 (and ~10× faster than a Cortex-M4 without DSP intrinsics). For ML inference at the edge, MVE is the reason you'd pick M55/M85 over M33.
+
+## What stayed the same
+
+- The NVIC, SysTick, and exception numbering. NVIC priorities still inverted.
+- Thumb-only execution. Same calling convention (AAPCS).
+- The default memory map (8 × 512 MB regions, same attributes).
+- CMSIS-Core APIs — `NVIC_EnableIRQ`, `__DSB`, `__ISB`, `__WFI` all work identically.
+
+If you're moving a Cortex-M4 codebase to Cortex-M33, ~90% of it compiles unchanged. The work is in security partitioning, not in retraining your reflexes.
+
+## See also
+
+- [TrustZone](/docs/architecture/trustzone/) — partitioning, veneers, and a full bring-up walkthrough.
+- [Cortex-M33 / M23](/docs/cortex-m/m33-m23/) — the cores themselves.
+- [Cortex-M55 / M85](/docs/cortex-m/m55-m85/) — Helium and beyond.

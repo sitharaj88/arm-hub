@@ -1,0 +1,154 @@
+---
+title: Cortex-M4
+description: The workhorse of the Cortex-M family — ARMv7E-M, 3-stage pipeline, DSP extensions, optional FPU. Everything you need to ship firmware on M4.
+order: 4
+updated: 2026-05-12
+tags: [cortex-m, m4, armv7e-m]
+---
+
+import Callout from '~/components/Callout.astro';
+import RegisterMap from '~/components/RegisterMap.astro';
+
+The Cortex-M4 has been the default Cortex-M for general-purpose firmware since 2010. It hits a sweet spot — full Thumb-2, hardware divide, DSP intrinsics, optional FPU — without the cost or complexity of M7's caches and superscalar pipeline.
+
+## At a glance
+
+- **ISA**: ARMv7E-M (Thumb-2 + DSP extensions)
+- **Pipeline**: 3-stage in-order
+- **Performance**: 1.25 DMIPS/MHz · 1.95 CoreMark/MHz
+- **Memory protection**: optional 8-region MPU
+- **FPU**: optional single-precision VFPv4-D16
+- **NVIC**: up to 240 IRQs, 256 priority levels
+- **Typical clock**: 80–300 MHz depending on vendor process
+
+## The pipeline
+
+```
+┌────────┐  ┌────────┐  ┌──────────┐
+│ Fetch  │→ │ Decode │→ │ Execute  │
+└────────┘  └────────┘  └──────────┘
+```
+
+In-order, no branch prediction (it has a 1-cycle branch shadow — most taken branches cost 2 cycles, but the assembler can sometimes fold them). Load-use latency is 1 cycle. Memory accesses go through a single AHB-Lite interface, so a flash fetch and an SRAM access can collide and one will stall.
+
+This is why vendors who target high-rate code (signal processing, USB DMA descriptors) usually wire SRAM onto a separate AHB matrix port — the "second SRAM" you see on STM32F4 datasheets exists exactly to avoid bus contention.
+
+## DSP instructions
+
+What you actually get from `-mcpu=cortex-m4`:
+
+- **Packed SIMD**: `QADD16`, `SADD8`, `UHSUB16`, etc. — saturating and halving arithmetic on packed lanes.
+- **Multiply-accumulate**: `SMLAL`, `SMMLA`, `SMUAD`, `SMLAD` — single-cycle 32x32+64 and dual-multiply variants.
+- **Bit operations**: `CLZ` (count leading zeros), `RBIT` (bit reverse), `REV16`/`REVSH`.
+- **Saturation**: `SSAT`/`USAT` — clamp to N bits.
+
+Use them through CMSIS-DSP intrinsics or `<arm_acle.h>`:
+
+```c
+#include <arm_acle.h>
+
+// 4-tap FIR filter, packed Q15 samples
+int32_t fir4_q15(const int16_t *x, const int16_t *h) {
+    int32_t x01 = *(const int32_t *)&x[0];   // x[0]<<0 | x[1]<<16
+    int32_t x23 = *(const int32_t *)&x[2];
+    int32_t h01 = *(const int32_t *)&h[0];
+    int32_t h23 = *(const int32_t *)&h[2];
+    int32_t acc = 0;
+    acc = __SMLAD(x01, h01, acc);            // x[0]*h[0] + x[1]*h[1]
+    acc = __SMLAD(x23, h23, acc);            // x[2]*h[2] + x[3]*h[3]
+    return acc;
+}
+```
+
+That's two single-cycle dual-multiply-accumulate instructions covering four MACs — roughly **4× the scalar throughput**.
+
+## The FPU
+
+The Cortex-M4 FPU implements VFPv4-D16 — 32 single-precision registers (or 16 double-precision register pairs, but **only single-precision instructions** are supported). It's pipelined: most ops take 1 cycle to issue, results land 2–3 cycles later.
+
+Critical build flags:
+
+```
+-mcpu=cortex-m4
+-mthumb
+-mfpu=fpv4-sp-d16
+-mfloat-abi=hard       # pass floats in s0–s15 (faster) — or 'softfp' to keep ABI compat
+```
+
+### Lazy stacking
+
+When an exception fires with the FPU active, the hardware *reserves space* for S0–S15 + FPSCR on the stack but doesn't actually push them until the handler issues an FPU instruction. This is **lazy stacking**, controlled by `FPCCR.LSPEN`. It avoids paying the ~17-cycle FPU stack cost on handlers that never touch floats — which is most of them.
+
+```c
+// Disable lazy stacking — pay always, get predictable latency
+FPU->FPCCR &= ~(FPU_FPCCR_ASPEN_Msk | FPU_FPCCR_LSPEN_Msk);
+```
+
+<Callout type="warn" title="Don't use float in interrupts you didn't budget for">
+A `float x = 1.0f;` inside a high-priority IRQ that fires every µs will quietly add 17 cycles of stacking latency per entry. Either disable lazy stacking and accept it, or stay integer-only in fast paths.
+</Callout>
+
+## MPU on Cortex-M4
+
+The Cortex-M4 MPU has **8 regions**, each with:
+
+- Base address (must be aligned to size)
+- Size (power of two, 32 B to 4 GB)
+- Access permissions (privileged R/W, user R/W, etc.)
+- Memory type (Normal, Device, Strongly-ordered) + cacheability hints (ignored on M4 without caches)
+- Sub-region disables (8 equal partitions per region)
+- Execute-never bit (XN)
+
+Regions can overlap — higher-numbered region wins. Common pattern: a single low-priority region covers the whole address space with sensible defaults, then higher-priority regions carve out exceptions for stack guards, ROM, peripheral windows.
+
+<RegisterMap
+  name="MPU_RASR"
+  address="0xE000_EDA0"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:29', name: 'reserved', access: 'RES',  description: 'Reserved, write 0.' },
+    { bits: '28',    name: 'XN',       access: 'RW',  reset: 0, description: 'Execute-never. 1 = instruction fetches faulted.' },
+    { bits: '27',    name: 'reserved', access: 'RES',  description: 'Reserved.' },
+    { bits: '26:24', name: 'AP',       access: 'RW',  reset: 0, description: 'Access permissions: 0=none, 1=priv-RW, 2=priv-RW/user-R, 3=full-RW, 5=priv-R, 6=R-only.' },
+    { bits: '23:22', name: 'reserved', access: 'RES',  description: 'Reserved.' },
+    { bits: '21:19', name: 'TEX',      access: 'RW',  reset: 0, description: 'Type extension — combined with C, B, S defines memory type.' },
+    { bits: '18',    name: 'S',        access: 'RW',  reset: 0, description: 'Shareable.' },
+    { bits: '17',    name: 'C',        access: 'RW',  reset: 0, description: 'Cacheable.' },
+    { bits: '16',    name: 'B',        access: 'RW',  reset: 0, description: 'Bufferable.' },
+    { bits: '15:8',  name: 'SRD',      access: 'RW',  reset: 0, description: 'Sub-region disable — 8 bits, one per equal-sized sub-region.' },
+    { bits: '7:6',   name: 'reserved', access: 'RES',  description: 'Reserved.' },
+    { bits: '5:1',   name: 'SIZE',     access: 'RW',  reset: 0, description: 'Region size = 2^(SIZE+1) bytes. Min 32 B (SIZE=4), max 4 GB (SIZE=31).' },
+    { bits: '0',     name: 'ENABLE',   access: 'RW',  reset: 0, description: 'Region enable.' },
+  ]}
+  caption="MPU Region Attribute and Size Register — one per region (indexed via MPU_RNR)."
+/>
+
+## Bit-banding (and why you probably shouldn't use it)
+
+Cortex-M3 and M4 expose two 32 MB **bit-band alias regions**:
+
+- `0x2200_0000` – `0x23FF_FFFF` aliases SRAM `0x2000_0000` – `0x200F_FFFF` (1 MB → 32 MB)
+- `0x4200_0000` – `0x43FF_FFFF` aliases peripherals `0x4000_0000` – `0x400F_FFFF`
+
+Each *bit* in the original region maps to a *word* in the alias. Writing 1 to `alias_addr` sets a single bit atomically without read-modify-write:
+
+```c
+*(volatile uint32_t *)(0x4200_0000 + (port_addr - 0x4000_0000) * 32 + bit * 4) = 1;
+```
+
+Sounds great. In practice: ARMv8-M removed it entirely, the Cortex-M7 doesn't have it, and tooling support is patchy. **Use `LDREX`/`STREX` or critical sections instead** — your code will port forward.
+
+## What vendors ship on it
+
+- **STM32F4 / G4 / L4** — STMicroelectronics, the most prolific M4 user. F4 = high-perf, G4 = motor control, L4 = low-power.
+- **NXP Kinetis K-series** — solid mainstream M4 with strong analog peripherals.
+- **Nordic nRF52** — Bluetooth-first M4 with a dedicated 2.4 GHz radio block.
+- **TI TM4C** — formerly Stellaris; rugged industrial M4.
+- **Microchip SAM4** — M4 line in Microchip's broader SAM family.
+
+## See also
+
+- [Cortex-M7](/docs/cortex-m/m7/) — when M4 isn't enough.
+- [NVIC deep dive](/docs/cortex-m/nvic/) — interrupt handling specifics.
+- [Linker scripts](/docs/programming/linker-scripts/) — laying out a Cortex-M4 binary.

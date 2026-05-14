@@ -1,0 +1,150 @@
+---
+title: UART
+description: Asynchronous serial — bit rates, framing, parity, hardware flow control, DMA, and the subtle differences across vendor implementations.
+order: 2
+updated: 2026-05-12
+tags: [peripherals, uart, serial]
+---
+
+import Callout from '~/components/Callout.astro';
+
+UART is the first thing you wire on a new board, the last thing you trust on a flaky bring-up. Despite being a 60-year-old protocol, every Cortex-M ships at least one — usually three to eight — and they all have slightly different quirks.
+
+## Frame structure
+
+```
+        idle (high)
+              │
+              ▼
+    ─┐  ┌──┬──┬──┬──┬──┬──┬──┬──┐  ┌──┐  ┌─
+     │  │ 0│ 1│ 2│ 3│ 4│ 5│ 6│ 7│  │P │  │
+     │  │  │  │  │  │  │  │  │  │  │  │  │
+     └──┘  └──┴──┴──┴──┴──┴──┴──┴──┘  └──┘
+      ^start         data (LSB first)    parity   stop
+      bit                                          bit
+```
+
+- **Start bit** — line goes low for one bit time.
+- **Data bits** — typically 8, LSB first. Some chips support 5–9.
+- **Parity** — optional. Even, odd, none. Receivers typically detect framing errors regardless.
+- **Stop bit(s)** — line returns high for 1, 1.5, or 2 bit times.
+
+8N1 (8 data, no parity, 1 stop) is the default. Anything else needs to match on both sides or you'll see frame errors.
+
+## Bit rate generation
+
+The peripheral has a baud-rate generator that divides a peripheral clock down to (sample_rate × baud_rate). The sample rate is typically 16× (oversample by 16) — the peripheral samples the line 16 times per bit and uses majority voting around the middle three samples to read the bit.
+
+```
+USART_BRR = f_PCLK / baud_rate    // for oversample-by-16
+```
+
+At 84 MHz PCLK1 and 115200 baud: `BRR = 84_000_000 / 115200 ≈ 729.17`. The peripheral's BRR register has a fractional part to handle this — typically 12.4 fixed-point on STM32, encoding "729" in the mantissa and "0.17 × 16 ≈ 3" in the fraction.
+
+**Tolerance**: most UART receivers tolerate ~3% baud-rate error before frame errors creep in. At 115200 baud over a 16 MHz internal RC oscillator (typical accuracy ±1%), you're fine. At higher baud rates or with poorer oscillators (factory-calibrated RC at ±2%), use an external crystal.
+
+## Hardware flow control — RTS/CTS
+
+Two extra pins:
+
+- **RTS** (Request To Send) — output. *We* assert when we have buffer space.
+- **CTS** (Clear To Send) — input. *They* assert when they have buffer space.
+
+The MCU only transmits when CTS is asserted, and asserts RTS when its receive FIFO has room. This is essential at high baud rates (≥460800) with software not always ready to drain the FIFO.
+
+```c
+// STM32: enable CTS and RTS
+USART2->CR3 |= USART_CR3_CTSE | USART_CR3_RTSE;
+```
+
+## Receive strategies
+
+### Polled
+
+Trivial, blocks the CPU. Fine for `printf` debugging:
+
+```c
+char uart_getc(void) {
+    while (!(USART2->ISR & USART_ISR_RXNE));
+    return USART2->RDR;
+}
+```
+
+### Interrupt-driven ring buffer
+
+The standard pattern. ISR drains the receiver into a ring buffer; main loop consumes from the ring buffer.
+
+```c
+volatile struct {
+    uint8_t buf[256];
+    uint8_t head, tail;
+} rx_ring;
+
+void USART2_IRQHandler(void) {
+    if (USART2->ISR & USART_ISR_RXNE) {
+        uint8_t c = USART2->RDR;            // also clears RXNE
+        uint8_t next = (rx_ring.head + 1) & 0xFF;
+        if (next != rx_ring.tail) {
+            rx_ring.buf[rx_ring.head] = c;
+            rx_ring.head = next;
+        }
+        // else: ring full, drop the byte
+    }
+}
+```
+
+ISR fires per byte. Fine up to ~921600 baud. Above that, the per-byte ISR overhead becomes a problem.
+
+### DMA — receive-to-circular-buffer with IDLE detection
+
+For sustained high-rate UART (1 Mbps+), DMA is essential. STM32's modern USARTs have a **receive-to-buffer** mode plus an **IDLE line interrupt** that fires when the line goes idle for one frame time, telling you "the burst is over, here's how many bytes are in the buffer":
+
+```c
+// Configure DMA to circularly write USART2->RDR into rx_buf
+hdma_usart2_rx.Instance         = DMA1_Stream5;
+hdma_usart2_rx.Init.Direction   = DMA_PERIPH_TO_MEMORY;
+hdma_usart2_rx.Init.Mode        = DMA_CIRCULAR;
+hdma_usart2_rx.Init.MemInc      = DMA_MINC_ENABLE;
+HAL_DMA_Init(&hdma_usart2_rx);
+
+USART2->CR3 |= USART_CR3_DMAR;
+USART2->CR1 |= USART_CR1_IDLEIE;   // IDLE-line interrupt
+
+void USART2_IRQHandler(void) {
+    if (USART2->ISR & USART_ISR_IDLE) {
+        USART2->ICR = USART_ICR_IDLECF;
+        uint16_t pos = sizeof(rx_buf) - DMA1_Stream5->NDTR;
+        process_chunk(rx_buf, pos);
+    }
+}
+```
+
+Zero CPU per byte. CPU intervention only at the end of bursts.
+
+## Transmit strategies
+
+Symmetric: polled, interrupt-driven, or DMA. Most projects use **DMA for TX** because long messages (debug logs, JSON responses) would otherwise block the main loop.
+
+```c
+HAL_UART_Transmit_DMA(&huart2, (uint8_t *)msg, len);
+```
+
+The HAL fires a callback when DMA finishes. Until then, the calling code can do other work.
+
+## Vendor differences
+
+- **STM32** — calls the peripheral USART; has a separate IRDA mode, smart-card mode, LIN mode. The H7 family has dedicated `LPUART` (low-power UART) on a separate bus that runs in stop mode.
+- **NXP Kinetis / LPC** — calls it LPUART (Low-Power UART) or LPC's UART. Different register layouts than STM32, otherwise comparable.
+- **Nordic nRF52** — calls it UARTE (UART with EasyDMA). DMA is baked into the peripheral — you don't configure DMA channels separately.
+- **RP2040** — `uart0`, `uart1`. PrimeCell PL011 IP — well-documented, GPIO-flexible.
+- **Microchip SAM** — SERCOM modular block configured as UART. Same hardware can be I²C or SPI by reconfiguration.
+
+<Callout type="tip" title="Always probe TX and RX before declaring 'UART is broken'">
+On bring-up, scope or logic-analyse both lines. If TX shows the right pattern at the right baud but the host sees garbage, it's likely a level mismatch (3.3 V vs 5 V), a baud-rate-tolerance issue, or you swapped TX/RX.
+</Callout>
+
+## See also
+
+- [DMA](/docs/peripherals/dma/) — for high-throughput RX/TX.
+- [GPIO](/docs/peripherals/gpio/) — pin configuration and alternate functions.
+- [Embedded C patterns](/docs/programming/embedded-c/) — ring buffers and atomicity.

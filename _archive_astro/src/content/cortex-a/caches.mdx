@@ -1,0 +1,130 @@
+---
+title: Caches & coherency
+description: Multi-level caches on ARM apps cores — L1/L2/L3 hierarchy, the cache coherency protocol, and where DMA still surprises you.
+order: 4
+updated: 2026-05-12
+tags: [cortex-a, caches, coherency]
+---
+
+Cortex-A cores always have caches. The smallest A-cluster cores have L1 I+D and a shared L2; bigger SoCs add a shared L3 and sometimes a system-level cache (SLC) between the cluster and DRAM. The good news: hardware coherency *between CPU cores* is automatic. The trickier news: coherency between CPU caches and DMA still needs software help, just like on Cortex-M7 — only the API and the scale are different.
+
+## The hierarchy
+
+```
+                              ┌──────────────┐
+                              │     DRAM     │   60–120 ns
+                              └──────┬───────┘
+                              ┌──────▼───────┐
+                              │     L3 / SLC │   25–40 ns  (shared cluster-wide)
+                              └──────┬───────┘
+                              ┌──────▼───────┐
+                              │      L2      │   10–15 ns  (shared per cluster)
+                              └──────┬───────┘
+                  ┌──────┬──────┴────┴──────┬──────┐
+              ┌───▼───┐ ┌──▼──┐         ┌──▼──┐ ┌──▼──┐
+              │ L1 I  │ │L1 D │   ...   │L1 I │ │L1 D │  1–3 ns
+              └───────┘ └─────┘         └─────┘ └─────┘
+                Core 0                    Core N
+```
+
+L1 is private to each core (so two cores aren't fighting for L1 ports). L2 is shared per cluster on most modern designs (saves area, avoids cross-cluster invalidations on shared data). L3 (or "DSU L3" on DynamIQ designs) is shared across the entire CPU complex.
+
+## Cache coherency — CCI / CCN / DSU
+
+Hardware coherency on ARM is mediated by a coherent interconnect. The names change with generation:
+
+- **CCI-400/500/550** — Cache Coherent Interconnect (older, separate cluster designs).
+- **CCN-5xx** — for server-class SoCs.
+- **DSU** (DynamIQ Shared Unit) — current generation, integrates the L3 and coherency in one block.
+
+These implement an **MOESI**-style coherence protocol. Each cache line has a state:
+
+- **Modified** — this cache has the only up-to-date copy; memory is stale.
+- **Owned** — this cache has an up-to-date copy that's also in others; can supply reads.
+- **Exclusive** — clean and only here.
+- **Shared** — clean, possibly in others.
+- **Invalid** — no valid data.
+
+Transitions happen *transparently*. When core A writes to a line that core B has, the coherency fabric snoops B's copy, invalidates it, and lets A's write proceed. You don't write `DMB` for this — it's just *how memory works* on ARM SMP.
+
+The cost shows up in benchmarks. A line that ping-pongs between two cores (false sharing on adjacent fields of a struct) can be 10–100× slower than a line touched by one core. Aligning hot per-CPU data to cache lines (`__attribute__((aligned(64)))`) is a real optimisation.
+
+## DMA coherency on Cortex-A
+
+Even with full CPU-cache coherency, **DMA engines aren't automatically coherent**. The pattern is the same as Cortex-M7:
+
+```c
+// Allocate coherent memory — the kernel maps it non-cacheably
+void *buf = dma_alloc_coherent(dev, size, &dma_handle, GFP_KERNEL);
+// CPU and DMA both see the same bytes immediately, no flush needed.
+
+// Or use streaming API — the kernel flushes/invalidates on map/unmap
+dma_addr_t handle = dma_map_single(dev, cpu_buf, size, DMA_TO_DEVICE);
+// ... DMA reads from cpu_buf — it was flushed during dma_map_single
+dma_unmap_single(dev, handle, size, DMA_TO_DEVICE);
+```
+
+The difference from M7: you don't write `SCB_CleanDCache_by_Addr` yourself. Linux's DMA API does it, transparently, with the right barriers, on the right cache levels. Drivers that "do their own coherency" are almost always wrong.
+
+### IOMMU-backed coherency
+
+Modern ARM SoCs include an **SMMU** (System MMU) — an IOMMU for DMA-capable devices. It does two things:
+
+1. **Translate I/O virtual addresses to physical**, so devices can use the same VA space as a process.
+2. **Enforce cacheability/shareability attributes** on DMA, often allowing devices to participate in the cache coherency protocol directly (with `dma-coherent` attribute on the device tree).
+
+On a system where the SMMU is coherent with the CPU caches, `dma_alloc_coherent` can return cacheable memory and skip the flush API entirely. ARM calls this **IO-coherent**.
+
+## L1 vs L2 maintenance
+
+When you do need explicit maintenance (firmware code, KVM, hibernation), the AArch64 instructions are:
+
+| Instruction        | Effect                                        |
+|--------------------|-----------------------------------------------|
+| `DC IVAC, Xn`      | Invalidate L1+L2 D-cache by VA                |
+| `DC CVAC, Xn`      | Clean (write back) by VA                      |
+| `DC CIVAC, Xn`     | Clean and invalidate by VA                    |
+| `DC CISW, Xn`      | Clean and invalidate by set/way (kernel only) |
+| `IC IVAU, Xn`      | Invalidate I-cache by VA                      |
+| `IC IALLU`         | Invalidate entire I-cache                     |
+
+Each is followed by a `DSB ISH` (data synch barrier, inner-shareable) to ensure the maintenance completes before subsequent accesses.
+
+```c
+asm volatile (
+    "dc cvac, %0\n"      // clean line at addr
+    "dsb ish\n"
+    : : "r" (addr) : "memory"
+);
+```
+
+You rarely write this — `__flush_dcache_area()` and friends wrap it.
+
+## False sharing — the silent killer
+
+Two cores writing to the *same cache line* but *different bytes* will ping-pong the line on every write. Classic example:
+
+```c
+struct counters {
+    long a;   // core 0 increments this
+    long b;   // core 1 increments this
+};   // 16 bytes — same cache line
+```
+
+Two cores hammering this drop throughput by 50× vs. a single core. The fix:
+
+```c
+struct counters {
+    long a __attribute__((aligned(64)));
+    char _pad[64];
+    long b __attribute__((aligned(64)));
+};
+```
+
+Now `a` and `b` are on different cache lines and neither core invalidates the other.
+
+## See also
+
+- [MMU & paging](/docs/cortex-a/mmu/) — cacheability attributes live in page tables.
+- [Memory model](/docs/architecture/memory-model/) — barriers around cache maintenance.
+- [DMA](/docs/peripherals/dma/) — the M-profile side of the same story.

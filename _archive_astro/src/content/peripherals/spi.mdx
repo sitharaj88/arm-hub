@@ -1,0 +1,132 @@
+---
+title: SPI
+description: Synchronous serial — clock polarity and phase, master/slave, multi-slave, full-duplex DMA, and the gotchas you only learn on the bench.
+order: 3
+updated: 2026-05-12
+tags: [peripherals, spi]
+---
+
+import Callout from '~/components/Callout.astro';
+
+SPI is the *fast* serial bus on Cortex-M. Up to half the peripheral clock as bit rate (so 42 MHz on an 84 MHz STM32F4 — though signal integrity usually limits you lower). Four wires, no addressing, point-to-point or one-master-many-slaves with chip-select gating.
+
+## The four signals
+
+| Signal | Direction (master perspective) | What it does          |
+|--------|-------------------------------|-----------------------|
+| SCK    | output                        | Clock — drives shift  |
+| MOSI   | output                        | Master Out, Slave In  |
+| MISO   | input                         | Master In, Slave Out  |
+| nCS / SS | output (multi-CS: one per slave) | Active-low chip select |
+
+SPI is **full-duplex** — every clock edge shifts a bit *out* of MOSI and a bit *in* on MISO simultaneously. You always send and receive the same number of bytes.
+
+## CPOL and CPHA — the four modes
+
+The two timing knobs that trip everyone up:
+
+- **CPOL** (Clock Polarity) — 0 = SCK idles low, 1 = idles high.
+- **CPHA** (Clock Phase) — 0 = sample on first edge, 1 = sample on second edge.
+
+| Mode | CPOL | CPHA | SCK idle | Sampled on |
+|------|------|------|----------|------------|
+| 0    | 0    | 0    | low      | rising     |
+| 1    | 0    | 1    | low      | falling    |
+| 2    | 1    | 0    | high     | falling    |
+| 3    | 1    | 1    | high     | rising     |
+
+Most peripherals are mode 0 or mode 3. **Check the device datasheet first**. A timing diagram in the datasheet that shows "data is valid on the rising edge of SCK and SCK idles low" → that's mode 0.
+
+<Callout type="warn" title="Mode mismatch is silent">
+If you set the wrong mode, SPI doesn't error out. It just reads junk — but plausible-looking junk. ID registers come back as 0x00 or 0xFF. Always confirm with a scope when you bring up a new device.
+</Callout>
+
+## Bit order
+
+Most SPI peripherals send MSB first. A handful of older devices (SD cards in SPI mode use MSB; some sensors use LSB) flip it. STM32's `LSBFIRST` bit in `CR1` selects the direction.
+
+## A full read/write transaction
+
+```c
+uint8_t spi_xfer(uint8_t tx) {
+    while (!(SPI1->SR & SPI_SR_TXE));    // wait for TX buffer empty
+    *(volatile uint8_t *)&SPI1->DR = tx; // 8-bit write — IMPORTANT
+    while (!(SPI1->SR & SPI_SR_RXNE));   // wait for RX byte
+    return *(volatile uint8_t *)&SPI1->DR;
+}
+
+void read_id(uint8_t *out) {
+    cs_low();
+    spi_xfer(0x9F);                       // JEDEC ID command
+    out[0] = spi_xfer(0xFF);              // dummy byte → manufacturer
+    out[1] = spi_xfer(0xFF);              // type
+    out[2] = spi_xfer(0xFF);              // capacity
+    cs_high();
+}
+```
+
+<Callout type="note" title="Byte vs half-word writes to DR">
+On STM32, writing a 16-bit value to `SPI1->DR` sends 16 bits per transfer. Writing an 8-bit value (with the `volatile uint8_t *` cast above) sends 8. Cast it the way you mean it — the 16-bit mode silently doubles transfer size if you forget.
+</Callout>
+
+## Multi-slave with software CS
+
+The peripheral can drive one hardware CS pin. If you have multiple slaves on the same SPI bus, you drive each CS as a regular GPIO.
+
+```c
+void with_slave(uint8_t cs_pin, void (*op)(void)) {
+    GPIOA->BSRR = (1 << (cs_pin + 16));   // CS low
+    op();
+    GPIOA->BSRR = (1 << cs_pin);           // CS high
+}
+```
+
+Keep the CS low across the *entire* transaction. Some chips reset state machines when CS goes high.
+
+## Full-duplex DMA
+
+For long transfers, set up two DMA streams — one MOSI-write, one MISO-read — both triggered by the SPI peripheral's TX-empty / RX-not-empty events:
+
+```c
+// TX DMA
+DMA2_Stream3->PAR = (uint32_t)&SPI1->DR;
+DMA2_Stream3->M0AR = (uint32_t)tx_buf;
+DMA2_Stream3->NDTR = len;
+DMA2_Stream3->CR  = DMA_SxCR_CHSEL_0 | DMA_SxCR_DIR_0 | DMA_SxCR_MINC | DMA_SxCR_EN;
+
+// RX DMA
+DMA2_Stream2->PAR = (uint32_t)&SPI1->DR;
+DMA2_Stream2->M0AR = (uint32_t)rx_buf;
+DMA2_Stream2->NDTR = len;
+DMA2_Stream2->CR  = DMA_SxCR_CHSEL_0 | DMA_SxCR_MINC | DMA_SxCR_EN;
+
+SPI1->CR2 |= SPI_CR2_TXDMAEN | SPI_CR2_RXDMAEN;
+SPI1->CR1 |= SPI_CR1_SPE;
+```
+
+The **RX DMA must be enabled before TX DMA** or you'll lose the first byte (because TX completes faster than you can configure RX).
+
+If you only need to **send and discard**, point the RX DMA at a 1-byte sink with `MINC = 0` so all bytes overwrite the same location.
+
+## Slave mode
+
+The same peripheral can be a slave. The master drives SCK and CS; your firmware just responds:
+
+```c
+SPI1->CR1 = 0;                  // clear master mode bit
+SPI1->CR1 |= SPI_CR1_SPE;
+```
+
+CS goes to NSS pin. The peripheral's TX FIFO must be **pre-loaded** before the master starts clocking — otherwise the first byte is whatever was in DR before (often 0xFF).
+
+This is where DMA shines: keep a DMA continuously refilling the TX FIFO so the slave can respond at line rate.
+
+## QSPI / OctoSPI
+
+For external flash, dedicated **Q**uad **SPI** (4 data lines) or **OctoSPI** (8 data lines + DDR) peripherals run 4–16× faster than standard SPI and present the flash as memory-mapped — you can `ldr` directly from a memory-mapped flash address and the peripheral fetches transparently. Configuration is significantly more involved than regular SPI; vendors provide HAL drivers for the common flash command sets (Winbond, Macronix, Cypress).
+
+## See also
+
+- [DMA](/docs/peripherals/dma/) — pairing SPI with DMA in depth.
+- [GPIO](/docs/peripherals/gpio/) — pin AF assignment.
+- [Memory model](/docs/architecture/memory-model/) — barriers around DR reads/writes.

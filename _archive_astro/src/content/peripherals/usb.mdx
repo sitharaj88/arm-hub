@@ -1,0 +1,129 @@
+---
+title: USB device
+description: USB Full-Speed device class on Cortex-M — descriptors, endpoints, control transfers, CDC ACM, and the gotchas of bring-up.
+order: 9
+updated: 2026-05-12
+tags: [peripherals, usb]
+---
+
+import Callout from '~/components/Callout.astro';
+
+USB is the most complex peripheral on a typical Cortex-M. The hardware is non-trivial; the stack on top is *huge*; vendor reference implementations are often tangled. But: implementing a simple USB CDC virtual COM port is now a well-trodden path, and it's worth knowing how to do it from scratch even if you mostly use vendor stacks.
+
+## Speed grades
+
+| Speed       | Bit rate    | Cortex-M support              |
+|-------------|-------------|-------------------------------|
+| Low-Speed   | 1.5 Mbps    | Many — but rarely used        |
+| Full-Speed  | 12 Mbps     | Most Cortex-M with USB        |
+| High-Speed  | 480 Mbps    | M4/M7 with ULPI PHY (external)|
+| SuperSpeed  | 5 Gbps      | Some i.MX RT and STM32H7      |
+
+Full-Speed is what 95% of designs use. High-Speed needs an external ULPI PHY (the on-chip USB block is the link layer; the PHY is a separate chip) — common on STM32H7's OTG_HS port.
+
+## The four endpoint types
+
+USB transfers go through "endpoints" — logical FIFOs in the device. Each endpoint has a number (0–15) and a direction (IN to host, OUT from host).
+
+- **Control** — bidirectional, used for enumeration and standard requests. Every device has endpoint 0 as the control endpoint.
+- **Bulk** — large transfers, error-checked, no latency guarantee. CDC data, mass-storage data.
+- **Interrupt** — small, low-latency, polled by the host. HID mouse/keyboard input.
+- **Isochronous** — fixed bandwidth, no error correction. Audio, video streams.
+
+## Enumeration in 30 seconds
+
+When you plug in:
+
+1. Host detects connect (pull-up on D+ for Full-Speed).
+2. Host resets the device.
+3. Host issues `GET_DESCRIPTOR(DEVICE)` on EP0. Device replies with vendor/product ID, USB version, max packet size.
+4. Host issues `SET_ADDRESS` — device starts responding to its new address.
+5. Host issues `GET_DESCRIPTOR(CONFIGURATION)` — device replies with the full configuration tree (interfaces, endpoints, etc.).
+6. Host issues `SET_CONFIGURATION(1)` — device "activates" its endpoints.
+7. Class-specific setup follows (e.g. CDC `SET_LINE_CODING`).
+
+The whole sequence is ~10-20 control transfers. If your descriptor table is wrong, the host will silently re-enumerate forever (Windows) or print a kernel message (Linux: `dmesg | grep -i usb`).
+
+## Descriptors
+
+The two main descriptors:
+
+### Device descriptor
+
+```c
+static const uint8_t device_desc[] = {
+    0x12,               // bLength
+    0x01,               // bDescriptorType = DEVICE
+    0x00, 0x02,         // bcdUSB = 2.00
+    0x02,               // bDeviceClass = CDC
+    0x00,               // bDeviceSubClass
+    0x00,               // bDeviceProtocol
+    64,                 // bMaxPacketSize0
+    0x83, 0x04,         // idVendor = 0x0483 (STM)
+    0x40, 0x57,         // idProduct
+    0x00, 0x02,         // bcdDevice = 2.00
+    0x01,               // iManufacturer (string index)
+    0x02,               // iProduct
+    0x03,               // iSerialNumber
+    0x01,               // bNumConfigurations
+};
+```
+
+### Configuration descriptor
+
+A nested tree describing interfaces and endpoints. For a CDC ACM (virtual COM port), the typical descriptor is ~67 bytes covering:
+
+- A configuration header.
+- A Communication interface (class 02, subclass 02 ACM).
+- Class-specific descriptors (CDC header, ACM functional, union, call-management).
+- An interrupt endpoint for notifications (rarely actually used).
+- A Data interface (class 0A).
+- Two bulk endpoints (one IN, one OUT) for the actual data.
+
+Writing this from scratch is tedious. Most projects use **TinyUSB** or the vendor's stack and never see the descriptor byte arrays directly.
+
+## CDC ACM — virtual COM port
+
+The simplest useful USB class. Once enumerated, the host shows a `/dev/ttyACM0` (Linux/Mac) or `COMx` (Windows). Bytes you write into the IN endpoint appear at the host; bytes the host writes appear in the OUT endpoint.
+
+```c
+// TinyUSB-style API
+void cdc_write(const char *s) {
+    tud_cdc_write_str(s);
+    tud_cdc_write_flush();
+}
+
+void cdc_task(void) {
+    if (tud_cdc_available()) {
+        char buf[64];
+        uint32_t n = tud_cdc_read(buf, sizeof(buf));
+        process_input(buf, n);
+    }
+}
+```
+
+CDC is what every Arduino, Raspberry Pi Pico, and ESP32 advertises as default. It's the modern UART.
+
+<Callout type="tip" title="Prefer TinyUSB over vendor stacks">
+TinyUSB is a vendor-neutral, MIT-licensed USB stack supporting most Cortex-M with USB. It's smaller, cleaner, better-tested, and easier to port than STM32 USB Device Library, Microchip's MLA, or NXP's middleware. Use it.
+</Callout>
+
+## Power and electrical
+
+- **5 V VBUS** from the host. Most Cortex-M boards add a 3.3 V LDO from VBUS.
+- **D+/D-** differential pair, 90 Ω diff impedance. Keep traces short, equal length, away from switching circuitry.
+- **Pull-ups**: a 1.5 kΩ pull-up on D+ (Full-Speed) tells the host the device is present. Most on-chip USB peripherals have an internal pull-up controlled by a register bit.
+- **Self-powered vs bus-powered**: if your device draws < 100 mA at enumeration and ≤ 500 mA after configuration, you can be bus-powered. Otherwise you need an external supply and your descriptor must declare it.
+
+## Bring-up checklist
+
+1. **48 MHz clock** — most USB FS peripherals need exactly 48 MHz. Configure the PLL.
+2. **VBUS sense** (optional but recommended) — a GPIO that detects when VBUS is present, to handle "host unplugged" gracefully.
+3. **Pull-up enable** — flip the bit *after* the rest of the stack is ready, not before.
+4. **Watch for sticky reset signals** — some chips need the USB block reset after every disconnect.
+
+## See also
+
+- [TinyUSB documentation](https://docs.tinyusb.org/) (external) — the de-facto open-source stack.
+- [GPIO](/docs/peripherals/gpio/) — D+/D- pin configuration.
+- [DMA](/docs/peripherals/dma/) — USB high-speed bulk endpoints typically pair with DMA.

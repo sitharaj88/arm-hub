@@ -1,0 +1,213 @@
+---
+title: SysTick & timing
+description: The universal Cortex-M 24-bit downcounter — how it works, how to use it for an RTOS tick or a delay, and what its limits are.
+order: 9
+updated: 2026-05-12
+tags: [cortex-m, systick, timing]
+---
+
+
+Every Cortex-M has a SysTick — a 24-bit downcounter mapped into the Private Peripheral Bus. It's there specifically so OS ports can have a portable tick source that exists on **every** Cortex-M, regardless of vendor. Even the smallest M0 has one.
+
+<SpecSheet
+  title="SysTick — quick reference"
+  specs={[
+    { label: 'Architectural status', value: 'Mandatory on Cortex-M3 and later; optional on Cortex-M0/M0+/M1 but in practice present on every shipping part' },
+    { label: 'Register block', value: '4 registers at 0xE000_E010: SYST_CSR, SYST_RVR, SYST_CVR, SYST_CALIB' },
+    { label: 'Counter width', value: '24 bits, down-counting from RVR to 0, then auto-reload to RVR' },
+    { label: 'Maximum reload', value: '0x00FF_FFFF (16,777,215) — sets the longest single-period a SysTick can produce' },
+    { label: 'Clock sources', value: 'Processor clock (CLKSOURCE=1) or external reference (CLKSOURCE=0, typically CPU/8, vendor-specific)' },
+    { label: 'Exception number', value: '15 (SysTick), configurable priority via SHPR3.PRI_15' },
+    { label: 'TICKINT', value: 'When set, the counter reaching zero raises the SysTick exception. When clear, the counter still wraps; software polls COUNTFLAG' },
+    { label: 'TrustZone behaviour', value: 'On ARMv8-M, SysTick is banked: SysTick_S and SysTick_NS at the same architectural address are independent counters' },
+    { label: 'Calibration', value: 'SYST_CALIB.TENMS contains the reload value for a 10 ms tick at the reference clock. NOREF and SKEW bits report hardware limitations' },
+  ]}
+/>
+
+## The registers
+
+Four registers at `0xE000_E010`:
+
+| Offset | Name        | Purpose                                |
+|--------|-------------|----------------------------------------|
+| 0x00   | SYST_CSR    | Control and Status — enable, clksource |
+| 0x04   | SYST_RVR    | Reload Value (the period - 1)          |
+| 0x08   | SYST_CVR    | Current Value (counting down)          |
+| 0x0C   | SYST_CALIB  | Calibration — vendor-defined           |
+
+<RegisterMap
+  name="SYST_CSR"
+  address="0xE000_E010"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:17', name: 'reserved', access: 'RES', description: 'Reserved.' },
+    { bits: '16',    name: 'COUNTFLAG', access: 'R',  reset: 0, description: 'Reads 1 if the counter reached 0 since last read. Reading clears it.' },
+    { bits: '15:3',  name: 'reserved', access: 'RES', description: 'Reserved.' },
+    { bits: '2',     name: 'CLKSOURCE', access: 'RW', reset: 0, description: '0 = external reference (vendor wires this — often CPU/8); 1 = processor clock.' },
+    { bits: '1',     name: 'TICKINT',   access: 'RW', reset: 0, description: '1 = SysTick exception fires when counter reaches 0.' },
+    { bits: '0',     name: 'ENABLE',    access: 'RW', reset: 0, description: 'Counter enable.' },
+  ]}
+  caption="SysTick Control and Status Register."
+/>
+
+## A 1 ms tick
+
+The standard incantation:
+
+```c
+#include "cmsis_gcc.h"
+
+void SystemInit_Tick_1ms(void) {
+    SysTick->LOAD = (SystemCoreClock / 1000) - 1;   // 1 ms reload
+    SysTick->VAL  = 0;                               // clear current
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk      // processor clock
+                  | SysTick_CTRL_TICKINT_Msk        // enable IRQ
+                  | SysTick_CTRL_ENABLE_Msk;        // start counting
+
+    NVIC_SetPriority(SysTick_IRQn, 0xF);            // lowest priority
+}
+
+volatile uint32_t ticks;
+
+void SysTick_Handler(void) {
+    ticks++;
+}
+```
+
+`SystemCoreClock` is a CMSIS-provided variable set during clock tree initialisation. At 168 MHz, `(168000000 / 1000) - 1 = 167999`, well below the 24-bit limit of `16777215`.
+
+<Callout type="warn" title="The 24-bit limit bites at very long periods">
+At a 480 MHz core (STM32H7), the max SysTick period is `(2^24 - 1) / 480e6 ≈ 35 ms`. If you need a slower base tick, use the external reference (often CPU/8) or fall back to a 32-bit hardware timer.
+</Callout>
+
+## A precise microsecond delay (no interrupt)
+
+For short blocking delays without committing to an ISR:
+
+```c
+void delay_us(uint32_t us) {
+    uint32_t start = SysTick->VAL;
+    uint32_t reload = SysTick->LOAD + 1;
+    uint32_t ticks_per_us = SystemCoreClock / 1000000;
+    uint32_t total = us * ticks_per_us;
+
+    uint32_t elapsed = 0;
+    uint32_t prev = start;
+    while (elapsed < total) {
+        uint32_t now = SysTick->VAL;
+        uint32_t delta = (prev >= now) ? (prev - now) : (prev + reload - now);
+        elapsed += delta;
+        prev = now;
+    }
+}
+```
+
+The downcounter direction means current value *decreases*. The wrap handling (`prev + reload - now`) covers the case where the counter rolls over while we're polling.
+
+For sub-microsecond resolution at high core clocks, the DWT cycle counter is better — see below.
+
+## The DWT cycle counter
+
+The Data Watchpoint and Trace unit at `0xE000_1000` includes a 32-bit free-running cycle counter, useful for precise profiling:
+
+```c
+void dwt_enable(void) {
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;  // enable DWT
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;              // start counting
+}
+
+uint32_t start = DWT->CYCCNT;
+// ... do work ...
+uint32_t cycles = DWT->CYCCNT - start;
+```
+
+32-bit wide, increments every CPU cycle. At 168 MHz it wraps every ~25 seconds. For longer measurements, sample the counter periodically and accumulate.
+
+<Callout type="note" title="DWT isn't on Cortex-M0">
+Cortex-M0/M0+ has no DWT (it's optional and most M0+ implementations omit it). On M0+ you fall back to SysTick or a hardware timer for profiling.
+</Callout>
+
+## TrustZone considerations
+
+On ARMv8-M, SysTick is duplicated: there's a Secure SysTick and a Non-secure SysTick at the same address range, each visible only from their respective state. RTOSes in both partitions can have independent ticks.
+
+## Calibration register — what SYST_CALIB actually tells you
+
+`SYST_CALIB` is the register most engineers ignore until they need it. It encodes vendor-supplied information about the hardware:
+
+- **TENMS (bits 23:0)** — the reload value that yields a 10 ms tick when SysTick is clocked from the reference clock (CLKSOURCE = 0). If your part runs the reference at CPU/8 and you want a 10 ms tick from the *processor* clock, multiply this by 8.
+- **SKEW (bit 30)** — set to 1 when the 10 ms calibration is approximate (vendor couldn't trim it to exactly 10 ms).
+- **NOREF (bit 31)** — set to 1 when there is no external reference clock; you must use the processor clock.
+
+```c
+/* Inspect calibration at boot to pick the right tick source */
+uint32_t calib = SysTick->CALIB;
+if (calib & SysTick_CALIB_NOREF_Msk) {
+    /* No reference clock — must use processor clock */
+    use_external_ref = false;
+} else if (calib & SysTick_CALIB_SKEW_Msk) {
+    /* Calibration is approximate; use the SystemCoreClock-derived value */
+    reload = (SystemCoreClock / 1000) - 1;
+} else {
+    /* Vendor-provided 10 ms calibration is exact */
+    reload = (calib & SysTick_CALIB_TENMS_Msk) / 10 - 1;  /* 1 ms */
+}
+```
+
+Most embedded codebases ignore SYST_CALIB and compute the reload value directly from `SystemCoreClock / freq`. That's perfectly fine on chips where `SystemCoreClock` is accurate (which means after every PLL update has been reflected through `SystemCoreClockUpdate()`). The calibration value is useful mainly when you don't trust the PLL accuracy or you want a portable tick that doesn't depend on the clock-tree code being correct.
+
+## Jitter sources — why SysTick is "approximate" in practice
+
+SysTick is architecturally precise: the counter decrements exactly once per clock cycle. The jitter that engineers observe in practice has four causes:
+
+1. **Interrupt-entry latency.** When the counter reaches zero, the NVIC pends the SysTick exception, but it doesn't dispatch immediately if a higher-priority handler is running. SysTick is conventionally placed at the *lowest* priority precisely because every other IRQ can delay it; this is the correct design — you want SysTick to be late rather than have it delay something time-critical — but it does mean the ISR runs late.
+2. **Memory wait states.** On parts with flash wait states (most STM32 above 30 MHz), the first instruction fetch in the SysTick handler may cost several cycles. Place the handler in RAM with `__attribute__((section(".ramfunc")))` if this matters.
+3. **Critical-section masking.** `__disable_irq` or `BASEPRI` raised above SysTick's priority will defer the handler. The maximum critical section duration in your code is the floor on SysTick jitter.
+4. **Cache effects** (Cortex-M7 only). The first execution of the SysTick handler after a context switch may miss in the I-cache. After warm-up the cost amortises.
+
+If you need sub-microsecond timing precision, SysTick is not the right tool. Use the DWT cycle counter (M3 and later) or a hardware timer with output-compare configured to assert a pin.
+
+## RTOS tick — what FreeRTOS and Zephyr actually do
+
+Both FreeRTOS and Zephyr use SysTick as the default kernel tick on Cortex-M.
+
+**FreeRTOS** configures SysTick at `configTICK_RATE_HZ` (usually 1000 Hz). The handler is `xPortSysTickHandler` (or `SysTick_Handler` via a macro alias). On every tick the kernel decrements task delay counters, checks for ready-to-run tasks of higher priority, and triggers a context switch through PendSV if one is needed. SysTick runs at the lowest priority; PendSV runs at the lowest priority too; the actual context switch happens in PendSV, not in SysTick, so SysTick stays short. This is the canonical "SysTick + PendSV" pattern documented in every FreeRTOS port.
+
+**Zephyr** does the same thing structurally but with more configuration options. `CONFIG_SYS_CLOCK_TICKS_PER_SEC` sets the rate (default 100, but commonly 1000 or 10000); `CONFIG_TICKLESS_KERNEL=y` enables tickless operation — the kernel reprograms SysTick on demand to the next interesting timeout instead of running it at a fixed rate, saving power. Tickless mode is the default on Zephyr and is one of the reasons Zephyr's idle power on a Cortex-M33 is competitive with bare-metal implementations.
+
+| RTOS | Tick source | Tick rate default | Tickless mode |
+|------|-------------|-------------------|---------------|
+| FreeRTOS | SysTick | 1000 Hz | Optional (configUSE_TICKLESS_IDLE) |
+| Zephyr | SysTick | 100 Hz (10000 Hz on lab boards) | Default-on |
+| ThreadX | SysTick | 100 Hz (configurable) | Optional |
+| RTX5 / CMSIS-RTOS2 | SysTick | 1000 Hz | Configurable |
+| ChibiOS | SysTick | 1000 Hz | Optional |
+
+## Alternatives when SysTick is not enough
+
+SysTick is excellent for a single kernel tick. It is *not* enough when you need:
+
+- **Multiple independent periodic timers.** Use vendor timer peripherals (TIM, GPT, BCTimer). SysTick offers exactly one period.
+- **Sub-microsecond profiling.** Use DWT cycle counter on M3+, or a free-running hardware timer.
+- **Tick rates &gt; ~10 kHz.** SysTick at 10 kHz on a 100 MHz part means an ISR every 10000 cycles — viable but expensive. Vendor timers can autonomous-trigger DMA without per-tick CPU cost.
+- **Wake from deep sleep.** SysTick stops in most deep-sleep modes; you need an RTC or always-on timer that survives the sleep state.
+- **Coordinated multi-domain timing.** On TrustZone parts the Secure and Non-secure SysTicks are independent; if you need a single source of truth across both, use a shared peripheral instead.
+
+<Callout type="warn" title="SysTick stops when the CPU is halted">
+Under a debugger, when the CPU is at a breakpoint, SysTick stops counting on most parts (the `DBG_HALT` debug control bit controls this). This is usually what you want — your delay routines don't fire while you're stepping — but it means tick-based timeouts won't expire while halted. If you're debugging an OTA update or a network protocol with hardware-enforced timeouts, disable `DBG_HALT` for SysTick (vendor-specific; on STM32 it's `DBGMCU->APB1FZR1`) to keep the counter alive across breakpoints.
+</Callout>
+
+## Cross-references
+
+- [NVIC deep dive](/docs/cortex-m/nvic/) — SysTick priority and the broader exception model.
+- [NVIC priority](/docs/cortex-m/nvic-priority/) — why SysTick goes at the lowest priority.
+- [Timers & PWM](/docs/peripherals/timers/) — vendor hardware timers when SysTick isn't enough.
+- [FreeRTOS](/docs/rtos/freertos/) — what the FreeRTOS port does with SysTick.
+- [Cortex-M3](/docs/cortex-m/m3/) — first core with DWT alongside SysTick.
+- [Cortex-M lineup](/docs/cortex-m/lineup/) — which cores include the DWT escape hatch.
+- [ARMv7-M vs ARMv8-M](/docs/architecture/armv7m-armv8m/) — SysTick banking under TrustZone.
+- [CMSIS](/docs/programming/cmsis/) — `SysTick_Config` and the `SystemCoreClock` variable.
+- [QEMU & Renode](/docs/tools/sim/) — both simulate SysTick faithfully.
+- [Interrupt latency tool](/tools/interrupt-latency) — model SysTick jitter under load.

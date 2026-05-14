@@ -1,0 +1,144 @@
+---
+title: CMSIS
+description: The Cortex Microcontroller Software Interface Standard — what's in it, why every vendor ships it, and the parts you actually use.
+order: 2
+updated: 2026-05-12
+tags: [programming, cmsis, abstraction]
+---
+
+import Callout from '~/components/Callout.astro';
+
+CMSIS is ARM's standardised abstraction layer for Cortex-M development. It started life as a thin layer over the core registers (NVIC, SysTick, SCB) so vendor SDKs could share an API. It's grown into a sprawling family of standards covering core, DSP, NN inference, RTOS APIs, build configurations, and pack management. The good news: most of it is optional. The parts you'll actually touch are a few headers and a handful of functions.
+
+## CMSIS layers
+
+| Layer        | What it is                                            | Header                     |
+|--------------|-------------------------------------------------------|----------------------------|
+| **Core**     | Cortex-M core registers (NVIC, SysTick, SCB, FPU)     | `cmsis_gcc.h`, `core_cm4.h`|
+| **Device**   | Vendor's MCU register map (SVD-generated)              | `stm32f4xx.h`              |
+| **Driver**   | Standardised driver API (not widely adopted)           | `Driver_USART.h`           |
+| **DSP**      | Hand-tuned DSP library                                 | `arm_math.h`               |
+| **NN**       | Quantised neural-net kernels (Helium-aware)            | `arm_nnfunctions.h`        |
+| **RTOS2**    | Vendor-neutral RTOS API                                | `cmsis_os2.h`              |
+| **Pack**     | Build/package format (CMSIS-Pack)                      | `*.pack` files             |
+
+In practice, almost every project uses **Core + Device**. DSP is used when needed. RTOS2 has thin uptake (most projects use FreeRTOS or Zephyr directly). Driver is rarely used. NN is gaining traction with M55/M85.
+
+## CMSIS-Core in practice
+
+The functions you'll call repeatedly:
+
+```c
+// Interrupts
+__enable_irq();
+__disable_irq();
+__set_PRIMASK(0);                          // enable
+__set_BASEPRI(0x60);                       // mask all but priority < 6 (with 4 bits implemented)
+
+NVIC_EnableIRQ(USART2_IRQn);
+NVIC_DisableIRQ(USART2_IRQn);
+NVIC_SetPriority(USART2_IRQn, 5);
+NVIC_SetPendingIRQ(USART2_IRQn);
+NVIC_ClearPendingIRQ(USART2_IRQn);
+
+// SysTick
+SysTick_Config(SystemCoreClock / 1000);     // 1 ms tick
+
+// Barriers
+__DMB(); __DSB(); __ISB();
+
+// Wait-for-event / wait-for-interrupt
+__WFI(); __WFE();
+
+// CPU features
+__CLZ(value);            // count leading zeros
+__REV(value);            // byte-reverse
+__RBIT(value);           // bit-reverse
+__SSAT(value, 12);       // saturate to signed 12-bit
+__SMLAD(a, b, acc);      // dual MAC (M4+)
+
+// Cache (M7 only)
+SCB_EnableICache();
+SCB_EnableDCache();
+SCB_CleanDCache_by_Addr((uint32_t *)buf, len);
+SCB_InvalidateDCache_by_Addr((uint32_t *)buf, len);
+
+// MPU (when present)
+ARM_MPU_Disable();
+ARM_MPU_SetRegion(rnr, rbar, rasr);
+ARM_MPU_Enable(MPU_CTRL_PRIVDEFENA_Msk);
+```
+
+## CMSIS-Device — the register map
+
+Each vendor ships a CMSIS-Device package, typically generated from an SVD (System View Description) XML file. The result: a header `stm32f407xx.h` that defines:
+
+```c
+typedef struct {
+    __IO uint32_t MODER;
+    __IO uint32_t OTYPER;
+    // ...
+} GPIO_TypeDef;
+
+#define GPIOA   ((GPIO_TypeDef *)0x40020000)
+#define GPIOA_BASE 0x40020000
+```
+
+This is what lets you write `GPIOA->MODER = ...` portably. `__IO`, `__O`, `__I` are CMSIS macros expanding to `volatile`, `volatile`, `const volatile` respectively.
+
+The SVD file itself is useful — Eclipse Embedded, OpenOCD, and most debuggers can use it to display peripheral registers symbolically when you halt.
+
+## CMSIS-DSP — the killer feature
+
+CMSIS-DSP is a hand-tuned library implementing:
+
+- FIR/IIR/biquad filters.
+- FFTs (radix-2, mixed-radix, RFFT).
+- Matrix operations.
+- Statistics (mean, RMS, std-dev).
+- Math functions (vector sin/cos/log via lookup tables).
+
+It's *fast*. The Cortex-M4 dual-MAC variants of these routines are essentially the optimal C implementation. The Cortex-M55/M85 variants use Helium and pull another 4–5× speedup automatically.
+
+```c
+#include "arm_math.h"
+
+arm_fir_instance_q15 fir;
+q15_t state[BLOCK_SIZE + NUM_TAPS - 1];
+q15_t coeffs[NUM_TAPS] = { /* ... */ };
+
+arm_fir_init_q15(&fir, NUM_TAPS, coeffs, state, BLOCK_SIZE);
+arm_fir_q15(&fir, input, output, BLOCK_SIZE);
+```
+
+Use the data type that matches your data — `q15` for 16-bit fixed point, `q31` for 32-bit, `f32` for single-precision float. The fixed-point versions are usually 3–5× faster than float when the FPU isn't single-issue with the rest of the pipeline.
+
+## CMSIS-RTOS2 — the standard RTOS API
+
+CMSIS-RTOS2 is a vendor-neutral RTOS API. There's a reference implementation (Keil RTX5) and a FreeRTOS adapter; both expose:
+
+```c
+osThreadId_t tid = osThreadNew(my_thread, NULL, NULL);
+osThreadFlagsSet(tid, 0x01);
+osDelay(100);
+osMutexAcquire(mid, osWaitForever);
+osMessageQueuePut(mq, &msg, 0, 100);
+```
+
+The intent is portability — you can switch the RTOS underneath without rewriting application code. In practice, projects usually pick FreeRTOS or Zephyr and stay there because the ecosystems are bigger. CMSIS-RTOS2 sees most use in certified environments (medical, automotive) where the abstraction is part of the spec.
+
+<Callout type="note" title="CMSIS isn't a HAL">
+CMSIS gives you symbolic register names. It doesn't tell you how to use the peripherals. That's the vendor's HAL (STM32 HAL, NXP MCUXpresso SDK, Nordic nrfx) — built *on top of* CMSIS. Many projects skip the vendor HAL and write directly to the registers using CMSIS names.
+</Callout>
+
+## CMSIS-Pack
+
+A `.pack` file is a zip containing CMSIS device headers, drivers, examples, and an XML manifest. Keil µVision and a few other tools consume them directly; most open-source workflows ignore them and pull the relevant headers from vendor GitHub repos.
+
+ARM hosts the central [CMSIS Pack repository](https://www.keil.arm.com/packs/) — useful for finding vendor packs even if you don't use Keil.
+
+## See also
+
+- [Embedded C patterns](/docs/programming/embedded-c/) — what to write *between* the CMSIS calls.
+- [Linker scripts](/docs/programming/linker-scripts/) — the CMSIS startup file structure.
+- [Toolchain](/docs/tools/toolchains/) — building against CMSIS headers.

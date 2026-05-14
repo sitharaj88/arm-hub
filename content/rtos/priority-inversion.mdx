@@ -1,0 +1,180 @@
+---
+title: Priority inversion
+description: How a high-priority task gets blocked by a low-priority one through a shared mutex. The Mars Pathfinder story. Priority inheritance, priority ceiling protocol, and how FreeRTOS / Zephyr / ThreadX implement them.
+order: 3
+updated: 2026-05-13
+tags: [rtos, priority-inversion, mutex, inheritance, ceiling-protocol]
+---
+
+Priority inversion is the classic real-time pathology: a high-priority task waits, indirectly, for a low-priority one — sometimes indefinitely. It was famously implicated in the 1997 Mars Pathfinder mission, where a system-reset cycle on the lander was traced to an unbounded inversion involving the spacecraft's information bus. The fix (priority inheritance) was uploaded over deep-space radio; the lander resumed working. Every embedded engineer has heard the story, but fewer can explain exactly what went wrong, why priority inheritance works, and why it's still not enough for some safety-critical systems (which need the priority ceiling protocol instead).
+
+This page walks through both protocols, their guarantees, their failure modes, and how the major RTOSes implement them.
+
+<SpecSheet
+  title="Priority inversion at a glance"
+  specs={[
+    { label: 'Definition', value: 'A high-priority task is blocked by a medium-priority task while a low-priority task holds a mutex the high-priority task needs.' },
+    { label: 'Unbounded inversion', value: 'When the inverted blocking time has no fixed upper bound — depends on the runtime behaviour of medium-priority tasks.' },
+    { label: 'Priority inheritance', value: 'The lock holder temporarily inherits the priority of the highest waiter. Used by FreeRTOS xSemaphoreCreateMutex, Zephyr K_MUTEX, ThreadX, pthread_mutex with PTHREAD_PRIO_INHERIT.' },
+    { label: 'Priority ceiling protocol', value: 'Each mutex has a static "ceiling" = max priority of any task that locks it. When a task takes the mutex, it boosts to the ceiling immediately.' },
+    { label: 'Trade-off', value: 'Inheritance is reactive (cheap, but transient boost only triggers on contention). Ceiling is proactive (more aggressive boost, prevents some deadlocks).' },
+  ]}
+/>
+
+## The Mars Pathfinder anecdote
+
+July 1997. NASA's Pathfinder lander is on Mars. Every few days, the spacecraft's information bus task — high priority, processed sensor data — was being starved long enough that a watchdog tripped and the system reset itself. Loss of science data each reset; the JPL team had to diagnose remotely.
+
+The root cause turned out to be a three-task interaction:
+
+- **Task H** (high priority): the information bus task.
+- **Task M** (medium priority): a meteorological data communications task.
+- **Task L** (low priority): a low-priority task that occasionally needed the same mutex as Task H to publish a record to the bus.
+
+Sequence:
+1. Task L locks the mutex and starts publishing a record.
+2. Task H becomes ready, tries to take the mutex, blocks (it's held by L).
+3. Task M, which never touches the mutex but has higher priority than L, becomes ready and preempts L.
+4. L cannot run because M is running. H cannot run because it's blocked on the mutex L holds. Result: H is blocked for as long as M wants — unbounded inversion.
+5. Eventually the watchdog times out and resets the spacecraft.
+
+The fix uploaded to the spacecraft enabled **priority inheritance** on the offending mutex. With inheritance, step 3 above changes: when H blocks on the mutex L holds, L's priority is temporarily boosted to H's level. Now M cannot preempt L (because L is at H's priority), L finishes, releases the mutex, drops back to its original priority, and H proceeds.
+
+The textbook version of the story is well-known. The detail less often noted: VxWorks shipped priority inheritance as a *feature you had to opt into*, and the Pathfinder team had left it disabled by default to save microseconds. The lesson is not just "enable inheritance" but "understand what your RTOS does by default."
+
+<TimingDiagram
+  title="Unbounded priority inversion — H, M, L racing on one mutex"
+  signals={[
+    { name: 'Task H (high)',  wave: '00010001', tone: 'destructive' },
+    { name: 'Task M (mid)',   wave: '00001100', tone: 'warning' },
+    { name: 'Task L (low)',   wave: '11100010', tone: 'muted' },
+    { name: 'Mutex held by L', wave: '11100011', tone: 'accent' },
+  ]}
+  markers={[
+    { x: 2, label: 'H ready, blocks on mutex' },
+    { x: 3, label: 'M preempts L — inversion' },
+    { x: 5, label: 'M done, L resumes' },
+    { x: 6, label: 'L releases, H runs' },
+  ]}
+  caption="L holds the mutex; H becomes ready and blocks on it; an unrelated medium-priority task M preempts L and keeps H starved for as long as it likes. Priority inheritance boosts L to H's priority while it owns the mutex, preventing M from running until L releases."
+/>
+
+## Why inversion is hard to spot
+
+The inversion is invisible until medium-priority work happens to fill the window. In testing, your medium task might never run while the mutex is held. In the field, with realistic load and timing, the conjunction occurs occasionally. Bugs that surface once a week in deployment are the worst kind to debug.
+
+Tracing tools (Tracealyzer, Percepio Tracealyzer, SystemView, Zephyr's tracing) make inversions visible — you can see Task H blocking, the lock holder (L) being preempted, and the gap. If your system has hard deadlines, you need a way to verify mutex holding times don't get extended by unrelated medium-priority work.
+
+## Priority inheritance
+
+The fundamental idea: if a lower-priority task holds a resource that a higher-priority task needs, temporarily raise the lower task's priority so unrelated medium tasks cannot preempt it. As soon as the resource is released, drop back to the original priority.
+
+Formal rules:
+
+1. When task H blocks on a mutex held by task L, **L's effective priority becomes max(L_original, H)**.
+2. If multiple waiters of different priorities exist, L inherits the maximum of all waiters' priorities.
+3. When L releases the mutex, L's priority drops back. If L holds *other* mutexes with waiters, it stays at the max of those waiters' priorities.
+4. Inheritance is **transitive**: if L holds mutex A and is waiting on mutex B held by K, and H blocks on A waiting for L, then K's priority also gets boosted to H — because K is indirectly blocking H.
+
+Implementation cost is modest: each mutex tracks its waiter list (sorted by priority); the task's priority structure tracks the set of mutexes it holds. On mutex acquire/release, walk the structures, recompute effective priority, possibly reschedule.
+
+### Limitations
+
+Inheritance bounds the inversion to **one** critical section per mutex per blocking task, but the bound can still be substantial:
+
+- If the mutex protects a long critical section (e.g., 50 ms flash erase), H waits 50 ms.
+- Nested mutexes can chain inheritance; the bound is the longest chain.
+- **Deadlock is not prevented.** If task A holds mutex 1 and tries to take mutex 2, while task B holds mutex 2 and tries to take mutex 1, both deadlock. Inheritance doesn't help — it only boosts priorities, doesn't detect cycles.
+
+Inheritance is the *de facto* standard solution. It's cheap, it's local (no system-wide configuration), and it bounds inversion to the critical section length — which is the engineer's responsibility to keep short.
+
+## Priority ceiling protocol (PCP)
+
+PCP is more aggressive. Every mutex has a **static ceiling** equal to the priority of the highest-priority task that *could* ever lock it. When a task takes the mutex, it immediately boosts to the ceiling — regardless of whether any high-priority task is currently waiting.
+
+Two variants:
+
+- **Original PCP (Sha-Rajkumar-Lehoczky)**: a task can only lock a mutex if its priority is strictly greater than the ceilings of all *currently locked* mutexes by other tasks. This prevents nested-locking deadlock entirely.
+- **Immediate priority ceiling protocol (IPCP)** or "highest locker protocol": simpler — on lock acquire, immediately boost to the ceiling. No chained checks.
+
+IPCP is what most "ceiling-protocol-capable" RTOSes actually implement (it's much simpler and almost as effective).
+
+### Guarantees PCP provides over inheritance
+
+1. **Bounded blocking per task, not per mutex.** A task can be blocked by at most *one* critical section in its lifetime, ever. Inheritance bounds per-mutex, not per-task.
+2. **Deadlock-free.** Original PCP's locking rule provably avoids nested deadlock.
+3. **Higher predictability.** The blocking bound is computable at design time from the mutex ceilings.
+
+### Cost
+
+PCP requires the ceiling to be configured at design time — every task that *could* lock a mutex must be enumerated. In a system with dynamic task creation or modular plugins, this is awkward. Inheritance has no such requirement.
+
+PCP also boosts more aggressively, which can starve unrelated medium-priority tasks that the engineer expected to run alongside.
+
+The compromise that some systems use: inheritance for general-purpose mutexes (no design-time burden), PCP for a small number of safety-critical resources (where the design-time work is justified).
+
+## Comparison
+
+<CoreCompare
+  rows={[
+    { core: 'No protocol', notes: 'Unbounded inversion possible. Never use a plain binary semaphore for mutual exclusion in a priority-preemptive system.' },
+    { core: 'Priority inheritance (PIP)', notes: 'Reactive boost on contention. Per-mutex bounded blocking. Deadlock still possible. Almost universal default in modern RTOSes.' },
+    { core: 'Priority ceiling protocol (PCP)', notes: 'Proactive boost to ceiling on every lock. Per-task bounded blocking. Deadlock-free. Requires design-time configuration. Used in DO-178 and ISO 26262 systems.' },
+    { core: 'Immediate ceiling (IPCP)', notes: 'Simplified PCP. Most RTOSes that advertise "ceiling protocol" implement this variant.' },
+    { core: 'Disable interrupts in critical section', notes: 'No blocking possible at all. Only viable for very short sections (≤ microseconds). Used for atomic register access.' },
+  ]}
+/>
+
+## How the major RTOSes implement it
+
+**FreeRTOS**: priority inheritance is automatic for mutexes created with `xSemaphoreCreateMutex()`. *Not* applied to binary or counting semaphores (which are not mutexes — they don't have an owner). Mutex holder is tracked; on a higher-priority block, holder's priority is boosted. The implementation is in `tasks.c` (`prvTaskPriorityInherit` and `prvTaskPriorityDisinherit`). No ceiling protocol.
+
+```c
+SemaphoreHandle_t mutex = xSemaphoreCreateMutex();   // PIP enabled
+xSemaphoreTake(mutex, portMAX_DELAY);
+// critical section
+xSemaphoreGive(mutex);
+```
+
+**Zephyr**: priority inheritance for `k_mutex`. Configurable mutex priority ceiling not supported directly, but `K_PRIO_PREEMPT` and `K_PRIO_COOP` allow a hybrid scheme where cooperative-priority tasks don't get preempted within their priority band — effectively an implicit ceiling. The implementation is in `kernel/mutex.c`.
+
+**ThreadX**: priority inheritance via `tx_mutex_create(..., TX_INHERIT, ...)`. The inherit flag must be set explicitly at create time — defaults to `TX_NO_INHERIT`. ThreadX also supports "preemption threshold," a per-task setting that lets a task disable preemption from tasks below a threshold priority — a per-task version of ceiling.
+
+**RT-Thread**: priority inheritance for `rt_mutex_t`. Default behaviour, can't be disabled. Implementation in `src/ipc.c`.
+
+**SAFERTOS** (the IEC 61508 SIL 3 version of FreeRTOS): the safety variant retains priority inheritance as in FreeRTOS but adds verification that the mutex implementation conforms to its safety case. PCP not provided — the FreeRTOS heritage made inheritance the obvious choice.
+
+**VxWorks**: configurable per-mutex; supports both inheritance and ceiling protocols. The default depends on the version and build.
+
+**QNX**: priority inheritance via standard POSIX mutex with `PTHREAD_PRIO_INHERIT`. PCP via `PTHREAD_PRIO_PROTECT` and a per-mutex ceiling. POSIX standardised this in IEEE 1003.1.
+
+## When neither protocol is enough
+
+There are workloads where even priority inheritance leaves unacceptable blocking. Two design alternatives:
+
+**Lock-free data structures.** Single-producer / single-consumer queues use atomic head and tail pointers and no mutex at all. Multi-producer or multi-consumer cases use CAS (compare-and-swap) with retries. No blocking, no inversion. Cost: subtle to get right, requires architectural support (LDREX/STREX on ARM).
+
+**Message-passing instead of shared state.** If task H needs a record from task L, send L a message asking for it rather than sharing a structure with a lock. The message queue handles the synchronisation; no mutex is held across user code. This is the Erlang / actor model, and it's a strong default for inter-task communication in event-driven embedded systems.
+
+<Callout type="tip">
+A practical heuristic: never hold a mutex across any operation that could block for more than a few microseconds. No flash erase under a mutex. No `printf` under a mutex (it can block on UART). No queue waits under a mutex. Keep critical sections measured-in-nanoseconds-short, and even simple priority inheritance is enough to bound blocking to negligible levels.
+</Callout>
+
+## Detecting and measuring inversion
+
+Use a tracing tool. The signature is unmistakable: a high-priority task in "blocked on mutex" state while a medium-priority task is running, neither acquiring nor releasing the mutex. Without tracing, look for:
+
+- Periodic deadline misses that correlate with some unrelated heavy task running
+- Watchdog timeouts on otherwise-healthy tasks
+- Reports of "the system is fine until X happens" where X is medium-priority work
+
+Add instrumentation: log lock-hold times for each mutex (start timestamp at acquire, delta at release). Alert if any hold exceeds the lock's ceiling response-time budget. This catches creeping critical-section bloat as code evolves.
+
+## Further reading
+
+- [RTOS scheduling](/docs/rtos/scheduling) — fixed-priority preemptive context
+- [IPC primitives](/docs/rtos/ipc) — mutex vs semaphore vs queue, when to use which
+- [FreeRTOS](/docs/rtos/freertos) — mutex API details
+- [NVIC priority](/docs/cortex-m/nvic-priority) — ISR-level priority and how it relates to task priority
+- Sha, L., Rajkumar, R. & Lehoczky, J.P. (1990) "Priority Inheritance Protocols: An Approach to Real-Time Synchronization", IEEE TC 39(9)
+- NASA JPL Pathfinder anecdote: research.microsoft.com/~mbj/Mars_Pathfinder/

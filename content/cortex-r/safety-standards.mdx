@@ -1,0 +1,133 @@
+---
+title: Safety standards (ISO 26262 / IEC 61508)
+description: How Cortex-R-based designs meet functional safety standards — ISO 26262 ASIL classification, IEC 61508 SIL, DO-178C for avionics, IEC 62304 for medical. What ARM ships as "safety packs" and what the integrator still owns.
+order: 7
+updated: 2026-05-13
+tags: [cortex-r, safety, iso-26262, iec-61508, asil, functional-safety]
+---
+
+If you're building a brake-by-wire ECU, an industrial robot's emergency-stop controller, or a railway signalling box, the silicon that runs your code can't just "be correct most of the time." It has to meet a *functional safety standard* — a document that prescribes what evidence you need to demonstrate that random hardware faults and systematic software defects can be detected, controlled, and recovered from within a defined time budget. Cortex-R cores exist primarily to serve these markets: their lockstep, ECC, and MPU features map almost directly to the diagnostic-coverage requirements in ISO 26262 and IEC 61508.
+
+This page walks through the standards landscape, what's actually being claimed in a "safety MCU" datasheet, what ARM ships in its safety packages, and what work the integrator still has to do on top.
+
+<SpecSheet
+  title="Functional safety — the landscape"
+  specs={[
+    { label: 'IEC 61508', value: 'Generic functional safety for electrical/electronic/programmable systems. SIL 1 (lowest) through SIL 4 (highest). Parent of most domain-specific standards.' },
+    { label: 'ISO 26262', value: 'Automotive functional safety. ASIL A/B/C/D — D is the highest. Derived from IEC 61508 but tuned for road-vehicle hazard analysis.' },
+    { label: 'IEC 61511', value: 'Process industry derivative of 61508 (oil & gas, chemical plant). SIL 1..4.' },
+    { label: 'EN 50128 / EN 50657', value: 'Railway software / hardware. SIL 0..4.' },
+    { label: 'IEC 62304', value: 'Medical device software. Class A/B/C by patient-harm risk.' },
+    { label: 'DO-178C / DO-254', value: 'Civil avionics — software (178C) and hardware (254). DAL A (catastrophic failure → loss of aircraft) through DAL E (no effect).' },
+    { label: 'ISO 25119', value: 'Agricultural / forestry machinery. AgPL a..e.' },
+    { label: 'Safety integrity targets', value: 'ASIL D ≈ SIL 3 ≈ DAL B — quantitatively: probabilistic failure rate < 10⁻⁸/hour for single-point faults.' },
+  ]}
+/>
+
+## What "safety standard" actually means
+
+A functional-safety standard is a *process* standard plus a *quantitative* standard, bundled together. The process side says: you must do hazard analysis, derive safety goals, allocate them to hardware and software requirements, trace every requirement to a test, control your tools, audit your suppliers. The quantitative side says: your hardware has to fail less than X times per hour (random fault), and your design has to detect at least Y% of those faults that do occur (diagnostic coverage).
+
+For Cortex-R targets, the numbers people quote most often are:
+
+| Metric | ASIL D (ISO 26262) | SIL 3 (IEC 61508) |
+|--------|---------------------|--------------------|
+| Single-point fault metric (SPFM) | ≥99% | ≥99% |
+| Latent fault metric (LFM) | ≥90% | ≥90% |
+| PMHF (Probabilistic Metric for random Hardware Failures) | &lt;10⁻⁸ failures/hour | &lt;10⁻⁸/hour |
+| Tool qualification | TCL 3 (highest scrutiny) | T3 |
+| Software unit-test coverage | 100% MC/DC (Modified Condition/Decision Coverage) for ASIL D | Structural coverage required |
+
+Diagnostic coverage of 99% sounds hard until you realize it's exactly what dual-core lockstep buys you for free: a stuck-at fault inside the core hits one lane but not the other, the comparator screams, and the safety mechanism activates. ARM ships analyses that show the lockstep + ECC + MPU triad gives you ~99% SPFM and ~95% LFM on a Cortex-R52, leaving only ~1% of fault modes for the integrator to cover with software techniques.
+
+## How Cortex-R features map to coverage
+
+The Cortex-R cores were designed with a specific shopping list of safety mechanisms. Each one targets a category of fault mode:
+
+| Cortex-R feature | Fault mode addressed | Coverage contribution |
+|-------------------|----------------------|------------------------|
+| Dual-core [lockstep](/docs/cortex-r/lockstep) | Permanent and transient logic faults inside the core | ~95% of core faults (single-point) |
+| [ECC on TCM/cache](/docs/cortex-r/ecc) | Single-event upsets in SRAM | 100% single-bit correction, double-bit detection |
+| Parity on bus interfaces | Transient errors on AXI/AHB | ~80% bus-error coverage |
+| [MPU](/docs/cortex-r/mpu-tcm) per privilege level | Software-induced memory corruption | Required for FFI (Freedom From Interference) |
+| Built-in self-test (BIST) | Boot-time validation of logic and memory | Boot-time fault detection |
+| Diversity (R52 split mode) | Common-cause failures across redundant channels | When paired with diverse software |
+| Watchdog timers (windowed + Q&A) | Software hang, control-flow corruption | Required for ASIL B and above |
+
+Diagnostic coverage isn't additive — you can't take 95% from lockstep and 100% from ECC and claim 195%. The standards require you to map every fault mode in the failure-mode and diagnostic-analysis (FMEDA) spreadsheet to the safety mechanism(s) that detect it, then compute coverage on a per-fault-mode basis. ARM provides FMEDAs for its cores; SoC vendors extend them for the full chip; you extend them again for the board.
+
+<Callout type="warn">
+Coverage numbers in datasheets are typically given for "random hardware faults" only. Systematic faults — bugs in the silicon design, bugs in the toolchain, bugs in your code — are not in those numbers. They're addressed by the *process* side of the standard: design reviews, structured V&V, change control, configuration management. Most safety projects spend 70% of their effort on systematic-fault prevention and 30% on the random-fault math.
+</Callout>
+
+## "Safety pack" — what ARM actually ships
+
+For each safety-targeted core (Cortex-R5, R52, M7-R, M0-DualCore), ARM publishes a "Safety Package" containing:
+
+- **Safety Manual** — describes the core's safety mechanisms, configuration constraints, and how to use them.
+- **FMEDA spreadsheet** — fault-mode analysis at the core level: every block, every fault mode, every safety mechanism that catches it, the resulting coverage.
+- **Safety Case Report** — ARM's evidence that the core meets the target SIL/ASIL.
+- **Development Interface Agreement** — documents what ARM did vs what the SoC vendor must do.
+- **Certification reports** — typically TÜV SÜD or SGS-TÜV Saar third-party attestation against IEC 61508 SIL 3 (extending to ASIL D for the vehicle case).
+
+The certifications cover the *core IP* — not the SoC, not your board, not your firmware. The SoC vendor (TI, NXP, STM, Renesas) takes the safety pack, extends it to cover their peripherals, and re-certifies the full chip. TI's Hercules family, NXP S32, ST SPC58, Renesas RH850 all hold SIL 3 / ASIL D certifications at the chip level.
+
+## Tool qualification
+
+The compiler you use to build safety-critical code has to be qualified. Under ISO 26262 the relevant clause is "tool confidence level" (TCL):
+
+- **TCL 1** — tool error has no impact on safety, *or* the impact can be detected by other tool/process means.
+- **TCL 2** — moderate confidence required.
+- **TCL 3** — high confidence required. Mandatory for tools whose output is included in the final product without further verification — i.e., your C compiler.
+
+A TCL 3 compiler isn't just "GCC with a sticker." Vendors like Green Hills, IAR, TI Code Composer, ARM Compiler 6 publish qualification packages: test suites, error-rate analysis, change-control evidence, support contracts. GNU GCC can be qualified through third parties (AdaCore's GNAT Pro Safety-Critical, OpenST Safety GCC) but you pay for the qualification.
+
+If you use an unqualified tool, you must compensate elsewhere — typically by 100% MC/DC unit testing of every generated binary, which makes the qualified compiler cheaper in practice for large projects.
+
+<Callout type="note">
+The C language standard itself is also a safety risk. MISRA C (currently MISRA C:2012 + Amendment 4) is the subset universally required: no recursion, no dynamic allocation outside init, no goto except in error-handling, mandatory braces on every `if`, no implicit casts. Verify with [static analysis](/docs/tools/static-analysis) — Polyspace, LDRA, PRQA, Coverity. Conformance is a contractual deliverable.
+</Callout>
+
+## Software design — the FFI requirement
+
+"Freedom From Interference" is the rule that lower-ASIL software cannot cause higher-ASIL software to fail. If a QM (Quality Managed — no ASIL) infotainment task shares an MCU with an ASIL D brake task, the brake task must be protected from the infotainment task by:
+
+- **Spatial separation** — different MPU regions, enforced by the kernel or partition manager.
+- **Temporal separation** — time-budgeted scheduling. The brake task gets its slot regardless of what infotainment is doing.
+- **Communication boundary** — no shared state except via vetted, bounded queues.
+
+Cortex-R MPUs (and the partition support in safety-RTOSes like SAFERTOS, ThreadX SMP, PikeOS) make this enforceable. Without the MPU you're relying on software-only memory partitioning, which the standard considers insufficient for ASIL C and above.
+
+## The integrator's checklist
+
+Even on a SIL 3 certified chip, the project still has to:
+
+1. **Hazard and Risk Assessment** — derive the vehicle-level (or process-level) safety goals. Took us six months on a recent project; not optional.
+2. **Allocate goals to ASIL/SIL levels** — each safety goal gets an ASIL via the S×E×C combination (severity × exposure × controllability).
+3. **Derive technical safety requirements** — each goal becomes a measurable, testable requirement.
+4. **Architect the hardware** — pick the safety mechanisms, do board-level FMEDA, demonstrate PMHF target met.
+5. **Architect the software** — partition by ASIL, document FFI, choose a qualified RTOS (see [safety-certified RTOS](/docs/rtos/safety-rtos)).
+6. **Implement under MISRA** — code review, structured V&V, MC/DC tests.
+7. **Tool-qualify the toolchain** — compiler, linker, debugger, test framework.
+8. **Operational safety analysis** — what happens at boot, at shutdown, at field service, at end-of-life.
+9. **Safety case** — assemble all evidence into one document; submit to assessor.
+
+This is typically a 2–4 year program for a new automotive ECU and longer for new rail or aviation. The Cortex-R hardware and qualified RTOS shrink the hardware-side effort; nothing shrinks the process side.
+
+## Audit, assessment, release
+
+A safety project ends (or, more accurately, begins shipping) with a third-party assessment. For ISO 26262 that's typically an accredited assessor — TÜV, Bureau Veritas, exida — who reads the safety case, asks pointed questions, samples the evidence, and either signs the conformance statement or sends you back with a punch list.
+
+For DO-178C avionics the equivalent is the *DER* (Designated Engineering Representative) acting on behalf of the FAA. Medical (IEC 62304) goes to a notified body for CE marking and to the FDA for 510(k) clearance.
+
+Plan the assessor's involvement *early*. They cannot bless work they didn't see being done; retrofitting evidence to a system already in production is roughly impossible. The Cortex-R cores and certified RTOSes are merely the table-stakes — the value-add of working with safety-graded silicon is that the vendor has already taken the same assessor through the IP, and you get to inherit their results.
+
+## Cross-references
+
+- [Lockstep & ASIL](/docs/cortex-r/lockstep) — the safety mechanism that buys most of your coverage
+- [ECC & error detection](/docs/cortex-r/ecc) — memory-fault diagnostic coverage
+- [MPU & TCM on Cortex-R](/docs/cortex-r/mpu-tcm) — Freedom From Interference enforcement
+- [Cortex-R52 cluster mode](/docs/cortex-r/r52-cluster) — split vs lockstep, mixed configurations
+- [Safety-certified RTOS](/docs/rtos/safety-rtos) — qualified kernel layer
+- [Static analysis](/docs/tools/static-analysis) — MISRA-C and beyond
+- ISO 26262:2018, IEC 61508:2010, DO-178C, IEC 62304:2006 — the canonical standards documents

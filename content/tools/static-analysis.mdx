@@ -1,0 +1,158 @@
+---
+title: Static analysis for firmware
+description: Catching bugs before the firmware runs — clang-tidy, scan-build, Coverity, Polyspace, PC-lint Plus, Cppcheck, MISRA-C 2012 conformance, and how to make CI gating actually useful.
+order: 19
+updated: 2026-05-13
+tags: [tools, static-analysis, misra, lint, polyspace, coverity, ci]
+---
+
+Static analysis runs your firmware source through a checker that flags bugs without executing the code: null-pointer dereferences, buffer overruns, use-after-free, integer overflow, dead stores, missing default cases, type confusion, race conditions on shared state. On a desktop project it's a nice-to-have. On firmware — where a bug ships to a fleet of devices that you can't roll back, that may run for a decade, that you may not be allowed to update over the air — it is a baseline expectation, and on safety-certified projects it is mandatory.
+
+This page covers the tooling landscape (open-source linters, commercial analysers, formal-grade tools), MISRA-C conformance, the practicalities of CI integration, and how to keep false-positive volume manageable so engineers actually act on the findings.
+
+<SpecSheet
+  title="Static analysis tools at a glance"
+  specs={[
+    { label: 'clang-tidy', value: 'Open-source, ~200 checks, integrates with cmake / compile_commands.json; cert-* and bugprone-* checks closely match MISRA' },
+    { label: 'scan-build / Clang Static Analyzer', value: 'Open-source, path-sensitive symbolic execution; flags null deref, leaks, use-after-free at line precision' },
+    { label: 'Cppcheck', value: 'Open-source, C/C++ only, fewer false positives than clang-tidy but shallower analysis; MISRA add-on available' },
+    { label: 'PC-lint Plus', value: 'Commercial (Gimpel), authoritative MISRA-C 2012 conformance; ~$5k seat' },
+    { label: 'Coverity', value: 'Commercial (Synopsys), inter-procedural, finds defects in millions of LOC; cloud-based reports' },
+    { label: 'Polyspace Bug Finder + Code Prover', value: 'Commercial (MathWorks), formal abstract interpretation, mathematically proves absence of run-time errors' },
+    { label: 'Sparse', value: 'Open-source, Linux-kernel-grown, annotations like __must_check / __user enforced statically' },
+    { label: 'CodeChecker / SARIF', value: 'Common output format; lets multiple tools feed one CI dashboard' },
+    { label: 'MISRA-C 2012', value: '143 rules + 16 directives; mandatory in ISO 26262 ASIL-B and above, IEC 62304 Class B+' },
+  ]}
+/>
+
+## Two families of tools
+
+Static analysers fall on a spectrum from **pattern matching** to **formal abstract interpretation**.
+
+**Pattern-based** tools (Cppcheck, basic clang-tidy checks, PC-lint's mainline rules) walk the AST or the LLVM IR, match templates like "function with no `return` on this path", and flag them. Fast, cheap, occasionally noisy. Run them on every commit.
+
+**Path-sensitive symbolic execution** (Clang Static Analyzer / scan-build, Coverity, deeper PC-lint checks) explores feasible execution paths, tracks symbolic values, and proves properties along each path: "on this path, `ptr` is null when dereferenced". Slower (minutes to hours for a million-line codebase), much more precise.
+
+**Formal abstract interpretation** (Polyspace Code Prover, Astrée) computes over-approximations of every reachable state using interval arithmetic and lattice theory. The output is mathematically sound: "this division can never be by zero" or "this array index can never exceed bound" — provable, not heuristic. Slower still (hours to days per build), and the cost is reflected in the licence price. Used on aerospace, automotive ASIL-D, medical Class III firmware.
+
+| Tool | Approach | Speed | False positive rate | Notes |
+|------|----------|-------|---------------------|-------|
+| clang-tidy | AST patterns | Seconds | Moderate | Use cert-*, bugprone-*, misc-* groups |
+| scan-build | Symbolic exec | Minutes | Moderate | `scan-build make` wrapper |
+| Cppcheck | AST + light dataflow | Seconds | Low | MISRA add-on (commercial) |
+| PC-lint Plus | Hybrid | Minutes | Low (with config) | MISRA 2012 reference |
+| Coverity | Symbolic exec | Hours | Low | Cloud or on-prem |
+| Polyspace Bug Finder | Symbolic | Hours | Low | MISRA, defects |
+| Polyspace Code Prover | Abstract interpretation | Hours-days | Very low (sound) | Mathematical proof |
+| Astrée | Abstract interpretation | Hours | Very low | Specialised on embedded C |
+
+## MISRA-C 2012 conformance
+
+MISRA-C is the dominant coding standard for safety-critical C. The 2012 edition has 143 rules grouped into 21 categories, classified as **Mandatory**, **Required**, or **Advisory**. Mandatory rules must not be deviated from. Required can be deviated with a documented justification. Advisory are recommendations.
+
+A few of the higher-impact rules:
+
+| Rule | Category | What it forbids |
+|------|----------|-----------------|
+| 11.3 | Required | Casting between pointers to objects of different essential types |
+| 13.5 | Required | Short-circuit operators with side-effects in the right-hand operand |
+| 14.4 | Required | The controlling expression of an if/while/for must be a boolean type |
+| 15.5 | Advisory | Multiple `return` from a function |
+| 17.7 | Required | Discarding the return value of a non-void function |
+| 18.4 | Advisory | Pointer arithmetic (use indexing instead) |
+| 21.3 | Required | No `malloc`/`free` family in safety-critical code |
+| 22.7 | Required | The macro `EOF` shall only be compared with the unmodified return value of `getchar`/`getc`/`fgetc` |
+
+A full MISRA-C 2012 checker is one of the differentiators of commercial tools — PC-lint Plus, Polyspace Bug Finder, Coverity, and LDRA all have certified MISRA rule sets that map each finding to the rule number and category. Open-source tools (Cppcheck with the MISRA add-on, clang-tidy's `cert-*` and `misc-*` checks) cover about 60–70% of MISRA — enough for "MISRA-aware" but not enough for formal "MISRA-compliant".
+
+Compliance is rarely 100%. A typical claim is "MISRA-C 2012 conformant with 12 documented deviations" — each deviation has a justification (e.g. "Rule 21.3 deviated for module X because the FreeRTOS heap_4 implementation uses pvPortMalloc; reviewed and accepted by safety case section 4.2.1").
+
+<Callout type="warn">
+MISRA-C is a syntactic-and-semantic standard, not a logical one. It will not tell you that your control loop has the wrong sign on the derivative term. It catches the class of bug that becomes a fault, not the class that becomes wrong behaviour. Use it as one layer of defence; rely on unit tests, [formal methods](/docs/tools/formal-methods), and HIL testing for the rest.
+</Callout>
+
+## clang-tidy as the daily driver
+
+For a project that hasn't bought into a commercial tool, clang-tidy gets you 80% of the value. It plugs into `compile_commands.json` (cmake emits this automatically with `CMAKE_EXPORT_COMPILE_COMMANDS=ON`), runs on the same translation units the compiler sees, and reports findings in standard compiler-message format that IDEs and CI dashboards already understand.
+
+A starter `.clang-tidy` for embedded C:
+
+```yaml
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  cppcoreguidelines-init-variables,
+  cppcoreguidelines-no-malloc,
+  misc-misplaced-const,
+  misc-redundant-expression,
+  misc-static-assert,
+  misc-unused-parameters,
+  modernize-use-bool-literals,
+  performance-*,
+  portability-*,
+  readability-non-const-parameter
+WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*'
+```
+
+Running:
+
+```bash
+$ run-clang-tidy -p build -checks='-*,bugprone-*,cert-*' src/
+```
+
+A common pattern is to enable WarningsAsErrors only for the bugprone and cert groups (high signal, low noise) and run the others as warnings — visible in the CI report but not blocking.
+
+## CI gating that engineers don't hate
+
+The fastest way to get static analysis ignored is to drop a thousand findings on the team on day one. The path that works:
+
+1. **Baseline the existing findings.** Run the tool, snapshot the warnings to a file, commit it.
+2. **Block only new warnings.** CI runs the analyser on the diff or the changed translation units; new warnings fail the build, baselined warnings don't.
+3. **Burn down the baseline.** Allocate 5% of each sprint to fixing baseline warnings, oldest first. The baseline shrinks; eventually it's empty and the gate becomes "no new warnings ever".
+4. **Categorise by severity.** A `bugprone-suspicious-string-compare` is not a `clang-analyzer-core-NullDereference`. Block the latter, warn on the former.
+5. **Suppress with justification, in code.** Each `// NOLINT(check-name): reason` lives next to the suppression, gets reviewed in PR, and shows up in `git log -p` if reverted. Centralised suppression files become uncurated landfills.
+
+Output should land in a single format — SARIF (Static Analysis Results Interchange Format) is the OASIS standard. CodeChecker, GitLab, GitHub, SonarQube, and Polyspace all consume and emit SARIF, so multi-tool aggregation works without custom adapters.
+
+| CI gate level | Tool | When |
+|---------------|------|------|
+| Pre-commit hook | clang-tidy on changed files | &lt;30 s feedback |
+| Per-PR | clang-tidy full + Cppcheck | &lt;5 min |
+| Nightly | Coverity / Polyspace Bug Finder | &lt;2 h |
+| Per-release | Polyspace Code Prover | Hours-days |
+
+## False-positive triage
+
+Every analyser produces false positives. The trick is to keep the *rate* below the threshold at which engineers stop reading findings — empirically about 10%. Above that, the tool gets ignored within a release cycle.
+
+Sources of false positives:
+
+- **Path infeasibility the tool can't prove.** "On this path, `len > 0` so the loop body executes" — but the tool doesn't know that. Add an assertion that documents the precondition; the analyser narrows its abstract value and the warning goes away.
+- **Hardware semantics the tool doesn't know.** A read from a memory-mapped peripheral returns different values across reads; the tool sees a redundant load. Mark the pointer `volatile` (which you should be doing anyway).
+- **Intentional UB.** Embedded code occasionally relies on implementation-defined or unspecified behaviour (signed overflow, bit manipulation of negative values, type punning via union). Wrap with `/*lint -e... */` or `// NOLINTNEXTLINE` with a justification.
+- **Compiler-built-in patterns.** Some compilers expand `memset` inline using patterns the analyser flags as "dead store"; configure the tool to recognise the built-in.
+
+A weekly triage rota — one engineer for an hour — keeps the queue clean. Without it, even good tools accumulate years of unactioned warnings and become CI noise.
+
+<Callout type="tip">
+For Polyspace Code Prover, the green/red/orange/grey colouring is itself a powerful triage tool: green is proven safe, red is proven faulty, orange is "I couldn't prove either way" (most of the work), grey is unreachable. Focus on red first (real bugs), then on orange paths that touch external inputs (driving the analyser to convert orange to green via stub annotations).
+</Callout>
+
+## Where the line is
+
+Static analysis catches: null deref, buffer overflow, integer overflow, type confusion, missing case in switch, dead code, locking errors, leaked resources, incorrect format strings, suspicious arithmetic.
+
+Static analysis does **not** catch: wrong algorithm, wrong constants, wrong sign on a coefficient, race conditions on data the tool doesn't model as shared, performance regressions, hardware fault sensitivity, EMC issues, supply-chain vulnerabilities in linked libraries.
+
+The mature firmware development process layers static analysis with unit tests, integration tests, hardware-in-the-loop simulation, fuzzing, and formal verification on the most-critical modules. Each catches what the others miss.
+
+## Cross-references
+
+- [Formal methods](/docs/tools/formal-methods) — when you need stronger proof than static analysis can give.
+- [Toolchains](/docs/tools/toolchains) — generating `compile_commands.json` from your build system.
+- [Build systems](/docs/tools/build) — CMake / Bazel hooks for analyser integration.
+- [GDB](/docs/tools/gdb) — runtime confirmation of static findings.
+- MISRA-C 2012 (with Amendments 1 and 2) — purchase from misra.org.uk.
+- CERT C Coding Standard — open and complementary to MISRA.

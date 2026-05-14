@@ -1,0 +1,74 @@
+---
+// MDX usage:
+// <CodeTabs labels={['C (CMSIS)', 'Rust', 'asm']}>
+//   <Fragment slot="tab-0">```c ... ```</Fragment>
+//   <Fragment slot="tab-1">```rust ... ```</Fragment>
+//   <Fragment slot="tab-2">```asm ... ```</Fragment>
+// </CodeTabs>
+interface Props { labels: string[] }
+const { labels } = Astro.props;
+const uid = `ct-${Math.random().toString(36).slice(2, 8)}`;
+---
+<div class="not-prose my-6 overflow-hidden rounded-xl border border-line/70 bg-bg-subtle/60" data-codetabs={uid}>
+  <div role="tablist" class="flex items-stretch border-b border-line/70 bg-bg-subtle/80">
+    {labels.map((l, i) => (
+      <button
+        role="tab"
+        type="button"
+        data-tab={i}
+        data-ct={uid}
+        class:list={[
+          'group relative -mb-px px-3.5 py-2 font-mono text-xs transition',
+          i === 0 ? 'text-brand' : 'text-ink-muted hover:text-ink',
+        ]}
+        aria-selected={i === 0 ? 'true' : 'false'}
+      >
+        {l}
+        <span class:list={['absolute inset-x-2 -bottom-px h-px transition', i === 0 ? 'bg-brand' : 'bg-transparent group-hover:bg-line']} />
+      </button>
+    ))}
+    <div class="ml-auto flex items-center pr-3 font-mono text-[0.65rem] text-ink-faint">
+      <button data-copy={uid} class="rounded border border-line bg-surface px-2 py-0.5 hover:text-ink">copy</button>
+    </div>
+  </div>
+  <div class="grid grid-cols-1">
+    {labels.map((_, i) => (
+      <div
+        data-panel={i}
+        data-ct={uid}
+        class:list={['min-w-0 [&_pre]:!my-0 [&_pre]:!rounded-none [&_pre]:!border-0', i === 0 ? '' : 'hidden']}
+      >
+        <slot name={`tab-${i}`} />
+      </div>
+    ))}
+  </div>
+</div>
+
+<script define:vars={{ uid }}>
+  const buttons = document.querySelectorAll(`[data-ct="${uid}"][data-tab]`);
+  const panels = document.querySelectorAll(`[data-ct="${uid}"][data-panel]`);
+  buttons.forEach((b) => {
+    b.addEventListener('click', () => {
+      const idx = b.getAttribute('data-tab');
+      buttons.forEach((other) => {
+        const active = other === b;
+        other.setAttribute('aria-selected', String(active));
+        other.classList.toggle('text-brand', active);
+        other.classList.toggle('text-ink-muted', !active);
+        other.querySelector('span')?.classList.toggle('bg-brand', active);
+        other.querySelector('span')?.classList.toggle('bg-transparent', !active);
+      });
+      panels.forEach((p) => p.classList.toggle('hidden', p.getAttribute('data-panel') !== idx));
+    });
+  });
+  const copyBtn = document.querySelector(`[data-copy="${uid}"]`);
+  copyBtn?.addEventListener('click', async () => {
+    const visible = Array.from(panels).find((p) => !p.classList.contains('hidden'));
+    const text = visible?.querySelector('pre')?.innerText ?? '';
+    try {
+      await navigator.clipboard.writeText(text);
+      copyBtn.textContent = 'copied';
+      setTimeout(() => (copyBtn.textContent = 'copy'), 1500);
+    } catch {}
+  });
+</script>

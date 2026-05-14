@@ -1,0 +1,112 @@
+---
+title: Cortex-M33 / M23
+description: The ARMv8-M cores — TrustZone, stack limits, and the M0+ / M4 successors that own the secure IoT market.
+order: 6
+updated: 2026-05-12
+tags: [cortex-m, m33, m23, armv8-m, trustzone]
+badge: v8-M
+---
+
+import Callout from '~/components/Callout.astro';
+
+Cortex-M33 and M23 are ARM's two ARMv8-M cores. Both add **TrustZone**, **stack-limit registers**, and a refreshed exception model. M23 succeeds the M0+; M33 succeeds the M4. If your roadmap mentions "secure boot" or "PSA-certified", you're heading toward one of these.
+
+## At a glance
+
+| Feature              | Cortex-M23           | Cortex-M33                |
+|----------------------|----------------------|---------------------------|
+| ISA variant          | ARMv8-M Baseline     | ARMv8-M Mainline          |
+| Pipeline             | 2-stage              | 3-stage                   |
+| Performance          | 0.99 DMIPS/MHz       | 1.50 DMIPS/MHz            |
+| FPU                  | —                    | optional single-precision |
+| DSP                  | —                    | optional                  |
+| MPU                  | optional, up to 16 regions | optional, up to 16 regions |
+| SAU                  | up to 8 regions      | up to 8 regions           |
+| TrustZone            | yes                  | yes                       |
+| Coprocessor interface | —                   | yes (custom accelerators) |
+
+## What TrustZone-M buys you
+
+In one sentence: **a hardware boundary between your bootloader/keys and your application** that an attacker can't bridge by overwriting RAM or hijacking an interrupt.
+
+A typical M33 product:
+
+- **Secure partition**: vendor-immutable bootloader, secure storage, key derivation, secure boot verification, TLS private key operations.
+- **Non-secure partition**: your application — RTOS, UI, networking stack — that calls into the secure partition for sensitive operations through veneers.
+
+Real cost: ~5–10% more silicon than a comparable M4, ~5% performance overhead on calls that cross the boundary. The trade-off is buying back what you'd otherwise pay a secure element vendor for.
+
+## Stack limits
+
+Both cores add explicit stack-limit registers:
+
+- **MSPLIM** — limit for the Main Stack Pointer.
+- **PSPLIM** — limit for the Process Stack Pointer (Mainline only; Baseline = M23 has only MSPLIM).
+
+If `SP < limit`, you get a UsageFault (`UFSR.STKOF`) instead of corrupting whatever lives below the stack:
+
+```c
+extern uint32_t _stack_end, _stack_limit;
+
+void initial_setup(void) {
+    __set_MSPLIM((uint32_t)&_stack_limit);
+    // also set PSPLIM if you use process stack
+}
+```
+
+This is a *huge* reliability win for free. The historical pattern — running into your `.bss` and silently corrupting global state until your watchdog finally trips — is finally trappable.
+
+## The coprocessor interface (M33 only)
+
+The M33 has a documented coprocessor interface (CP0–CP7) that vendors can wire to custom hardware. NXP uses it for the **PowerQuad** DSP accelerator on LPC55xx. Microchip uses it for cryptographic accelerators on PIC32CK. Used right, it's like having a vector unit without paying for Helium.
+
+```c
+// PowerQuad-style — fire-and-forget hardware FFT
+PQ->BASE = input;
+PQ->OUTBASE = output;
+PQ->LENGTH = 256;
+PQ->CONTROL = PQ_FFT | PQ_START;
+while ((PQ->STATUS & PQ_BUSY)) ; // poll or wait on IRQ
+```
+
+## Where they ship
+
+### Cortex-M33
+
+- **STM32L5 / U5** — STM's lead M33 families. U5 is the "mass-market secure MCU".
+- **Nordic nRF53 / nRF54L** — dual-core BLE; M33 application core + M0+ network core.
+- **NXP LPC55xx** — M33 with PowerQuad coprocessor, popular in industrial.
+- **Microchip SAM L11** — entry-level M33 with TrustZone.
+- **Renesas RA4M2 / RA6M4 / RA6M5** — M33-based RA family.
+
+### Cortex-M23
+
+- **STM32L0+** — successor to M0+ STM32L0.
+- **Nuvoton M2351** — secure IoT M23.
+- **NXP LPC845 successors** — quieter line, but present.
+
+M23 has been somewhat squeezed: most "low-end" v8-M designs now skip M23 and go straight to M33 with FPU/DSP disabled at synthesis time. The cost difference is small enough that the broader ISA is usually worth it.
+
+## Build flags
+
+```
+# Cortex-M33 with FPU and DSP, secure-aware
+-mcpu=cortex-m33
+-mthumb
+-mfpu=fpv5-sp-d16
+-mfloat-abi=hard
+-mcmse                  # enable TrustZone built-ins
+
+# Cortex-M23
+-mcpu=cortex-m23
+-mthumb
+-mcmse                  # M23 supports TrustZone too
+```
+
+Building Secure code with `-mcmse` enables `cmse_nonsecure_entry`/`cmse_nonsecure_call` attributes and emits the veneer object the Non-secure firmware links against.
+
+## See also
+
+- [TrustZone](/docs/architecture/trustzone/) — partitioning and veneers in detail.
+- [ARMv8-M overview](/docs/architecture/armv7m-armv8m/) — what changed at the ISA level.
+- [Cortex-M55 / M85](/docs/cortex-m/m55-m85/) — next steps beyond M33.

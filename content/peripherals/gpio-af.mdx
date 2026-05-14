@@ -1,0 +1,168 @@
+---
+title: GPIO alternate functions & drive
+description: How a single physical pin gets multiplexed between dozens of peripherals — alternate-function tables, output type, slew-rate control, pull resistors, Schmitt input, and the vendor differences between STM32 AF, NXP IOCON, and Nordic GPIOTE.
+order: 11
+updated: 2026-05-13
+tags: [peripherals, gpio, alternate-function, iocon, drive-strength]
+---
+
+A modern Cortex-M part has 50–200 peripheral signals competing for 30–100 physical pins. Pin multiplexing is the wiring matrix that decides which signal a given pad carries. On top of that, every pin has its own analog properties — output drive strength, slew rate, pull-up/down, input hysteresis — that you must tune to the signal, not just to the peripheral.
+
+This page covers the multiplexing model and the per-pin electrical configuration. It uses STM32 as the primary reference because the AF table is exemplary, then compares NXP's IOCON and Nordic's GPIOTE-based routing.
+
+<SpecSheet
+  title="GPIO multiplexing at a glance"
+  specs={[
+    { label: 'STM32 alternate-function values', value: 'AF0..AF15 per pin, selected via GPIOx_AFRL/AFRH (4 bits each)' },
+    { label: 'STM32 modes (MODER)', value: 'Input (00), General-purpose output (01), Alternate function (10), Analog (11)' },
+    { label: 'Output types (OTYPER)', value: 'Push-pull (0) or open-drain (1) — per pin' },
+    { label: 'Speed grades (OSPEEDR)', value: 'Low / Medium / High / Very-High — controls slew rate, not toggle frequency directly' },
+    { label: 'Pull configuration (PUPDR)', value: 'No pull (00), pull-up (01), pull-down (10). Typical R ≈ 30–50 kΩ' },
+    { label: 'Schmitt input', value: 'Enabled by default on digital input; bypassed in analog mode' },
+    { label: 'NXP IOCON', value: 'Per-pin 32-bit register selects function + drive + slew + hysteresis + filter' },
+    { label: 'Nordic GPIOTE channels', value: '8 channels (nRF52) routing any pin to any task/event — decoupled from peripheral muxing' },
+  ]}
+/>
+
+## The STM32 alternate-function model
+
+Every STM32 pin from F1 onwards (the F1 family is the exception — it uses an older remap-bit scheme) has a 4-bit AF selector. Sixteen possible alternate functions per pin sounds generous, but most pins only have 4–8 real options; the rest of the slots are reserved. The mapping is fixed in silicon and documented in the datasheet's "Alternate function mapping" table — not in the reference manual, because it varies by package.
+
+A typical row from an STM32G474 datasheet looks like:
+
+| Pin   | AF0     | AF1     | AF2     | AF4     | AF5     | AF7     | AF9     |
+|-------|---------|---------|---------|---------|---------|---------|---------|
+| PA9   | -       | TIM1_CH2| TIM2_CH3| I2C2_SCL| -       | USART1_TX| CAN1_TX|
+| PA10  | -       | TIM1_CH3| TIM2_CH4| I2C2_SDA| -       | USART1_RX| CAN1_RX|
+
+To route USART1 to PA9/PA10 you need three writes per pin: set `MODER[A9] = 10` (AF mode), set `AFRH[9] = 7` (AF7 = USART1), and configure `OTYPER`, `OSPEEDR`, `PUPDR` to match the electrical requirement of a USART TX/RX pin (push-pull medium-speed TX, no-pull or pull-up RX).
+
+The HAL hides this behind `HAL_GPIO_Init` but for register-poke code:
+
+```c
+// PA9 = USART1_TX (AF7), push-pull, very-high speed, no pull
+GPIOA->MODER   = (GPIOA->MODER   & ~(3u << (9*2))) | (2u << (9*2));   // AF mode
+GPIOA->OTYPER &= ~(1u << 9);                                          // push-pull
+GPIOA->OSPEEDR = (GPIOA->OSPEEDR & ~(3u << (9*2))) | (3u << (9*2));   // very-high
+GPIOA->PUPDR   = (GPIOA->PUPDR   & ~(3u << (9*2))) | (0u << (9*2));   // no pull
+GPIOA->AFR[1]  = (GPIOA->AFR[1]  & ~(0xFu << ((9-8)*4))) | (7u << ((9-8)*4));
+```
+
+Note the split between `AFRL` (pins 0–7) and `AFRH` (pins 8–15). CMSIS exposes them as `AFR[0]` and `AFR[1]`.
+
+<Callout type="warn">
+Switching MODER to AF before configuring AFRL/AFRH can briefly route the pin to AF0 — which on many parts is the reset state (typically the JTAG/SWD function for the debug pins, or "system" for the rest). On debug pins (PA13, PA14, PA15, PB3, PB4) writing the wrong AF will cut your SWD connection. The safe sequence is: AFRL/AFRH first, then MODER, then OTYPER/OSPEEDR/PUPDR.
+</Callout>
+
+## Output type — push-pull vs open-drain
+
+`OTYPER` is one bit per pin. Push-pull (0) drives the pin actively both high and low through complementary FETs. Open-drain (1) drives only the low side; the high side is replaced by either an external pull-up or the internal `PUPDR` pull-up.
+
+Push-pull is the default for almost everything: GPIO output to an LED, UART TX, SPI MOSI/SCK, clock outputs. The only common signals that need open-drain are:
+
+- **I²C SDA and SCL** — required by the bus standard; multiple masters/slaves can pull the line low without contention.
+- **SMBus** — same as I²C.
+- **1-Wire** (Dallas/Maxim) — single-line bus with multiple devices.
+- **Wired-OR signals** — open-drain interrupt lines shared among several peripherals.
+- **Level shifting** — when you need a 3.3 V MCU pin to interface with a 5 V device, an open-drain output plus a 5 V pull-up gives you the level shift for free.
+
+The internal pull-up (≈30–50 kΩ) is too weak for fast I²C — at 400 kHz fast-mode you need 2–4 kΩ external pull-ups. The internal pull is only useful for slow signals or button inputs.
+
+## Speed / slew rate
+
+`OSPEEDR` has four grades on most STM32 lines: low, medium, high, very-high. The grade does **not** set a toggle frequency directly — it controls the FET drive current, which determines the **slew rate** (V/ns) and thus the maximum useful toggle frequency on a given load.
+
+| Grade | Typical slew (3.3 V into 50 pF) | Use case |
+|-------|----------------------------------|----------|
+| Low | ~20 V/µs | Slow GPIO, LEDs, debounced button reads, infrequent strobes |
+| Medium | ~50 V/µs | Standard digital, I²C up to 100 kHz, UART up to 1 Mbaud |
+| High | ~100 V/µs | SPI up to 25 MHz, fast UART, I²C 400 kHz–1 MHz |
+| Very-High | ~200 V/µs | SDIO 50 MHz, QSPI, FMC, high-speed SPI |
+
+The exact values are in the datasheet's AC characteristics — they depend on supply voltage and pin capacitance. The rule of thumb: pick the **lowest** speed grade that meets your signal-integrity requirement. Higher speed = faster slew = more EMI, more crosstalk, more ringing on long traces. For an LED driver, low-speed is correct; running it at very-high speed will radiate noise into adjacent ADC channels.
+
+<Callout type="tip">
+Slew-rate control is your most accessible EMI mitigation knob. If your design fails radiated-emission testing, the first thing to try is dropping every non-critical output from very-high to medium. A 4× reduction in slew can cut harmonics by 12 dB or more, often enough to pass without redesigning the layout.
+</Callout>
+
+## Pull-up / pull-down
+
+`PUPDR` selects one of four states per pin: no pull, pull-up, pull-down, reserved. The internal pulls are nominally 30–50 kΩ — strong enough to define an idle state on a high-impedance input but weak enough that any real driver overrides them instantly.
+
+Common patterns:
+
+- **Floating digital input** with no pull: only valid when an external driver is always present. A floating CMOS input draws fluctuating current and may oscillate, wasting power and corrupting nearby analog circuits.
+- **Button to ground + pull-up**: idle state is high, pressed state is low. The cheapest debounced-button circuit.
+- **Open-drain peripheral output + pull-up**: relying on the internal pull is acceptable only for slow signals. I²C, SMBus, and any bus running above 100 kHz needs an external resistor.
+- **Wake-from-stop input**: must have a defined pull during stop modes; the GPIO retains its `PUPDR` setting through Stop unless the option byte says otherwise.
+
+The pulls are **disabled** when the pin is configured as analog (MODER=11), because the analog mux ties the pad to the ADC/DAC/comparator input directly. Programming a pull and an analog mode at the same time has no effect on the analog measurement but does still draw the bias current.
+
+## Schmitt trigger and input filtering
+
+Digital inputs on Cortex-M GPIO pass through a Schmitt trigger with hysteresis of roughly 200–400 mV around the supply midpoint. This is what cleans up slow rising edges (e.g. RC-filtered buttons) and rejects small noise spikes. The Schmitt is automatic — there is no register to disable it in normal digital input mode.
+
+In analog mode the Schmitt is bypassed (otherwise you'd quantize the input). On STM32H7 and U5 there's an additional `ADC_SMPR`-controlled input switching network that further isolates analog channels from digital activity on the same pad.
+
+Some parts (NXP LPC55, RP2040) add **digital input glitch filters**: a configurable N-cycle digital low-pass that rejects pulses shorter than the filter window. Useful for noisy industrial inputs but adds latency.
+
+## NXP IOCON
+
+NXP's pin-mux register, called IOCON, packs everything into a single 32-bit register per pin:
+
+| Field | Bits | Purpose |
+|-------|------|---------|
+| FUNC | 0:2 | Selects alternate function 0..7 (or 0..15 on some parts) |
+| MODE | 3:4 | Pull configuration (inactive/pull-down/pull-up/repeater) |
+| HYS | 5 | Hysteresis enable |
+| INV | 6 | Inverted input |
+| DIGIMODE | 7 | Digital mode (1) or analog (0) |
+| FILTEROFF | 8 | Disable input filter |
+| SLEW | 9 | Slew-rate (fast/standard) |
+| OD | 10 | Open-drain |
+| S_MODE | 11:12 | Sample mode / digital filter cycles |
+| CLKDIV | 13:15 | Filter clock divider |
+
+It's more compact than STM32's multi-register scheme but you have to write the whole word atomically. On LPC55, the IOCON peripheral has its own clock gate that must be enabled before writes take effect (a classic boot-up gotcha).
+
+## Nordic GPIOTE — decoupled pin routing
+
+Nordic's nRF52 and nRF53 take a different approach. The fixed pin-to-peripheral muxing of STM32 is replaced by a flexible routing layer: **any** peripheral signal can be connected to **any** pin via the GPIOTE (GPIO Tasks and Events) peripheral and the PSEL (peripheral select) registers.
+
+To route UARTE0 TX to P0.06, you write `UARTE0.PSEL.TXD = 6`. There is no AF table — you set the pin number directly. GPIOTE adds a layer on top: eight channels that can either drive a pin from a PPI (Programmable Peripheral Interconnect) task or capture pin events as PPI events, enabling hardware-only signal paths that bypass the CPU.
+
+This is more flexible than STM32's fixed AF model but pays for it with more setup code and slightly higher current draw (the routing matrix is always energized). For battery-powered designs, Nordic's documentation is explicit about which peripherals can use the low-power EasyDMA path versus the legacy CPU-fed path.
+
+<Callout type="note">
+The vendor diversity here is not cosmetic. Code that routes "USART1 to PA9/PA10" on STM32 must, on nRF52, route "UARTE0 PSEL.TXD = 6 / PSEL.RXD = 8" with GPIOTE channels reserved if you want hardware flow control. There is no portable abstraction — a HAL pin layer per vendor is essentially unavoidable. CMSIS-Driver provides a thin abstraction but stops short of unifying pin muxing.
+</Callout>
+
+## Drive-strength tables in practice
+
+For STM32H7 high-speed outputs into a 50 Ω trace with 10 pF load, the datasheet AC table looks like:
+
+| Mode | tr / tf (typ) | Fmax sustained |
+|------|----------------|------------------|
+| Low | 25 ns | 8 MHz |
+| Medium | 12 ns | 25 MHz |
+| High | 6 ns | 50 MHz |
+| Very-High | 3 ns | 100 MHz |
+
+For FMC (parallel memory bus), QSPI, OCTOSPI, and SDMMC running at 50–100 MHz you must use very-high; nothing else is fast enough. For everyday SPI at 10 MHz, high is the right choice. For an I²C bus at 400 kHz, medium with internal pull-up is acceptable (though external pull-ups are still recommended).
+
+## Common mistakes
+
+1. **Forgetting to enable the GPIO clock.** Writing to `MODER` while `RCC->AHB2ENR.GPIOAEN` is 0 silently fails. Always set the clock-enable bit first, with a barrier or a dummy read of the same register before further access.
+2. **Configuring debug pins as GPIO during early boot.** PA13/PA14 (SWDIO/SWCLK) come up as AF0 (SWD). If your `MX_GPIO_Init` blindly sets them to general-purpose output, your debugger drops the target. Either leave debug pins alone or gate the reconfiguration on a non-debug build flag.
+3. **Open-drain without a pull.** An open-drain output with `PUPDR = 00` produces a Z-state on the high half of every cycle. Always pair open-drain with either the internal pull-up or an external resistor.
+4. **Using "very-high" everywhere.** EMI compliance failures and signal-integrity issues on long traces. Match speed to the signal.
+5. **Re-reading the AF on every write.** `GPIOx_AFR[]` is read-modify-write; if multiple cores or DMA stream the same register, you need atomic-RMW. In practice GPIO config is single-CPU and single-shot, so this rarely bites.
+
+## Cross-references
+
+- [GPIO](/docs/peripherals/gpio) — the basic GPIO peripheral model
+- [I2C](/docs/peripherals/i2c) — open-drain bus that depends on correct pull-up sizing
+- [SPI](/docs/peripherals/spi) — high-speed push-pull signalling
+- [QSPI / OSPI](/docs/peripherals/qspi-ospi) — needs very-high-speed drive
+- [Memory model](/docs/architecture/memory-model) — peripheral region attributes that affect GPIO ordering
+- [CMSIS](/docs/programming/cmsis) — `HAL_GPIO_Init` and the underlying register layout

@@ -1,0 +1,201 @@
+---
+title: libc for embedded — newlib, newlib-nano, picolibc
+description: The C standard library on Cortex-M and Cortex-A. newlib, newlib-nano, picolibc, glibc, musl. Syscall stubs, heap layout, re-entrancy, printf cost, and how to retarget a libc for a bare-metal target.
+order: 10
+updated: 2026-05-13
+tags: [programming, libc, newlib, picolibc, syscalls, retargeting]
+---
+
+The C standard library is one of those pieces of infrastructure that most engineers stop thinking about after their first month with a toolchain — until something breaks. Then it turns out that `printf` is calling `_write`, which calls `_sbrk`, which collides with the stack, or that `malloc` isn't thread-safe, or that `%f` adds 15 KB to your binary, or that `errno` is a single global that races between an ISR and a thread. None of those are bugs in libc; they're the consequence of running a library designed for hosted systems on a target that has neither a kernel nor a filesystem.
+
+This page covers the four libcs you'll meet in practice — newlib, newlib-nano, picolibc, and glibc/musl on Cortex-A — and the **retargeting** work that turns a hosted library into a bare-metal-ready one.
+
+<SpecSheet
+  title="The libc landscape"
+  specs={[
+    { label: 'newlib', value: 'RedHat / Cygnus libc, ships with arm-none-eabi-gcc. Full-featured (printf with %f, math, FILE*, getopt). ~75 KB minimum footprint.' },
+    { label: 'newlib-nano', value: 'newlib with code-size optimisations: integer-only printf by default, smaller malloc, no wide-char unless asked. ~25 KB minimum. Default for most STM32CubeIDE / Zephyr builds.' },
+    { label: 'picolibc', value: 'Keith Packard fork of newlib + AVR libc. Designed for embedded from the start: TLS-based reentrancy, smaller stdio, optional small printf. ~15 KB. Used by Zephyr, Nordic Connect SDK.' },
+    { label: 'glibc / musl', value: 'Linux libc. Cortex-A only — requires kernel syscalls and dynamic linking. glibc on most distros, musl on Alpine and many embedded Linux builds (~600 KB).' },
+    { label: 'Tinystd / nostdlib', value: 'No libc at all. Build with -nostdlib and provide your own essentials. Smallest possible footprint; used in some hard-real-time and security-sensitive bare-metal builds.' },
+  ]}
+/>
+
+## newlib — the default for arm-none-eabi-gcc
+
+When you install the GNU Arm Embedded Toolchain (`arm-none-eabi-gcc`), the libc is **newlib**. Originally written by Cygnus Solutions in 1995 as a libc for Cygwin, newlib has become the de facto embedded libc because it's freely licensed, portable to any target with about a dozen syscall stubs, and has full implementations of math, stdio, locale, and most of C99.
+
+newlib's architecture has two layers:
+
+1. **The library proper** — `printf`, `malloc`, `strtod`, `qsort`, `<math.h>`, the whole standard. Built once, shipped as `libc.a`.
+2. **The system layer** — about 17 functions (`_write`, `_read`, `_close`, `_lseek`, `_sbrk`, `_exit`, `_kill`, `_getpid`, `_fstat`, `_isatty`, `_open`, `_link`, `_unlink`, `_stat`, `_times`, `_gettimeofday`, `_environ`). You provide these for your target.
+
+The system layer is what makes newlib portable. A Linux build provides `_write` that calls the kernel `write` syscall; a bare-metal build provides `_write` that pushes characters to a UART; a semihosted build provides `_write` that triggers a `BKPT` instruction the debugger intercepts.
+
+## newlib-nano — the size-optimised variant
+
+newlib-nano is the same source tree built with different defaults: integer-only `printf` (no `%f`/`%g` support), simplified `malloc`, no wide-character support, no locale (just "C"), and reduced error-message strings. The result is roughly **1/3 the code size** of full newlib.
+
+Enable nano with the GCC flag `--specs=nano.specs`. CMSIS templates and most vendor IDEs default to nano now. If you need `%f` back, add `-u _printf_float`; this pulls in the float-formatting code (~9 KB) on top of nano.
+
+The big code-size knobs:
+
+| Knob | Cost (flash) | Notes |
+|------|--------------|-------|
+| Full newlib vs nano | ~50 KB | nano strips wide-char, complex printf, complex locale |
+| `%f` / `%g` in printf | ~9 KB | Pulls in `__sf_fake_*` and softfloat formatting |
+| `malloc` | ~3 KB | Even nano malloc; replace with a fixed-block allocator if not needed |
+| `<math.h>` (transcendentals) | ~6 KB per fn | `sin`, `cos`, `log`, `exp`, `pow` each pull a polynomial approximation |
+| `errno` | ~1 KB plus per-thread storage | Thread-local in re-entrant builds |
+| `printf` itself | ~5 KB (nano, int only) | The format-string parser; replace with `tinyprintf` if size-critical |
+
+<Callout type="tip">
+Run `arm-none-eabi-nm --size-sort firmware.elf | tail -40` to see the largest symbols in your build. If `__udivmoddi4`, `__aeabi_dadd`, or `_printf_common` are in the top ten, you're paying for libc features you may not need. Compile with `-Wl,--print-memory-usage` to see total flash/RAM usage by region.
+</Callout>
+
+## picolibc — the modern alternative
+
+picolibc is Keith Packard's combination of AVR libc's small stdio and newlib's everything-else, redesigned around two principles:
+
+1. **TLS (thread-local storage) instead of `struct _reent`.** newlib stores per-thread state (`errno`, stdin/stdout buffers, random seed, etc.) in a `struct _reent`; each thread gets one, the active one is at `_impure_ptr`. picolibc uses `__thread` (TLS) and lets the linker handle per-thread storage, which is cheaper and cleaner with multi-thread builds.
+2. **Smaller stdio.** picolibc's stdio is non-buffered by default, parses format strings in ~1 KB rather than ~3 KB, and supports a "tiny" printf variant.
+
+picolibc shipped as the default libc in Zephyr 3.0+ and Nordic Connect SDK 2.0+. It builds with `-specs=picolibc.specs` on a GCC that has been built with picolibc multilib support.
+
+Footprint comparison for a "hello, world" via UART (Cortex-M4, no FP, integer printf):
+
+| libc | Flash | RAM (incl. heap) |
+|------|-------|------------------|
+| newlib | ~28 KB | ~6 KB |
+| newlib-nano | ~9 KB | ~2 KB |
+| picolibc | ~5 KB | ~600 B |
+| picolibc + tinystdio | ~3 KB | ~200 B |
+
+## glibc and musl — Cortex-A territory
+
+On Cortex-A running Linux, you don't pick a libc per project — it's the libc the distro shipped. The two relevant choices:
+
+- **glibc** — the GNU C Library. Used on Debian, Ubuntu, Fedora, RHEL, most embedded Linux Yocto builds. Very feature-complete, very fast for hot paths (uses SIMD where available), but big (~2 MB shared object on AArch64) and complex.
+- **musl** — a smaller, simpler libc designed for static linking and small distros. Used on Alpine Linux, often in containerised embedded Linux. ~600 KB and lacks some glibc extensions, but produces smaller static binaries.
+
+If you're cross-compiling Linux userspace, you'll typically use `aarch64-linux-gnu-gcc` (glibc) or `aarch64-linux-musl-gcc` (musl). The two are not ABI-compatible at the source level — a binary linked against glibc won't run on musl and vice versa, except via static linking.
+
+## Syscall retargeting — the minimum set
+
+To make newlib (or any unix-style libc) work on bare metal, you provide implementations of about a dozen functions. The compiler links against weak default versions that just return `-1`; you override them. Minimum set for a UART-backed `printf`:
+
+```c
+#include <errno.h>
+#include <sys/stat.h>
+
+extern char __heap_start;     // from linker script
+extern char __heap_end;
+static char *heap_ptr = &__heap_start;
+
+void *_sbrk(int incr) {
+    char *prev = heap_ptr;
+    if (heap_ptr + incr > &__heap_end) {
+        errno = ENOMEM;
+        return (void *)-1;
+    }
+    heap_ptr += incr;
+    return prev;
+}
+
+int _write(int fd, const char *buf, int len) {
+    (void)fd;  // we send everything to UART
+    for (int i = 0; i < len; i++) {
+        while (!(USART1->ISR & USART_ISR_TXE)) { }
+        USART1->TDR = buf[i];
+    }
+    return len;
+}
+
+int _read(int fd, char *buf, int len) {
+    (void)fd;
+    int i;
+    for (i = 0; i < len; i++) {
+        while (!(USART1->ISR & USART_ISR_RXNE)) { }
+        buf[i] = USART1->RDR;
+        if (buf[i] == '\n') { i++; break; }
+    }
+    return i;
+}
+
+int _close(int fd)         { (void)fd; return -1; }
+int _lseek(int fd, int off, int whence) { (void)fd; (void)off; (void)whence; return 0; }
+int _fstat(int fd, struct stat *st) { (void)fd; st->st_mode = S_IFCHR; return 0; }
+int _isatty(int fd)        { (void)fd; return 1; }
+void _exit(int status)     { (void)status; while (1) { __asm__("bkpt 0"); } }
+int _kill(int pid, int sig){ (void)pid; (void)sig; errno = EINVAL; return -1; }
+int _getpid(void)          { return 1; }
+```
+
+That's enough for `printf("hello %d\n", 42)` and `scanf("%d", &x)` to work over UART. Adding more (`_open`, `_link`, `_stat`) only matters if you're building a file-system layer on top.
+
+## The heap — `_sbrk` and the linker
+
+`malloc` calls `_sbrk` (sometimes called "the program break") to extend the heap. The standard newlib pattern: `_sbrk` returns the previous heap pointer and advances by `incr` bytes. If the heap would collide with the stack (or any guard), `_sbrk` returns `(void *)-1` and sets `errno = ENOMEM`, and `malloc` returns NULL.
+
+The heap region comes from the linker script. A typical Cortex-M linker script:
+
+```ld
+_estack = ORIGIN(RAM) + LENGTH(RAM);   /* stack starts at top of RAM */
+_Min_Heap_Size = 0x2000;               /* 8 KB heap */
+_Min_Stack_Size = 0x1000;              /* 4 KB minimum stack */
+
+.heap (NOLOAD) : {
+    __heap_start = .;
+    . = . + _Min_Heap_Size;
+    . = ALIGN(8);
+    __heap_end = .;
+} >RAM
+
+.stack (NOLOAD) : {
+    . = ALIGN(8);
+    . = . + _Min_Stack_Size;
+} >RAM
+```
+
+The heap grows up from `__heap_start`, the stack grows down from `_estack`. If they collide, you have a stack overflow or a heap exhaustion — your `_sbrk` should detect this and refuse the allocation.
+
+<Callout type="warn">
+`malloc` in newlib is **not interrupt-safe**. Calling it from an ISR can corrupt the heap. Either don't call malloc from interrupts (use a fixed-block pool or queue work to a thread) or replace the default allocator with a thread-safe one. FreeRTOS provides `pvPortMalloc`/`vPortFree` that wrap the kernel's heap in a critical section; ThreadX provides `tx_byte_allocate` with its own mutex.
+</Callout>
+
+## Re-entrancy — why `errno` is per-thread
+
+newlib's standard library is reentrant by design: every function that needs per-thread state takes a `struct _reent *` argument internally. The user-visible API hides this through a thread-local `_impure_ptr` that points at the active thread's `_reent` block. When the RTOS switches threads, it updates `_impure_ptr`, and the next libc call sees the new thread's state.
+
+What lives in `_reent`:
+
+- `errno` (so two threads don't race on the global)
+- stdin/stdout/stderr `FILE *` buffers
+- `strtok` state, `rand`/`srand` state
+- `getenv`/`setenv` environment
+- math fenv state on some builds
+
+A FreeRTOS port that doesn't update `_impure_ptr` per task will see `errno` race across tasks — task A reads `errno` set by task B's failing `read()`. Configure `configUSE_NEWLIB_REENTRANT 1` to make FreeRTOS allocate a `_reent` per task and switch it on context switch. This costs about 100 bytes of RAM per task — worth it.
+
+picolibc uses TLS instead, which the linker arranges. No per-call function-pointer indirection, faster and simpler. Zephyr and the Nordic SDK rely on this.
+
+## printf cost — stack, flash, time
+
+`printf` is the single most expensive libc function you'll routinely call:
+
+- **Flash**: 5–15 KB depending on options
+- **Stack**: ~400 bytes for the format-string parser plus the size of the longest argument
+- **Time**: hundreds to thousands of cycles per call, depending on format specifiers
+
+For tight code, replace `printf` with `tinyprintf`, `mpaland/printf`, or write a fixed-format alternative that just emits bytes to UART. A bare-metal "print hex dump" routine can be 200 bytes of flash and 50 cycles per byte.
+
+For floats, `-u _printf_float` enables `%f`/`%g`/`%e` in newlib-nano. Cost: ~9 KB flash. Alternative: format the float manually with `arm_float_to_q15` or `snprintf` an integer scaled version.
+
+## Further reading
+
+- [Linker scripts](/docs/programming/linker-scripts) — defining the heap and stack regions
+- [Startup & vector table](/docs/programming/startup) — runs before main, initialises BSS / data
+- [FreeRTOS — overview](/docs/rtos/freertos) — newlib-reentrant configuration
+- [Zephyr — overview](/docs/rtos/zephyr) — picolibc integration
+- newlib documentation: sourceware.org/newlib/
+- picolibc README: github.com/picolibc/picolibc

@@ -1,0 +1,133 @@
+---
+title: Renesas RA / RX / RZ
+description: Renesas's ARM portfolio — the RA family (modern Cortex-M from the Synergy line) and RZ (Cortex-A/R) for industrial.
+order: 5
+updated: 2026-05-12
+tags: [vendors, renesas]
+---
+
+Renesas is a Japan-based semiconductor giant that historically pushed its own architectures (RX, RL78, RH850). After acquiring Dialog (BLE, audio) and IDT (timing, memory), they've doubled down on ARM-based products. The **RA** family is now their flagship general-purpose Cortex-M line.
+
+<SpecSheet
+  title="Renesas ARM portfolio — quick reference"
+  specs={[
+    { label: 'RA family ISA span', value: 'ARMv8-M Baseline (M23), ARMv8-M Mainline (M33), ARMv8.1-M (M85) — covers RA2 entry through RA8 flagship' },
+    { label: 'Top RA clock', value: 'RA8M1 / RA8D1 — Cortex-M85 at 480 MHz, single-cycle Helium, branch prediction' },
+    { label: 'RZ application cores', value: 'RZ/A (Cortex-A9), RZ/G (A55/A53), RZ/T (R52), RZ/V (A-class + DRP-AI)' },
+    { label: 'Flagship SDK', value: 'FSP (Flexible Software Package) — Apache 2.0, CMake-buildable, supports e2 studio and VS Code' },
+    { label: 'Security IP', value: 'SCE7 / SCE9 crypto engine, TSIP (Trusted Secure IP), Arm PSA Level 2 certified on RA6/RA8' },
+    { label: 'Motor control hardware', value: 'TFU (Trigonometric Function Unit) — single-cycle sin/cos/atan2; complementary PWM with deadtime; high-resolution PWM on RA6T2' },
+    { label: 'Non-ARM neighbours', value: 'RX (32-bit Renesas ISA), RL78 (16-bit), RH850 (32-bit auto) — separate toolchains, mentioned for disambiguation only' },
+  ]}
+/>
+
+## RA — Renesas Advanced
+
+The RA family covers Cortex-M23 through M85, with strong analog and security peripherals. Inherited from the older "Synergy" line, but the SDK (FSP — Flexible Software Package) is now much improved.
+
+| Group | Core           | Position                                    |
+|-------|----------------|---------------------------------------------|
+| RA2   | M23            | Entry, low-power, low-cost                  |
+| RA4   | M33            | Mainstream IoT, TrustZone                   |
+| RA6   | M33            | Higher-perf M33, more memory and peripherals |
+| RA8   | M85 (or M33)   | Highest-perf — RA8M1, RA8D1 with Helium      |
+
+The **RA8** line is currently one of the few production Cortex-M85 silicons available — competing with NXP's RT700 in the edge-ML space.
+
+## FSP — Flexible Software Package
+
+Renesas's SDK. Apache 2.0 licensed, CMake-buildable, includes:
+
+- e² studio (Eclipse-based IDE).
+- HAL drivers for every peripheral.
+- FreeRTOS support out of the box.
+- TrustZone-aware project templates.
+
+The IDE is the standard Eclipse experience; CLI builds via the FSP CMake files work fine and are recommended for production.
+
+## RX — Renesas's own architecture
+
+Not ARM. Renesas's proprietary 32-bit ISA, popular in industrial automation, automotive, white goods. Different toolchain (CC-RX or GCC-RX) and different ecosystem. Mentioned here only to disambiguate when you see "Renesas RX" in a job description — it's *not* an ARM part.
+
+## RZ — Cortex-A and Cortex-R for industrial
+
+The RZ family runs Cortex-A and Cortex-R cores for higher-performance industrial:
+
+- **RZ/A** — Cortex-A9 with on-chip SRAM (no SDRAM needed), good for HMI.
+- **RZ/G** — Cortex-A55/A53, runs Linux.
+- **RZ/T** — Cortex-R52, real-time industrial (motor control, EtherCAT).
+- **RZ/V** — Cortex-A + vision DRP-AI accelerator.
+
+For mixed Linux + real-time designs, RZ/T2M (R52) and RZ/G2L (A55) are common picks.
+
+## When you'd pick Renesas
+
+- **Industrial / automotive Tier 1 supplier** with existing Renesas relationships.
+- **Need Cortex-M85** — RA8M1 is one of the few in production.
+- **Japanese market** — Renesas has stronger distribution there.
+- **Strong analog requirements** + ARM ISA — the RA family's analog peripherals are first-tier.
+
+For most greenfield projects elsewhere, ST or NXP have stronger ecosystems. Renesas catches up in specific niches.
+
+## Inside the RA architecture
+
+The RA family is not just a re-badge of the older Synergy line — the silicon was retargeted, the security IP was upgraded, and the SDK was rewritten. A typical mid-range RA6M5 (Cortex-M33 at 200 MHz) ships with 2 MB flash, 512 KB SRAM, dual-bank flash for OTA, Ethernet MAC, USB HS with on-chip PHY, Quad-SPI, CAN-FD, and a comprehensive analog complement: 12-bit ADC with 26 channels, 12-bit DAC, comparators, programmable gain amplifier, and a 32-bit temperature sensor with calibrated trim. The DMA controller has 8 channels with a separate **DTC** (Data Transfer Controller) that off-loads simple register-to-register transfers without occupying a DMA channel — a Renesas-specific peripheral inherited from the RX line.
+
+The RA8 tier is currently one of the few production Cortex-M85 silicons on the market. RA8M1 runs at 480 MHz with single-cycle Helium MVE, low-overhead loops, branch prediction, and PACBTI. The combination of a 1 MB on-chip SRAM and an Octal-SPI interface (running at 200 MB/s) puts it in the same edge-ML conversation as NXP's RT700 and ST's STM32N6. For voice activation, keyword spotting, and low-resolution vision inference, the RA8 hits the sweet spot of single-core determinism plus enough vector throughput to skip a dedicated NPU.
+
+<Callout type="spec" title="TFU — the Trigonometric Function Unit">
+The TFU is a hardware coprocessor mapped into the AHB bus that computes single-precision `sin`, `cos`, `atan2`, and `hypot` in a handful of cycles. On RA6T2 (motor control) the TFU is wired into the field-oriented-control loop: the Clarke/Park transforms cost roughly 100 cycles end-to-end instead of the &gt;1000 they'd take using CMSIS-DSP. The hardware is accessed via memory-mapped operand registers, then the result is read back from a result register after a fixed pipeline delay. CMSIS-DSP intrinsics are layered on top so portable code still compiles.
+</Callout>
+
+## RA security IP — SCE7, SCE9, and TSIP
+
+Renesas's secure-element story is one of the more technically thorough in the Cortex-M space. The RA4/RA6/RA8 lines integrate one of three crypto engines depending on the part:
+
+- **SCE7** — AES-128/192/256, SHA-1/256, TRNG, ECC P-256, RSA-2048. Keys are wrapped in a per-chip device-unique key so they can be stored in plain flash but only used after the SCE unwraps them at runtime.
+- **SCE9** — adds AES-GCM, SHA-512, ECC P-384/P-521, RSA-3072/4096, Curve25519. Found on RA6M5 and the RA8 line.
+- **TSIP** (Trusted Secure IP) — the high-assurance variant used on RA6M3 and beyond. Provides a "key never leaves the IP" model, certified to PSA Level 2 and Common Criteria EAL3+.
+
+The combination of TrustZone-M, the SCE/TSIP, and the IDAU (which statically maps secure/non-secure flash banks on RA6/RA8) lets you build a credible secure-boot chain entirely on-chip. Renesas ships the **Renesas Secure Bootloader** reference design and the **TF-M** (Trusted Firmware-M) port pre-integrated into FSP.
+
+| RA family | Core | TFU | TSIP | Motor PWM | Typical use |
+|-----------|------|-----|------|-----------|-------------|
+| RA2 | M23 @ 48 MHz | no | no | basic | sensors, BLE peripherals |
+| RA4 | M33 @ 100 MHz | yes (RA4T1) | no | yes | mid-range IoT |
+| RA6 | M33 @ 200 MHz | yes (RA6T2) | yes | high-res PWM, dual encoder | servo drives, FOC |
+| RA8 | M85 @ 480 MHz | yes | yes | yes | edge ML, motor + AI fusion |
+
+## FSP toolflow and e2 studio
+
+FSP is generated from a YAML configuration file (`configuration.xml` in the IDE) that captures pin muxing, clock tree, interrupt mapping, and the list of HAL modules you want. The generator emits a CMake-friendly project tree with the BSP, the HAL, RTOS glue (FreeRTOS or ThreadX), and optional middleware (lwIP, FreeRTOS-Plus-TCP, mbedTLS, FileX, NetX Duo for Azure RTOS). The output is a normal CMake project that builds with `arm-none-eabi-gcc` outside the IDE — important for CI.
+
+```bash
+# Build an FSP-generated project headlessly
+cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=arm-gcc.cmake \
+      -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+# Flash using the Renesas DLM (Device Lifecycle Manager) or J-Link
+JLinkExe -device R7FA8M1AH -if SWD -speed 4000 -CommanderScript flash.jlink
+```
+
+e2 studio remains the recommended GUI for the initial pin/clock configuration, but most production teams shift to VS Code + CMake + cortex-debug after the first sprint. The FSP generator can be run from the command line as `rasc` for fully reproducible builds.
+
+## Positioning against ST and NXP
+
+For a senior engineer choosing between an STM32U5, an i.MX RT500, and an RA8M1, the trade-offs come down to ecosystem breadth versus specific peripheral strengths. ST has the largest community and the most reference designs; NXP has the strongest crossover-MCU story with i.MX RT; Renesas has the broadest analog complement and the only readily available Cortex-M85 silicon today. For motor control or sensor-fusion applications where the TFU saves measurable cycles, RA wins. For consumer IoT, ST and Nordic typically still win on community size.
+
+<Callout type="tip" title="Pin compatibility within RA tiers">
+Renesas designed the RA family with pin-compatibility groups: an RA4M1 in 64-pin LQFP shares its pinout with an RA4M2 and an RA4M3 in the same package. This means a board designed around an RA4M1 can be upgraded to an RA4M3 (more flash, more SRAM, higher clock) without a PCB respin. The same trick works within the RA6 tier and within the RA8 tier. The trade-off is that pin-compat across tiers (RA4 to RA6) is partial, not complete; check the part-selection guide before assuming a drop-in upgrade.
+</Callout>
+
+## Cross-references
+
+- [Cortex-M85 / M55](/docs/cortex-m/m55-m85/) — Helium and PACBTI, the basis of RA8.
+- [Cortex-M33 / M23](/docs/cortex-m/m33-m23/) — RA4 and RA6 cores.
+- [Cortex-R overview](/docs/cortex-r/overview/) — RZ/T2M lockstep R52.
+- [Cortex-A overview](/docs/cortex-a/overview/) — RZ/G2L A55 application class.
+- [TrustZone](/docs/architecture/trustzone/) — how Renesas wires SAU/IDAU with TSIP.
+- [CMSIS](/docs/programming/cmsis/) — FSP layers on standard CMSIS-Core and CMSIS-DSP.
+- [NXP](/docs/vendors/nxp/) — i.MX RT500/RT700 competitor to RA8.
+- [STMicro](/docs/vendors/stm/) — STM32U5 versus RA6 trade-off.
+- [QEMU & Renode](/docs/tools/sim/) — Renode has experimental RA6 platform files.
+- [Interrupt latency tool](/tools/interrupt-latency) — model TFU-assisted motor control loops.

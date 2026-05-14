@@ -1,0 +1,135 @@
+---
+title: ThreadX (Azure RTOS / Eclipse ThreadX)
+description: The certifiable RTOS — fast context switches, deterministic primitives, and pre-existing safety certifications for IEC 61508 and ISO 26262.
+order: 4
+updated: 2026-05-12
+tags: [rtos, threadx, certified]
+---
+
+
+ThreadX is the RTOS you choose when you need a certification — IEC 61508 SIL 4, ISO 26262 ASIL D, IEC 62304 Class C, DO-178C Level A. Originally from Express Logic, acquired by Microsoft in 2019 (then branded "Azure RTOS"), and relicensed to MIT and donated to the Eclipse Foundation in 2024 as **Eclipse ThreadX**.
+
+## What's different from FreeRTOS
+
+The technical APIs are similar (priority-based preemptive scheduler, semaphores, mutexes, queues, timers). The differences are:
+
+- **Pre-certified** for industrial / automotive / medical / aviation safety standards. The cert package is buyable from Microsoft/partners.
+- **Faster context switch on Cortex-M** — ~100 cycles vs. ~80 (FreeRTOS) but with a more deterministic worst case.
+- **Picokernel architecture** — a single optimised C kernel rather than FreeRTOS's portable C + per-port ASM.
+- **Bundled middleware** — NetX (TCP/IP), FileX (FAT), USBX, GUIX, LevelX (flash) — all from the same vendor, all certified.
+- **Smaller minimum footprint** — ~2 KB ROM, 1 KB RAM for the bare kernel.
+
+## API at a glance
+
+```c
+#include "tx_api.h"
+
+TX_THREAD blink_thread;
+UCHAR blink_stack[1024];
+
+void blink_entry(ULONG arg) {
+    while (1) {
+        toggle_led();
+        tx_thread_sleep(500);   // 500 ticks ≈ 500ms with 1ms tick
+    }
+}
+
+void tx_application_define(void *first_unused_memory) {
+    tx_thread_create(&blink_thread, "blink",
+                     blink_entry, 0,
+                     blink_stack, sizeof(blink_stack),
+                     5, 5,             // priority, preempt-threshold
+                     TX_NO_TIME_SLICE,
+                     TX_AUTO_START);
+}
+
+int main(void) {
+    tx_kernel_enter();
+    return 0;   // never reached
+}
+```
+
+`tx_application_define` is the entry point — ThreadX calls it before starting the scheduler, and you use it to create all your tasks and synchronisation objects.
+
+## Preemption threshold — the ThreadX-specific feature
+
+Each thread has both a **priority** and a **preempt threshold**. The threshold says "this thread can only be preempted by threads with priority higher than my threshold (numerically lower)". Setting threshold = priority gives standard preemptive behaviour; setting threshold higher (numerically lower) than priority limits preemption.
+
+This lets you build a set of "cooperative" priorities within an overall preemptive system:
+
+```c
+// Thread A: priority 5, threshold 3 — can only be preempted by priority < 3
+tx_thread_create(&task_a, "A", a_entry, 0, stack_a, sizeof(stack_a),
+                 5, 3, TX_NO_TIME_SLICE, TX_AUTO_START);
+
+// Thread B: priority 4 — can't preempt A (because A's threshold is 3)
+tx_thread_create(&task_b, "B", b_entry, 0, stack_b, sizeof(stack_b),
+                 4, 4, TX_NO_TIME_SLICE, TX_AUTO_START);
+
+// Thread C: priority 2 — can preempt A (because 2 < threshold 3)
+tx_thread_create(&task_c, "C", c_entry, 0, stack_c, sizeof(stack_c),
+                 2, 2, TX_NO_TIME_SLICE, TX_AUTO_START);
+```
+
+Useful for situations where you want most threads to be cooperative but reserve preemption for a small set of critical ones.
+
+## Synchronisation primitives
+
+| Primitive    | API                          | Use case                            |
+|--------------|------------------------------|-------------------------------------|
+| Semaphore    | `tx_semaphore_*`             | Counting signalling                 |
+| Mutex        | `tx_mutex_*`                 | Recursive locking, priority inheritance |
+| Event flags  | `tx_event_flags_*`           | Multi-bit signal sets               |
+| Message queue| `tx_queue_*`                 | Inter-thread messages               |
+| Block pool   | `tx_block_pool_*`            | Fixed-size memory allocation        |
+| Byte pool    | `tx_byte_pool_*`             | Variable-size memory allocation     |
+| Timer        | `tx_timer_*`                 | Software timers                     |
+
+The **block pool** is worth highlighting — it's a fixed-block memory allocator with deterministic O(1) alloc/free. Combine with a message queue and you have zero-copy IPC: the producer allocates a block, fills it, sends the pointer through the queue; the consumer receives the pointer, uses it, returns the block.
+
+## NetX — the TCP/IP stack
+
+NetX Duo (the IPv4 + IPv6 version) is ThreadX's TCP/IP stack. Fully integrated with the kernel, zero-copy where possible, IEC 61508 certifiable. The API is similar to BSD sockets but more explicit:
+
+```c
+NX_TCP_SOCKET socket;
+nx_tcp_socket_create(&ip_instance, &socket, "client",
+                     NX_IP_NORMAL, NX_FRAGMENT_OKAY, NX_IP_TIME_TO_LIVE,
+                     2048, NX_NULL, NX_NULL);
+nx_tcp_client_socket_connect(&socket, server_ip, server_port, NX_WAIT_FOREVER);
+nx_tcp_socket_send(&socket, &packet, NX_WAIT_FOREVER);
+```
+
+For embedded TCP/IP, NetX has a strong reputation for being one of the most reliable stacks available.
+
+## FileX, USBX, GUIX, LevelX
+
+A whole vendor-coherent middleware family:
+
+- **FileX** — FAT12/16/32 + exFAT filesystem.
+- **USBX** — USB device + host stack with class support (CDC, MSC, HID, etc.).
+- **GUIX** — GUI library for small displays.
+- **LevelX** — wear-levelling for NOR and NAND flash.
+
+Each is independently certifiable and integrated into the ThreadX scheduler.
+
+## Performance on Cortex-M
+
+ThreadX is *fast*. On a Cortex-M4 at 120 MHz:
+
+- Context switch: ~100 cycles (≈ 0.8 µs).
+- ISR exit to thread: ~25 cycles.
+- Semaphore get with wait: ~250 cycles.
+- Message queue send: ~300 cycles.
+
+The numbers are competitive with FreeRTOS — slightly better worst case on some operations, slightly worse on others. The bigger story is that the cert package documents these numbers as worst case under the certification's failure model.
+
+<Callout type="tip" title="If you're not after certification, you may not need ThreadX">
+ThreadX's main differentiator over FreeRTOS is the certification path and the integrated middleware. If you don't need cert and you don't need NetX specifically, FreeRTOS or Zephyr are usually fine. ThreadX's recent open-source move makes it more accessible, but the ecosystem still skews toward safety-critical.
+</Callout>
+
+## See also
+
+- [The RTOS landscape](/docs/rtos/landscape/) — picking between RTOSes.
+- [FreeRTOS](/docs/rtos/freertos/) — for comparison.
+- [Eclipse ThreadX](https://github.com/eclipse-threadx) (external) — the GitHub home of the project.

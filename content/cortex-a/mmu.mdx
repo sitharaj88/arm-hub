@@ -1,0 +1,137 @@
+---
+title: MMU & paging
+description: How ARMv8-A translates virtual addresses to physical — page table levels, TLBs, memory attributes, and the AArch64 translation regime.
+order: 3
+updated: 2026-05-12
+tags: [cortex-a, mmu, paging, tlb]
+---
+
+
+The MMU is what makes A-profile *not* a microcontroller. Every load and store goes through page-table translation. Get the page table wrong and the system either faults forever or — worse — runs with the wrong physical mapping and corrupts memory you didn't even know existed.
+
+## The translation pipeline
+
+```
+              VA = 0xFFFF_8000_0000_1000
+                       │
+                       ▼
+              ┌────────────────────┐
+              │      TLB lookup     │ ← hit: done in ~1 cycle
+              └────────┬───────────┘
+                       │ miss
+                       ▼
+              ┌────────────────────┐
+              │  Page table walk   │  ← 1–4 memory accesses
+              └────────┬───────────┘
+                       ▼
+              PA = 0x4080_1000
+              Memory attributes (cacheable, shareable, RWX, …)
+```
+
+A TLB hit is essentially free. A miss costs as many memory accesses as there are page table levels — typically 4 for 4 KB pages at 48-bit VA.
+
+## AArch64 page table levels
+
+For 4 KB pages with a 48-bit virtual address space:
+
+```
+VA[47:39]  →  Level 0 table index   (PGD)
+VA[38:30]  →  Level 1 table index   (PUD)
+VA[29:21]  →  Level 2 table index   (PMD)
+VA[20:12]  →  Level 3 table index   (PTE)
+VA[11:0]   →  byte offset within page
+```
+
+Each level is a 4 KB table of 512 64-bit descriptors. A descriptor can be:
+
+- **Invalid** — fault on access.
+- **Block** — translates a large region directly (1 GB at L1, 2 MB at L2) — saves a table walk.
+- **Table** — points to the next level.
+- **Page** (L3 only) — translates a 4 KB page.
+
+Switching from "table" to "block" at L2 turns 512 × 4 KB pages into one 2 MB **huge page**, with one TLB entry instead of 512. This is critical for Linux's `madvise(MADV_HUGEPAGE)` and database workloads.
+
+## Two address spaces — TTBR0 and TTBR1
+
+AArch64 has **two translation tables active simultaneously**, selected by the top bit of the virtual address:
+
+| VA range                         | Base register | Typical use      |
+|----------------------------------|---------------|------------------|
+| `0x0000_0000_0000_0000` – `0x0000_FFFF_FFFF_FFFF` | TTBR0_EL1     | User space       |
+| `0xFFFF_0000_0000_0000` – `0xFFFF_FFFF_FFFF_FFFF` | TTBR1_EL1     | Kernel (Linux 0xFFFF_8000_0000_0000+) |
+
+When the kernel context-switches, it only updates TTBR0_EL1 (the user-space mapping). TTBR1_EL1 stays put — the kernel half of every address space is the same, so the TLB entries can stay valid.
+
+This is why a syscall on AArch64 is so cheap: no TTBR swap, no full TLB flush. Compare to x86, where syscall entry historically required a CR3 reload (relaxed somewhat by KPTI's PCIDs).
+
+## Memory attributes
+
+Each page descriptor carries attribute bits selecting from an indexed attribute table — `MAIR_EL1` defines 8 attribute slots, the descriptor's `AttrIndex` picks one.
+
+Typical Linux MAIR setup:
+
+| Slot | Attribute            | Used for                       |
+|------|----------------------|--------------------------------|
+| 0    | Device-nGnRnE        | Strongly-ordered MMIO          |
+| 1    | Device-nGnRE         | Most peripherals               |
+| 2    | Normal, NC           | Non-cacheable buffers (DMA)    |
+| 3    | Normal, WB-WA        | Regular RAM                    |
+| 4    | Normal, WT           | Write-through (rarely)         |
+
+Combined with the **shareability** bits (Inner-Shareable, Outer-Shareable, Non-Shareable) and **access permissions** (kernel R/W, user R/W, Execute Never variants), every page gets a precise specification of how the hardware should treat accesses to it.
+
+<ProtocolFrame
+  title="AArch64 stage-1 page descriptor (4 KB page, L3)"
+  fields={[
+    { name: 'UXN', bits: 1, tone: 'destructive' },
+    { name: 'PXN', bits: 1, tone: 'destructive' },
+    { name: 'res', bits: 5, tone: 'muted' },
+    { name: 'Output address bits[47:12]', bits: 36, tone: 'primary', flexible: true },
+    { name: 'nG', bits: 1, tone: 'warning' },
+    { name: 'AF', bits: 1, tone: 'success' },
+    { name: 'SH', bits: 2, tone: 'accent' },
+    { name: 'AP', bits: 2, tone: 'highlight' },
+    { name: 'NS', bits: 1, tone: 'warning' },
+    { name: 'AttrIdx', bits: 3, tone: 'accent' },
+    { name: 'type', bits: 2, tone: 'muted' },
+  ]}
+  caption="A 64-bit L3 page descriptor packs the output physical-address bits with the attribute index (MAIR slot), shareability (SH), access permissions (AP), the access flag (AF), and the execute-never bits for kernel (PXN) and user (UXN)."
+/>
+
+## TLBs and ASIDs
+
+TLBs cache translations. To avoid flushing the entire TLB on every context switch, ARM tags entries with an **ASID** (Address Space IDentifier — 8 or 16 bits). The kernel assigns each process an ASID; context switches update TTBR0_EL1 and ASID together, and only entries with the old ASID become inaccessible to the new process.
+
+Periodically (when ASIDs wrap around), the kernel does a full TLB flush and starts re-issuing ASIDs.
+
+## Performance pitfalls
+
+### Page-table walk on cache-cold workloads
+
+If your working set crosses many pages and TLB misses dominate, the four-level walk is itself a series of memory accesses. **Transparent Huge Pages** mitigate this by reducing the working set in TLB terms — one 2 MB huge page = 512 fewer TLB entries.
+
+### TLB shootdown
+
+Multiprocessor cache-coherent TLB invalidation isn't free. On Linux, an `munmap()` that affects pages mapped on multiple CPUs triggers an IPI to each one to flush its TLB. Heavy `mmap`/`munmap` churn can hurt scaling.
+
+### Cache-line / page-size mismatches in DMA
+
+When a DMA engine writes to a 64-byte cache line that straddles two pages with different cacheability attributes, behaviour is implementation-defined. Always align DMA buffers to **page boundaries** when crossing cacheable/non-cacheable transitions.
+
+<Callout type="warn" title="Don't disable the MMU on Cortex-A">
+A common Cortex-M habit — "just turn it off and access physical addresses" — has no Cortex-A analogue. Disabling the MMU on a Cortex-A switches all memory to Device, breaks instruction caches in subtle ways, and is essentially never done outside the first hundred instructions of BL1.
+</Callout>
+
+## Touching the MMU from kernel code
+
+You almost never write MMU code directly — Linux's `arch/arm64/mm/` does it for you. But you'll occasionally:
+
+- **`ioremap()`** — map a physical MMIO region into kernel virtual space with Device attributes. The driver author's bread and butter.
+- **`dma_alloc_coherent()`** — allocate Normal-non-cacheable memory for DMA. Maps it twice (cached kernel view + non-cached DMA view) on platforms that need it.
+- **`set_memory_*()`** — change attributes of an existing mapping (read-only, NX). Used by module loaders for W^X.
+
+## See also
+
+- [Caches & coherency](/docs/cortex-a/caches/) — how MMU attributes interact with caches.
+- [Memory model](/docs/architecture/memory-model/) — barriers and ordering at the ISA level.
+- [Boot flow & EL levels](/docs/cortex-a/boot-and-exception-levels/) — when the MMU first comes up.

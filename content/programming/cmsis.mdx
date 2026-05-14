@@ -1,0 +1,260 @@
+---
+title: CMSIS
+description: The Cortex Microcontroller Software Interface Standard — what's in it, why every vendor ships it, and the parts you actually use.
+order: 2
+updated: 2026-05-12
+tags: [programming, cmsis, abstraction]
+---
+
+
+CMSIS is ARM's standardised abstraction layer for Cortex-M development. It started life as a thin layer over the core registers (NVIC, SysTick, SCB) so vendor SDKs could share an API. It's grown into a sprawling family of standards covering core, DSP, NN inference, RTOS APIs, build configurations, and pack management. The good news: most of it is optional. The parts you'll actually touch are a few headers and a handful of functions.
+
+<SpecSheet
+  title="CMSIS — at a glance"
+  specs={[
+    { label: 'Current version', value: 'CMSIS 6 (2024) — modular layout, Apache 2.0, hosted at github.com/ARM-software/CMSIS_6' },
+    { label: 'CMSIS-Core', value: 'Cortex-M core register access. M and A profile variants (core_cm0/3/4/7/23/33/55/85.h, core_ca5/7/9.h)' },
+    { label: 'CMSIS-DSP', value: 'Hand-tuned signal-processing library: FIR/IIR/biquad/FFT/matrix/stats. Helium-aware on v8.1-M' },
+    { label: 'CMSIS-NN', value: 'Quantised neural-net kernels (INT8 / INT4 INT16). Helium-aware on M55/M85' },
+    { label: 'CMSIS-Driver', value: 'Standardised peripheral driver API (USART, SPI, I2C, USB, Ethernet, Flash, NAND). Used in Keil ecosystem' },
+    { label: 'CMSIS-RTOS2', value: 'Vendor-neutral RTOS API. Reference impl Keil RTX5; FreeRTOS adapter shipped by ARM' },
+    { label: 'CMSIS-SVD', value: 'System View Description — XML schema describing every peripheral register. Used by debuggers, header generators' },
+    { label: 'CMSIS-Pack', value: 'Distribution format (.pack = zip of headers, drivers, examples, manifest). Consumed by Keil and open-pack tools' },
+    { label: 'CMSIS-Build', value: 'csolution.yml / cproject.yml descriptors. Replaces uVision project files. CMake / cbuild backends' },
+    { label: 'CMSIS-Toolbox', value: 'cbuild, csolution, packchk CLI tools — the open-source build flow ARM ships alongside CMSIS 6' },
+  ]}
+/>
+
+## CMSIS layers
+
+| Layer        | What it is                                            | Header                     |
+|--------------|-------------------------------------------------------|----------------------------|
+| **Core**     | Cortex-M core registers (NVIC, SysTick, SCB, FPU)     | `cmsis_gcc.h`, `core_cm4.h`|
+| **Device**   | Vendor's MCU register map (SVD-generated)              | `stm32f4xx.h`              |
+| **Driver**   | Standardised driver API (not widely adopted)           | `Driver_USART.h`           |
+| **DSP**      | Hand-tuned DSP library                                 | `arm_math.h`               |
+| **NN**       | Quantised neural-net kernels (Helium-aware)            | `arm_nnfunctions.h`        |
+| **RTOS2**    | Vendor-neutral RTOS API                                | `cmsis_os2.h`              |
+| **Pack**     | Build/package format (CMSIS-Pack)                      | `*.pack` files             |
+
+In practice, almost every project uses **Core + Device**. DSP is used when needed. RTOS2 has thin uptake (most projects use FreeRTOS or Zephyr directly). Driver is rarely used. NN is gaining traction with M55/M85.
+
+## CMSIS-Core in practice
+
+The functions you'll call repeatedly:
+
+```c
+// Interrupts
+__enable_irq();
+__disable_irq();
+__set_PRIMASK(0);                          // enable
+__set_BASEPRI(0x60);                       // mask all but priority < 6 (with 4 bits implemented)
+
+NVIC_EnableIRQ(USART2_IRQn);
+NVIC_DisableIRQ(USART2_IRQn);
+NVIC_SetPriority(USART2_IRQn, 5);
+NVIC_SetPendingIRQ(USART2_IRQn);
+NVIC_ClearPendingIRQ(USART2_IRQn);
+
+// SysTick
+SysTick_Config(SystemCoreClock / 1000);     // 1 ms tick
+
+// Barriers
+__DMB(); __DSB(); __ISB();
+
+// Wait-for-event / wait-for-interrupt
+__WFI(); __WFE();
+
+// CPU features
+__CLZ(value);            // count leading zeros
+__REV(value);            // byte-reverse
+__RBIT(value);           // bit-reverse
+__SSAT(value, 12);       // saturate to signed 12-bit
+__SMLAD(a, b, acc);      // dual MAC (M4+)
+
+// Cache (M7 only)
+SCB_EnableICache();
+SCB_EnableDCache();
+SCB_CleanDCache_by_Addr((uint32_t *)buf, len);
+SCB_InvalidateDCache_by_Addr((uint32_t *)buf, len);
+
+// MPU (when present)
+ARM_MPU_Disable();
+ARM_MPU_SetRegion(rnr, rbar, rasr);
+ARM_MPU_Enable(MPU_CTRL_PRIVDEFENA_Msk);
+```
+
+## CMSIS-Device — the register map
+
+Each vendor ships a CMSIS-Device package, typically generated from an SVD (System View Description) XML file. The result: a header `stm32f407xx.h` that defines:
+
+```c
+typedef struct {
+    __IO uint32_t MODER;
+    __IO uint32_t OTYPER;
+    // ...
+} GPIO_TypeDef;
+
+#define GPIOA   ((GPIO_TypeDef *)0x40020000)
+#define GPIOA_BASE 0x40020000
+```
+
+This is what lets you write `GPIOA->MODER = ...` portably. `__IO`, `__O`, `__I` are CMSIS macros expanding to `volatile`, `volatile`, `const volatile` respectively.
+
+The SVD file itself is useful — Eclipse Embedded, OpenOCD, and most debuggers can use it to display peripheral registers symbolically when you halt.
+
+## CMSIS-DSP — the killer feature
+
+CMSIS-DSP is a hand-tuned library implementing:
+
+- FIR/IIR/biquad filters.
+- FFTs (radix-2, mixed-radix, RFFT).
+- Matrix operations.
+- Statistics (mean, RMS, std-dev).
+- Math functions (vector sin/cos/log via lookup tables).
+
+It's *fast*. The Cortex-M4 dual-MAC variants of these routines are essentially the optimal C implementation. The Cortex-M55/M85 variants use Helium and pull another 4–5× speedup automatically.
+
+```c
+#include "arm_math.h"
+
+arm_fir_instance_q15 fir;
+q15_t state[BLOCK_SIZE + NUM_TAPS - 1];
+q15_t coeffs[NUM_TAPS] = { /* ... */ };
+
+arm_fir_init_q15(&fir, NUM_TAPS, coeffs, state, BLOCK_SIZE);
+arm_fir_q15(&fir, input, output, BLOCK_SIZE);
+```
+
+Use the data type that matches your data — `q15` for 16-bit fixed point, `q31` for 32-bit, `f32` for single-precision float. The fixed-point versions are usually 3–5× faster than float when the FPU isn't single-issue with the rest of the pipeline.
+
+## CMSIS-RTOS2 — the standard RTOS API
+
+CMSIS-RTOS2 is a vendor-neutral RTOS API. There's a reference implementation (Keil RTX5) and a FreeRTOS adapter; both expose:
+
+```c
+osThreadId_t tid = osThreadNew(my_thread, NULL, NULL);
+osThreadFlagsSet(tid, 0x01);
+osDelay(100);
+osMutexAcquire(mid, osWaitForever);
+osMessageQueuePut(mq, &msg, 0, 100);
+```
+
+The intent is portability — you can switch the RTOS underneath without rewriting application code. In practice, projects usually pick FreeRTOS or Zephyr and stay there because the ecosystems are bigger. CMSIS-RTOS2 sees most use in certified environments (medical, automotive) where the abstraction is part of the spec.
+
+<Callout type="note" title="CMSIS isn't a HAL">
+CMSIS gives you symbolic register names. It doesn't tell you how to use the peripherals. That's the vendor's HAL (STM32 HAL, NXP MCUXpresso SDK, Nordic nrfx) — built *on top of* CMSIS. Many projects skip the vendor HAL and write directly to the registers using CMSIS names.
+</Callout>
+
+## CMSIS-Pack
+
+A `.pack` file is a zip containing CMSIS device headers, drivers, examples, and an XML manifest. Keil µVision and a few other tools consume them directly; most open-source workflows ignore them and pull the relevant headers from vendor GitHub repos.
+
+ARM hosts the central [CMSIS Pack repository](https://www.keil.arm.com/packs/) — useful for finding vendor packs even if you don't use Keil.
+
+## CMSIS-SVD — XML descriptions of every peripheral
+
+The System View Description format is a deceptively important piece of the ecosystem. An SVD file is XML that describes every peripheral, every register, every bitfield of a given MCU, including reset values, access permissions, and human-readable descriptions. The XML lineage is rigorous: each peripheral has a base address, an address block (size of the mapped region), a list of registers (each with offset, size, access, reset value), and each register has a list of fields (each with bit range, access, and enumerated values).
+
+A typical SVD entry:
+
+```xml
+<peripheral>
+  <name>GPIOA</name>
+  <baseAddress>0x40020000</baseAddress>
+  <addressBlock>
+    <offset>0x0</offset><size>0x400</size>
+    <usage>registers</usage>
+  </addressBlock>
+  <interrupt><name>EXTI0</name><value>6</value></interrupt>
+  <registers>
+    <register>
+      <name>MODER</name>
+      <addressOffset>0x00</addressOffset>
+      <size>32</size>
+      <access>read-write</access>
+      <resetValue>0xA8000000</resetValue>
+      <fields>
+        <field><name>MODER0</name><bitOffset>0</bitOffset><bitWidth>2</bitWidth></field>
+        <!-- ... -->
+      </fields>
+    </register>
+  </registers>
+</peripheral>
+```
+
+What consumes SVD files:
+
+- **CMSIS-Device headers** — the `stm32f407xx.h` and equivalents are generated from SVD by SVDConv (the ARM tool) or `svd2rust` (the Rust embedded community tool).
+- **Debuggers** — OpenOCD, pyOCD, Segger Ozone, J-Link RTT, GDB with the `monitor svd` extension, and VS Code's cortex-debug all display peripheral registers symbolically when fed an SVD.
+- **Static analysis** — some tools cross-reference register names from the SVD with usage in C code to detect "you wrote to a read-only register" bugs.
+- **Documentation generators** — armhub's own peripheral diagrams are partially generated from vendor SVDs.
+
+Almost every vendor ships an SVD per chip, although quality varies. Nordic and STMicro produce excellent, complete SVDs; some smaller vendors ship SVDs that omit half the bit-field descriptions.
+
+## CMSIS-Pack — the distribution format
+
+A `.pack` file is a renamed `.zip` containing four things: device headers (the SVD-generated `*.h`), driver source (HAL `.c` + `.h`), examples, and a `PDSC` XML manifest describing the contents. Pack files are versioned, GPG-signed (optionally), and indexed in a central repository hosted at `keil.arm.com/packs`.
+
+The pack model lets ARM's tools (Keil µVision, CMSIS-Build, the open-source `csolution` CLI) consume vendor SDKs uniformly: install the pack, pick a device, configure peripherals via the included `RTE_Components.h` file, build. Outside the ARM/Keil ecosystem, pack consumption is rarer — most open-source workflows pull vendor SDKs as git submodules and ignore the pack layer.
+
+CMSIS 6 separates pack publishing from pack consumption: `cpackget` is the CLI tool to install / remove packs from a local cache; `packchk` validates them; `csolution` generates build descriptions from `csolution.yml` against installed packs. This stack is reproducible and CI-friendly in a way that the old uVision-only flow was not.
+
+## CMSIS-Build versus vendor IDEs
+
+The traditional Cortex-M build flow was vendor-IDE-driven: STM32CubeIDE, MCUXpresso IDE, Simplicity Studio, Code Composer Studio. Each generates a project that only builds inside the IDE. CI integration ranged from painful to impossible.
+
+CMSIS-Build is ARM's answer. The `csolution.yml` describes a solution (think Visual Studio "solution"), `*.cproject.yml` files describe projects, and `*.clayer.yml` files describe reusable layers (a HAL layer, an RTOS layer, an application layer). The CLI `cbuild` generates a `compile_commands.json` and either emits CMake or invokes ninja directly.
+
+```yaml
+# minimal cproject.yml
+project:
+  groups:
+    - group: app
+      files:
+        - file: src/main.c
+        - file: src/startup.c
+  components:
+    - component: ARM::CMSIS:CORE
+    - component: STMicroelectronics::Device:STM32CubeMX
+  device: STMicroelectronics::STM32F407VGTx
+```
+
+```bash
+cbuild app.cproject.yml --packs --update-rte
+ninja -C out/app/Debug
+```
+
+This is the recommended way to start a new CMSIS project in 2025. The barrier is community familiarity — vendor SDKs still ship CubeIDE-first, so onboarding to CMSIS-Build means re-doing the project glue.
+
+## Version history — from CMSIS 1 to CMSIS 6
+
+- **CMSIS 1.x** (2008) — original release. Just core_cm3.h, basic NVIC / SysTick / SCB abstractions.
+- **CMSIS 2.x** (2010) — added CMSIS-DSP, expanded core_cm0/cm4/cm7 headers.
+- **CMSIS 3.x** (2012) — introduced CMSIS-Pack and the manifest model. CMSIS-DSP added.
+- **CMSIS 4.x** (2014) — CMSIS-Driver standard introduced.
+- **CMSIS 5.x** (2018) — major rewrite. CMSIS-RTOS2, CMSIS-NN added. Modular pack layout. Apache 2.0 license (was BSD-3).
+- **CMSIS 6.0** (2024) — clean split between core, DSP, NN, RTOS, Build. Helium kernels in DSP / NN. PACBTI awareness. csolution / cbuild CLI replaces uVision-only build path.
+
+If you've been away from CMSIS since v3 or v4, the v5/v6 era is essentially a new platform. The header naming, the build flow, the pack semantics — all rewritten. Most vendor SDKs in 2025 ship CMSIS 5.9 or CMSIS 6 alongside their own HAL.
+
+<Callout type="tip" title="If you only learn three CMSIS pieces, learn these">
+1. **`core_cm{n}.h`** — the inline assembly intrinsics (`__DSB`, `__WFI`, `__CLZ`) and the NVIC / SCB / SysTick struct definitions. You'll use these every day.
+2. **arm_math.h** — CMSIS-DSP. When you need an FFT, an FIR, or a biquad, this is what you use. The Helium variants on M55/M85 give roughly 4x speedup automatically.
+3. **SVD-driven debugger views** — load the SVD into your debugger and stop hand-decoding register bits. This single workflow change saves hours per week.
+</Callout>
+
+## Cross-references
+
+- [Embedded C patterns](/docs/programming/embedded-c/) — what to write *between* the CMSIS calls.
+- [Linker scripts](/docs/programming/linker-scripts/) — the CMSIS startup file structure.
+- [Toolchain](/docs/tools/toolchains/) — building against CMSIS headers.
+- [NVIC priority](/docs/cortex-m/nvic-priority/) — what `NVIC_SetPriority` actually writes.
+- [SysTick & timing](/docs/cortex-m/systick/) — what `SysTick_Config` configures.
+- [MPU on Cortex-M](/docs/cortex-m/mpu/) — `ARM_MPU_*` helpers, v7-M vs v8-M.
+- [ARMv7-M vs ARMv8-M](/docs/architecture/armv7m-armv8m/) — header naming across the generations.
+- [Cortex-M lineup](/docs/cortex-m/lineup/) — pick which `core_cm{n}.h` to include.
+- [ARM ISA family](/docs/architecture/isa-family/) — how CMSIS abstracts ISA differences.
+- [TrustZone](/docs/architecture/trustzone/) — CMSIS-Core helpers for security-state-aware code.
+- [QEMU & Renode](/docs/tools/sim/) — runs CMSIS-based binaries unchanged.
+- [STMicro](/docs/vendors/stm/), [NXP](/docs/vendors/nxp/), [Renesas](/docs/vendors/renesas/) — how each vendor packages CMSIS.

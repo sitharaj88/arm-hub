@@ -1,0 +1,134 @@
+---
+title: Silicon Labs (EFM32 / EFR32)
+description: Silicon Labs's energy-friendly Cortex-M parts — and their EFR32 wireless line that owns much of the Zigbee / Thread / Matter market.
+order: 8
+updated: 2026-05-12
+tags: [vendors, silicon-labs, silabs]
+---
+
+Silicon Labs (SiLabs) built their brand on **energy-friendly** microcontrollers. The "Gecko" lineup of EFM32 chips have long led the low-power benchmarks, and the EFR32 wireless line is dominant in **Zigbee, Thread, Matter, and now BLE** — particularly in smart home and connected lighting.
+
+<SpecSheet
+  title="Silicon Labs ARM portfolio — at a glance"
+  specs={[
+    { label: 'EFM32 (pure MCU)', value: 'Cortex-M0+ / M3 / M4F / M33 — Zero, Happy, Tiny, Gecko, Pearl, Jade, Giant, Wonder, Series 2' },
+    { label: 'EFR32 (wireless)', value: 'Cortex-M33 + 2.4 GHz / sub-GHz radio — BG (BLE), MG (multi-protocol), FG (Flex), ZG (Zigbee), xG24 / xG27 (flagship)' },
+    { label: 'Series 1 vs Series 2', value: 'Series 1 = Cortex-M4F, no TrustZone; Series 2 = Cortex-M33 + TrustZone, AI/ML accelerator, secure vault' },
+    { label: 'Energy modes', value: 'EM0 active, EM1 sleep, EM2 deep sleep (RTCC), EM3 stop, EM4S retention, EM4H pin-wake only' },
+    { label: 'Typical EM2 current', value: '~1.4 microamps with RTCC running, full RAM retention, 32 kHz LFXO' },
+    { label: 'Radio Abstraction', value: 'RAIL (Radio Abstraction Interface Layer) — vendor API beneath every wireless stack' },
+    { label: 'SDK', value: 'Simplicity SDK (formerly Gecko SDK) — git-versioned, CMake-buildable, includes Bluetooth, OpenThread, Zigbee, Matter, Z-Wave, Wi-SUN' },
+    { label: 'Tooling', value: 'Simplicity Studio (Eclipse-based), Energy Profiler, Network Analyzer, Pin Tool, Radio Configurator' },
+  ]}
+/>
+
+## EFM32 — pure MCU
+
+| Series           | Core             | Position                                  |
+|------------------|------------------|-------------------------------------------|
+| EFM32 Zero Gecko | Cortex-M0+       | Lowest-power M0+                          |
+| EFM32 Happy Gecko| Cortex-M0+       | USB-equipped M0+                          |
+| EFM32 Tiny Gecko | Cortex-M3        | Low-cost M3                               |
+| EFM32 Gecko      | Cortex-M3        | Mainstream M3                             |
+| EFM32 Pearl Gecko| Cortex-M4F       | Performance + low-power M4F               |
+| EFM32 Jade Gecko | Cortex-M3        | Mid-range M3                              |
+| EFM32 Series 2   | Cortex-M33       | Modern TrustZone M33                      |
+
+The "Gecko" branding has multiple generations. Series 2 (newer) is the recommended path for new MCU designs.
+
+## EFR32 — wireless
+
+This is where SiLabs really wins. EFR32 chips combine a Cortex-M33 with a 2.4 GHz radio supporting multiple protocols.
+
+| Series           | Protocols                                            |
+|------------------|------------------------------------------------------|
+| EFR32 BG (Blue Gecko) | BLE                                            |
+| EFR32 MG (Mighty Gecko) | Zigbee, Thread, Bluetooth Mesh               |
+| EFR32 FG (Flex Gecko) | proprietary 2.4 GHz / sub-GHz                  |
+| EFR32 ZG         | Zigbee-only                                          |
+| EFR32 SG         | Sub-GHz proprietary                                  |
+| EFR32 xG24       | Multi-protocol (BLE + 802.15.4 + AI/ML)              |
+
+The **EFR32xG24** is currently SiLabs's flagship — Cortex-M33 with Matter support, AI/ML accelerator, dual-bank flash for OTA. It ships in Amazon Sidewalk endpoints, Philips Hue lights, Aqara sensors, and a long list of similar consumer products.
+
+## Energy modes
+
+SiLabs's defining feature: a granular set of low-power modes, going beyond ARM's standard sleep states.
+
+| Mode  | Active                                | Wake source                |
+|-------|---------------------------------------|----------------------------|
+| EM0   | CPU active                            | —                          |
+| EM1   | CPU sleep, peripherals on, RAM active | any peripheral             |
+| EM2   | Most peripherals off, RTCC running    | RTCC, GPIO                 |
+| EM3   | RTCC off, only Burtcc + GPIO          | Burtcc, GPIO               |
+| EM4S  | RAM retained, ultra-low                | Wake pin, Burtcc           |
+| EM4H  | No RAM retention, just pin wake       | Wake pin                   |
+
+A SiLabs design typically operates in **EM2** (around 1.5 µA) the vast majority of the time, waking briefly to EM0 to handle events. Battery life of 5+ years on a CR2032 is routine.
+
+## Simplicity Studio
+
+SiLabs's vendor IDE. Eclipse-based, integrates board management, energy profiler, network analyser (for the EFR32 lines), and an OTA flash debugger. Better than most vendor IDEs, particularly the **energy profiler** — it shows you per-µs current consumption correlated with your code, so you can see exactly which function call costs how many microcoulombs.
+
+For non-wireless EFM32 work, command-line CMake + arm-none-eabi-gcc + their HAL works fine.
+
+## When you'd pick SiLabs
+
+- **You need Matter / Thread / Zigbee** — the EFR32 family is arguably the most mature for these protocols.
+- **Energy budget is critical** — SiLabs's deep-sleep modes are reliably class-leading.
+- **Smart home / connected lighting product** — you'll find more relevant reference designs at SiLabs than anywhere else.
+
+## Series 1 versus Series 2 — what changed under the hood
+
+The Series 1 / Series 2 split is the most important versioning fact for any new SiLabs design. Series 1 parts (EFR32xG12, xG13, xG14, MG12, BG13, etc.) are Cortex-M4F based, lack TrustZone, and use the older Peripheral Reflex System (PRS) v1. Series 2 (xG21, xG22, xG23, xG24, xG27, xG28) moves to Cortex-M33, adds **TrustZone-M**, a **Secure Vault** for key storage, an **AI/ML accelerator** (xG24 only — a CMSIS-NN-compatible matrix-vector engine), and an upgraded PRS v2 with deeper routing.
+
+Series 2 also restructures the clock tree: the older HFXO/LFXO/HFRCO/LFRCO split is replaced by **HFXO + HFRCODPLL + LFXO + LFRCO + ULFRCO**, with the DPLL allowing the high-frequency RC to be calibrated against the 32 kHz crystal to within roughly 100 ppm — useful when you want to skip the 38.4 MHz radio crystal in cost-down designs. Cryptographic acceleration moves from the standalone CRYPTO peripheral to the integrated **SE** (Security Element) subsystem, which on xG21B/xG24 is a separate Cortex-M0+ running signed firmware.
+
+| Feature | Series 1 (M4F) | Series 2 (M33) |
+|---------|---------------|----------------|
+| Core | Cortex-M4F @ 40 MHz | Cortex-M33 @ 78–80 MHz |
+| TrustZone | no | yes (xG21 onward) |
+| Secure Vault | no | high tier on xG21B, xG24 |
+| AI/ML accelerator | no | yes on xG24 (MVP — Matrix Vector Processor) |
+| OpenThread / Matter | yes | yes (recommended) |
+| Bluetooth Mesh / BLE 5.4 | partial | yes |
+| Lifecycle status | mature, recommend Series 2 for new | active development |
+
+For new designs in 2025+, default to Series 2. Series 1 is still in production for backwards compatibility, but xG24 is now the standard pick for Matter/Thread end-devices.
+
+## RAIL — the Radio Abstraction Interface Layer
+
+Beneath every SiLabs wireless stack — BLE, OpenThread, Zigbee, Bluetooth Mesh, Wi-SUN, Z-Wave LR, proprietary — sits **RAIL**. RAIL exposes a uniform API for "configure the radio, transmit a packet, receive a packet, schedule a TX event, ACK, retry." Above RAIL, the stacks layer their protocol logic; below RAIL, the radio is a programmable engine with PHY parameters (modulation, data rate, channel filter, packet structure) loaded from a configuration blob generated by the **Radio Configurator** tool in Simplicity Studio.
+
+This architecture has two important consequences. First, RAIL lets a single Series 2 chip switch protocols at runtime — an xG24 can act as a Zigbee coordinator in one second and as a BLE peripheral in the next, sharing the antenna. Second, RAIL is the right abstraction layer for *proprietary* protocols: if your product needs a custom 2.4 GHz link (long-range, low-rate, robust to interference), you write your MAC over RAIL rather than fighting the BLE / Zigbee stacks.
+
+```c
+/* Minimal RAIL transmit pattern */
+RAIL_Handle_t handle = RAIL_Init(&railCfg, NULL);
+RAIL_ConfigChannels(handle, channelConfig, NULL);
+RAIL_SetTxFifo(handle, txFifo, 0, sizeof(txFifo));
+RAIL_WriteTxFifo(handle, payload, length, true);
+RAIL_StartTx(handle, channel, RAIL_TX_OPTIONS_DEFAULT, NULL);
+```
+
+## Inside the energy modes — what each one actually gates
+
+The published numbers (1.4 microamps in EM2, 50 nanoamps in EM4H) only hold if you understand what each mode is gating. EM2 keeps the LFXO crystal running, the RTCC counting, all RAM retained, and any peripheral that opted into "EM2 capable" mode (BURTC, LEUART, LETIMER, I2C in master-pull mode, GPIO with async sense) operational. The CPU is clock-gated, the HF oscillator off, the radio off. Wake to EM0 from EM2 typically takes 5–10 microseconds — fast enough for sensor-polling profiles that wake hundreds of times per second.
+
+EM3 drops the RTCC and most LF peripherals; only the BURTC (Backup RTC) and GPIO interrupts can wake you. EM4S retains RAM and a small set of registers; EM4H retains nothing and wakes via a dedicated pin or a programmable wake counter. The trick to ultra-low-power designs is to do as much as possible in EM2 with peripheral autonomy: a typical EFR32 design runs a state machine where the LDMA (Linked DMA), peripheral PRS chains, and CRYOTIMER trigger packet transmissions without the CPU ever waking.
+
+<Callout type="tip" title="Use the Energy Profiler from day one">
+Simplicity Studio's Energy Profiler correlates a per-microsecond current trace with your source code via PC sampling over SWO. You can see exactly which line of code is responsible for which microcoulombs. On a battery-budget review, this single tool replaces hours of guesswork. Run it on every PR that touches a sleep path.
+</Callout>
+
+## Cross-references
+
+- [Cortex-M33 / M23](/docs/cortex-m/m33-m23/) — EFR32 / EFM32 Series 2 core.
+- [Cortex-M0+](/docs/cortex-m/m0-m0plus/) — older Gecko core.
+- [Cortex-M4](/docs/cortex-m/m4/) — Series 1 EFR32 core.
+- [TrustZone](/docs/architecture/trustzone/) — used by the Series 2 Secure Vault.
+- [CMSIS](/docs/programming/cmsis/) — Gecko SDK layers on CMSIS-Core.
+- [Nordic](/docs/vendors/nordic/) — primary BLE competitor.
+- [NXP](/docs/vendors/nxp/) — alternative Matter/Thread option via K32W and MCX-W.
+- [QEMU & Renode](/docs/tools/sim/) — Renode has EFM32 Giant Gecko and partial EFR32 models.
+- [Interrupt latency tool](/tools/interrupt-latency) — explore EM2-wake versus EM0 trade-offs.

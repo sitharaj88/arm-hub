@@ -1,0 +1,577 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* ───────── Light — sophisticated indigo/cyan with warm card tints ───────── */
+  :root {
+    --background: 230 30% 99%;
+    --foreground: 234 35% 12%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 234 35% 12%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 234 35% 12%;
+
+    /* Primary — violet/indigo, modern dev-tool accent */
+    --primary: 252 76% 56%;
+    --primary-foreground: 0 0% 100%;
+    --primary-glow: 252 100% 70%;
+
+    --secondary: 230 30% 95%;
+    --secondary-foreground: 234 35% 18%;
+
+    --muted: 230 25% 96%;
+    --muted-foreground: 234 12% 42%;
+
+    --accent: 198 90% 48%;
+    --accent-foreground: 0 0% 100%;
+    --accent-glow: 198 100% 60%;
+
+    /* Highlight — warm amber for badges / "new" markers */
+    --highlight: 30 95% 55%;
+    --highlight-foreground: 0 0% 100%;
+
+    --destructive: 0 72% 50%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 158 64% 42%;
+    --warning: 30 95% 50%;
+    --info: 199 95% 50%;
+
+    --border: 230 18% 90%;
+    --input: 230 18% 90%;
+    --ring: 252 76% 60%;
+
+    --radius: 0.75rem;
+
+    /* Mesh gradient colors */
+    --mesh-1: 252 100% 70%;   /* violet */
+    --mesh-2: 198 95% 60%;    /* cyan */
+    --mesh-3: 320 90% 70%;    /* pink */
+    --mesh-4: 30 100% 65%;    /* amber */
+  }
+
+  /* ───────── Dark — deep indigo black with vibrant accents ───────── */
+  .dark {
+    --background: 234 32% 6%;
+    --foreground: 230 20% 96%;
+
+    --card: 234 28% 9%;
+    --card-foreground: 230 20% 96%;
+
+    --popover: 234 28% 9%;
+    --popover-foreground: 230 20% 96%;
+
+    --primary: 252 90% 70%;
+    --primary-foreground: 234 35% 8%;
+    --primary-glow: 252 100% 75%;
+
+    --secondary: 234 22% 14%;
+    --secondary-foreground: 230 20% 96%;
+
+    --muted: 234 22% 12%;
+    --muted-foreground: 230 14% 65%;
+
+    --accent: 198 95% 60%;
+    --accent-foreground: 234 35% 8%;
+    --accent-glow: 198 100% 70%;
+
+    --highlight: 30 95% 60%;
+    --highlight-foreground: 234 35% 8%;
+
+    --destructive: 0 72% 60%;
+    --destructive-foreground: 230 20% 96%;
+
+    --success: 158 64% 55%;
+    --warning: 30 95% 60%;
+    --info: 199 95% 60%;
+
+    --border: 234 18% 16%;
+    --input: 234 18% 16%;
+    --ring: 252 90% 70%;
+
+    --mesh-1: 252 100% 60%;
+    --mesh-2: 198 95% 55%;
+    --mesh-3: 320 80% 60%;
+    --mesh-4: 30 95% 55%;
+  }
+
+  * {
+    border-color: hsl(var(--border));
+  }
+
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-feature-settings: "rlig" 1, "calt" 1, "ss01" 1, "cv11" 1;
+  }
+
+  ::selection {
+    background-color: hsl(var(--primary) / 0.25);
+    color: hsl(var(--foreground));
+  }
+
+  :focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+  button:focus-visible,
+  a:focus-visible { outline-offset: 3px; }
+}
+
+@layer components {
+  /* ───────── Prose — refined typography with brand color accents ───────── */
+  .prose :where(h1, h2, h3, h4, h5, h6):not(:where([class~="not-prose"] *)) {
+    position: relative;
+    font-weight: 600;
+    letter-spacing: -0.012em;
+    scroll-margin-top: 5rem;
+    color: hsl(var(--foreground));
+  }
+  /* Anchor copy button (appended by rehype-autolink-headings) */
+  .prose :where(.heading-anchor) {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-left: 0.4em;
+    height: 1.5em;
+    width: 1.5em;
+    border-radius: 6px;
+    color: hsl(var(--muted-foreground) / 0.7);
+    text-decoration: none !important;
+    border: 1px solid transparent;
+    opacity: 0;
+    transition: opacity 120ms, color 120ms, border-color 120ms, background-color 120ms;
+    vertical-align: middle;
+  }
+  .prose :where(h2, h3, h4):hover .heading-anchor,
+  .prose :where(h2, h3, h4):focus-within .heading-anchor,
+  .prose .heading-anchor:focus-visible {
+    opacity: 1;
+  }
+  .prose .heading-anchor:hover {
+    color: hsl(var(--primary));
+    background-color: hsl(var(--primary) / 0.08);
+    border-color: hsl(var(--primary) / 0.25);
+  }
+  .prose .heading-anchor[data-copied="true"] {
+    color: hsl(var(--success));
+    background-color: hsl(var(--success) / 0.10);
+    border-color: hsl(var(--success) / 0.30);
+    opacity: 1;
+  }
+  .prose :where(h1):not(:where([class~="not-prose"] *)) {
+    font-size: 2rem; line-height: 1.15; margin: 0 0 1.5rem;
+    letter-spacing: -0.025em;
+  }
+  .prose :where(h2):not(:where([class~="not-prose"] *)) {
+    font-size: 1.5rem; line-height: 1.25; margin: 3rem 0 1rem;
+    padding-bottom: 0.5rem; border-bottom: 1px solid hsl(var(--border));
+  }
+  .prose :where(h3):not(:where([class~="not-prose"] *)) {
+    font-size: 1.25rem; line-height: 1.3; margin: 2rem 0 0.75rem;
+  }
+  .prose :where(h4):not(:where([class~="not-prose"] *)) {
+    font-size: 1.05rem; line-height: 1.4; margin: 1.5rem 0 0.5rem;
+  }
+  .prose :where(p):not(:where([class~="not-prose"] *)) {
+    margin: 1rem 0; line-height: 1.7; color: hsl(var(--foreground));
+  }
+  .prose :where(a):not(:where([class~="not-prose"] *)) {
+    color: hsl(var(--primary));
+    text-decoration: underline;
+    text-decoration-color: hsl(var(--primary) / 0.4);
+    text-underline-offset: 3px;
+    font-weight: 500;
+    transition: text-decoration-color 150ms, color 150ms;
+  }
+  .prose :where(a):not(:where([class~="not-prose"] *)):hover {
+    color: hsl(var(--primary-glow));
+    text-decoration-color: hsl(var(--primary));
+  }
+  .prose :where(strong):not(:where([class~="not-prose"] *)) {
+    color: hsl(var(--foreground)); font-weight: 600;
+  }
+  .prose :where(ul):not(:where([class~="not-prose"] *)) {
+    padding-left: 1.25rem; list-style-type: disc; margin: 1rem 0;
+  }
+  .prose :where(ol):not(:where([class~="not-prose"] *)) {
+    padding-left: 1.25rem; list-style-type: decimal; margin: 1rem 0;
+  }
+  .prose :where(li):not(:where([class~="not-prose"] *)) {
+    margin: 0.4rem 0; padding-left: 0.25rem; line-height: 1.6;
+  }
+  .prose :where(li)::marker { color: hsl(var(--primary) / 0.6); }
+  .prose :where(hr):not(:where([class~="not-prose"] *)) {
+    border-color: hsl(var(--border)); margin: 2.5rem 0;
+  }
+  .prose :where(blockquote):not(:where([class~="not-prose"] *)) {
+    border-left: 3px solid hsl(var(--primary) / 0.5);
+    padding: 0.75rem 1rem;
+    margin: 1.25rem 0;
+    color: hsl(var(--muted-foreground));
+    font-style: normal;
+    background: linear-gradient(90deg, hsl(var(--primary) / 0.05), transparent 60%);
+    border-radius: 0 var(--radius) var(--radius) 0;
+  }
+  .prose :where(blockquote p):not(:where([class~="not-prose"] *)) { margin: 0; }
+
+  /* Inline code with primary tint */
+  .prose :where(code):not(:where([class~="not-prose"] *, pre *)) {
+    font-family: var(--font-geist-mono), ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: linear-gradient(180deg, hsl(var(--primary) / 0.08), hsl(var(--primary) / 0.12));
+    color: hsl(var(--primary));
+    padding: 0.15rem 0.4rem;
+    border-radius: calc(var(--radius) - 4px);
+    font-size: 0.85em;
+    font-weight: 500;
+    border: 1px solid hsl(var(--primary) / 0.2);
+  }
+  .dark .prose :where(code):not(:where([class~="not-prose"] *, pre *)) {
+    background: linear-gradient(180deg, hsl(var(--primary) / 0.15), hsl(var(--primary) / 0.2));
+    color: hsl(var(--primary-glow));
+    border-color: hsl(var(--primary) / 0.3);
+  }
+  .prose :where(code):not(:where([class~="not-prose"] *, pre *))::before,
+  .prose :where(code):not(:where([class~="not-prose"] *, pre *))::after { content: '' !important; }
+
+  /* Tables */
+  .prose :where(table):not(:where([class~="not-prose"] *)) {
+    display: block; overflow-x: auto;
+    width: max-content; max-width: 100%;
+    margin: 1.5rem 0; font-size: 0.875rem;
+    border: 1px solid hsl(var(--border));
+    border-radius: var(--radius);
+    -webkit-overflow-scrolling: touch;
+  }
+  .prose :where(thead):not(:where([class~="not-prose"] *)) {
+    background: linear-gradient(180deg, hsl(var(--muted) / 0.8), hsl(var(--muted) / 0.4));
+    border-bottom: 1px solid hsl(var(--border));
+  }
+  .prose :where(th):not(:where([class~="not-prose"] *)) {
+    padding: 0.625rem 1rem; text-align: left; font-weight: 600;
+    color: hsl(var(--foreground)); white-space: nowrap;
+  }
+  .prose :where(td):not(:where([class~="not-prose"] *)) {
+    padding: 0.625rem 1rem; vertical-align: top;
+    border-top: 1px solid hsl(var(--border));
+    color: hsl(var(--foreground));
+  }
+  .prose :where(tbody tr:first-child td):not(:where([class~="not-prose"] *)) { border-top: 0; }
+  .prose :where(tbody tr:hover):not(:where([class~="not-prose"] *)) {
+    background: hsl(var(--muted) / 0.3);
+  }
+}
+
+/* ────────── Shiki code blocks ─────────
+   Targets both rehype-pretty-code output (pre[data-language]) and
+   plain `codeToHtml` output (pre.shiki). */
+[data-rehype-pretty-code-fragment] { margin: 1.25rem 0; }
+
+pre[data-language],
+pre.shiki {
+  background: linear-gradient(180deg, hsl(var(--card)), hsl(var(--muted) / 0.4)) !important;
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius);
+  padding: 1rem;
+  overflow-x: auto;
+  font-size: 0.86rem;
+  line-height: 1.65;
+  color: hsl(var(--foreground));
+}
+pre[data-language] code,
+pre.shiki code {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+  counter-reset: line;
+}
+pre[data-language] code {
+  display: grid;
+}
+pre[data-language] code [data-line] { padding: 0 1rem; border-left: 2px solid transparent; }
+pre[data-language] code [data-highlighted-line] {
+  background: hsl(var(--primary) / 0.08);
+  border-left-color: hsl(var(--primary));
+}
+pre[data-language] code [data-line-numbers] [data-line]::before {
+  content: counter(line); counter-increment: line;
+  display: inline-block; width: 1.5rem; margin-right: 1rem;
+  text-align: right; color: hsl(var(--muted-foreground));
+}
+.dark pre[data-language] code span,
+.dark pre[data-language] code,
+.dark pre.shiki code span,
+.dark pre.shiki code,
+.dark pre.shiki { color: var(--shiki-dark) !important; }
+
+pre[data-language] code span,
+pre[data-language] code,
+pre.shiki code span,
+pre.shiki code,
+pre.shiki { color: var(--shiki-light); }
+
+[data-rehype-pretty-code-title] {
+  background: linear-gradient(180deg, hsl(var(--primary) / 0.08), hsl(var(--muted) / 0.4));
+  border: 1px solid hsl(var(--border)); border-bottom: 0;
+  border-radius: var(--radius) var(--radius) 0 0;
+  padding: 0.5rem 1rem;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 0.78rem; color: hsl(var(--foreground));
+  margin-bottom: -1px;
+}
+[data-rehype-pretty-code-title] + pre[data-language] {
+  border-top-left-radius: 0; border-top-right-radius: 0;
+}
+
+/* ────────── Visual signatures ────────── */
+
+/* Mesh gradient — bold colorful hero background */
+.mesh-bg {
+  background-color: hsl(var(--background));
+  background-image:
+    radial-gradient(at 18% 0%, hsl(var(--mesh-1) / 0.22) 0px, transparent 50%),
+    radial-gradient(at 80% 5%, hsl(var(--mesh-2) / 0.18) 0px, transparent 50%),
+    radial-gradient(at 50% 50%, hsl(var(--mesh-3) / 0.10) 0px, transparent 50%),
+    radial-gradient(at 90% 80%, hsl(var(--mesh-4) / 0.10) 0px, transparent 55%);
+}
+.dark .mesh-bg {
+  background-image:
+    radial-gradient(at 18% 0%, hsl(var(--mesh-1) / 0.30) 0px, transparent 55%),
+    radial-gradient(at 80% 5%, hsl(var(--mesh-2) / 0.25) 0px, transparent 55%),
+    radial-gradient(at 50% 50%, hsl(var(--mesh-3) / 0.12) 0px, transparent 55%),
+    radial-gradient(at 90% 80%, hsl(var(--mesh-4) / 0.15) 0px, transparent 55%);
+}
+
+/* Subtle grid lines overlay */
+.grid-overlay {
+  background-image:
+    linear-gradient(to right, hsl(var(--foreground) / 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, hsl(var(--foreground) / 0.05) 1px, transparent 1px);
+  background-size: 48px 48px;
+  background-position: -1px -1px;
+  mask-image: radial-gradient(ellipse 60% 60% at 50% 30%, black 30%, transparent 80%);
+  -webkit-mask-image: radial-gradient(ellipse 60% 60% at 50% 30%, black 30%, transparent 80%);
+}
+
+/* Gradient text */
+.gradient-text {
+  background: linear-gradient(135deg, hsl(var(--primary)) 0%, hsl(var(--accent)) 55%, hsl(var(--highlight)) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+}
+
+/* Glow shadow */
+.glow {
+  box-shadow:
+    0 0 0 1px hsl(var(--primary) / 0.18),
+    0 8px 30px -6px hsl(var(--primary) / 0.35);
+}
+.glow-accent {
+  box-shadow:
+    0 0 0 1px hsl(var(--accent) / 0.18),
+    0 8px 30px -6px hsl(var(--accent) / 0.30);
+}
+
+/* Tinted hover for cards */
+.card-tint-primary:hover {
+  border-color: hsl(var(--primary) / 0.4);
+  box-shadow: 0 0 0 1px hsl(var(--primary) / 0.1), 0 14px 40px -10px hsl(var(--primary) / 0.20);
+}
+.card-tint-accent:hover {
+  border-color: hsl(var(--accent) / 0.4);
+  box-shadow: 0 0 0 1px hsl(var(--accent) / 0.1), 0 14px 40px -10px hsl(var(--accent) / 0.20);
+}
+
+/* Tabular numerals */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1, "lnum" 1;
+}
+
+/* Animated gradient border ring */
+.ring-gradient {
+  position: relative;
+  background: hsl(var(--card));
+}
+.ring-gradient::before {
+  content: '';
+  position: absolute; inset: -1px;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(135deg, hsl(var(--primary) / 0.6), hsl(var(--accent) / 0.6), hsl(var(--highlight) / 0.5));
+  mask: linear-gradient(#000, #000) content-box, linear-gradient(#000, #000);
+  -webkit-mask: linear-gradient(#000, #000) content-box, linear-gradient(#000, #000);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+/* ────────── View Transitions (cross-fade on route nav) ────────── */
+@view-transition {
+  navigation: auto;
+}
+
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 220ms;
+  animation-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+}
+::view-transition-old(root) {
+  animation-name: fade-out;
+}
+::view-transition-new(root) {
+  animation-name: fade-in;
+}
+@keyframes fade-out { to { opacity: 0; transform: translateY(-2px); } }
+@keyframes fade-in  { from { opacity: 0; transform: translateY(4px); } }
+
+/* Scrollbar polish */
+.thin-scrollbar { scrollbar-width: thin; scrollbar-color: hsl(var(--muted-foreground) / 0.3) transparent; }
+.thin-scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
+.thin-scrollbar::-webkit-scrollbar-thumb { background: hsl(var(--muted-foreground) / 0.25); border-radius: 4px; }
+
+/* ───────── Modern visual layer (added) ───────── */
+
+/* Gradient mesh that breathes — subtle moving accent */
+.mesh-bg-animated {
+  background-color: hsl(var(--background));
+  background-image:
+    radial-gradient(at 18% 0%, hsl(var(--mesh-1) / 0.22) 0px, transparent 50%),
+    radial-gradient(at 80% 5%, hsl(var(--mesh-2) / 0.18) 0px, transparent 50%),
+    radial-gradient(at 50% 50%, hsl(var(--mesh-3) / 0.10) 0px, transparent 50%),
+    radial-gradient(at 90% 80%, hsl(var(--mesh-4) / 0.10) 0px, transparent 55%);
+  background-size: 130% 130%;
+  animation: meshDrift 20s ease-in-out infinite alternate;
+}
+.dark .mesh-bg-animated {
+  background-image:
+    radial-gradient(at 18% 0%, hsl(var(--mesh-1) / 0.30) 0px, transparent 55%),
+    radial-gradient(at 80% 5%, hsl(var(--mesh-2) / 0.25) 0px, transparent 55%),
+    radial-gradient(at 50% 50%, hsl(var(--mesh-3) / 0.14) 0px, transparent 55%),
+    radial-gradient(at 90% 80%, hsl(var(--mesh-4) / 0.17) 0px, transparent 55%);
+}
+@keyframes meshDrift {
+  0%   { background-position: 0% 0%; }
+  100% { background-position: 100% 100%; }
+}
+
+/* Card hover lift — subtle elevation with gradient halo */
+.card-lift {
+  transition: transform 220ms cubic-bezier(0.4, 0, 0.2, 1),
+              border-color 220ms,
+              box-shadow 220ms;
+}
+.card-lift:hover {
+  transform: translateY(-2px);
+  border-color: hsl(var(--primary) / 0.4);
+  box-shadow:
+    0 0 0 1px hsl(var(--primary) / 0.12),
+    0 22px 50px -16px hsl(var(--primary) / 0.30),
+    0 12px 24px -12px hsl(var(--accent) / 0.18);
+}
+
+/* Section divider with gradient pulse */
+.section-divider {
+  height: 1px;
+  border: 0;
+  background: linear-gradient(90deg,
+    transparent 0%,
+    hsl(var(--primary) / 0.35) 25%,
+    hsl(var(--accent) / 0.45) 50%,
+    hsl(var(--highlight) / 0.35) 75%,
+    transparent 100%);
+}
+
+/* Animated underline used on hover for inline links */
+.link-underline {
+  position: relative;
+  background-image: linear-gradient(currentColor, currentColor);
+  background-position: 0% 100%;
+  background-repeat: no-repeat;
+  background-size: 0% 1px;
+  transition: background-size 220ms cubic-bezier(0.4, 0, 0.2, 1);
+}
+.link-underline:hover { background-size: 100% 1px; }
+
+/* Floating dotted backdrop — used behind hero content */
+.dot-grid {
+  background-image: radial-gradient(hsl(var(--foreground) / 0.08) 1px, transparent 1px);
+  background-size: 16px 16px;
+  mask-image: radial-gradient(ellipse 65% 70% at 50% 35%, black 25%, transparent 80%);
+  -webkit-mask-image: radial-gradient(ellipse 65% 70% at 50% 35%, black 25%, transparent 80%);
+}
+
+/* Pulse glow for active/important items */
+.pulse-glow {
+  animation: pulseGlow 2.6s ease-in-out infinite;
+}
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 0 0 hsl(var(--primary) / 0.0); }
+  50%      { box-shadow: 0 0 0 6px hsl(var(--primary) / 0.18); }
+}
+
+/* Inline accent chip — for small inline keywords */
+.chip-accent {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.1rem 0.5rem;
+  font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+  font-size: 0.68rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: hsl(var(--primary));
+  background-color: hsl(var(--primary) / 0.10);
+  border: 1px solid hsl(var(--primary) / 0.25);
+  border-radius: 9999px;
+}
+
+/* Heading with gradient underline (used on landing hero/section titles) */
+.heading-gradient-rule {
+  position: relative;
+  padding-bottom: 0.45em;
+}
+.heading-gradient-rule::after {
+  content: '';
+  position: absolute; left: 0; bottom: 0;
+  width: 4rem; height: 3px;
+  border-radius: 2px;
+  background: linear-gradient(90deg, hsl(var(--primary)), hsl(var(--accent)), hsl(var(--highlight)));
+}
+
+/* Soft inner border for content panels */
+.panel-soft {
+  background:
+    linear-gradient(180deg,
+      hsl(var(--card)) 0%,
+      hsl(var(--card) / 0.92) 100%);
+  border: 1px solid hsl(var(--border));
+  box-shadow:
+    inset 0 1px 0 hsl(var(--foreground) / 0.04),
+    0 1px 0 hsl(var(--foreground) / 0.02);
+}
+
+/* Tinted SVG figure container — for our new diagram components */
+figure.not-prose { transition: border-color 200ms, box-shadow 200ms; }
+figure.not-prose:hover {
+  border-color: hsl(var(--primary) / 0.3);
+  box-shadow: 0 14px 40px -16px hsl(var(--primary) / 0.18);
+}
+
+/* Reduced-motion respect */
+@media (prefers-reduced-motion: reduce) {
+  .mesh-bg-animated,
+  .pulse-glow { animation: none; }
+  .card-lift { transition: none; }
+  .card-lift:hover { transform: none; }
+}
+.thin-scrollbar::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground) / 0.4); }

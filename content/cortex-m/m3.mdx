@@ -1,0 +1,183 @@
+---
+title: Cortex-M3
+description: The original mainstream Cortex-M. Full Thumb-2, hardware divide, bit-banding — still everywhere despite being twenty years old.
+order: 3
+updated: 2026-05-12
+tags: [cortex-m, m3, armv7-m]
+---
+
+The Cortex-M3 shipped in 2004 and effectively invented the modern microcontroller market. It introduced the Thumb-2 ISA, the NVIC, the bit-band alias, and the deterministic exception model that defines every Cortex-M today.
+
+<SpecSheet
+  title="Cortex-M3 — quick reference"
+  specs={[
+    { label: 'Year', value: '2004 — first M-profile core to ship; Luminary Micro LM3S in 2006 was the first commercial silicon' },
+    { label: 'ISA', value: 'ARMv7-M (full Thumb-2, no ARM mode, no DSP, no FPU)' },
+    { label: 'Pipeline', value: '3-stage Harvard (Fetch / Decode / Execute), in-order, with single-target branch speculation' },
+    { label: 'Performance', value: '1.25 DMIPS/MHz (CoreMark roughly 1.9 CoreMark/MHz)' },
+    { label: 'Hardware divide', value: 'SDIV / UDIV, 2-12 cycles depending on operand magnitudes' },
+    { label: 'Multiply', value: 'Single-cycle 32x32 -> 32 (MUL), 3-5 cycle 32x32 -> 64 (UMULL / SMULL)' },
+    { label: 'NVIC', value: 'Up to 240 external IRQs, 8 implementation-defined priority bits (typically 4 implemented)' },
+    { label: 'MPU', value: 'Optional, 8 regions, power-of-two sizes, sub-region disable mask' },
+    { label: 'Bit-banding', value: '1 MB SRAM alias at 0x2200_0000 + 1 MB peripheral alias at 0x4200_0000 — atomic single-bit access via aliased word writes' },
+    { label: 'WIC', value: 'Wakeup Interrupt Controller — wakes the core from deep sleep without restoring full state' },
+    { label: 'BASEPRI / FAULTMASK', value: 'Available — priority-threshold masking and HardFault-masking' },
+    { label: 'No FPU, no DSP, no caches', value: 'Those are M4 / M7 features. M3 stays minimal and deterministic.' },
+  ]}
+/>
+
+## At a glance
+
+- **ISA**: ARMv7-M (full Thumb-2)
+- **Pipeline**: 3-stage in-order with branch speculation
+- **Performance**: 1.25 DMIPS/MHz
+- **MPU**: optional, 8 regions
+- **NVIC**: up to 240 IRQs, 256 priority levels
+- **Bit-banding**: 1 MB SRAM + 1 MB peripheral alias
+- **No FPU, no DSP** (those are M4)
+
+## What it added over M0+
+
+Every M3 feature *missing* on the M0/M0+:
+
+- **Hardware divide** (`SDIV`, `UDIV`) — 2–12 cycles vs. ~30+ for the library call.
+- **Bit-field instructions** — `BFI`, `BFC`, `UBFX`, `SBFX`.
+- **Conditional execution via `IT`** — `IT` block lets up to four instructions execute conditionally without branches.
+- **`LDREX`/`STREX`** — exclusive monitor for lock-free atomics.
+- **`BASEPRI`** — priority-threshold interrupt masking.
+- **Bit-banding** — single-cycle atomic bit set/clear.
+
+## Pipeline and branch speculation
+
+Three stages, in-order, but the M3 *does* speculatively fetch both targets of a branch:
+
+```
+Fetch ─┬─▶ Decode ─▶ Execute     (taken path: 1 bubble)
+       └─▶ Fetch alt target
+```
+
+Most taken branches cost 1 cycle (the bubble) instead of 2; not-taken branches are free. This is a real speedup on tight loops, and one reason the M3 hits 1.25 DMIPS/MHz vs. the M0+'s 0.95.
+
+<PipelineDiagram
+  title="Cortex-M3 3-stage Harvard pipeline with branch speculation"
+  stages={['F', 'D', 'EX']}
+  instructions={[
+    { name: 'LDR r0, [r1]', stages: ['F', 'D', 'EX'] },
+    { name: 'ADD r2, r0, #4', stages: ['', 'F', 'D', 'EX'] },
+    { name: 'STR r2, [r3]', stages: ['', '', 'F', 'D', 'EX'] },
+    { name: 'CMP r2, #0', stages: ['', '', '', 'F', 'D', 'EX'] },
+    { name: 'BEQ target (taken)', stages: ['', '', '', '', 'F', 'D', 'EX'] },
+    { name: 'target: MOV r0, r2', stages: ['', '', '', '', '', 'F', 'D', 'EX'] },
+  ]}
+  caption="Separate I-bus and D-bus mean LDR/STR run alongside instruction fetch — there's no bus contention. The fetch unit speculatively pulls the branch target, so a correctly-predicted taken branch costs one bubble instead of two."
+/>
+
+## Bit-banding
+
+Two alias regions on the M3:
+
+| Original region                      | Alias region                          |
+|--------------------------------------|---------------------------------------|
+| SRAM `0x2000_0000` – `0x200F_FFFF` (1 MB) | `0x2200_0000` – `0x23FF_FFFF` (32 MB) |
+| Peripheral `0x4000_0000` – `0x400F_FFFF` (1 MB) | `0x4200_0000` – `0x43FF_FFFF` (32 MB) |
+
+Each bit in the original region maps to a word in the alias. The hardware translates `alias_word_address` into `original_word_address + (bit_index)` and operates on a single bit:
+
+```c
+#define BITBAND_PERIPH(addr, bit) \
+    (*(volatile uint32_t *)(0x42000000 + (((uintptr_t)(addr) - 0x40000000) << 5) + ((bit) << 2)))
+
+// Atomic set of GPIOA->ODR bit 5
+BITBAND_PERIPH(&GPIOA->ODR, 5) = 1;
+```
+
+The hardware turns this into a read-modify-write on the underlying word, but it's done **atomically** by the bus — no interrupt can land in between.
+
+**The catch**: bit-banding was removed in ARMv8-M. The Cortex-M7 doesn't have it (single-cycle accesses to the bit-band alias would have complicated the cache topology). Most modern peripheral drivers avoid it for portability. Use `LDREX`/`STREX` or peripheral-side atomic registers (e.g. STM32 `BSRR` for GPIO set-and-reset) instead.
+
+## Still everywhere
+
+Despite being 20 years old, Cortex-M3 ships in volumes that dwarf every newer Cortex-M:
+
+- **STM32F1** — still the highest-volume STM32 line; cheap, well-understood, eight bazillion designs.
+- **STM32F2** — higher clock M3, 120 MHz.
+- **NXP LPC1700** — classic M3 with Ethernet and CAN.
+- **TI Stellaris / Tiva (older C series)** — pre-M4 Stellaris LM3S parts.
+
+For greenfield designs, the Cortex-M4 has mostly displaced it — same pipeline, same MPU, same NVIC, but with DSP and FPU options for the same price. Cortex-M3 makes sense when you don't need either and want to optimise BOM cost.
+
+## The exception model the M3 introduced
+
+The M3 defined the entire Cortex-M exception model that every subsequent M-profile core inherits. The model has three key properties:
+
+1. **Hardware stacking.** On exception entry, the core automatically pushes R0-R3, R12, LR, PC, and PSR onto the active stack. The handler runs as a plain C function — no prologue needed for register preservation. On `BX LR` (where LR holds a magic `EXC_RETURN` value), the hardware pops the frame and resumes. The result: ISR latency is a deterministic 12 cycles (best case) regardless of the C compiler.
+2. **Tail-chaining.** If a second exception becomes pending while the first is exiting, the hardware skips the pop / push pair and dispatches the second handler directly. The saving is 6-8 cycles.
+3. **Late-arriving.** If a higher-priority exception pends during the stack-push phase of a lower-priority one, the hardware aborts the lower dispatch and runs the higher handler with the stacked frame already in place.
+
+These properties make Cortex-M3 the first ARM core where worst-case interrupt latency is statically computable from the highest-priority handler's start-up cost plus a constant 12 cycles. That alone explains why it displaced ARM7TDMI and ARM9 in real-time designs.
+
+## Memory model and bus architecture
+
+Cortex-M3 exposes three AHB-Lite buses: **I-bus** for instruction fetch from `0x0000_0000`-`0x1FFF_FFFF`, **D-bus** for data accesses to the same range, and **S-bus** (System bus) for everything else (SRAM, peripherals, private peripheral bus). Having separate I-bus and D-bus over the code region means a flash-resident program can be fetched at the same time the CPU is loading from SRAM — no contention. This is the **Harvard architecture** advantage; the M3 is technically von-Neumann from the programmer's view (single address space) but Harvard at the bus level.
+
+The standard 4 GB address space is divided into eight 512 MB regions, each with a default memory type:
+
+| Range | Default type | Typical use |
+|-------|--------------|-------------|
+| 0x0000_0000 - 0x1FFF_FFFF | Normal, Non-cacheable | Code (flash) |
+| 0x2000_0000 - 0x3FFF_FFFF | Normal, Non-cacheable | SRAM |
+| 0x4000_0000 - 0x5FFF_FFFF | Device | Peripherals |
+| 0x6000_0000 - 0x9FFF_FFFF | Normal | External RAM |
+| 0xA000_0000 - 0xDFFF_FFFF | Device | External peripherals |
+| 0xE000_0000 - 0xE00F_FFFF | Strongly-ordered | Private Peripheral Bus (NVIC, SysTick, SCB, DWT) |
+| 0xE010_0000 - 0xFFFF_FFFF | Device | Vendor-specific |
+
+The MPU can override these defaults for any region it covers, but the default mapping is what code sees with the MPU disabled (the typical reset state).
+
+## Bit-banding semantics in detail
+
+Bit-banding is one of the M3's signature features and the most-asked question in interview prep. The mapping rule:
+
+```
+alias_word_address = alias_base + ((target_word_address - target_base) * 32) + (bit * 4)
+```
+
+A read of `alias_word_address` returns 0 or 1 (the targeted bit, zero-extended). A write of 0 or 1 to `alias_word_address` causes the hardware to perform an atomic read-modify-write on the underlying word, updating only the targeted bit. The atomicity is **bus-level** — an interrupt that fires mid-instruction does not interleave with the read-modify-write.
+
+```c
+/* Set GPIOA->ODR bit 5 atomically via bit-band */
+#define BB_PERIPH(addr, bit) \
+    (*(volatile uint32_t *)(0x42000000 + (((uintptr_t)(addr) - 0x40000000) << 5) + ((bit) << 2)))
+
+BB_PERIPH(&GPIOA->ODR, 5) = 1;  /* LED on */
+BB_PERIPH(&GPIOA->ODR, 5) = 0;  /* LED off */
+```
+
+The catch: bit-banding only covers the **first 1 MB** of SRAM (so SRAM in your design that lives at `0x2010_0000` and above has no alias) and the **first 1 MB** of the peripheral region (so peripherals at `0x4010_0000` and above similarly have no alias). On STM32F1 every interesting peripheral is in range; on STM32F2/F4 several aren't, including AHB peripherals at `0x4002_0000`+.
+
+## Why Cortex-M3 is still shipping in 2025
+
+Despite being twenty years old, the M3 ships in volumes that exceed every newer Cortex-M combined. The reasons:
+
+- **STM32F1** is the highest-volume STM32 line ever produced. It costs roughly USD 1.20 in volume, has 256-1024 KB flash, runs at 72 MHz, ships with USB / CAN / Ethernet variants, and has more reference designs in production than any other 32-bit MCU.
+- **STM32F2** pushed M3 to 120 MHz with an art-accelerator prefetch buffer that pre-emptively reads flash lines, hiding wait states.
+- **Texas Instruments LM3S** (now Tiva C TM4C123/129) remains in production for industrial Ethernet and academic boards.
+- **NXP LPC1700** ships in industrial gateways with CAN-FD and Ethernet.
+
+For a new design that doesn't need DSP, FPU, or TrustZone, an M3 part remains the cost-optimal choice. The trade-off is ecosystem trajectory: most vendor SDK investment is now in M33 and M85 parts; M3 receives only maintenance updates.
+
+<Callout type="note" title="M3 versus M4 — when M3 is actually the right pick">
+A Cortex-M3 at 72 MHz with no FPU costs roughly half of a Cortex-M4F at 80 MHz from the same vendor. If your application is integer-heavy control logic, parsing, or state machines, the M3 is genuinely the right answer. If you're going to do any floating-point math at all, pay the FPU premium — soft-float on M3 costs roughly 50x the cycles, and your "cheaper" chip will need a bigger flash to fit the math library, eating the savings.
+</Callout>
+
+- [Cortex-M4](/docs/cortex-m/m4/) — the M3 with DSP and FPU.
+- [Cortex-M lineup](/docs/cortex-m/lineup/) — picking between cores.
+- [Memory model](/docs/architecture/memory-model/) — bit-banding caveats.
+- [NVIC priority](/docs/cortex-m/nvic-priority/) — what the M3 introduced.
+- [MPU on Cortex-M](/docs/cortex-m/mpu/) — v7-M MPU register layout, which the M3 defines.
+- [SysTick & timing](/docs/cortex-m/systick/) — the universal tick source the M3 mandated.
+- [ARM ISA family](/docs/architecture/isa-family/) — ARMv7-M placement.
+- [ARMv7-M vs ARMv8-M](/docs/architecture/armv7m-armv8m/) — what changed since M3.
+- [CMSIS](/docs/programming/cmsis/) — `core_cm3.h` is where it started.
+- [STMicro](/docs/vendors/stm/), [NXP](/docs/vendors/nxp/), [TI](/docs/vendors/ti/) — major M3 vendors.
+- [QEMU & Renode](/docs/tools/sim/) — both have excellent M3 coverage (`mps2-an385`, `lm3s6965evb`).

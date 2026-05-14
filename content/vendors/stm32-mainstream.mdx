@@ -1,0 +1,134 @@
+---
+title: STM32 mainstream — F, G, H series
+description: The mainstream STM32 lines — F-series general-purpose M3/M4/M7, G-series cost-optimised M4 with ART accelerator, H-series M7 with cache and Chrom-ART. Architecture differences, ecosystem, and how to pick.
+order: 11
+updated: 2026-05-13
+tags: [vendors, stm32, cortex-m4, cortex-m7, stm32f4, stm32g4, stm32h7]
+---
+
+STMicroelectronics' STM32 line is the most-shipped Cortex-M family on the planet — by some counts more than every competitor combined. The mainstream portfolio splits into three series: the long-running F (general-purpose M3/M4/M7), the cost-optimised G (newer M4 with ART Accelerator at 170 MHz), and the high-end H (Cortex-M7 with L1 cache, dual-core, and Chrom-ART graphics). All three share the same Cube ecosystem, HAL/LL drivers, and STM32CubeIDE / STM32CubeMX tooling, but the silicon underneath is quite different.
+
+This page covers what each series targets, the architectural choices that make them perform differently, and the trade-offs when you're picking a part for a new design.
+
+<SpecSheet
+  title="STM32 mainstream at a glance"
+  specs={[
+    { label: 'F series', value: 'Cortex-M3 (F1/F2), M4F (F3/F4), M7 (F7) — broadest catalogue, 24..216 MHz, 32 KB..2 MB Flash' },
+    { label: 'G series', value: 'Cortex-M4F at 170 MHz, ART Accelerator, math accelerators (CORDIC, FMAC) — replacement target for F4 in new designs' },
+    { label: 'H series', value: 'Cortex-M7 at up to 550 MHz, L1 I/D cache, optional Cortex-M4 companion (H745/H755/H757), Chrom-ART 2D, MIPI-DSI' },
+    { label: 'Process node', value: 'F1/F2/F4: 90 nm; F7/H7: 40 nm; G4: 90 nm; G0/G4: improved low-leakage' },
+    { label: 'Voltage range', value: '1.7..3.6 V across the family; SMPS internal regulator on H7 for efficient core supply' },
+    { label: 'Flash performance', value: 'F4: ART Accelerator (instruction prefetch + cache); G4: 8-line cache; H7: L1 32 KB I-cache + 32 KB D-cache' },
+    { label: 'Common peripherals', value: 'USB FS/HS, Ethernet MAC, FDCAN, QuadSPI/OctoSPI, DCMI camera, LTDC display, FMC SDRAM' },
+    { label: 'Ecosystem', value: 'STM32CubeMX (config), STM32CubeIDE (Eclipse-based), STM32CubeMonitor, X-CUBE expansion packages' },
+  ]}
+/>
+
+## F series — the workhorse
+
+STM32F1 launched in 2007 (Cortex-M3, 72 MHz) and the F line has accumulated five generations on the same naming scheme: F0, F1, F2, F3, F4, F7. F0 is M0+ (covered separately under [low-power](/docs/vendors/stm32-lowpower)); the rest are mainstream.
+
+| Family | Core | Max MHz | Flash | RAM | Notes |
+|--------|------|---------|-------|-----|-------|
+| F1 | M3 | 72 | 16 KB..1 MB | 4 KB..96 KB | Original "Performance" line; still in mass production |
+| F2 | M3 | 120 | 128 KB..1 MB | 64 KB..128 KB | 90 nm shrink of F1; rare in new designs |
+| F3 | M4F | 72 | 16 KB..512 KB | 4 KB..80 KB | Analog peripherals (op-amps, comparators), motor control |
+| F4 | M4F | 168..180 | 64 KB..2 MB | 64 KB..384 KB | The dominant mid-range; ART Accelerator gives zero-wait Flash at 168 MHz |
+| F7 | M7 | 216 | 256 KB..2 MB | 256 KB..512 KB | L1 cache (4 KB I/D), no DP-FPU on most variants |
+
+F4 (STM32F405/407/427/429) became the de-facto choice for two decades of mid-range embedded — flight controllers, BLDC drives, audio processors, low-volume industrial controllers. The combination of M4 with FPU, peripherals (USB OTG, Ethernet, dual CAN, lots of timers), and the ART Accelerator that hides Flash wait states made it good enough for almost everything.
+
+The ART Accelerator is worth understanding because every newer STM32 has a descendant. The Flash on F4 has 5 wait states at 168 MHz (Flash is much slower than the core). Without help, every instruction fetch would stall. ART is a 128-bit-wide instruction prefetch buffer with a 64-line associative cache; for sequential code, it streams instructions at the core's clock rate. The HAL turns it on with a single bit; you almost always want it on.
+
+## G series — the modern replacement for F4
+
+G4 (launched 2019) is STM's pitch for what F4 should be in 2020: Cortex-M4F at 170 MHz (up from 168), a much more aggressive Flash cache (8 lines × 256 bits, hit-under-miss), and dedicated math accelerators. The CORDIC unit accelerates trigonometric functions (40 cycles for sin/cos vs ~400 for software), and the FMAC (Filter Math Accelerator) does FIR/IIR filters and convolutions in hardware. Both are aimed at motor control and digital power conversion, which is where G4 is positioned.
+
+| Variant | Core | Max MHz | Use case |
+|---------|------|---------|----------|
+| G0 | M0+ | 64 | Entry-level cost-sensitive |
+| G4 | M4F | 170 | Motor control, digital power, high-resolution timers |
+| G47x | M4F | 170 | Adds USB FS, larger Flash |
+
+G4 also has the **HRTIM** — High-Resolution Timer — with 184 ps resolution. This is for switching power converters (LLC, totem-pole PFC) where the duty cycle resolution drives the regulation precision. F4's timers max out at ~1 ns resolution; HRTIM is the differentiator.
+
+For new designs that would have used F4, evaluate G4 first. Same package families, similar pin compatibility on some variants, lower power, faster cache, longer manufacturing roadmap.
+
+## H series — the heavyweight
+
+H7 (launched 2017) is STM's answer to NXP i.MX RT and Microchip SAM E70 — Cortex-M7 at up to 550 MHz, L1 cache, DP-FPU, and a full graphics subsystem. The flagship parts are:
+
+| Part | Cores | Flash | RAM | Highlight |
+|------|-------|-------|-----|-----------|
+| STM32H723 | M7 @ 550 MHz | 1 MB | 564 KB | Single-core flagship |
+| STM32H743 | M7 @ 480 MHz | 2 MB | 1 MB | Most popular H7 |
+| STM32H750 | M7 @ 480 MHz | 128 KB | 1 MB | "Value-line": tiny Flash, expects external XIP |
+| STM32H745 | M7 + M4 | 2 MB | 1 MB | Dual-core, M7 application + M4 logging |
+| STM32H7A3 | M7 @ 280 MHz | 2 MB | 1.4 MB | Energy-efficient, lower MHz |
+| STM32H7S | M7 @ 600 MHz | 64 KB internal + external | up to 1 MB | XIP-first, fastest |
+
+The L1 caches (32 KB I + 32 KB D on H7) change the programming model. They are **not coherent with DMA**. Any buffer the CPU touched and a DMA peripheral will read needs a cache clean before the DMA starts; any buffer DMA wrote and the CPU will read needs an invalidate before the CPU touches it. The CMSIS helpers (`SCB_CleanDCache_by_Addr`, `SCB_InvalidateDCache_by_Addr`) are mandatory in any non-trivial H7 firmware. Alternatively, place DMA buffers in **non-cacheable SRAM** (the MPU can mark a region uncached) or in **D-TCM**, which the cache bypasses.
+
+H7 also has multiple memory regions with different bandwidth:
+
+| Region | Bandwidth | Use |
+|--------|-----------|-----|
+| ITCM (64 KB) | Single-cycle | Hot ISR code |
+| DTCM (128 KB) | Single-cycle | Stack, control variables, DMA buffers |
+| AXI SRAM (512 KB) | ~50% of core clock | Bulk RAM |
+| SRAM1/2/3 (288 KB) | Via AHB | Lower-priority |
+| SRAM4 (64 KB) | D3 domain | Wake-from-stop persistent |
+
+A well-tuned H7 firmware places the 8 kHz control loop in ITCM, its working set in DTCM, the network stack in AXI SRAM, and uses SRAM4 for variables that must survive Stop mode. The linker script does all the placement; see [linker scripts](/docs/programming/linker-scripts).
+
+The Chrom-ART 2D graphics accelerator (DMA2D) handles colour conversion, alpha blending, and rectangle copy at memory bandwidth — used in conjunction with the LTDC display controller for sub-200 MHz UI rendering on 800×480 TFT panels. The combination of H7 + LTDC + Chrom-ART + DSI is why STM32 dominates the embedded-touch-display space below an i.MX 6.
+
+<Callout type="warn">
+The H7's voltage scaling has caught many engineers. To reach 480/550 MHz you must enable the SMPS-bypass + LDO mode and write to PWR->D3CR.VOS field; the default is Scale 3 (limits the CPU to 240 MHz). The CubeMX wizard sets this correctly but hand-written initialisation often misses it. The first symptom is "I configured the PLL for 480 MHz and Flash reads return 0x00000000" — the CPU exceeded its supply voltage's frequency limit and the bus is in safe mode.
+</Callout>
+
+## Comparing F4, G4, and H7
+
+A working choice matrix:
+
+| Metric | F4 (F407) | G4 (G474) | H7 (H743) |
+|--------|-----------|-----------|-----------|
+| Core | M4F | M4F | M7 |
+| Clock | 168 MHz | 170 MHz | 480 MHz |
+| CoreMark | ~600 | ~640 | ~2400 |
+| Flash cache | ART (64 lines) | 8 lines × 256 bit, hit-under-miss | L1 32 KB I-cache |
+| DP-FPU | No | No | Yes |
+| Tightly-coupled mem | None | None | ITCM 64 KB + DTCM 128 KB |
+| Math accel | None | CORDIC, FMAC, HRTIM | None |
+| Max GPIO | 140 | 96 | 168 |
+| Ethernet | 10/100 MAC | No | 10/100 MAC + IEEE-1588 |
+| USB | OTG FS + HS | FS only | OTG FS + HS |
+| FD-CAN | No (bxCAN only) | Yes (3 inst.) | Yes (2 inst.) |
+| Cost (1k qty, mid-size) | ~$5 | ~$5 | ~$15 |
+
+Rules of thumb:
+
+- New motor-control or digital-power design — **G4**. The HRTIM, CORDIC, FMAC, and 170 MHz M4F are aimed at exactly this niche.
+- General-purpose firmware with USB, Ethernet, lots of UART/SPI — **F4** remains valid for cost; **G4** if you want a longer roadmap. **H7** if CPU performance is needed.
+- Vision, graphics, machine learning inference, high-rate signal processing — **H7** (or the newer H7R/S parts with external XIP). The M7's dual-issue pipeline and large caches give 4× the F4 throughput on these workloads.
+- Dual-core firmware split (real-time on one core, logging on the other) — **H745/H755/H757** with M7 + M4.
+
+## Ecosystem — what comes in the box
+
+Every STM32 ships with a HAL and LL driver layer in source form (BSD), an Eclipse-based STM32CubeIDE, a graphical pin/peripheral configurator (STM32CubeMX) that emits driver init code, a runtime monitor (STM32CubeMonitor) for variable graphing over ITM/SWO, and a suite of X-CUBE expansion packages — middleware for USB Host, FAT, FreeRTOS, lwIP TCP/IP, AzureRTOS ThreadX, ML inference (X-CUBE-AI), and motor control (X-CUBE-MCSDK). The HAL has earned mixed reviews — verbose, sometimes over-abstracted — but it gets a new design booted in a day. Production-grade firmware typically migrates the hot paths to the LL ("Low Layer") drivers or direct register access, leaving the slow paths on HAL.
+
+For toolchains, the supported set is: STM32CubeIDE (GCC, free), Keil µVision (Arm Compiler, commercial), IAR EWARM (commercial), and increasingly Zephyr / LL-only builds with `arm-none-eabi-gcc` driven by CMake.
+
+<Callout type="tip">
+The STM32 errata sheets are essential reading and not optional. Each part has a separate errata document (e.g. ES0182 for STM32H743) listing silicon bugs and the documented workaround. Examples: H7 I2C clock recovery bug, F4 USB OTG ULPI mode requires specific clock sequence, G4 ADC sample-time minimum requirements. Read the errata before committing a design; many bugs have no software workaround and require an external component.
+</Callout>
+
+## Cross-references
+
+- [STM32 low-power L and U](/docs/vendors/stm32-lowpower) — the battery-oriented sibling.
+- [STM32 wireless WB and WL](/docs/vendors/stm32-wireless) — wireless variants.
+- [Cortex-M7](/docs/cortex-m/m7) — the core inside H7 and F7.
+- [Cortex-M4](/docs/cortex-m/m4) — the core inside F4, G4, H745 M4 companion.
+- [CAN-FD](/docs/peripherals/can-fd) — STM32 FDCAN peripheral details.
+- ST AN4891 — "STM32H7 Series clock configuration", required reading before clock bring-up.
+- ST RM0090 (F4), RM0440 (G4), RM0433 (H7) — the reference manuals.

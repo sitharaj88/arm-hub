@@ -1,0 +1,186 @@
+---
+title: Virtualization & EL2
+description: How Cortex-A virtualization works at EL2 — stage-1 and stage-2 translation, VHE for type-2 hypervisors, vGIC for interrupt delivery, the HVC/SVC/SMC instruction split, and what KVM, Xen, and Jailhouse do with all of it.
+order: 6
+updated: 2026-05-13
+tags: [cortex-a, virtualization, el2, kvm, hypervisor, vhe, vgic]
+---
+
+Cortex-A has supported virtualization in hardware since ARMv7-A with the Virtualization Extensions, and ARMv8-A made it a baseline architectural feature with a dedicated **Exception Level 2 (EL2)** for the hypervisor. The model is comprehensive: two-stage address translation, virtualized interrupts via the GIC, virtualized generic timer, a dedicated `HVC` instruction for hypercalls, and a Secure Monitor (`SMC`) for handoff to firmware/TrustZone. Modern KVM, Xen, Jailhouse, and pkvm all run at EL2.
+
+This page covers the architectural model and the engineering trade-offs — what runs where, how guest physical addresses become host physical addresses, what VHE does for type-2 hypervisors, and where the costs lie.
+
+<SpecSheet
+  title="Cortex-A virtualization at a glance"
+  specs={[
+    { label: 'Exception levels', value: 'EL0 (app), EL1 (kernel/guest), EL2 (hypervisor), EL3 (secure monitor / firmware)' },
+    { label: 'Stage-1 translation', value: 'Guest VA → guest IPA (Intermediate Physical Address). Managed by guest OS via TTBR0_EL1/TTBR1_EL1' },
+    { label: 'Stage-2 translation', value: 'IPA → host PA. Managed by hypervisor via VTTBR_EL2 + VTCR_EL2' },
+    { label: 'VHE (Virtualization Host Extensions)', value: 'ARMv8.1+. Lets the host kernel itself run at EL2 — needed for performant KVM' },
+    { label: 'Hypercall instruction', value: 'HVC #imm — traps from EL1 to EL2 (or from EL0 to EL2 if configured)' },
+    { label: 'Secure monitor call', value: 'SMC #imm — traps to EL3 (firmware/TF-A). Used for PSCI, TrustZone secure-world calls' },
+    { label: 'vGIC', value: 'GICv3 vICH (Virtual Interface) — list registers inject interrupts directly into the guest' },
+    { label: 'Major hypervisors', value: 'KVM (Linux), Xen (type-1), Jailhouse (partitioning), pkvm (Android Protected KVM)' },
+  ]}
+/>
+
+## Exception levels — the four-tier model
+
+AArch64 organizes privilege into four levels:
+
+| EL | Typical user | Privileges |
+|----|--------------|-----------|
+| 0 | Application | Userspace. Cannot access most system registers. |
+| 1 | OS kernel | Page tables, exception vector, IRQ masking. |
+| 2 | Hypervisor | Stage-2 page tables, vGIC config, trap-and-emulate. |
+| 3 | Secure Monitor | TrustZone gateway, firmware (TF-A). Optional. |
+
+EL3 is optional on chips that don't ship TrustZone (rare in practice). EL2 is optional too — but every Cortex-A part since the Cortex-A15 supports it, and modern Cortex-A57+ silicon makes it mandatory.
+
+Each EL has its own banked system registers: `SP_EL0/1/2/3`, `ELR_ELx` (exception link register, the equivalent of return address), `SPSR_ELx` (saved program status). Exception entry into ELx automatically swaps to that EL's bank. No software banking required, unlike AArch32.
+
+## Stage-1 and Stage-2 translation
+
+Without virtualization, the OS at EL1 manages a one-step translation: Virtual Address (VA) → Physical Address (PA), via TTBR0_EL1 (low VA, user) and TTBR1_EL1 (high VA, kernel).
+
+Under virtualization, the guest OS still uses TTBR0_EL1/TTBR1_EL1 — but the PAs it produces are **Intermediate Physical Addresses (IPAs)**, not real ones. The hypervisor at EL2 maintains a second set of page tables (via VTTBR_EL2 / VTCR_EL2) that translates IPA → host PA. The MMU walks both stages on every TLB miss:
+
+```
+guest VA  --stage 1--> guest IPA  --stage 2--> host PA
+         (guest TTBR)           (hypervisor VTTBR)
+```
+
+Each stage can fault independently. A stage-1 fault delivers to the guest as a normal page fault. A stage-2 fault delivers to the hypervisor at EL2 — this is how the hypervisor implements demand-paging of guest memory, copy-on-write for VM forks, or balloon driver eviction.
+
+The cost of two-stage translation: a fully cold walk reads ~9 descriptors from DRAM (4 stage-1 + 4 stage-2 + the cross-product at intermediate levels = up to 24 in the worst-case nested walk). Walk caches help enormously — the L2 walk caches typically hold the upper-level entries for both stages.
+
+For workloads dominated by stable mappings (most after warm-up), the steady-state TLB-miss cost under virtualization is ~1.5× the non-virtualized cost. For workloads that thrash translations (memory-bound databases, JITs), the gap widens to 2–3×.
+
+<Callout type="tip">
+Stage-2 huge pages help enormously. KVM allocates guest memory in 2 MB or 1 GB stage-2 blocks when the host has huge-page-backed memory. The guest's stage-1 may still use 4 KB pages, but the second stage of every walk skips levels. THP (Transparent Huge Pages) on the host directly benefits guest performance.
+</Callout>
+
+## VHE — Virtualization Host Extensions
+
+ARMv8.1-A added VHE, addressing a structural problem for type-2 hypervisors like KVM. Before VHE, the Linux kernel ran at EL1 and the KVM hypervisor module had to ferry state in and out of EL2 on every world switch — expensive, especially for short hypercalls. The "kernel" and "hypervisor" were not the same code.
+
+VHE introduces a mode where the host kernel runs **at EL2 directly**. `HCR_EL2.E2H = 1` re-maps EL1 system register accesses to their EL2 equivalents — so kernel code that touches `TTBR0_EL1` actually writes `TTBR0_EL2` transparently. The kernel doesn't need to be rebuilt for EL2; the same binary runs at EL1 (no virtualization) or EL2 (host with virtualization) depending on what the bootloader hands it.
+
+With VHE:
+- Host kernel: EL2 (effectively EL1 semantics via E2H)
+- Guest kernel: EL1
+- Guest user: EL0
+
+World switches stay within EL2/EL1; the hypervisor doesn't need to copy as much state across levels. KVM on VHE-capable hosts (Cortex-A75+, Neoverse) sees ~30% lower vmexit latency than on non-VHE hosts.
+
+```
+  no VHE:                             with VHE:
+   guest user (EL0)                    guest user (EL0)
+       |                                   |
+   guest kernel (EL1)                  guest kernel (EL1)
+       |                                   |
+   KVM hypervisor (EL2)                host kernel (EL2)
+       |                                       (KVM is part of the host kernel)
+   host kernel (EL1)
+```
+
+## HVC vs SVC vs SMC
+
+Three trap instructions, three destinations:
+
+- **`SVC #imm`** — Supervisor Call. EL0 → EL1. The user-space syscall entry. Always traps to the kernel.
+- **`HVC #imm`** — Hypervisor Call. EL1 → EL2. The hypercall entry. Used by paravirt guests and by Linux to call PSCI services if they're routed through EL2.
+- **`SMC #imm`** — Secure Monitor Call. Any EL → EL3. Used for TrustZone calls, PSCI when EL3 firmware (TF-A) handles it, OEM-specific firmware features.
+
+PSCI calls are interesting because they can be routed via either HVC or SMC depending on the platform. The PSCI version detection routine probes both:
+
+```c
+asm volatile("smc #0" : "=r"(ret) : "r"(0x84000000));  // PSCI_VERSION via SMC
+// if SMC traps to EL3 and returns OK, use SMC path.
+// otherwise try HVC.
+asm volatile("hvc #0" : "=r"(ret) : "r"(0x84000000));
+```
+
+Linux's PSCI driver records the chosen conduit at probe time and uses that for subsequent calls. Under KVM, guest PSCI calls go HVC → KVM hypervisor; KVM emulates them by manipulating the guest's vCPU state directly.
+
+<StateDiagram
+  title="EL traps under virtualization (SVC / HVC / SMC)"
+  width={720}
+  height={320}
+  states={[
+    { id: 'el0', label: 'Guest user (EL0)', x: 40,  y: 60,  w: 150, h: 56, tone: 'muted', initial: true },
+    { id: 'el1', label: 'Guest kernel (EL1)', x: 290, y: 60,  w: 150, h: 56, tone: 'primary' },
+    { id: 'el2', label: 'Hypervisor (EL2)', x: 540, y: 60,  w: 150, h: 56, tone: 'accent' },
+    { id: 'el3', label: 'Secure monitor (EL3)', x: 290, y: 210, w: 150, h: 56, tone: 'destructive' },
+  ]}
+  transitions={[
+    { from: 'el0', to: 'el1', label: 'SVC (syscall)' },
+    { from: 'el1', to: 'el0', label: 'ERET to user', curve: 30 },
+    { from: 'el1', to: 'el2', label: 'HVC (hypercall) / stage-2 fault' },
+    { from: 'el2', to: 'el1', label: 'inject + ERET', curve: 30 },
+    { from: 'el1', to: 'el3', label: 'SMC (PSCI / TZ)' },
+    { from: 'el3', to: 'el1', label: 'ERET', curve: 30 },
+    { from: 'el2', to: 'el3', label: 'SMC' },
+  ]}
+  caption="A guest syscall stays in EL0/EL1; a paravirt or trap-and-emulate event crosses up to EL2; PSCI and TrustZone calls fall through to EL3. ERET unwinds back to the saved EL using SPSR_ELx and ELR_ELx."
+/>
+
+## vGIC — virtualized interrupts
+
+The GIC has a dedicated virtualization architecture. The hypervisor at EL2 sees the **virtual CPU interface** registers (`ICH_*` and `ICV_*`); the guest at EL1 sees registers that look like the normal `ICC_*` GIC registers but are actually virtual.
+
+The hypervisor programs **List Registers** (`ICH_LR0_EL2..ICH_LR15_EL2`) before resuming the guest. Each list register describes one virtual interrupt to inject: virtual ID, priority, group, state. When the guest reads its `ICC_IAR1_EL1`, the hardware returns the next pending list-register entry. EOI from the guest pops the entry.
+
+This means most interrupt activity in a guest needs zero hypervisor intervention — the guest reads IAR, services the IRQ, writes EOIR, and the hardware drains the list register without trapping. Only the initial *injection* of the interrupt (the hypervisor populating a list register) is a hypervisor responsibility.
+
+GICv4 takes this further with **direct vLPI injection**: PCIe devices passed through to a guest can deliver their MSI interrupts straight to the guest's vGIC, completely bypassing the hypervisor. The ITS translates the device write into a vLPI and delivers it to the vCPU's redistributor — only if the target vCPU is currently running. If not, it's pended for the next scheduling cycle.
+
+## The vTimer
+
+The ARM Generic Timer has virtual variants. Each guest has its own `CNTV_*` (virtual timer) registers; they tick at the same rate as the physical timer but with a per-guest offset (`CNTVOFF_EL2`). The hypervisor sets the offset on guest creation and can shift it on suspend/resume to hide pause durations from the guest.
+
+The vtimer is the primary clock source for guest schedulers. Modern Linux as a KVM guest uses CNTV directly — no trap on every timer read. The interrupt for the vtimer (PPI 27) is injected as a virtual interrupt via vGIC.
+
+## Trap-and-emulate vs paravirt
+
+Two integration patterns coexist:
+
+**Trap-and-emulate** — the guest runs unmodified. Whenever it touches a privileged register or MMIO that the hypervisor wants to control, the access traps to EL2 and the hypervisor emulates it. Costs cycles per trap (~1000 cycles round-trip on modern silicon).
+
+**Paravirt** — the guest knows it's virtualized and calls the hypervisor directly via `HVC`. Used for PSCI, for vhost-style I/O (virtio queues), for memory ballooning. Much cheaper than trap-and-emulate because the guest avoids the trap on every operation.
+
+Modern guests (Linux from 4.x onward) lean heavily on paravirt for I/O — virtio devices over PCIe, vhost-net for fast packet processing, virtio-scsi for storage. The trap-and-emulate path is reserved for system register access and the few MMIO regions the hypervisor must mediate.
+
+<Callout type="warn">
+A trap to EL2 is not free even when the hypervisor takes minimal action. The world switch saves and restores ~80 system registers plus the GIC list registers — typically 800-1500 cycles. High-rate trap workloads (e.g., a guest doing many small MMIO accesses to an emulated device) bottleneck on this. The fix is usually to switch the device to virtio (paravirt) or to a passthrough configuration.
+</Callout>
+
+## KVM, Xen, Jailhouse, pkvm
+
+**KVM** — the dominant Linux hypervisor. Type-2: the Linux kernel is the hypervisor, with KVM as a kernel module. Uses VHE on capable hardware. QEMU provides the user-space VMM (CPU emulation in some cases, but mostly device emulation). KVM/ARM has supported AArch64 since 3.13 and is feature-complete.
+
+**Xen** — type-1, runs on bare metal at EL2 with Dom0 (a privileged Linux) at EL1. Used in some automotive and embedded designs where the hypervisor needs to be smaller and more auditable than Linux+KVM.
+
+**Jailhouse** — a partitioning hypervisor (not a virtualization layer in the classic sense). After boot, Jailhouse divides the hardware into *cells* with strictly assigned CPUs, memory, and devices. No emulation, no scheduling — pure partitioning. Used in real-time + Linux mixed-criticality systems.
+
+**pkvm (Protected KVM)** — Android's hypervisor mode. The host kernel runs at EL1, a small trusted hypervisor at EL2 enforces isolation between Android and trusted apps without trusting the host kernel. Reduces the TCB for confidential workloads.
+
+## Trap-tracking — what to measure
+
+For a guest hypervisor performance investigation:
+
+- **`perf kvm stat`** on the host — counts vmexits by reason.
+- **`HCR_EL2.TVM`** behaviour — if set, every guest write to system control registers traps. Default in KVM is selective TVM.
+- **`MDCR_EL2.TPM`** — trap performance monitor accesses (so the guest's perf counters are virtualized, not raw).
+- **Wait-for-Interrupt (WFI) traps** — a busy idle guest constantly traps WFI; KVM uses this to deschedule the vCPU. High WFI rate indicates an idle guest; low rate indicates a busy one.
+
+Top vmexit reasons on a server-class guest are typically (in descending order): WFI, HVC (paravirt calls), data abort (MMIO emulation), instruction abort (rare).
+
+## Cross-references
+
+- [GIC](/docs/cortex-a/gic) — vGIC, list registers, GICv4 direct vLPI
+- [TLB and address translation](/docs/cortex-a/tlb) — stage-1 + stage-2 mechanics and VMIDs
+- [SMP and PSCI](/docs/cortex-a/smp) — PSCI calls under virtualization
+- [ARMv8 ISA evolution](/docs/cortex-a/isa-compare) — VHE and the v8.1+ feature set
+- ARM ARM (DDI 0487), volume D — virtualization architecture
+- KVM/ARM design: lwn.net/Articles/557132 and kernel/arch/arm64/kvm

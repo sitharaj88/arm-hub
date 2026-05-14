@@ -1,0 +1,94 @@
+---
+import BaseLayout from './BaseLayout.astro';
+import DocSidebar from '~/components/DocSidebar.astro';
+import TableOfContents from '~/components/TableOfContents.astro';
+import { sections } from '~/utils/nav';
+
+interface Heading { depth: number; slug: string; text: string }
+interface Props {
+  title: string;
+  description: string;
+  sectionKey?: string;
+  updated?: Date;
+  headings?: Heading[];
+  editUrl?: string;
+  badge?: string;
+}
+const { title, description, sectionKey, updated, headings = [], editUrl, badge } = Astro.props;
+const section = sections.find((s) => s.key === sectionKey);
+const updatedDisplay = updated
+  ? new Intl.DateTimeFormat('en', { year: 'numeric', month: 'short', day: 'numeric' }).format(updated)
+  : null;
+---
+<BaseLayout title={title} description={description}>
+  <div class="container-page grid gap-8 lg:grid-cols-[16rem_minmax(0,1fr)] xl:grid-cols-[16rem_minmax(0,1fr)_14rem]">
+    <DocSidebar current={sectionKey} />
+    <article class="min-w-0 py-6 sm:py-8 lg:py-12">
+      <nav class="mb-5 flex flex-wrap items-center gap-x-1.5 gap-y-1 font-mono text-xs text-ink-faint">
+        <a href="/" class="hover:text-ink">~</a>
+        {section && (
+          <>
+            <span>/</span>
+            <a href={section.links[0]?.href ?? `/docs/${section.key}/`} class="hover:text-ink">{section.title.toLowerCase()}</a>
+          </>
+        )}
+        <span>/</span>
+        <span class="text-ink break-all">{title.toLowerCase().replace(/\s+/g, '-')}</span>
+      </nav>
+
+      {section && section.links.length > 1 && (
+        <details class="mb-6 lg:hidden rounded-lg border border-line bg-surface/60 open:bg-surface shadow-card transition">
+          <summary class="flex cursor-pointer items-center justify-between gap-2 px-3 py-3 text-sm min-h-11">
+            <span class="flex flex-wrap items-center gap-2 font-mono text-[0.7rem] uppercase tracking-wider text-ink-faint">
+              <span class="text-brand">▸</span> {section.title}
+              <span class="text-ink-faint">·</span>
+              <span class="text-ink">{section.links.length} pages</span>
+            </span>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-4 w-4 shrink-0 text-ink-muted transition-transform [details[open]>summary>&]:rotate-180">
+              <path d="m6 9 6 6 6-6" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </summary>
+          <ul class="border-t border-line/70 px-2 py-2 text-sm">
+            {section.links.map((l) => {
+              const active = Astro.url.pathname === l.href || Astro.url.pathname.startsWith(l.href);
+              return (
+                <li>
+                  <a
+                    href={l.href}
+                    class:list={[
+                      'flex min-h-11 items-center justify-between rounded-md px-2 py-2 transition',
+                      active ? 'bg-brand/10 text-brand' : 'text-ink-muted hover:bg-surface hover:text-ink',
+                    ]}
+                  >
+                    <span>{l.title}</span>
+                    {l.badge && <span class="ml-2 rounded bg-surface px-1.5 py-0.5 text-[0.65rem] uppercase tracking-wide text-ink-faint">{l.badge}</span>}
+                  </a>
+                </li>
+              );
+            })}
+          </ul>
+        </details>
+      )}
+
+      <header class="mb-8 border-b border-line/70 pb-6 sm:pb-7">
+        <div class="flex flex-wrap items-center gap-2 mb-3">
+          {section && <span class="pill pill-brand">{section.title}</span>}
+          {badge && <span class="pill pill-accent">{badge}</span>}
+        </div>
+        <h1 class="font-display text-[1.75rem] leading-tight sm:text-4xl md:text-5xl font-semibold tracking-tight text-balance break-words">{title}</h1>
+        <p class="mt-3 max-w-2xl text-base sm:text-lg text-ink-muted text-balance">{description}</p>
+        {updatedDisplay && (
+          <div class="mt-4 sm:mt-5 font-mono text-xs text-ink-faint">updated · {updatedDisplay}</div>
+        )}
+      </header>
+      <div class="prose max-w-none">
+        <slot />
+      </div>
+      <footer class="mt-14 flex flex-wrap items-center justify-between gap-3 border-t border-line/70 pt-6 text-sm text-ink-muted">
+        <a href={editUrl ?? `https://github.com/sitharaj88/armhub/edit/main/src/content${Astro.url.pathname.replace('/docs', '')}index.mdx`} class="hover:text-brand">Edit this page on GitHub →</a>
+        <a href="#top" class="hover:text-brand">Back to top ↑</a>
+      </footer>
+    </article>
+    <TableOfContents headings={headings} />
+  </div>
+</BaseLayout>

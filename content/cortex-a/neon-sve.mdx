@@ -1,0 +1,211 @@
+---
+title: NEON, SVE & SVE2
+description: ARM's SIMD lineage — fixed-width NEON (Advanced SIMD), scalable-vector SVE with predicate-driven loops, and SVE2's expansion into integer, string, and crypto. Practical auto-vectorization and intrinsics for dot products and image filters.
+order: 4
+updated: 2026-05-13
+tags: [cortex-a, neon, sve, sve2, simd, vectorization]
+---
+
+ARM has shipped three generations of SIMD on Cortex-A cores: NEON (Advanced SIMD), the 128-bit fixed-width vector unit baseline since ARMv7-A; SVE (Scalable Vector Extension), a variable-length predicate-driven design introduced in ARMv8.2-A; and SVE2, which extends SVE to integer, string, and crypto domains and is mandatory in ARMv9-A. Each generation solves a different problem — NEON for media and audio, SVE for HPC and AI, SVE2 as the unified replacement for most NEON workloads.
+
+This page walks through the architectural model of each, how vectorization in practice looks (intrinsics, auto-vec, hand-written assembly), and the migration story across them.
+
+<SpecSheet
+  title="SIMD generations on Cortex-A"
+  specs={[
+    { label: 'NEON (v7-A optional, v8-A mandatory)', value: '32×128-bit registers (v0..v31 in AArch64). Integer (8/16/32/64-bit) + single & double precision float.' },
+    { label: 'Crypto extension', value: 'AES, SHA1, SHA256, SHA512 (in v8.4+), SM3/SM4 (v8.2+). Optional in v8.0, mandatory in v8.2-A.' },
+    { label: 'SVE (v8.2-A optional)', value: '32×scalable Z registers, 128–2048 bits in 128-bit increments. 16 predicate registers p0..p15. First in Cortex-A64FX, Neoverse V1.' },
+    { label: 'SVE2 (v9-A mandatory)', value: 'SVE + integer/string/crypto extensions. Replaces NEON for most workloads. Cortex-A510/A710/X2+.' },
+    { label: 'Vector length detection', value: 'CNTB (count bytes in vector), CNTH/CNTW/CNTD for halfwords/words/doublewords' },
+    { label: 'Vector length control (privileged)', value: 'ZCR_EL1.LEN (and ZCR_EL2/EL3 for VMs and SecureWorld). 0 = 128 bits, 1 = 256, ... 15 = 2048' },
+    { label: 'Lane configurations (NEON)', value: 'v0.16b (16×bytes), v0.8h (8×halfwords), v0.4s (4×words), v0.2d (2×doublewords)' },
+    { label: 'Compiler flags (GCC/Clang)', value: '-march=armv8-a+simd (NEON), +crypto, +sve, +sve2, +sve2-bitperm, +sve2-aes, +sha3' },
+  ]}
+/>
+
+## NEON — fixed-width 128-bit SIMD
+
+NEON on AArch64 has 32 vector registers, each 128 bits, named `v0..v31`. The same register can be viewed as different lane configurations depending on the instruction suffix:
+
+| Suffix | Lanes | Element size |
+|--------|-------|---------------|
+| `.16b` | 16 | 8-bit byte |
+| `.8h`  | 8 | 16-bit halfword |
+| `.4s`  | 4 | 32-bit word |
+| `.2d`  | 2 | 64-bit doubleword |
+| `.8b`, `.4h`, `.2s` | half-width | (lower 64 bits only) |
+
+A typical NEON-coded inner loop in C using intrinsics from `<arm_neon.h>`:
+
+```c
+// Sum-of-absolute-differences for 16-byte chunks (image diff)
+uint32_t sad16(const uint8_t *a, const uint8_t *b, size_t n) {
+    uint32x4_t acc = vdupq_n_u32(0);
+    for (size_t i = 0; i < n; i += 16) {
+        uint8x16_t va = vld1q_u8(a + i);
+        uint8x16_t vb = vld1q_u8(b + i);
+        uint8x16_t diff = vabdq_u8(va, vb);     // |a-b| per byte
+        uint16x8_t lo = vpaddlq_u8(diff);       // pairwise add into 16-bit
+        acc = vpadalq_u16(acc, lo);             // pairwise accumulate into 32-bit
+    }
+    return vaddvq_u32(acc);                     // horizontal sum
+}
+```
+
+The compiler emits one load per `vld1q_u8`, one `UABD` for the absolute-difference, and chained reduction instructions. On a Cortex-A76, that's roughly 1 byte/cycle/lane throughput — 16 bytes per cycle steady-state.
+
+NEON's strength is its tight cycle counts and predictable throughput. Its weakness is the **tail handling problem**: any loop where `n` isn't a multiple of 16 needs cleanup code, and that cleanup is often half the source bytes of the function. SVE was designed to make this go away.
+
+## SVE — scalable vectors
+
+SVE's premise: vector length is *implementation-defined*. The same SVE binary runs on a 128-bit implementation, a 256-bit one (Neoverse V1 at 256), a 512-bit one (A64FX at 512), or a hypothetical 2048-bit one — no recompile, no code branching on width.
+
+Three new register files:
+
+- **Z registers** (`z0..z31`) — vector registers. Width is `VL` bits, where `VL ∈ {128, 256, ..., 2048}`. The lower 128 bits of each `z` alias the NEON `v` register of the same number.
+- **P registers** (`p0..p15`) — predicate registers. One bit per byte-lane of `z`; widths 16–256 bits. `p0..p7` are "fully governing" (used as the predicate operand of most ops); `p8..p15` are "governing-only-for-predicate-generating" instructions.
+- **FFR** (First Fault Register) — for speculative loads (LDFF1/LDNF1).
+
+The canonical SVE vectorized loop pattern uses **predicate-driven length-agnostic** form:
+
+```asm
+    // Sum an array of N int32 (x0 = ptr, w1 = N, w2 = result)
+    mov     x3, #0                  // index
+    mov     z0.s, #0                // accumulator (all lanes 0)
+    whilelt p0.s, w3, w1            // p0 = lanes where 3+lane < N
+sve_loop:
+    ld1w    {z1.s}, p0/z, [x0, x3, lsl #2]  // gather active lanes; inactive = 0
+    add     z0.s, p0/m, z0.s, z1.s          // accumulate under mask
+    incw    x3                              // advance by VL-words
+    whilelt p0.s, w3, w1                    // regenerate predicate
+    b.first sve_loop                        // loop while any lane active
+
+    // Horizontal sum (predicate = all-true since lanes default to ptrue at end)
+    ptrue   p1.s
+    saddv   d0, p1, z0.s
+    fmov    w2, s0
+```
+
+`WHILELT` generates a predicate true for lanes whose index is less than the bound — encoding the "are we past the end?" check directly in the predicate. `LD1W` under predicate gathers only the active lanes (and writes zero to inactive lanes in zero-extending form, or leaves them in merging form). The body of the loop is unchanged across implementations of different VL.
+
+No tail-cleanup code. No vector-length branching. One loop covers `N=1` as well as `N=10000`.
+
+<Callout type="tip">
+GCC and Clang auto-vectorize for SVE more aggressively than for NEON. Even `for (int i = 0; i < n; i++) c[i] = a[i] + b[i]` compiled with `-O3 -march=armv8.2-a+sve` produces clean SVE output. The reason is precisely the lack of tail handling — the compiler can vectorize an indefinite-bound loop without unrolling decisions or runtime length checks.
+</Callout>
+
+## SVE2 — the unified successor
+
+ARMv9-A mandates **SVE2**, which adds to baseline SVE:
+
+- **Integer instructions** that NEON had but SVE didn't — saturating arithmetic, polynomial multiplication, pairwise add/min/max, integer dot products (`SDOT`, `UDOT`).
+- **String / parsing primitives** — `MATCH`/`NMATCH` for byte-wise comparison against multiple patterns (memchr, JSON parsing), `BEXT`/`BDEP` for bit-extraction.
+- **Crypto** — AES, SHA, SM4 — both NEON crypto and SVE2 crypto variants.
+- **Bit-permutation** (`+sve2-bitperm`) — `BGRP`, `BEXT`, `BDEP` for compression/decompression loops.
+- **FP8 / BF16 / matrix-multiply** — added in v8.6 and propagated into SVE2.
+
+For typical workloads — video codecs, image processing, machine-learning inference — SVE2 is a strict superset of NEON's capabilities and offers length-agnostic code. The migration recommendation from ARM is: target SVE2 for new code; retain NEON paths only for the ARMv8.0–v8.1 fleet where SVE isn't available.
+
+### Practical example: dot product (8-bit)
+
+```c
+// SVE2 8-bit dot product accumulating into int32
+int32_t dot_i8(const int8_t *a, const int8_t *b, size_t n) {
+    svint32_t acc = svdup_n_s32(0);
+    size_t i = 0;
+    svbool_t pg = svwhilelt_b8(i, n);
+    do {
+        svint8_t va = svld1_s8(pg, a + i);
+        svint8_t vb = svld1_s8(pg, b + i);
+        acc = svdot_s32(acc, va, vb);    // 4-element dot, accumulate 32-bit
+        i += svcntb();                    // bytes per vector
+        pg = svwhilelt_b8(i, n);
+    } while (svptest_first(svptrue_b8(), pg));
+    return svaddv_s32(svptrue_b32(), acc);
+}
+```
+
+On a 256-bit SVE2 implementation (Neoverse V1), `SDOT` processes 32 8-bit pairs per instruction — 32 ops, ~1 cycle. That's the engine behind AI inference workloads doing INT8 matmul.
+
+## Matrix-multiply primitives
+
+ARMv8.6-A added 4-element-by-4-element matrix-multiply instructions: `SMMLA`/`UMMLA`/`USMMLA` for INT8, and `BFMMLA` for BF16. Each instruction does a 2×2 INT8 matrix multiply per 128-bit lane group, accumulating into INT32 — 8 multiply-adds per instruction per 128 bits.
+
+For a 256-bit SVE2 implementation, one `SMMLA` is 16 multiply-adds per cycle. ARM Compute Library and oneDNN both have hand-tuned matmul kernels using these instructions; speedups of 4–8× over scalar/NEON inference are typical on Neoverse V1.
+
+## Auto-vectorization in GCC and Clang
+
+The vectorizer works best on:
+
+- **Counted loops** with a known trip-count expression (even if dynamic).
+- **Loops without backward dependencies** — `a[i] = b[i] * c[i]` vectorizes; `a[i] = a[i-1] + b[i]` does not, unless the compiler can prove no aliasing and convert to a reduction.
+- **Aligned or alignment-known accesses** — `restrict` qualifiers and `__builtin_assume_aligned` matter.
+- **Simple control flow** — early exits and complex branches inside the loop body inhibit vectorization (though SVE's predicated execution helps).
+
+```sh
+gcc -O3 -march=armv8.2-a+sve2 -fopt-info-vec
+clang -O3 -march=armv8.2-a+sve2 -Rpass=loop-vectorize
+```
+
+Both compilers report which loops were vectorized and which weren't (with reasons). A common pattern: the inner loop vectorizes cleanly but the outer one doesn't, leaving 4×-8× speedup on the table. `#pragma omp simd` or `#pragma clang loop vectorize(enable)` can force the issue.
+
+<Callout type="warn">
+Aliased pointers kill vectorization. If two pointer arguments could overlap, the compiler must assume the worst case and serialize. Mark them with `__restrict` (or `restrict` in C99+) when you know they don't overlap; without that promise the compiler is forced into scalar code.
+</Callout>
+
+## Practical: image convolution
+
+A 3×3 convolution kernel applied to a grayscale image is a textbook auto-vec example. Plain C, with `restrict` hints:
+
+```c
+void conv3x3(const uint8_t *restrict src, uint8_t *restrict dst,
+             int w, int h, const int16_t k[9]) {
+    for (int y = 1; y < h-1; y++) {
+        for (int x = 1; x < w-1; x++) {
+            int sum = 0;
+            for (int j = -1; j <= 1; j++)
+                for (int i = -1; i <= 1; i++)
+                    sum += src[(y+j)*w + (x+i)] * k[(j+1)*3 + (i+1)];
+            dst[y*w + x] = (uint8_t)(sum >> 8);
+        }
+    }
+}
+```
+
+Compiled with `-O3 -march=armv8.2-a+sve2`, GCC unrolls the inner 3×3, fuses three loads-per-row, and emits an SVE2 loop that processes VL/8 pixels per iteration. On a 256-bit SVE2 part, that's 32 pixels per iteration vs 16 for NEON — and the source is unchanged.
+
+For hand-tuned versions you can outperform the compiler by ~10–20% via careful instruction scheduling and predicate reuse, but the auto-vectorized output is usually within striking distance.
+
+## Migration: NEON → SVE2
+
+For codebases with significant NEON intrinsics, the migration is mechanical but tedious. The mapping:
+
+| NEON intrinsic | SVE2 equivalent |
+|----------------|-----------------|
+| `vld1q_s32(p)` | `svld1_s32(pg, p)` (predicate-aware) |
+| `vaddq_s32(a, b)` | `svadd_s32_z(pg, a, b)` (zero-merging) or `svadd_s32_m` (preserving) |
+| `vaddvq_s32(a)` | `svaddv_s32(svptrue_b32(), a)` |
+| `vfmaq_f32(a, b, c)` | `svmla_f32_m(pg, a, b, c)` |
+| `vdupq_n_s32(x)` | `svdup_n_s32(x)` |
+
+The predicate-merging vs zero-merging distinction has no NEON analogue. The shape of the loop changes — instead of a fixed N=4 or N=16 per iteration, the iteration step is `svcnt_s32()` or similar.
+
+ARM provides a portable header `<arm_sve.h>`. Code can be conditional on `__ARM_FEATURE_SVE2`. For applications that need to run on both v8.0 (no SVE) and v9 (SVE2) silicon, the dual-implementation + runtime dispatch pattern is standard:
+
+```c
+#if defined(__ARM_FEATURE_SVE2)
+    if (caps & HWCAP2_SVE2) return dot_i8_sve2(...);
+#endif
+    return dot_i8_neon(...);   // fallback
+```
+
+The function-multiversioning attribute (`__attribute__((target_clones("default,sve2"))) `) does this automatically if compiler support is available.
+
+## Cross-references
+
+- [ARMv7-A vs v8-A vs v9-A](/docs/cortex-a/isa-compare) — SIMD context across architecture generations
+- [Big.LITTLE & DynamIQ](/docs/cortex-a/big-little) — SVE/SVE2 availability per core class
+- [PMU & profiling](/docs/cortex-a/pmu) — measuring vectorization effectiveness
+- ARM ARM (DDI 0487), volume C (NEON), volume B5/B6 (SVE)
+- ARM C Language Extensions for SVE (`<arm_sve.h>`) — ACLE document IHI 0073

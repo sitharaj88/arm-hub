@@ -1,0 +1,183 @@
+---
+title: Formal methods in firmware
+description: Mathematical proof of firmware properties — Frama-C with WP and EVA, TLA+ for protocol design, CBMC bounded model checking, Astrée abstract interpretation. When the investment pays off, and how Airbus, SEL, and Amazon use them.
+order: 20
+updated: 2026-05-13
+tags: [tools, formal-methods, frama-c, tla, cbmc, astree, verification]
+---
+
+Formal methods replace "we tested it and it works" with "we proved it cannot fail in any input on any execution path". For most firmware projects, unit tests and static analysis are sufficient evidence of correctness — the cost of a residual bug is annoyance, a recall, an OTA push. For the projects where the cost is human life, financial catastrophe, or a multibillion-dollar mission lost — flight control, nuclear plant protection, anti-lock braking, pacemakers, distributed consensus in cloud systems — the investment in mathematical proof becomes the cheaper option.
+
+This page covers the four tool families an embedded team will encounter, the type of proof each provides, the engineering effort each demands, and the industrial examples that show where formal methods pay off.
+
+<SpecSheet
+  title="Formal methods toolchain at a glance"
+  specs={[
+    { label: 'Frama-C + WP', value: 'Deductive verification of C; ACSL contracts; proves function-level pre/postconditions via SMT' },
+    { label: 'Frama-C + EVA', value: 'Abstract interpretation plugin; proves absence of run-time errors (no UB) across whole programs' },
+    { label: 'TLA+ / TLC / Apalache', value: 'Specification language for concurrent and distributed protocols; model-checks safety + liveness' },
+    { label: 'CBMC', value: 'Bounded model checker for C / C++; unrolls loops to a depth and proves properties within that bound' },
+    { label: 'Astrée', value: 'Sound abstract interpretation specialised for embedded C; used on A380 fly-by-wire' },
+    { label: 'SPARK / Ada', value: 'Ada subset with provable contracts; widely used in defence and rail signalling' },
+    { label: 'Coq / Isabelle / Lean', value: 'General-purpose proof assistants; underpin seL4, CompCert, Sail' },
+    { label: 'KLEE', value: 'Symbolic execution; useful for high-coverage test generation rather than full proof' },
+    { label: 'Typical effort', value: '5–20× the cost of equivalent unit testing for the first project; amortises across reuse' },
+  ]}
+/>
+
+## What "proof" means here
+
+Three distinct flavours of formal verification get conflated.
+
+**Deductive verification** — annotate the code with logical contracts (pre/postconditions, invariants) and have the tool generate verification conditions discharged by an SMT solver (Z3, Alt-Ergo, CVC4). Frama-C/WP, SPARK, Dafny work this way. Output: "every contract holds on every execution path."
+
+**Model checking** — exhaustively explore a state space, either bounded (CBMC unrolls loops to N) or via a finite abstraction (TLA+ TLC enumerates all reachable states of a protocol model). Output: "no execution reaches a bad state, within the explored space."
+
+**Abstract interpretation** — compute a sound over-approximation of all reachable program states. Astrée, Polyspace Code Prover, Frama-C/EVA. Output: "the set of possible values for each variable at each program point is contained in this interval / convex polyhedron; no value triggers UB."
+
+Each has tradeoffs. Deductive verification scales to large code but requires expertly written annotations. Model checking is push-button but bounded. Abstract interpretation is sound and fully automatic but flags warnings on every place it cannot prove safety, leading to triage burden.
+
+## Frama-C and ACSL
+
+Frama-C is the open-source workhorse for C verification. You annotate functions with ACSL (ANSI/ISO C Specification Language) contracts:
+
+```c
+/*@ requires \valid(buf + (0 .. len-1));
+    requires len > 0 && len <= MAX_LEN;
+    assigns buf[0 .. len-1];
+    ensures \forall integer i; 0 <= i < len ==> buf[i] == 0;
+*/
+void zero_buffer(uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        /*@ loop invariant 0 <= i <= len;
+            loop invariant \forall integer k; 0 <= k < i ==> buf[k] == 0;
+            loop assigns i, buf[0 .. len-1];
+            loop variant len - i;
+        */
+        buf[i] = 0;
+    }
+}
+```
+
+Run `frama-c -wp -wp-rte zero_buffer.c` and the WP plugin emits verification conditions; the SMT solver discharges them. If proof succeeds, you have a mathematical guarantee that:
+
+- The function only writes to the buffer.
+- After the call, every byte in the buffer is zero.
+- The loop terminates (the `variant` decreases each iteration).
+- No run-time error occurs (no buffer overrun, no integer overflow).
+
+For modules that pass a critical interface — boot-up integrity check, cryptographic primitive, watchdog refresh — this is the strongest evidence you can ship to a certification authority.
+
+Frama-C/EVA is the alternative entry point: no annotations required, point it at the code, and it computes the abstract value of every variable at every point. The output is a coloured listing — green for "proven safe", red for "proven UB", orange for "could not prove". You iterate by narrowing imprecision through partition annotations or by adding `//@ assert` to give the analyser strong invariants.
+
+<Callout type="tip">
+Start with EVA for whole-program safety (no UB anywhere) and add WP contracts only for the modules whose functional behaviour you care about. Trying to write contracts for every function upfront is the failure mode that kills formal-methods adoption.
+</Callout>
+
+## TLA+ for protocol design
+
+TLA+ (Leslie Lamport, 1993) is for *design-time* verification of concurrent and distributed algorithms — before any code is written. You write a high-level specification of the algorithm as a state machine, write safety and liveness properties as temporal logic formulas, and run TLC to check them.
+
+A simple two-phase commit specification might define states `{init, prepared, committed, aborted}`, transitions between them, a safety property "no participant commits while any other has aborted", and a liveness property "if all participants prepare, eventually all commit". TLC enumerates every reachable state with every interleaving of message arrivals and node failures, and reports any state that violates the properties. For a model with 5 nodes and bounded message queues, this is a few hundred thousand states — tractable.
+
+TLA+ gets used at:
+
+- **Amazon Web Services** — DynamoDB, S3, EBS protocol layer designs are specified in TLA+ before implementation. AWS published a paper showing TLA+ caught a 35-step subtle bug in DynamoDB Global Tables that would have caused data loss; no integration test would have found it.
+- **Microsoft Azure** — Cosmos DB consistency layer, the Service Fabric leader election.
+- **MongoDB, CockroachDB, ConfluentKafka** — replication and consensus algorithms.
+- **Embedded** — CAN-based safety protocols, Time-Triggered Architecture schedules.
+
+TLA+ does **not** verify the implementation; it verifies the algorithm. You still need to ensure the C code matches the spec — typically by manual refinement or by re-modelling key invariants in the implementation language (CBMC or Frama-C).
+
+## CBMC — bounded model checking of C
+
+CBMC unrolls loops to a fixed bound, encodes the resulting straight-line program as a SAT instance, and asks "does any assignment falsify this assertion?". It is push-button — no annotations required, just `assert` statements in the code and a bound on the unrolling.
+
+```c
+int find_max(const int *arr, size_t n) {
+    int max = arr[0];
+    for (size_t i = 1; i < n; i++) {
+        if (arr[i] > max) max = arr[i];
+    }
+    return max;
+}
+
+int main(void) {
+    int arr[5];
+    __CPROVER_assume(/* arbitrary inputs */ 1);
+    int m = find_max(arr, 5);
+    for (size_t i = 0; i < 5; i++)
+        __CPROVER_assert(m >= arr[i], "max is >= each element");
+}
+```
+
+`cbmc --unwind 5 find_max.c` proves the assertion holds for any 5-element input array. Limitations: bounded — if n could be 1000, you must unwind to 1000, which blows up the SAT instance. Best for small "atomic" properties on routines with bounded inputs: parser state machines, hash functions on bounded-length input, ring-buffer implementations.
+
+Amazon uses CBMC heavily on FreeRTOS — the kernel's queue, mutex, and semaphore implementations have CBMC harnesses that prove memory safety and the absence of common concurrency bugs under all schedules. The FreeRTOS GitHub `tools/cbmc/` directory has examples.
+
+## Astrée and the A380
+
+Astrée (developed by AbsInt) is a sound abstract interpreter for embedded C, with domains tuned for control-system idioms (PID controllers, FIR filters, state machines). It famously verified the absence of run-time errors in the entire flight-control software for the Airbus A380 — approximately 132,000 lines of C — in 2003.
+
+Astrée's output: "for every input the system can receive, on every execution path, no run-time error occurs". That's division by zero, integer overflow, out-of-bounds array access, NULL dereference, invalid arithmetic, uninitialised reads. The proof is mathematically sound, not statistical.
+
+The cost: significant effort to provide stubs for the I/O boundary (Astrée needs to know what the sensors can return), and tuning of the abstract domains to keep the analysis precise enough to avoid false positives. For a code base in active development, the analysis is rerun nightly.
+
+Astrée and competitors (Polyspace Code Prover, Frama-C/EVA) are the tools the FDA, EASA, FAA, and national rail authorities look for in DO-178C, IEC 61508, ISO 26262, and IEC 62304 certification packages. The evidence is "this code, this version, has been proven free of UB".
+
+| Industry | Tool | Proof target |
+|----------|------|--------------|
+| Aerospace (Airbus) | Astrée | Absence of run-time errors |
+| Power grid relays (SEL) | SPARK / Ada | Functional contracts |
+| Rail signalling (CBTC, ETCS) | B-Method, SPARK | Safety properties |
+| Automotive ASIL-D | Polyspace Code Prover, TIS Toolchain | UB freedom + MISRA |
+| Cloud distributed systems (AWS) | TLA+ | Protocol correctness |
+| Operating system kernel (seL4) | Isabelle/HOL | Full functional correctness |
+
+## When the investment pays off
+
+Formal methods are expensive. A reasonable rule of thumb: 5–20× the engineering effort of equivalent unit testing for the first project; amortised across multiple deployments of the same module, costs become comparable to thorough testing.
+
+The investment pays off when:
+
+- **Bug cost is catastrophic.** Loss of life, loss of mission, multi-million-dollar recall.
+- **Field-update is impossible or restricted.** Pacemakers, deep-space probes, automotive boot ROM.
+- **Concurrency is the bug source.** Distributed protocols, lock-free data structures, multi-ISR sharing where path-coverage testing cannot enumerate interleavings.
+- **Regulatory mandate.** DO-178C Level A, ISO 26262 ASIL-D, IEC 61508 SIL-4, CC EAL-6 / EAL-7 — formal methods are required, not optional.
+- **The same module is reused for years.** Annotating once and re-proving on each change is cheaper over five years than re-running a huge test campaign.
+
+It rarely pays off for:
+
+- Rapidly changing UI / display layer.
+- Glue code between mature libraries.
+- One-off prototypes.
+- Code that's mostly I/O bound with simple logic.
+
+<Callout type="warn">
+Formal verification proves the model matches the spec. It does not prove the spec matches reality. If the spec says "the watchdog refreshes every 100 ms" but the real-world requirement is "the watchdog refreshes within 80 ms of the last sensor sample", proof of the former tells you nothing about the latter. Independent V&amp;V of the specification itself is part of any serious safety case.
+</Callout>
+
+## A pragmatic ladder
+
+Most embedded teams climb a ladder of evidence:
+
+1. **Compiler warnings as errors** — costs nothing, catches some.
+2. **Static analysis** ([clang-tidy, Cppcheck](/docs/tools/static-analysis)) — modest cost, catches more.
+3. **Unit tests with coverage** — measurable, sustainable.
+4. **MISRA + commercial linter** (PC-lint, Coverity) — meaningful for safety claims.
+5. **Bounded model checking** on critical routines (CBMC) — high-value, targeted.
+6. **Abstract interpretation** on the whole program (Polyspace, Astrée, Frama-C/EVA) — required for ASIL-D / DO-178C Level A.
+7. **Deductive verification** on the most-critical modules (Frama-C/WP, SPARK).
+8. **Specification model + protocol verification** (TLA+) for distributed or concurrent design.
+9. **Refinement-proven implementation** (seL4 / CompCert level) — research-grade, multi-year.
+
+Climbing the ladder is monotonic — you don't drop the lower rungs as you add the higher ones. They are complementary, not substitutes.
+
+## Cross-references
+
+- [Static analysis](/docs/tools/static-analysis) — the immediate neighbour on the ladder.
+- [Toolchains](/docs/tools/toolchains) — CompCert, the formally verified C compiler.
+- [Build systems](/docs/tools/build) — integrating Frama-C into nightly CI.
+- Leslie Lamport, "Specifying Systems" — the TLA+ canonical text.
+- Frama-C user manual; Astrée whitepapers (AbsInt); CBMC tutorial on the Diffblue/Kroening site.
+- "seL4: from General Purpose to a Proof of Information Flow Enforcement" — landmark paper.

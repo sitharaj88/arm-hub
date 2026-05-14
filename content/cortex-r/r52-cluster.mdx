@@ -1,0 +1,224 @@
+---
+title: Cortex-R52 cluster modes
+description: Split vs lockstep configurations in a Cortex-R52 cluster — up to 4 cores, mix of lockstep pairs and independent cores, inter-core memory bus, L1 cache coherency in split mode, and use in ASIL-D powertrain and brake-by-wire designs.
+order: 5
+updated: 2026-05-13
+tags: [cortex-r, r52, cluster, lockstep, split, asil-d, automotive]
+---
+
+The Cortex-R52 is ARM's flagship real-time processor for safety-critical automotive, industrial, and aerospace use. What makes it distinctive isn't the core itself — it's the **cluster architecture**: up to 4 cores per cluster, each independently configurable as either a stand-alone "split" core or as one half of a lockstep pair. The same physical silicon ships with different SKUs that expose different mixes: 4 split, 2 split + 1 lockstep pair, or 2 lockstep pairs. The choice is fixed at chip integration, not run-time.
+
+This page walks through what the cluster looks like, what changes between split and lockstep modes, how cores share state (or don't), and why the architecture maps so well onto automotive safety requirements like ASIL-D powertrain control and brake-by-wire.
+
+<SpecSheet
+  title="R52 cluster overview"
+  specs={[
+    { label: 'Cores per cluster', value: '1, 2, 3, or 4. Configured at silicon integration time' },
+    { label: 'Mode per core', value: 'Split (independent execution context) or Lockstep (paired with adjacent core for fault detection)' },
+    { label: 'Lockstep delta', value: 'Typically 1.5 cycles — the second core runs slightly behind so common-cause faults differ in time' },
+    { label: 'Comparator', value: 'Per-pair output comparator on architectural state — register writes, memory accesses, exception entry' },
+    { label: 'Cluster cache (L2)', value: '256 KB – 2 MB optional. Shared across all cores in the cluster, with ECC' },
+    { label: 'Inter-core bus', value: 'Cluster-internal AXI/CHI fabric. Cache coherency in split mode, single channel in lockstep' },
+    { label: 'GIC', value: 'GIC v3 — affinity-routed SPIs, per-core SGI/PPI, optional ITS for LPIs' },
+    { label: 'Use cases', value: 'ASIL-D engine control, transmission, ESC, ADAS sensor fusion (R52+), brake-by-wire, steer-by-wire' },
+  ]}
+/>
+
+## What "lockstep" means architecturally
+
+Two physical CPU cores run the **same** instruction stream from the **same** memory locations, in tight phase-locked synchronization (with the second core delayed by 1–2 cycles to detect common-cause failures from voltage glitches or cosmic rays that would affect both cores instantly).
+
+A dedicated **comparator** monitors the architectural outputs of both cores cycle by cycle:
+- Register file writes (every register write commits in both cores; comparator XORs and flags any difference)
+- Memory write addresses and data
+- Exception entry vectors
+- Some pipeline-internal signals (depends on implementation)
+
+If the comparator detects a mismatch, it raises a system-level fault signal — typically routed to the GIC as a high-priority IRQ and also driven on a dedicated `nERROR` pin out of the cluster. The fault handler logs the event, transitions the system to a safe state, and triggers a reset.
+
+To software, a lockstep pair looks like **one** core. The OS schedules tasks on it, the GIC delivers interrupts to it, the memory model is single-core semantics. The redundant core is invisible.
+
+```
+   Lockstep pair (single execution context to software)
+   ┌──────────────┐        ┌──────────────┐
+   │   Core A     │        │   Core B     │
+   │ (master,     │        │ (shadow,     │
+   │  drives bus) │        │  ~2-cycle    │
+   │              │        │  delay)      │
+   └──────┬───────┘        └──────┬───────┘
+          │                       │
+          ▼                       ▼
+   ┌────────────────────────────────────┐
+   │     Architectural comparator       │
+   │  - register file writes            │
+   │  - memory write addr/data          │
+   │  - exception entry                 │
+   └─────────────────┬──────────────────┘
+                     │
+                  mismatch → nERROR / system fault IRQ
+                     │
+                     ▼
+                 to system safety logic
+```
+
+## Split mode
+
+In split mode, each core runs independently. Two cores in split mode are two separate execution contexts that can run different threads, take different interrupts, and access different memory. Cache coherency between them is maintained via the cluster's snoop network (using the AMBA ACE-Lite protocol).
+
+Split-mode cores share:
+- The cluster's L2 cache (if present)
+- The GIC distributor and redistributors
+- The MPU region descriptors are *per-core* — each core has its own MPU. Memory partitioning between cores is enforced by software.
+
+Split mode gives you more raw throughput per cluster. A 4-core split cluster delivers ~3.5× the compute of a single-core configuration (less than 4 due to coherency overhead and shared cache pressure). But each core operates without redundancy — a hardware fault in one core produces a wrong result silently.
+
+## Mixed configurations
+
+Where it gets interesting is the *mixed* mode: some cores split, some in lockstep, in the same cluster. The R52 cluster supports configurations like:
+
+| Cluster config | Execution contexts visible to software | Use |
+|----------------|-----------------------------------------|-----|
+| 4 split | 4 | Maximum throughput, lower safety. ADAS fusion, infotainment-adjacent |
+| 3 split + 1 lockstep pair (= 4 cores hw) | (Not possible — pairs come in 2s) | — |
+| 2 split + 1 lockstep pair (4 cores hw) | 3 | Mixed criticality — high-throughput on split, safety-critical on lockstep |
+| 2 lockstep pairs (4 cores hw) | 2 | Pure safety. Both contexts fault-tolerant. Brake-by-wire, steering, powertrain |
+
+The cluster reports its configuration through `CLIDR_EL1` and vendor-specific cluster configuration registers. Software reads these at boot to enumerate the actual context count and topology.
+
+<BlockDiagram
+  title="Cortex-R52 cluster — four cores configurable as split or lockstep pairs"
+  width={780}
+  height={400}
+  nodes={[
+    { id: 'c0',   x: 40,  y: 30,  w: 150, h: 55, kind: 'core',    label: 'Core 0', detail: 'pair-0 master' },
+    { id: 'c1',   x: 210, y: 30,  w: 150, h: 55, kind: 'core',    label: 'Core 1', detail: 'pair-0 shadow' },
+    { id: 'c2',   x: 400, y: 30,  w: 150, h: 55, kind: 'core',    label: 'Core 2', detail: 'pair-1 master or split' },
+    { id: 'c3',   x: 570, y: 30,  w: 150, h: 55, kind: 'core',    label: 'Core 3', detail: 'pair-1 shadow or split' },
+    { id: 'cmp0', x: 100, y: 105, w: 200, h: 45, kind: 'security', label: 'Comparator (pair 0)' },
+    { id: 'cmp1', x: 460, y: 105, w: 200, h: 45, kind: 'security', label: 'Comparator (pair 1)' },
+    { id: 'cfg',  x: 280, y: 170, w: 220, h: 40, kind: 'periph',  label: 'Cluster config (split / 2x lockstep)' },
+    { id: 'l2',   x: 200, y: 225, w: 380, h: 50, kind: 'memory',  label: 'Cluster L2 cache + snoop fabric', detail: 'ECC, ACE-Lite / CHI' },
+    { id: 'gic',  x: 40,  y: 300, w: 230, h: 50, kind: 'periph',  label: 'GIC v3 distributor', detail: 'affinity-routed SPIs' },
+    { id: 'fault',x: 290, y: 300, w: 230, h: 50, kind: 'security', label: 'Fault aggregator → nERROR' },
+    { id: 'bus',  x: 540, y: 300, w: 200, h: 50, kind: 'periph',  label: 'AXI / CHI to SoC' },
+  ]}
+  edges={[
+    { from: 'c0', to: 'cmp0', tone: 'accent' },
+    { from: 'c1', to: 'cmp0', tone: 'accent' },
+    { from: 'c2', to: 'cmp1', tone: 'accent' },
+    { from: 'c3', to: 'cmp1', tone: 'accent' },
+    { from: 'cmp0', to: 'fault', label: 'mismatch', tone: 'destructive' },
+    { from: 'cmp1', to: 'fault', label: 'mismatch', tone: 'destructive' },
+    { from: 'cfg', to: 'cmp0', label: 'enable' },
+    { from: 'cfg', to: 'cmp1', label: 'enable' },
+    { from: 'c0', to: 'l2' }, { from: 'c1', to: 'l2' },
+    { from: 'c2', to: 'l2' }, { from: 'c3', to: 'l2' },
+    { from: 'l2', to: 'bus', arrow: 'both' },
+    { from: 'gic', to: 'c0' }, { from: 'gic', to: 'c2' },
+  ]}
+  caption="The same 4-core silicon is shipped as 4 independent split cores, 2 split + 1 lockstep pair, or 2 lockstep pairs. The per-pair comparators are enabled or bypassed at integration time and feed a cluster-wide fault aggregator."
+/>
+
+A typical ASIL-D automotive design uses 2 lockstep pairs:
+- Pair 1: real-time control loops (engine, transmission)
+- Pair 2: monitoring and diagnostics (verifies pair 1's outputs are sane, drives the actuators only if both pairs agree)
+
+The two pairs each provide their own fault detection (lockstep within the pair) and the inter-pair cross-check adds another layer (independent redundancy).
+
+## Lockstep entry and exit — synchronization
+
+When the cluster boots, lockstep pairs need to synchronize their state. The cluster's reset sequence brings both cores out of reset simultaneously, initializes both register files to known values, and starts both cores executing from the same vector. From that point, the cores remain in lockstep automatically — they execute the same instruction stream and observe the same memory.
+
+Faults that *only* affect one core (single-event upset in a register on core A) cause a divergence that the comparator catches on the next architectural output. The comparator's resolution latency is 1–2 cycles — fast enough that an erroneous write hasn't reached external memory yet.
+
+**Lockstep exit** is harder. Some designs allow software to deliberately exit lockstep — for example, to use the shadow core for self-test. But re-entering lockstep requires re-synchronizing the register file, the cache, the TLB. Most safety designs avoid this and treat lockstep as a permanent property.
+
+## Inter-core memory bus
+
+Within a cluster, cores share L2 cache and a coherency fabric. Each core has private L1 I and D caches. The fabric is typically AMBA CHI (Coherent Hub Interface) or ACE-Lite for non-coherent regions.
+
+In **split mode**, the fabric maintains coherency: when core 0 writes to a cache line that core 1 has cached, core 1's copy is invalidated (or updated, depending on the protocol). Software can use shared-memory communication between split cores like on any SMP system. Memory ordering is enforced by `DMB SY` barriers.
+
+In **lockstep mode**, only the master core drives the bus. The shadow core's bus output is suppressed (or compared internally and discarded after the comparator check). To the rest of the system, a lockstep pair looks like a single bus master with the same coherency obligations as a single core.
+
+For cross-pair communication in mixed-mode clusters, software uses cache-coherent shared memory (write-back coherent region in the MPU). The R52 cluster's coherency fabric handles snooping between pairs the same way it does between split cores — a write from pair 1 is observed by pair 2 via the normal cache-invalidate path.
+
+<Callout type="tip">
+Inter-pair messages are best done lock-free with a single-writer single-reader queue. Both pairs are running real-time code where blocking on a mutex is unacceptable. The pattern is: pair 1 writes a message to a ring buffer in shared cache-coherent memory, increments a head pointer with `STLR` (store-release), and pair 2 reads the buffer up to a `LDAR`-loaded head pointer.
+</Callout>
+
+## Cache and MPU in cluster
+
+L1 caches are private to each core. L1 D-cache uses ECC; L1 I-cache uses parity or ECC depending on the design. In a lockstep pair, both cores' L1 caches are populated identically by the comparator-enforced execution; any divergence is caught.
+
+L2 cache is shared across the entire cluster (all split cores and lockstep pairs). It also has ECC. The L2 size is configurable from 256 KB up to 2 MB.
+
+The MPU on R52 follows the ARMv8-R model:
+- 16 to 24 region descriptors per core
+- 32-byte-aligned base and limit (no power-of-two restriction)
+- MAIR-based attribute indirection
+- Per-core MPU — each core programs its own descriptor set
+- For lockstep pairs, both cores see and program the same MPU because they execute the same instructions
+
+The MPU is also a critical *isolation* mechanism in mixed-mode clusters: the high-criticality pair uses its MPU to forbid the lower-criticality split cores from writing to its memory. The split cores can read shared regions (telemetry, configuration) but not modify the pair's working RAM.
+
+## GIC v3 in the cluster
+
+Each core (split or lockstep pair) appears to the GIC as a single processing element. The GIC v3 distributor routes SPIs to specific cores via affinity routing. Each core has its own redistributor.
+
+In a 2 lockstep pairs + 2 split mode cluster, the GIC sees 4 affinity slots:
+- Aff0=0 → pair 1 (master core of pair 1 is the affinity-visible one)
+- Aff0=1 → pair 2
+- Aff0=2 → split core 2
+- Aff0=3 → split core 3
+
+SGIs between these contexts work normally — pair 1 can send an SGI to split core 3 via `ICC_SGI1R_EL1` with the right affinity bits.
+
+The GIC distributor itself has ECC on its configuration tables. A fault in the GIC's routing table could redirect an interrupt to the wrong CPU; the ECC catches this.
+
+## Boot sequence
+
+On reset, only one core (the boot core, typically core 0) executes. Other cores (or pairs) are held in reset. Boot proceeds:
+
+1. Boot core (lockstep pair 1, typically) executes the bootloader from flash or ROM.
+2. Bootloader initializes the cluster's shared resources: L2 cache ECC, GIC distributor, MPU defaults.
+3. Bootloader prepares per-CPU initialization data in shared memory (entry points, stack pointers).
+4. Bootloader powers up the remaining cores or pairs by writing to the cluster's power control register (sometimes via PSCI calls if EL2/EL3 firmware is present).
+5. Each newly-released core executes its own initialization (its MPU, its caches) and enters the application's main scheduler.
+
+Lockstep pairs come out of reset *together* — both cores of pair 2 are released simultaneously, and the comparator is enabled. Until then, the pair's comparator is disabled (cores are uninitialized; differences are expected).
+
+## Use case: ASIL-D powertrain
+
+A modern automotive powertrain ECU using a Cortex-R52 cluster:
+
+- **Pair 1 (lockstep)**: Engine control torque calculation. 100 µs control loop. ASIL-D.
+- **Pair 2 (lockstep)**: Plausibility checks on pair 1's outputs. Independent calibration of expected torque. ASIL-D.
+- **Split core 0**: Diagnostic logging, UDS communications stack. ASIL-B.
+- **Split core 1**: HMI gateway, CAN routing. ASIL-A.
+
+Pair 1 produces the desired torque; pair 2 independently computes an expected torque based on different model inputs. Only when the two values agree (within tolerance) does the system command the actuator. A fault in pair 1 (caught by lockstep) triggers a fault; even if lockstep misses (vanishingly unlikely), pair 2's disagreement catches it. Diagnostic coverage approaches 99.99% — sufficient for ASIL-D's hardware fault metric (≤10⁻⁸ failures per hour).
+
+The lower-criticality split cores can crash without compromising safety — they're firewalled from the pair's RAM by the MPU and from the actuators by hardware-level interlock.
+
+<Callout type="warn">
+The mixed-criticality argument requires that the MPU configuration is itself trustworthy. A bug that misconfigures the MPU (allowing the split core to write to the pair's memory) defeats the isolation. ASIL-D arguments include formal verification of the MPU configuration and runtime monitoring (re-reading the MPU descriptors and comparing against an expected hash).
+</Callout>
+
+## Comparison with TI Hercules and Infineon AURIX
+
+TI Hercules TMS570 family uses a similar dual-core lockstep scheme but in a fixed configuration — no split/lockstep flexibility. Two Cortex-R5F cores in permanent lockstep.
+
+Infineon AURIX TC3xx and TC4xx use **TriCore** cores (not ARM) in lockstep + diverse architecture (one TriCore + one independent TriCore running diverse software). Different approach to the same problem.
+
+The R52 cluster's flexibility — configurable mix of split and lockstep — is what differentiates it. A single chip can target ASIL-D in lockstep mode and lower-criticality high-throughput workloads in split mode, using the same toolchain and the same instruction set.
+
+## Cross-references
+
+- [Cortex-R ISA generations](/docs/cortex-r/isa-compare) — R52 architecture details
+- [Cortex-R MPU and TCM](/docs/cortex-r/mpu-tcm) — per-core MPU, ATCM in cluster context
+- [ECC and parity](/docs/cortex-r/ecc) — fault detection within the cluster
+- [Cortex-R interrupts](/docs/cortex-r/interrupts) — GIC v3 affinity in cluster mode
+- [Cortex-A SMP](/docs/cortex-a/smp) — for comparison, much larger SMP scaling
+- ARM Cortex-R52 Technical Reference Manual
+- ISO 26262-11 — guidelines on semiconductor in automotive safety

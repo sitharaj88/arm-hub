@@ -1,0 +1,160 @@
+---
+title: Rust on Cortex-M
+description: The modern path — cortex-m, embedded-hal, RTIC, Embassy. What Rust gives you that C doesn't, and where the rough edges still are.
+order: 6
+updated: 2026-05-12
+tags: [programming, rust, modern]
+badge: modern
+---
+
+
+Rust on Cortex-M has gone from "interesting experiment" to "viable production choice" in the last few years. The toolchain is solid, the HAL ecosystem (`embedded-hal`) is mature, two excellent application frameworks (RTIC and Embassy) compete for mindshare, and major vendors (Espressif, Infineon, ST, Nordic) ship official Rust support.
+
+## What Rust buys you on embedded
+
+**At the language level:**
+
+- **Memory safety without GC** — no dangling pointers, no use-after-free, no buffer overruns *in safe code*. The borrow checker enforces it at compile time.
+- **Thread/ISR safety** — you can't accidentally share mutable state across ISR boundaries without explicit synchronisation. The type system makes the unsafe constructs explicit (and `Send`/`Sync` documents them).
+- **No null pointers** — `Option<T>` instead. `null.deref()` is a compile error.
+- **Exhaustive `match`** — enums must be matched exhaustively, so adding a new state to a state machine forces you to handle it everywhere.
+- **First-class iterators, closures, generics** — without the C++ baggage.
+
+**At the toolchain level:**
+
+- **One build system** — `cargo build --target thumbv7em-none-eabihf`. No CMakeLists, no IDE-specific project files, no vendor SDK to install.
+- **`cargo add`** — Crates.io has thousands of pre-tested crates. Need a CRC library? `cargo add crc`. Done.
+- **One debugger** — `probe-rs` works with J-Link, ST-Link, CMSIS-DAP, BlackMagic. Flash and debug in one tool.
+
+## The toolchain
+
+```bash
+rustup target add thumbv7em-none-eabihf            # Cortex-M4F / M7F
+rustup target add thumbv8m.main-none-eabihf        # Cortex-M33F
+cargo install probe-rs --features cli              # flash/debug tool
+```
+
+That's the install. Now create a project:
+
+```bash
+cargo generate --git https://github.com/rust-embedded/cortex-m-quickstart
+cd my-app
+cargo build --release
+probe-rs run --chip STM32F407VGTx target/thumbv7em-none-eabihf/release/my-app
+```
+
+Three commands and you're running on hardware.
+
+## The crate stack
+
+```
+┌──────────────────────────────────────────┐
+│  Application                              │
+├──────────────────────────────────────────┤
+│  RTIC  or  Embassy  ← frameworks         │
+├──────────────────────────────────────────┤
+│  stm32f4-hal  ← vendor HAL                │
+├──────────────────────────────────────────┤
+│  embedded-hal  ← peripheral traits        │
+├──────────────────────────────────────────┤
+│  stm32f4   ← PAC (Peripheral Access)      │
+├──────────────────────────────────────────┤
+│  cortex-m  ← NVIC, SysTick, intrinsics    │
+└──────────────────────────────────────────┘
+```
+
+- **cortex-m** — equivalent to CMSIS-Core. NVIC, SysTick, SCB, MPU, FPU access.
+- **PAC** (Peripheral Access Crate) — generated from the SVD. `stm32f4::stm32f407` gives you typed register access: `peripherals.GPIOA.moder.modify(|_, w| w.moder5().output())`.
+- **HAL** — higher-level wrappers implementing `embedded-hal` traits. `stm32f4xx_hal::serial::Serial::new(...)`.
+- **embedded-hal** — vendor-neutral trait set. A library that takes an `impl spi::FullDuplex<u8>` works with any chip's HAL.
+- **RTIC / Embassy** — application frameworks (concurrency, scheduling).
+
+## RTIC — Real-Time Interrupt-driven Concurrency
+
+RTIC is a *scheduler made out of NVIC priorities*. You declare your tasks with priorities; the framework arranges them as ISRs and uses the NVIC to schedule. No RTOS kernel, no context switches in software, latency bounded by NVIC tail-chaining.
+
+```rust
+#[rtic::app(device = stm32f4xx_hal::pac, peripherals = true, dispatchers = [USART1])]
+mod app {
+    use stm32f4xx_hal::{pac, prelude::*};
+
+    #[shared]
+    struct Shared { counter: u32 }
+
+    #[local]
+    struct Local {}
+
+    #[init]
+    fn init(_: init::Context) -> (Shared, Local) {
+        // Set up clocks, peripherals, ...
+        background::spawn().ok();
+        (Shared { counter: 0 }, Local {})
+    }
+
+    #[task(priority = 1, shared = [counter])]
+    async fn background(mut ctx: background::Context) {
+        loop {
+            ctx.shared.counter.lock(|c| *c += 1);
+            // ... yield ...
+        }
+    }
+
+    #[task(binds = TIM2, priority = 3, shared = [counter])]
+    fn tim2_isr(mut ctx: tim2_isr::Context) {
+        ctx.shared.counter.lock(|c| *c = 0);
+    }
+}
+```
+
+The compiler proves that the `Shared::counter` lock can never deadlock (because priorities are static and inversion is impossible by construction). It's a fundamentally safer concurrency model than a traditional RTOS.
+
+## Embassy — async/await on bare metal
+
+Embassy lets you write `async` functions that suspend on hardware events, scheduled by an executor that uses interrupts to wake them up.
+
+```rust
+use embassy_stm32::{gpio::{Level, Output, Speed}, init};
+use embassy_time::{Duration, Timer};
+
+#[embassy_executor::main]
+async fn main(_spawner: embassy_executor::Spawner) {
+    let p = init(Default::default());
+    let mut led = Output::new(p.PC13, Level::High, Speed::Low);
+
+    loop {
+        led.set_high();
+        Timer::after(Duration::from_millis(500)).await;
+        led.set_low();
+        Timer::after(Duration::from_millis(500)).await;
+    }
+}
+```
+
+`Timer::after(...).await` suspends the task without blocking the CPU. The executor schedules other ready tasks while the timer is ticking. If nothing is ready, it issues `WFI` and the chip sleeps.
+
+This style is *very* productive — it reads like async JavaScript or Python, but with zero allocations and full hardware access. It's becoming the default for new Rust embedded projects.
+
+## What's still rough
+
+- **Vendor-specific peripherals** — if your STM32H7 needs Ethernet with a specific PHY config, the HAL might not expose it; you drop to PAC. Fine, but more friction than C with a vendor HAL.
+- **No `std`** — no `String`, no `HashMap` (use `heapless::String`, `heapless::FnvIndexMap`). Different muscle memory.
+- **`async` size on flash** — the executor + futures machinery adds ~2–4 KB. Not free, but reasonable.
+- **Debug info bloat** — Rust's debug info is detailed; `cargo build --release` is mandatory for size-constrained chips.
+
+<Callout type="tip" title="probe-rs + defmt = magic">
+[defmt](https://defmt.ferrous-systems.com/) is a deferred-formatting logger that sends *format strings as integer indices* over RTT — you log megabytes of structured data over a 2-pin SWD link in real time without slowing the application. `probe-rs run` decodes and prints them. It's the killer feature of Rust embedded that no C ecosystem has matched.
+</Callout>
+
+## When to pick Rust over C
+
+- **New project, you control the team's training** — yes, increasingly the right answer.
+- **Existing C codebase, mature drivers** — sticking with C is rational; Rust gives you safety where you have time to rewrite, not as a forklift.
+- **Vendor SDK is essential** (e.g. Nordic Bluetooth softdevice) — C, unless the vendor has a Rust binding (they increasingly do).
+- **Certification (DO-178, IEC 61508)** — C still, until Rust toolchain certification (Ferrocene, etc.) catches up. Progressing fast.
+
+## See also
+
+- [The Embedded Rust Book](https://docs.rust-embedded.org/book/) — the canonical introduction.
+- [Embassy docs](https://embassy.dev/) — the async framework.
+- [RTIC book](https://rtic.rs/) — the scheduler framework.
+- [Embedded C patterns](/docs/programming/embedded-c/) — for comparison.

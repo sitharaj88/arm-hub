@@ -1,0 +1,210 @@
+---
+title: Medical-grade wearable
+description: Architecting a medical-grade wearable — PPG and ECG signal chain, sample rate and ADC requirements, BLE for sync, regulatory framework (IEC 60601, ISO 14971, IEC 62304), battery life via duty-cycling.
+order: 17
+updated: 2026-05-13
+tags: [systems, medical, wearable, ppg, ecg, ble, iec-60601, iso-14971, iec-62304]
+---
+
+A medical-grade wearable is a small body-worn device that measures physiological signals — heart rate, blood oxygenation (SpO2), single-lead or multi-lead ECG, respiratory rate, body temperature, motion — with sufficient accuracy to inform clinical decisions, while being unobtrusive enough that a patient will wear it. It looks like a consumer fitness tracker but is held to a different standard: signal quality has to be clinical, the regulatory burden is substantial, and the firmware lifecycle is governed by IEC 62304. The Cortex-M inside is the same family as in a smartwatch; the engineering rigour around it is not.
+
+This page covers the analog front-end choices for PPG and ECG, the sampling and DSP that turns raw signals into clinical-quality measurements, the BLE-based connectivity to a paired phone or gateway, the regulatory framework that constrains everything, and the battery-life arithmetic that makes the device wearable for days or weeks rather than hours.
+
+<SpecSheet
+  title="Medical wearable at a glance"
+  specs={[
+    { label: 'Class', value: 'FDA Class II in US (most non-invasive monitors); CE Class IIa in EU under MDR; sometimes Class I for HR-only fitness use' },
+    { label: 'MCU', value: 'Cortex-M33 with TrustZone (security + secure boot) or M4F; nRF5340, nRF52840, STM32U5, MAX32665, Apollo4' },
+    { label: 'AFE (PPG)', value: 'MAX86150, MAX30101, AFE4404; integrated LED drivers + photodiode + 16-22 bit ADC' },
+    { label: 'AFE (ECG)', value: 'AD8232, MAX30003, ADS1292; instrumentation amp + LPF + delta-sigma 24-bit ADC' },
+    { label: 'Sample rate', value: 'PPG: 100-400 Hz; ECG: 200-1000 Hz clinical; both decimated from oversampled internal rates' },
+    { label: 'ADC requirements', value: 'ECG: 24-bit Σ∆ for the µV resolution; PPG: 16-22 bit, oversampled' },
+    { label: 'Battery', value: 'Li-Po 100-300 mAh in patch form, 200-500 mAh in band form; target 7-30 days' },
+    { label: 'Wireless', value: 'BLE 5.0+ for sync (GATT to smartphone or hub); optional LTE-M for direct cellular' },
+    { label: 'Regulations', value: 'IEC 60601-1 (electrical safety), IEC 60601-1-2 (EMC), ISO 14971 (risk), IEC 62304 (software), ISO 13485 (QMS)' },
+  ]}
+/>
+
+<BlockDiagram
+  title="Medical wearable signal chain"
+  width={860}
+  height={420}
+  minWidth={760}
+  nodes={[
+    { id: 'optics', x: 40,  y: 50,  w: 190, h: 64, kind: 'external', label: 'PPG optics', detail: 'red · IR · green LED/PD' },
+    { id: 'ppg',    x: 40,  y: 142, w: 190, h: 64, kind: 'sensor',   label: 'PPG AFE', detail: '18-bit ADC · ambient cancel' },
+    { id: 'elec',   x: 40,  y: 246, w: 190, h: 56, kind: 'external', label: 'ECG electrodes', detail: '2-3 lead contact' },
+    { id: 'ecg',    x: 270, y: 246, w: 190, h: 56, kind: 'sensor',   label: 'ECG AFE', detail: '24-bit Σ∆ · lead-off' },
+    { id: 'mcu',    x: 310, y: 112, w: 240, h: 76, kind: 'core',     label: 'Cortex-M33 clinical SoC', detail: 'TrustZone · DSP · BLE 5' },
+    { id: 'flash',  x: 310, y: 36,  w: 240, h: 44, kind: 'storage',  label: 'Encrypted flash log' },
+    { id: 'batt',   x: 310, y: 320, w: 240, h: 44, kind: 'power',    label: 'Li-Po + PMIC' },
+    { id: 'phone',  x: 620, y: 86,  w: 190, h: 64, kind: 'external', label: 'Host phone / hub', detail: 'BLE GATT · FHIR sync' },
+    { id: 'cloud',  x: 620, y: 214, w: 190, h: 64, kind: 'cloud',    label: 'Cloud / EHR', detail: 'TLS · encrypted at rest' },
+  ]}
+  edges={[
+    { from: 'optics', to: 'ppg',   label: 'reflected light', tone: 'accent' },
+    { from: 'ppg',    to: 'mcu',   label: 'samples', tone: 'accent' },
+    { from: 'elec',   to: 'ecg' },
+    { from: 'ecg',    to: 'mcu',   label: 'ECG frames', tone: 'accent' },
+    { from: 'mcu',    to: 'flash', label: 'events' },
+    { from: 'batt',   to: 'mcu',   tone: 'warning' },
+    { from: 'mcu',    to: 'phone', label: 'BLE 5', tone: 'primary', arrow: 'both' },
+    { from: 'phone',  to: 'cloud', label: 'TLS', tone: 'success' },
+  ]}
+  caption="PPG and ECG AFEs digitise the analog signals; the M33 SoC runs the DSP and clinical classifiers, persists events, and streams over BLE GATT to a paired phone that forwards to the cloud EHR backend."
+/>
+
+## PPG — photoplethysmography
+
+PPG is the technology in every modern smartwatch heart-rate sensor: an LED illuminates the skin; the photodiode measures the reflected light. As blood pulses through the capillaries with each heartbeat, the absorption changes slightly — the AC component of the photodiode signal is the heart-beat-derived "plethysmogram". By measuring this at two wavelengths (red ~660 nm and infrared ~940 nm), the ratio of pulsation between them yields SpO2 (the Lambert-Beer pulse oximetry equation).
+
+An AFE like the MAX86150 integrates:
+
+- Three LED drivers (red, IR, green; the green is mainly for HR, the red/IR for SpO2).
+- Photodiode preamp with selectable gain.
+- 18-bit ADC sampling each LED's contribution separately (time-multiplexed: pulse LED1, sample; pulse LED2, sample; ambient sample for dark cancellation).
+- I²C interface to the MCU.
+
+Signal challenges:
+
+- **Motion artefact** dominates. A person walking, running, or even gesturing produces optical-modulation an order of magnitude larger than the cardiac signal. Adaptive noise cancellation (using a 3-axis accelerometer as reference) is mandatory.
+- **Skin tone variation.** Darker skin absorbs more; LED currents must auto-adjust to keep the photodiode in its linear range.
+- **Perfusion** — fingertip PPG has 5x the signal-to-noise of wrist PPG. Wrist-worn designs need every bit of SNR they can extract.
+- **Ambient light.** Sun, room lights add DC and 50/60 Hz components. The AFE does ambient-only samples for subtraction.
+
+Signal processing pipeline:
+
+```
+Raw 100-400 Hz PPG → Ambient subtraction → DC removal (HPF 0.5 Hz)
+  → Bandpass 0.5-4 Hz (cardiac band) → Motion artefact rejection (accelerometer-correlated removal)
+  → Peak detection / FFT for HR → Cardiac quality assessment
+```
+
+A typical HR algorithm uses Welch's method or autocorrelation in a sliding window, returns "60-200 bpm with confidence X". The confidence is what distinguishes a clinical from a consumer device — clinical devices flag low-confidence intervals rather than report a number you might trust when you shouldn't.
+
+SpO2 uses the red/IR ratio:
+
+```
+R = (AC_red / DC_red) / (AC_IR / DC_IR)
+SpO2 = lookup_table(R)   // calibrated against arterial blood gas measurement
+```
+
+The calibration table comes from clinical trials — humans with measured arterial SpO2 wearing the device. FDA / CE clearance for SpO2 requires this calibration to be documented and validated against a standard.
+
+## ECG — single-lead and multi-lead
+
+ECG measures the electrical activity of the heart directly via skin electrodes. Single-lead (two electrodes) gives a single voltage trace — enough for rhythm classification (sinus, atrial fibrillation, etc.). Multi-lead (typically 3, 5, 6, or the clinical 12) gives spatial information about the heart's electrical axes and is required for ischemia / MI detection.
+
+A wearable patch ECG typically has 2-3 electrodes: one positive, one negative, one reference (driven-right-leg amplifier). The signal at the electrodes is ~1 mV peak with a bandwidth of 0.05-150 Hz for diagnostic quality (and the QRS complex is ~5-30 ms wide, demanding sample rates of at least 200 Hz, ideally 500-1000 Hz).
+
+The AFE (MAX30003, AD8232) provides:
+
+- Instrumentation amplifier with very high CMRR (>100 dB) to reject the 50/60 Hz interference from mains.
+- Front-end filter (HPF ~0.05 Hz to remove DC drift, LPF ~150 Hz to anti-alias).
+- 24-bit delta-sigma ADC oversampling at 8-32 kHz, decimated to 200-1000 Hz output.
+- Lead-off detection — checks if the electrodes are making good skin contact.
+- Pace-pulse detection — fast circuitry to identify pacemaker spikes (which would otherwise look like QRS to a software detector).
+
+Software processing:
+
+```
+Raw 24-bit ECG @ 250 Hz → Notch 50/60 Hz → Bandpass 0.5-40 Hz (diagnostic) or 5-15 Hz (monitor)
+  → Pan-Tompkins QRS detector → Beat classification (normal, supraventricular, ventricular)
+  → Rhythm classifier (sinus, AFib, AFlutter, brady, tachy)
+```
+
+The QRS detector is classic Pan-Tompkins (1985) for monitoring grade or a neural-network-based classifier for higher accuracy. AFib detection from a wearable is FDA-cleared on multiple consumer products now (Apple Watch, Fitbit Sense, KardiaMobile) — the model has been validated against cardiologist-read 12-lead ECG ground truth in clinical trials.
+
+## MCU choice
+
+The MCU does the DSP, BLE, storage, and supervises the AFEs. Constraints:
+
+- **Sample rate × DSP load**: a 500 Hz ECG with motion-correlated PPG + AFib classifier consumes 5-15% of a Cortex-M4F at 64 MHz.
+- **BLE concurrency**: streaming ECG to a phone over BLE in real time needs ~50 kbps throughput, well within BLE 5.0 PHY capability.
+- **Battery life**: target average current < 3 mA for a 200 mAh battery to give 3 days; &lt;1 mA for a week. Most of this is the AFE and the LED drivers; the MCU is a fraction.
+- **Memory**: store 24 hours of raw ECG at 500 Hz × 16 bits = 86 MB. Internal flash won't fit; either compress aggressively (ECG compresses 5-10:1 with lossless wavelet transforms) and store events of interest only, or include external NOR flash, or stream to phone continuously.
+- **Security**: patient data is regulated. On-device encryption (AES-256), secure boot, TLS for cloud upload — all needed.
+
+Popular choices:
+
+| MCU | Strengths |
+|-----|-----------|
+| Nordic nRF5340 | Dual M33, TrustZone, BLE 5.4, FPU |
+| Nordic nRF52840 | Single M4F, mature, lots of reference designs |
+| STM32U5 | M33, TrustZone, ultra-low-power, autonomous peripherals |
+| Maxim MAX32665 | M4F with ultra-low-power BLE, designed for wearable AFE pairing |
+| Ambiq Apollo4 | M4F at 192 MHz with sub-µA sleep, very efficient |
+| Renesas RA4W1 / RA6T2 | BLE M4, M33 |
+
+Maxim and Ambiq have specifically targeted wearable medical with feature sets like integrated PMIC + BLE + AFE companion chips that minimise external components.
+
+## Regulatory framework
+
+Going from "it works" to "it can be sold" requires:
+
+**IEC 60601-1 (general electrical safety).** Covers leakage currents, dielectric strength, mechanical integrity, biocompatibility of contact materials. The wearable's housing must not leak more than a few microamps under fault conditions; the battery must not exceed a safe surface temperature.
+
+**IEC 60601-1-2 (EMC).** Emissions and immunity. The device must not interfere with other medical equipment in a clinical environment, and must continue to operate (or fail safely) under typical hospital electromagnetic disturbance.
+
+**ISO 14971 (risk management).** Required process for identifying, evaluating, and mitigating risks. Every hazard ("device falsely reports normal SpO2 during hypoxic event") gets a risk score and a mitigation strategy. Software bugs are first-class risks.
+
+**IEC 62304 (medical device software lifecycle).** The software process standard. Categorises software by safety class (A: no injury risk; B: non-life-threatening injury; C: death or serious injury possible) and prescribes development rigour proportional to class. A Class C wearable (e.g. critical-care monitor) requires unit tests, integration tests, code reviews, traceability from requirements to implementation to test, and formal verification or extensive testing of safety-critical algorithms.
+
+**ISO 13485 (quality management).** The company's quality management system. Covers design controls, change control, supplier management, post-market surveillance. ISO 13485 certification is a prerequisite to selling.
+
+**FDA 21 CFR Part 820 (Quality System Regulation).** US-specific QMS. Equivalent to ISO 13485 but with some additional requirements.
+
+**Cybersecurity (FDA 2023+ premarket guidance).** Wearables that transmit data must demonstrate threat modelling, secure development practices, and a vulnerability disclosure / patching plan. SBOM (Software Bill of Materials) for every third-party component.
+
+| Class | Typical product | Software class | Effort |
+|-------|----------------|----------------|--------|
+| FDA Class I (low risk) | Optical pulse rate "wellness" device | IEC 62304 Class A | 6 months |
+| FDA Class II (moderate) | Wrist-worn pulse oximeter, single-lead ECG | IEC 62304 Class B | 18-30 months |
+| FDA Class III (high) | Implantable cardiac monitor | IEC 62304 Class C | 30+ months |
+
+The class affects the entire engineering process. A Class II SaMD (Software as a Medical Device) wearable is not a place to move fast and break things.
+
+<Callout type="warn">
+Field-update of a medical device is regulated. An OTA update that changes an algorithm or a safety-critical behaviour requires a new submission (or, at minimum, a documented change-control with risk assessment). You cannot iterate the way a consumer product team does. Plan the firmware architecture to allow security-only updates without changing the regulated algorithm versions.
+</Callout>
+
+## Power and form-factor budgeting
+
+A wrist wearable target — 7 days on a single charge with a 250 mAh battery — needs an average current of 250 mAh / (7 × 24 h) ≈ 1.5 mA. Component contributions:
+
+| Component | Average current | Notes |
+|-----------|-----------------|-------|
+| MCU (Cortex-M4 + BLE radio) | ~150 µA | Mostly sleep, brief BLE activity |
+| AFE (PPG continuous HR) | ~600 µA | LEDs at 20 mA × 25 ms × 1 Hz |
+| AFE (ECG on demand) | adds ~500 µA when active | User-initiated, ~5 min/day |
+| Display (OLED) | adds ~5 mA when on | &lt;5 min/day in interactive |
+| Accelerometer | ~10 µA | Continuously sampling for step counting and motion |
+| Buck regulator efficiency | adds ~10% loss | Quiescent ~10 µA |
+
+This budget barely fits. The first thing to drop is "continuous HR" — switching to 5-minute sampling with adaptive on-demand brings PPG average down to ~100 µA. Trade is loss of continuous data; in a clinical use case (Holter-style cardiac monitoring), continuous is the requirement and the battery sets the wear-time.
+
+Battery technology improvements (silicon-anode Li-Po, hybrid Li-Po + thin-film) push capacity-per-volume up; the design budget improves slowly.
+
+## BLE and data flow
+
+The device pairs with a phone (iOS or Android) via BLE GATT. Standard services for some signals:
+
+- **Heart Rate Service (0x180D)** — HR + RR intervals.
+- **Pulse Oximeter Service (0x1822)** — SpO2.
+- **Body Composition Service (0x181B)** — body fat, lean mass.
+- **Custom services** for ECG, motion, raw signals.
+
+The phone app stores data, syncs to a backend, applies higher-level analytics, and presents to the user or clinician. Modern apps also support FHIR (Fast Healthcare Interoperability Resources) for integration with electronic health records.
+
+For continuous medical-grade transmission, BLE alone is insufficient — it requires the phone to be in range. Premium products add LTE-M directly to the wearable for cellular fallback, at the cost of significant battery drain (cellular TX is 10-100x BLE).
+
+## Cross-references
+
+- [Nordic nRF53](/docs/vendors/nordic-nrf53) — BLE option.
+- [STM32 low-power](/docs/vendors/stm32-lowpower) — U5 with TrustZone for secure medical.
+- [Smartwatch system](/docs/systems/smartwatch) — consumer-grade cousin.
+- [IoT sensor node](/docs/systems/iot-sensor-node) — same low-power patterns.
+- IEC 60601-1 (4th edition) and 60601-1-2.
+- IEC 62304:2006 + AMD1:2015.
+- FDA "Software as a Medical Device (SaMD)" guidance and cybersecurity premarket guidance.
+- Pan & Tompkins, "A real-time QRS detection algorithm", IEEE Trans Biomed Eng 1985.

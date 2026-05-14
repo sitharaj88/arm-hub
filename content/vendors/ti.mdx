@@ -1,0 +1,129 @@
+---
+title: Texas Instruments (Tiva, MSP432, Hercules)
+description: TI's ARM portfolio — Tiva (was Stellaris, M4), MSP432 (low-power M4F), Hercules (Cortex-R safety).
+order: 6
+updated: 2026-05-12
+tags: [vendors, ti]
+---
+
+
+Texas Instruments has a complicated ARM story. They bought Luminary Micro (Stellaris — the original Cortex-M3 family), rebranded as Tiva, then deprioritised it. MSP432 (Cortex-M4F low-power) was a play to extend the MSP430 legacy and was also discontinued. **Hercules** (Cortex-R safety) is alive and well in automotive and industrial.
+
+<SpecSheet
+  title="TI ARM portfolio — at a glance"
+  specs={[
+    { label: 'Tiva C series', value: 'TM4C123 (M4F @ 80 MHz, USB), TM4C129 (M4F @ 120 MHz, Ethernet MAC+PHY). Ex-Luminary Stellaris. Mature; not heavily marketed.' },
+    { label: 'MSP432', value: 'Cortex-M4F low-power, MSP430-style analog. Discontinued for new designs 2021; migration target = Tiva or MSPM0.' },
+    { label: 'MSPM0 (new)', value: 'Cortex-M0+ low-cost line (2023). 32-bit replacement for MSP430 8/16-bit parts.' },
+    { label: 'Hercules safety', value: 'TMS570 (Cortex-R4F dual-lockstep), RM57 / TMS570LC (Cortex-R5F dual-lockstep). IEC 61508 SIL-3, ISO 26262 ASIL-D pre-certified.' },
+    { label: 'SimpleLink wireless', value: 'CC13xx (sub-GHz + 2.4 GHz), CC26xx (2.4 GHz), CC23xx (BLE 5.4), CC27xx (Matter + 802.15.4). Cortex-M4F application core + Cortex-M0 radio core.' },
+    { label: 'AM2x MCUs', value: 'AM243x / AM263x — Cortex-R5F industrial real-time (EtherCAT, PROFINET) with hardware PRU coprocessors. Bridging to AM6x Sitara A-class.' },
+    { label: 'SDK', value: 'SimpleLink SDK (wireless), Hercules HALCoGen + SafeTI diagnostic library, MSPM0-SDK, MCU+ SDK for AM2x.' },
+    { label: 'Toolchain', value: 'Code Composer Studio (Eclipse-based) with TI Arm Clang compiler; arm-none-eabi-gcc fully supported via CMake.' },
+  ]}
+/>
+
+## Tiva C series (was Stellaris)
+
+The first commercially shipping Cortex-M3 was Luminary Micro's. TI bought them, rebranded to Stellaris, then to Tiva C. The TM4C123 / TM4C129 lines are widely used in academic courses (the "TIVA Launchpad" was the educational board for years) and still in production for industrial designs.
+
+- **TM4C123** — Cortex-M4F, 80 MHz, 256 KB flash, USB 2.0.
+- **TM4C129** — Cortex-M4F, 120 MHz, 1 MB flash, Ethernet MAC+PHY on chip.
+
+TI's marketing focus is now more on SimpleLink (BLE, WiFi) and SitaraLinux processors, but the Tiva parts remain available for legacy designs.
+
+## MSP432 — discontinued
+
+Marketed as the bridge from MSP430 (16-bit) to ARM Cortex-M4F. Was popular in academia. Discontinued for new designs in 2021. If you see it in older codebases, the migration target is typically Tiva C or a different vendor.
+
+## Hercules — automotive Cortex-R
+
+The **TMS570** and **RM48** Hercules lines are Cortex-R4F/R5F in **dual-core lockstep** with extensive BIST, ECC, and ASIL-D certification artefacts. Used in:
+
+- Airbag electronic control units.
+- Antilock braking systems (ABS).
+- Electric power steering (EPS).
+- Industrial robotics.
+
+Hercules ships with HALCoGen (a graphical configurator that generates HAL code) and a full safety certification package (TÜV-SÜD-evaluated, ISO 26262 ASIL D ready). The toolchain is TI's CCS (Code Composer Studio, Eclipse-based with TI's compiler) or commercial Wind River / Green Hills.
+
+For functional-safety work, Hercules + Wind River VxWorks is a textbook combination.
+
+## SimpleLink — TI's wireless line
+
+The **CC13xx** (sub-GHz + 2.4 GHz) and **CC26xx** (2.4 GHz / BLE) families are Cortex-M4 SoCs with integrated radio. Competitive with Nordic nRF52 for some BLE applications, with TI's strength being **sub-GHz** (915 MHz, 868 MHz) support that Nordic only added recently.
+
+- **CC1352** — sub-GHz + 2.4 GHz, BLE + 802.15.4 + proprietary.
+- **CC2640R2F / CC2650** — BLE-only.
+- **CC2652R** — BLE + 802.15.4 (Thread / Zigbee).
+
+The SimpleLink SDK is reasonably good — it's what you'll find in TI's reference designs and academic courses.
+
+## When you'd pick TI ARM
+
+- **Existing automotive program** with Hercules tooling — very strong functional-safety story.
+- **Industrial with strict EMC requirements** — TI's analog and PCB recommendations are top-tier.
+- **Sub-GHz wireless** — CC13xx still has the edge over Nordic in some sub-GHz applications.
+- **You're heavily TI elsewhere** (analog ICs, power, MCUs) — supply chain consolidation is real value.
+
+For greenfield consumer / IoT designs, ST or Nordic typically win on ecosystem.
+
+## Hercules in depth — Cortex-R lockstep safety
+
+Hercules is TI's flagship for IEC 61508 SIL-3 and ISO 26262 ASIL-D programs. The architectural pattern is **dual-core lockstep**: two identical Cortex-R4F or R5F cores execute the same instruction stream from a single fetch unit, with a small phase delay between them. A **CCM-R5** (CPU Compare Module) compares architectural state cycle-by-cycle and asserts an error if they diverge. The phase delay is critical — it ensures that a transient single-event upset (cosmic ray, EMI glitch) affects only one core's state at a time and is therefore caught by the comparator rather than corrupting both cores identically.
+
+Beyond lockstep, Hercules ships with extensive built-in self-test:
+
+- **LBIST** — Logic Built-In Self-Test, exercises every flip-flop in the CPU at boot and on demand.
+- **PBIST** — Programmable Built-In Self-Test, tests every SRAM cell with march patterns.
+- **ECC** — Single-Error-Correct / Double-Error-Detect on every memory and every bus.
+- **Cross-bar parity** — every AHB / VBus path has parity protection.
+- **Voltage and clock monitors** — independent oscillator that cross-checks the main PLL.
+- **DCC** (Dual-Clock Comparator) — verifies the system clock against an independent reference; trips a fault if drift exceeds a threshold.
+
+The certification artefacts shipped with each Hercules part — Safety Manual, FMEDA spreadsheets, DFA (Dependent Failure Analysis) reports — represent the bulk of the value. A functional-safety auditor reads the Safety Manual first; without it, even an excellent hardware design takes years to certify. SafeTI Diagnostic Library is the TI-provided runtime code that exercises these self-tests and reports fault status.
+
+| Feature | TMS570LS | RM57L | RM48 |
+|---------|----------|-------|------|
+| Core | Cortex-R4F dual lockstep | Cortex-R5F dual lockstep | Cortex-R4F dual lockstep |
+| Max clock | 220 MHz | 330 MHz | 220 MHz |
+| Flash | up to 4 MB | up to 4 MB | up to 3 MB |
+| Ethernet | yes (EMAC) | yes | optional |
+| Target | EV inverters, BMS, ABS | EPS, ADAS pre-fusion | industrial automation, robotics |
+| Cert level | SIL-3 / ASIL-D | SIL-3 / ASIL-D | SIL-3 / ASIL-D |
+
+<Callout type="warn" title="Hercules toolchain choice has compliance implications">
+The TI Arm Clang compiler ships with TÜV-SÜD qualification documents that map compiler version to verified output behaviour — required for ISO 26262 ASIL-D and IEC 61508 SIL-3 sign-off. Using `arm-none-eabi-gcc` instead is technically possible (the code builds fine) but you lose the qualification certificate and must produce your own, which is expensive. For certified programs, stay with CCS + TI Arm Clang. For prototypes, GCC is fine.
+</Callout>
+
+## SimpleLink wireless — the CC13xx / CC26xx architecture
+
+SimpleLink wireless parts use a dual-core architecture that's important to understand. The **application core** is a Cortex-M4F (CC26x2, CC1352, CC2652) at up to 48 MHz, running the user application and most middleware. The **radio core** is a Cortex-M0 (or, on CC27xx, a Cortex-M33) running TI's RFCore firmware — a closed-source ROM image that implements PHY-layer packet handling. The two cores communicate through a doorbell interface and shared SRAM.
+
+This architecture means BLE / 802.15.4 / Sub-GHz packet handling continues *even when the M4F is in deep sleep*. A typical BLE peripheral profile wakes the M4F only when a connection event requires application-layer processing; otherwise the M0 radio core handles connection maintenance, link-layer ACKs, and slave-latency timing. Current consumption while connected runs roughly 1–3 microamps average for a CC2640R2F.
+
+CC1352 dual-band (sub-GHz + 2.4 GHz) is unique: the radio can switch bands within 100 microseconds, supporting concurrent multi-protocol designs where the same chip acts as a Thread border router and a 915 MHz mesh node. The newer **CC2674** adds Wi-SUN support — important for utility metering.
+
+## Code Composer Studio and SimpleLink SDK
+
+Code Composer Studio (CCS) is the TI-branded Eclipse IDE, with the TI Arm Clang compiler as the default toolchain. CCS supports SWO trace, ETM trace (on parts with the trace pins exposed), and TI's **XDS110** / **XDS200** debug probes that run TI's own protocol over USB. For most non-certified work, CCS is replaceable by VS Code + cortex-debug + arm-none-eabi-gcc with no real loss.
+
+```bash
+# SimpleLink SDK headless build
+export SIMPLELINK_CC13X2_26X2_SDK=/path/to/sdk
+make -C example/ble5_simple_peripheral
+```
+
+The SimpleLink SDK is decent — it uses TI's **TI-RTOS** (now SYS/BIOS, with a FreeRTOS option) as the kernel, with a board-specific HAL on top. The kernel selection is opinionated; if your team standardised on Zephyr, the migration cost is non-trivial.
+
+- [Cortex-R overview](/docs/cortex-r/overview/) — Hercules R4F / R5F cores.
+- [Cortex-M4](/docs/cortex-m/m4/) — Tiva, SimpleLink M4F application core.
+- [Cortex-M0+](/docs/cortex-m/m0-m0plus/) — MSPM0 entry line; SimpleLink M0 radio core.
+- [Cortex-M3](/docs/cortex-m/m3/) — original Stellaris.
+- [CMSIS](/docs/programming/cmsis/) — what TI SDKs layer over.
+- [NVIC priority](/docs/cortex-m/nvic-priority/) — important for Hercules safety partitioning.
+- [STMicro](/docs/vendors/stm/) — STM32G4 versus Tiva TM4C129 for industrial Ethernet.
+- [Renesas](/docs/vendors/renesas/) — RZ/T R52 versus Hercules trade.
+- [NXP](/docs/vendors/nxp/) — S32K versus Hercules in automotive.
+- [QEMU & Renode](/docs/tools/sim/) — QEMU `lm3s6965evb` models Stellaris; Renode covers TMS570LS.
+- [Interrupt latency tool](/tools/interrupt-latency) — explore Hercules lockstep timing budgets.

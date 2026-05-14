@@ -1,0 +1,70 @@
+---
+title: System designs — overview
+description: How real products are actually built — block-level walkthroughs of seven everyday embedded systems, from Wi-Fi routers to flight controllers.
+order: 0
+updated: 2026-05-12
+tags: [systems, design, reference]
+---
+
+
+The rest of armhub treats topics one at a time: a peripheral, a core, an RTOS. This section flips that orientation — we pick a finished product and walk it backwards into the silicon and firmware that make it work.
+
+The goal is *grounded*. When you read about Cortex-A53, you can come here to see one of the millions of devices it actually ships in. When you read about hard real-time, you can see why a drone flight controller picks one core architecture over another.
+
+## What each page covers
+
+- **At-a-glance specs** — chip class, RAM/flash, OS, peripherals, certifications.
+- **Block diagram** — the silicon you'd see if you decap'd the SoC.
+- **What the cores do** — every CPU/coprocessor and what it owns.
+- **Software stack** — bootloader, OS/RTOS, key middleware.
+- **The hard parts** — failure modes, certifications, non-obvious tradeoffs.
+- **Real products** — concrete examples you can buy and tear down.
+
+## The seven devices
+
+<div class="grid gap-4 not-prose md:grid-cols-2 mt-6">
+  <Card
+    href="/docs/systems/wifi-router/"
+    title="Wi-Fi router (Wi-Fi 6 consumer)"
+    description="MediaTek MT7986 / Qualcomm IPQ8074 class. Quad Cortex-A53 + dedicated Wi-Fi MAC/PHY. Linux/OpenWrt. ~$80–$250 retail."
+  />
+  <Card
+    href="/docs/systems/smartwatch/"
+    title="Smartwatch / fitness tracker"
+    description="Cortex-M33 + BLE radio (Nordic nRF53/54 class). 5–15 day battery, sensor fusion, GATT services, AMOLED touchscreen."
+  />
+  <Card
+    href="/docs/systems/drone-flight-controller/"
+    title="Drone flight controller"
+    description="Cortex-M7/M85 (STM32H7, RA8). 8 kHz control loop, IMU + barometer + GPS, PWM/DSHOT to ESCs. Pixhawk/PX4 stack."
+  />
+  <Card
+    href="/docs/systems/ev-charger/"
+    title="EV charger (Level 2 home)"
+    description="Cortex-M7 + WiFi MCU. PWM control-pilot signal, residual-current protection, OCPP 1.6/2.0 over WiFi, 7.2–11.5 kW."
+  />
+  <Card
+    href="/docs/systems/smart-thermostat/"
+    title="Smart thermostat"
+    description="Cortex-M33 + Wi-Fi/Thread radio (nRF7002, EFR32MG24). Capacitive touch, e-paper/LCD, HVAC relays, Matter."
+  />
+  <Card
+    href="/docs/systems/automotive-ecu/"
+    title="Automotive ECU"
+    badge="ASIL"
+    description="Cortex-R52 lockstep + Cortex-M for I/O. CAN-FD, ISO 26262 ASIL-B/D, AUTOSAR Classic, hard real-time."
+  />
+  <Card
+    href="/docs/systems/motor-drive/"
+    title="Industrial motor drive"
+    description="Cortex-M4F (STM32G4) or M7. Advanced PWM timer, current-sense ADC sync'd to inverter, FOC at 16–32 kHz, CANopen/EtherCAT."
+  />
+</div>
+
+## How to read these
+
+Each page assumes you've read the relevant background pages — but you can absolutely jump straight in. Cross-references are everywhere, and you'll often find that *one device touches half the rest of the site*: a Wi-Fi router uses [Cortex-A](/docs/cortex-a/overview/), [Linux boot flow](/docs/cortex-a/boot-and-exception-levels/), [DMA](/docs/peripherals/dma/), [USB](/docs/peripherals/usb/), and [vendor SoCs](/docs/vendors/nxp/).
+
+A flight controller touches [Cortex-M7](/docs/cortex-m/m7/), [SPI](/docs/peripherals/spi/), [I²C](/docs/peripherals/i2c/), [DMA cache coherency](/docs/peripherals/dma/), [Rust on Cortex-M](/docs/programming/rust/), [FreeRTOS](/docs/rtos/freertos/), and [linker scripts](/docs/programming/linker-scripts/) for ITCM placement.
+
+That's the point of this section — to make the rest of the site useful in context.

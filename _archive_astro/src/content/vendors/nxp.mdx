@@ -1,0 +1,85 @@
+---
+title: NXP (Kinetis, LPC, i.MX RT)
+description: NXP's Cortex-M lines — Kinetis for industrial, LPC for embedded mainstream, i.MX RT for crossover MCUs running at GHz speeds.
+order: 2
+updated: 2026-05-12
+tags: [vendors, nxp]
+---
+
+NXP (formerly Freescale + Philips Semi) has three distinct Cortex-M brands, each born from a different acquisition. Knowing which is which saves a lot of confused datasheet hunting.
+
+## The three lines
+
+### Kinetis (was Freescale)
+
+- **Kinetis K** series — Cortex-M4 with strong analog (high-resolution ADCs, DACs, comparators). Industrial control, medical instrumentation.
+- **Kinetis L** series — Cortex-M0+ low-power.
+- **Kinetis V** series — motor control specific.
+- **Kinetis E/EA** — automotive-qualified.
+
+### LPC (was Philips/NXP)
+
+- **LPC8xx** — Cortex-M0+, single-cycle I/O port, "switch matrix" for flexible pin routing.
+- **LPC11xx/13xx** — entry-level M0/M3.
+- **LPC15xx/4xx** — mainstream M3/M4 with SCT (state-configurable timer — a very powerful peripheral).
+- **LPC55xx** — Cortex-M33 with **PowerQuad** DSP coprocessor.
+
+### i.MX RT — the crossover MCUs
+
+The most distinctive product line. **i.MX RT10xx** and **RT11xx** run a Cortex-M7 at **600 MHz to 1 GHz** with code/data backed by external QSPI flash and external SDRAM accessed through a memory-mapped cache. Performance approaches Cortex-A7 at lower power, with deterministic interrupt latency.
+
+- **RT1010 / 1020** — entry-level i.MX RT, M7 @ 500–600 MHz.
+- **RT1050 / 1060** — mainstream, M7 @ 600 MHz, Ethernet, USB HS.
+- **RT1170** — M7 @ 1 GHz + M4 helper, GPU, dual Ethernet, USB.
+- **RT500** — M33 + M33 + Cadence Tensilica HiFi 4 DSP — for AI and audio.
+- **RT700** — M85 + M33, ML accelerator. Newest tier.
+
+If you're considering a Cortex-A7 Linux box for performance but want hard real-time and instant boot, **i.MX RT is the crossover answer**.
+
+## MCUXpresso SDK
+
+NXP's vendor SDK. Apache-licensed, well-organised, CMake-buildable. Includes:
+
+- CMSIS-Core for every NXP MCU.
+- A "fsl_" driver layer (HAL).
+- FreeRTOS, mbedTLS, lwIP, USB, SD-card middleware.
+- Examples for every dev board.
+
+MCUXpresso IDE is the Eclipse-based front-end. Like ST's CubeIDE, it works but isn't loved. Most production teams use VS Code + the MCUXpresso SDK + their own CMake.
+
+## NXP-specific peripherals worth knowing
+
+### LPC SCT — State Configurable Timer
+
+A timer that's effectively a programmable state machine driving 16 outputs. Can generate complex waveforms (motor commutation, communication protocols, lighting) without CPU intervention. Documented in 60+ pages of the LPC reference manuals; once mastered, replaces a small FPGA.
+
+### LPC55 PowerQuad
+
+A coprocessor accessible through the Cortex-M33 coprocessor interface. Implements FFT, FIR, IIR, matrix operations in hardware — fire-and-forget. ~10× faster than CMSIS-DSP on the same core, freeing the CPU for control logic.
+
+### i.MX RT Flexible Communication
+
+The **FlexCAN**, **FlexSPI**, **FlexIO** peripherals — programmable enough to implement almost any serial protocol. FlexIO can be configured as a SDIO controller, a parallel LCD interface, multiple PWM channels — at runtime. Powerful but documentation-heavy.
+
+### Kinetis crossbar switch
+
+Lets you route any signal to any pin without changing the schematic. Reduces design changes during PCB iteration.
+
+## Boot flow on i.MX RT
+
+Different from typical Cortex-M because of the external flash:
+
+1. ROM reads the **IVT** (Image Vector Table) and **boot data** from external flash.
+2. ROM initialises the QSPI / OctoSPI controller to memory-map the flash.
+3. ROM hands off to your firmware running directly from external flash address space.
+
+A **DCD** (Device Configuration Data) block in the image lets ROM run register init scripts (DDR training, etc.) before jumping to your code. This is documented in the i.MX RT reference manual under "Boot ROM".
+
+For secure boot, **HAB** (High Assurance Boot) signs the image with vendor keys fused into the chip. Critical for production.
+
+## See also
+
+- [Cortex-M4](/docs/cortex-m/m4/) — Kinetis K and some LPC.
+- [Cortex-M7](/docs/cortex-m/m7/) — i.MX RT.
+- [Cortex-M33](/docs/cortex-m/m33-m23/) — LPC55xx, RT500.
+- [NXP community](https://community.nxp.com/) (external) — sometimes faster than official support.

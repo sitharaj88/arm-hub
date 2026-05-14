@@ -1,0 +1,288 @@
+---
+title: System Control Block (SCB)
+description: ICSR, AIRCR, SCR, CCR, SHPR1-3, SHCSR, CFSR, HFSR, MMFAR, BFAR — every SCB register decoded. Reset, sleep, fault handling, exception priority, and unaligned-access trapping.
+order: 18
+updated: 2026-05-13
+tags: [cortex-m, scb, system-control, fault, aircr, ccr]
+---
+
+The System Control Block is where ARM put everything that didn't fit naturally into the NVIC, the MPU, or the FPU. It controls system-wide behaviour: reset, sleep mode entry, exception priority for the architectural exceptions, fault enable/status, vector table relocation. About 60 bytes of MMIO at `0xE000_ED00`, but density-of-meaning is extreme — every bit matters and most have surprising side effects.
+
+This page walks the SCB register-by-register. The companion pages — [NVIC registers](/docs/cortex-m/nvic-registers) and [FPU](/docs/cortex-m/fpu) — cover the adjacent register blocks.
+
+<SpecSheet
+  title="SCB at a glance"
+  specs={[
+    { label: 'Base address', value: '0xE000_ED00 (inside the PPB)' },
+    { label: 'Privileged access only', value: 'All SCB registers require privileged mode' },
+    { label: 'Reset state', value: 'Most fields zero. CCR.STKALIGN has a 1-by-default architectural reset on v7-M' },
+    { label: 'Key fault-related registers', value: 'CFSR, HFSR, MMFAR, BFAR, AFSR' },
+    { label: 'Key control registers', value: 'ICSR, AIRCR, SCR, CCR, SHPRx, SHCSR' },
+    { label: 'Critical bits to know', value: 'STKALIGN, BFHFNMIGN, DIV_0_TRP, UNALIGN_TRP, USERSETMPEND, VECTKEY' },
+  ]}
+/>
+
+## CPUID — read-only identification
+
+`CPUID` at offset 0x00 returns the core's implementer, variant, architecture, part number, and revision. Useful for runtime feature detection.
+
+```c
+uint32_t cpuid = SCB->CPUID;
+uint32_t partno = (cpuid >> 4) & 0xFFF;     // 0xC60 = M0, 0xC20 = M0+, 0xC23 = M3, 0xC24 = M4, 0xC27 = M7, 0xD20 = M23, 0xD21 = M33, 0xD22 = M55, 0xD23 = M85
+```
+
+| Bits | Name | Description |
+|---|---|---|
+| 31:24 | IMPLEMENTER | 0x41 = ARM |
+| 23:20 | VARIANT | Major revision (rN) |
+| 19:16 | ARCHITECTURE | 0xC for ARMv6-M / ARMv7-M, 0xF for ARMv8-M |
+| 15:4  | PARTNO | Part number — see table above |
+| 3:0   | REVISION | Minor revision (pM) |
+
+## ICSR — Interrupt Control and State Register
+
+`ICSR` at offset 0x04. Mixes status (read-only fields) and control (write-1-to-set / write-1-to-clear). The mix-and-match is the source of many bugs.
+
+| Bits | Name | Access | Description |
+|---|---|---|---|
+| 31 | NMIPENDSET | W1S / RO | Set NMI pending |
+| 28 | PENDSVSET | W1S / RO | Set PendSV pending — the canonical RTOS context-switch trigger |
+| 27 | PENDSVCLR | W1C / RO | Clear PendSV pending |
+| 26 | PENDSTSET | W1S / RO | Set SysTick pending |
+| 25 | PENDSTCLR | W1C / RO | Clear SysTick pending |
+| 23 | ISRPREEMPT | RO | An IRQ will preempt at the next return |
+| 22 | ISRPENDING | RO | An external IRQ is pending |
+| 21:12 | VECTPENDING | RO | Highest-priority pending exception number |
+| 11:0 | VECTACTIVE | RO | Currently-active exception number (0 = thread mode) |
+
+The classic RTOS pattern uses `PENDSVSET` to request a context switch from anywhere:
+
+```c
+SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;   /* trigger context switch via PendSV */
+```
+
+PendSV runs at the lowest priority (after every other pending IRQ has finished), making it the safe place to switch contexts.
+
+<Callout type="warn" title="ICSR is W1S / W1C, not RW">
+`SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;` looks right but isn't. Read-modify-write reads ISRPENDING, VECTPENDING, VECTACTIVE bits — and writing those bits back is harmless on most fields, but **PENDSTSET and PENDSVSET have W1S semantics**, so the OR-then-write pattern works by accident. Cleaner is `SCB->ICSR = SCB_ICSR_PENDSVSET_Msk;` — just write the bit, no RMW.
+</Callout>
+
+## VTOR — Vector Table Offset Register
+
+Covered in detail on the [vector table](/docs/cortex-m/vector-table) page. Offset 0x08.
+
+## AIRCR — Application Interrupt and Reset Control Register
+
+`AIRCR` at offset 0x0C. Holds PRIGROUP, the endianness indicator, and the system-reset command.
+
+| Bits | Name | Access | Description |
+|---|---|---|---|
+| 31:16 | VECTKEY | RW (with key) | Must be 0x05FA on every write — guards against accidental resets |
+| 15 | ENDIANNESS | RO | 0 = little-endian, 1 = big-endian (almost always 0) |
+| 10:8 | PRIGROUP | RW | Priority group split for NVIC priorities |
+| 2 | SYSRESETREQ | WO | Write 1 to request a full system reset |
+| 1 | VECTCLRACTIVE | WO | Debug only — clear all active state |
+| 0 | VECTRESET | WO | Cortex-M debug only — local reset |
+
+The `VECTKEY` requirement means every write must specify both the new bits and the magic value:
+
+```c
+/* Set PRIGROUP = 3 (4 preempt bits / 4 sub bits on a 4-bit-prio part) */
+SCB->AIRCR = (0x05FA << 16) | (3 << 8);
+
+/* System reset — board-level reset, retains debug connection on most parts */
+SCB->AIRCR = (0x05FA << 16) | SCB_AIRCR_SYSRESETREQ_Msk;
+while (1) { }   /* wait for reset to take effect */
+```
+
+`SYSRESETREQ` resets the core and all peripherals except the SWD/JTAG debug logic, RTC backup domain, and (on some vendors) the watchdog. It's the standard programmatic reset path.
+
+## SCR — System Control Register
+
+`SCR` at offset 0x10. Configures sleep behaviour.
+
+| Bits | Name | Access | Description |
+|---|---|---|---|
+| 4 | SEVONPEND | RW | Send an event when an IRQ pends (for WFE wakeup) even if it's disabled or masked |
+| 2 | SLEEPDEEP | RW | When 1, WFI/WFE enters the deep-sleep mode (vendor-defined behavior) |
+| 1 | SLEEPONEXIT | RW | When 1, the core sleeps automatically on returning to thread mode |
+
+`SLEEPDEEP` is the bridge from "WFI" (which is otherwise just "clock-gate the core until next IRQ") to the vendor's deep sleep mode (Stop, Standby, whatever the marketing name is). The peripheral-specific configuration — which clocks to keep on, which to gate off — is in vendor MMIO outside the SCB. See [low-power modes](/docs/cortex-m/low-power) for the full taxonomy.
+
+`SLEEPONEXIT` is for interrupt-driven applications. The thread mode does nothing useful — only ISRs do work. Set SLEEPONEXIT once, then never run any code outside ISRs.
+
+```c
+SCB->SCR |= SCB_SCR_SLEEPONEXIT_Msk;
+SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;    /* if you want deep sleep on every WFI */
+```
+
+## CCR — Configuration and Control Register
+
+`CCR` at offset 0x14. A bag of orthogonal control bits with high impact.
+
+| Bits | Name | Description |
+|---|---|---|
+| 18 | BP | Branch prediction enable (M7, M85 only) |
+| 17 | IC | I-cache enable (M7, M55, M85) |
+| 16 | DC | D-cache enable (M7, M55, M85) |
+| 10 | STKALIGN | Force 8-byte stack alignment on exception entry. **Reset = 1** on v7-M, fixed = 1 on v8-M |
+| 9 | BFHFNMIGN | Bus faults in HardFault, NMI, FAULTMASK-asserted handlers are ignored (e.g., for fault-tolerant probe drivers) |
+| 8 | DIV_0_TRP | Trap on integer divide by zero (UsageFault). Off by default — divide returns 0. |
+| 4 | UNALIGN_TRP | Trap on unaligned word/halfword access (UsageFault). Off by default on v7-M. |
+| 3 | USERSETMPEND | Allow unprivileged code to write STIR |
+| 1 | USERSETMPEND - alt naming | (same) |
+| 0 | NONBASETHRDENA | Allow thread-mode code to be entered with an empty exception stack |
+
+The big ones to know:
+
+- **DIV_0_TRP** — turn this on. Silent divide-by-zero returning 0 hides bugs; trapping makes them visible.
+- **UNALIGN_TRP** — controversial. On v7-M, halfword and word accesses to unaligned addresses are *allowed by default* but slow. Trapping forces clean code, but may break legacy drivers that hand-roll unaligned access. Turn it on for new code.
+- **BFHFNMIGN** — fault-tolerance bit. With BFHFNMIGN = 1, a bus fault inside HardFault doesn't escalate to a lockup. Useful for fault-handler code that probes possibly-bad memory.
+
+```c
+SCB->CCR |= SCB_CCR_DIV_0_TRP_Msk
+         |  SCB_CCR_UNALIGN_TRP_Msk;
+__DSB();
+```
+
+## SHPR1, SHPR2, SHPR3 — System Handler Priority
+
+Three registers at offsets 0x18, 0x1C, 0x20. They hold the 8-bit priority bytes for the architectural exceptions 4..15.
+
+| Register | Bytes (low to high) |
+|---|---|
+| SHPR1 | MemMgmt (4), BusFault (5), UsageFault (6), SecureFault (7, v8-M) |
+| SHPR2 | reserved, reserved, reserved, SVCall (11) |
+| SHPR3 | DebugMon (12), reserved, PendSV (14), SysTick (15) |
+
+The priority encoding is the same as IPR — upper `__NVIC_PRIO_BITS` bits implemented, lower bits zero. CMSIS gives `NVIC_SetPriority()` overloads that accept the negative IRQ numbers (`-1 = SysTick`, `-2 = PendSV`, etc.) and route to SHPR.
+
+The standard RTOS pattern:
+
+```c
+NVIC_SetPriority(PendSV_IRQn, 0xFF);  /* lowest urgency — context switch */
+NVIC_SetPriority(SysTick_IRQn, 0xFF); /* lowest urgency — RTOS tick */
+NVIC_SetPriority(SVCall_IRQn, 0);     /* highest urgency — kernel entry */
+```
+
+## SHCSR — System Handler Control and State Register
+
+`SHCSR` at offset 0x24. Enables individual fault handlers and reports their state.
+
+| Bits | Name | Description |
+|---|---|---|
+| 18 | USGFAULTENA | Enable UsageFault as a separate exception (else escalates to HardFault) |
+| 17 | BUSFAULTENA | Enable BusFault as separate exception |
+| 16 | MEMFAULTENA | Enable MemManage as separate exception |
+| 15 | SVCALLPENDED | SVCall pending |
+| 14 | BUSFAULTPENDED | BusFault pending |
+| ...etc. | | (other pending/active bits) |
+| 7 | SVCALLACT | SVCall active |
+| 4 | MONITORACT | DebugMonitor active |
+| 3 | SVCALLACT | (already listed; this is BusFault active by spec) |
+| 1 | MEMFAULTACT | MemManage active |
+| 0 | MEMFAULTACT | (same — encoding varies; see ARM ARM) |
+
+The most important bits are MEMFAULTENA, BUSFAULTENA, USGFAULTENA. By default, all fault classes escalate to HardFault, which makes triage hard ("HardFault — was it bus, mem, usage, or fault-on-fault?"). Enable each fault separately to get distinct handlers:
+
+```c
+SCB->SHCSR |= SCB_SHCSR_MEMFAULTENA_Msk
+           |  SCB_SHCSR_BUSFAULTENA_Msk
+           |  SCB_SHCSR_USGFAULTENA_Msk;
+```
+
+Now MemMgmt faults call `MemManage_Handler`, BusFault calls `BusFault_Handler`, UsageFault calls `UsageFault_Handler`. The handler can read CFSR for the per-class detail.
+
+## CFSR — Configurable Fault Status Register
+
+`CFSR` at offset 0x28. Three 8-bit subfields packed into a word:
+
+| Bits | Subfield | Source |
+|---|---|---|
+| 7:0 | MMFSR | MemManage fault status |
+| 15:8 | BFSR | BusFault status |
+| 31:16 | UFSR | UsageFault status |
+
+**MMFSR bits**:
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 0 | IACCVIOL | Instruction-access violation |
+| 1 | DACCVIOL | Data-access violation |
+| 3 | MUNSTKERR | Fault during exception unstacking |
+| 4 | MSTKERR | Fault during exception stacking |
+| 5 | MLSPERR | Lazy FP stacking fault |
+| 7 | MMARVALID | MMFAR holds a valid address |
+
+**BFSR bits**:
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 8 | IBUSERR | Instruction bus error |
+| 9 | PRECISERR | Precise data bus error |
+| 10 | IMPRECISERR | Imprecise data bus error |
+| 11 | UNSTKERR | Bus fault during unstacking |
+| 12 | STKERR | Bus fault during stacking |
+| 13 | LSPERR | Lazy FP stacking bus error |
+| 15 | BFARVALID | BFAR holds a valid address |
+
+**UFSR bits**:
+
+| Bit | Name | Meaning |
+|---|---|---|
+| 16 | UNDEFINSTR | Undefined instruction |
+| 17 | INVSTATE | Invalid execution state (e.g., entered ARM mode) |
+| 18 | INVPC | Invalid PC load (bad EXC_RETURN) |
+| 19 | NOCP | No-coprocessor (FPU access without enabling) |
+| 24 | UNALIGNED | Unaligned access (only if CCR.UNALIGN_TRP = 1) |
+| 25 | DIVBYZERO | Divide by zero (only if CCR.DIV_0_TRP = 1) |
+
+A fault handler should read CFSR, then write the bits back (CFSR is W1C) to clear them:
+
+```c
+void HardFault_Handler_C(uint32_t *stack) {
+    uint32_t cfsr = SCB->CFSR;
+    uint32_t hfsr = SCB->HFSR;
+    uint32_t mmfar = SCB->MMFAR;
+    uint32_t bfar  = SCB->BFAR;
+    /* log everything, then... */
+    SCB->CFSR = cfsr;   /* clear by writing 1s back */
+    SCB->HFSR = hfsr;
+}
+```
+
+## HFSR — HardFault Status Register
+
+`HFSR` at offset 0x2C. Why a HardFault triggered.
+
+| Bits | Name | Meaning |
+|---|---|---|
+| 1 | VECTTBL | Vector table fetch failed |
+| 30 | FORCED | A configurable fault was escalated to HardFault (because its enable was off or fault-on-fault) |
+| 31 | DEBUGEVT | Debug event |
+
+If `FORCED = 1`, read CFSR to find the original fault class. If `VECTTBL = 1`, the vector fetch faulted — usually a bad VTOR.
+
+## MMFAR / BFAR — Fault Address Registers
+
+`MMFAR` at offset 0x34, `BFAR` at offset 0x38. The faulting address for MemManage and BusFault respectively. Valid only if the corresponding `MMARVALID` / `BFARVALID` bit in CFSR is set.
+
+```c
+if (SCB->CFSR & SCB_CFSR_MMARVALID_Msk) {
+    printf("MemMgmt fault address: 0x%08X\n", SCB->MMFAR);
+}
+```
+
+## AFSR — Auxiliary Fault Status Register
+
+`AFSR` at offset 0x3C. Implementation-defined. Vendors use it to expose bus-matrix-level fault info (which AHB master, which slave). Read the silicon's TRM for the encoding.
+
+## Cross-references
+
+- [NVIC registers](/docs/cortex-m/nvic-registers) — adjacent register block
+- [NVIC priority](/docs/cortex-m/nvic-priority) — PRIGROUP details
+- [Vector table & VTOR](/docs/cortex-m/vector-table)
+- [Exception model](/docs/architecture/exception-model) — what each fault means
+- [Fault decoder tool](/tools/fault-decoder) — paste in CFSR/HFSR/MMFAR/BFAR, get a diagnosis
+- [Stack frame inspector](/tools/stack-frame) — decode the stacked registers on entry
+- ARMv7-M ARM section B3.2; ARMv8-M ARM section D1.2

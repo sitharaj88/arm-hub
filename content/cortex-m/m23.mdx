@@ -1,0 +1,150 @@
+---
+title: Cortex-M23
+description: ARMv8-M Baseline — the M0+ successor with TrustZone-M, improved ISA (divide, compare-and-branch), and an updated MPU. The smallest secure-capable Cortex.
+order: 3
+updated: 2026-05-13
+tags: [cortex-m, cortex-m23, armv8-m, trustzone, baseline]
+---
+
+The Cortex-M23 is the M0+ done over for the ARMv8-M era. Same target market — smallest, lowest-power Cortex — but built on the ARMv8-M Baseline architecture profile, which brings TrustZone-M (optional), a re-spun MPU, and a handful of ISA additions that close the gap to the old M3. If your design needs M0-class size and power **and** any kind of security partition, the M23 is the only sensible choice.
+
+The M23 is positioned as the secure-capable replacement for the M0+ in safety- and security-critical applications. Notably, vendors have been slower to adopt it than expected — the M0+ keeps shipping in huge volumes because the additional area for TrustZone-M is not free, and the M33 covers most use cases that need security at the cost of a slightly bigger die. M23 occupies a narrow but real niche: IoT endpoints where the bill-of-materials prohibits an M33 but the threat model demands isolation.
+
+<SpecSheet
+  title="Cortex-M23 at a glance"
+  specs={[
+    { label: 'Architecture', value: 'ARMv8-M Baseline' },
+    { label: 'Pipeline', value: '2-stage (same as M0+)' },
+    { label: 'TrustZone-M', value: 'Optional — adds secure / non-secure partitioning of memory and peripherals' },
+    { label: 'MPU', value: 'Optional, ARMv8-M MPU (separate secure and non-secure region sets if TZ present)' },
+    { label: 'ISA additions vs M0+', value: 'Hardware divide (SDIV/UDIV), compare-and-branch (CBZ/CBNZ), branch-target identification (BTI)' },
+    { label: 'IT block', value: 'Not present (still Baseline)' },
+    { label: 'NVIC priority bits', value: 'Up to 4 (16 levels), implementation-defined — most vendors ship with 2 or 3' },
+    { label: 'SAU / IDAU', value: 'Security Attribution Unit and Implementation-Defined Attribution Unit — define secure / non-secure / NSC regions' },
+    { label: 'Stack pointers', value: 'MSP_S, MSP_NS, PSP_S, PSP_NS — four stack pointers if TrustZone enabled' },
+    { label: 'DMIPS/MHz', value: '0.99 (Dhrystone 2.1)' },
+    { label: 'CoreMark/MHz', value: '~2.5' },
+    { label: 'Typical parts', value: 'Microchip SAML10/SAML11 (the latter has TrustZone-M), Nuvoton M2351, GigaDevice GD32A5' },
+  ]}
+/>
+
+## ARMv8-M Baseline — what's in, what's out
+
+ARM split ARMv8-M into two profiles, **Baseline** and **Mainline**. Baseline (M23) is for area-constrained parts; Mainline ([M33](/docs/cortex-m/m33), [M55](/docs/cortex-m/m55), [M85](/docs/cortex-m/m85)) is for performance-oriented designs.
+
+Compared to ARMv6-M (M0/M0+):
+
+- **Adds**: UDIV, SDIV (hardware divide), CBZ/CBNZ (compare-and-branch zero), wider MOVW/MOVT for 32-bit immediates, MRS/MSR access to all special registers, exclusive load/store (LDREX/STREX-style — actually LDA/STL on v8), TrustZone-M state transitions (SG, BLXNS, BXNS), and the v8-M memory model with explicit acquire/release semantics.
+- **Still missing vs Mainline (M33)**: IT blocks, DSP saturating arithmetic, FPU, bit-field instructions (BFI/UBFX), some LDR/STR addressing modes, no CLZ in Baseline (wait — actually CLZ is in Baseline now, unlike on M0).
+
+Net result: the M23's "small Thumb-2 subset" is meaningfully bigger than the M0+'s. Hot loops with division (any C++ STL iterator math, any RSA primitive) run 10× faster on M23 than M0+. Code density is slightly better thanks to MOVW/MOVT replacing literal-pool loads.
+
+| Feature | M0+ (v6-M) | M23 (v8-M Baseline) | M33 (v8-M Mainline) |
+|---|---|---|---|
+| UDIV/SDIV | no | yes | yes |
+| CBZ/CBNZ | no | yes | yes |
+| MOVW/MOVT | partial | yes | yes |
+| IT blocks | no | no | yes |
+| DSP saturating | no | no | yes (optional) |
+| FPU | no | no | yes (optional) |
+| TrustZone-M | no | yes (optional) | yes (optional) |
+| CLZ | no | yes | yes |
+| LDREX/STREX | no | LDA/STL exclusive | LDA/STL exclusive |
+
+## TrustZone-M on the M23
+
+TrustZone-M is the headline feature. It splits the chip into two execution states — **Secure** and **Non-secure** — and partitions every byte of address space and every peripheral into one of those states. Non-secure code cannot read, write, or fetch instructions from secure regions; secure code can access both. Transitions between states happen through **Non-Secure Callable (NSC)** gateway functions marked with the `SG` instruction.
+
+The mechanics:
+
+1. **SAU (Security Attribution Unit)** — programmable inside the core. Up to 8 regions defining the security state of each address range.
+2. **IDAU (Implementation-Defined Attribution Unit)** — provided by the silicon vendor outside the core. Often hard-wired to give a coarse partition the SAU then refines.
+3. **NSC regions** — small islands within secure memory containing `SG` (Secure Gateway) instructions. Non-secure code can branch to an SG instruction; the SG validates the transition and switches the core to secure state. Any other entry to secure code faults with a SecureFault.
+
+A representative use case:
+
+```c
+// Secure side (cryptography)
+__attribute__((cmse_nonsecure_entry))
+int verify_signature(const uint8_t *msg, const uint8_t *sig) {
+    // Runs in secure state. Has access to the private key in secure flash.
+    return ecdsa_verify(msg, sig, secure_private_key);
+}
+
+// Non-secure side (application)
+extern int verify_signature(const uint8_t *msg, const uint8_t *sig);
+
+void check_firmware_update(void) {
+    if (verify_signature(image_bytes, image_sig)) {
+        // Apply update
+    }
+}
+```
+
+The toolchain (GCC `arm-none-eabi-gcc` with `-mcmse`) generates the SG-based veneers. The non-secure caller's branch hits an SG in the NSC region; SG validates the call and the secure function runs. On return, the secure code uses `BXNS` to return to non-secure state.
+
+For the architectural details, see the [TrustZone deep dive](/docs/architecture/trustzone). The page covers SAU programming, the security attribution flow, and the full set of new instructions.
+
+<Callout type="warn">
+The four stack pointers (MSP_S, MSP_NS, PSP_S, PSP_NS) are a real headache during context switching. An RTOS aware of TrustZone-M must save and restore the non-secure stack pointers on every task switch, and the secure side has its own private stacks the non-secure RTOS never touches. CMSIS-RTOS v2 has TZ-aware variants; raw FreeRTOS needs the TZ port.
+</Callout>
+
+## NVIC, MPU, and stack handling
+
+The NVIC is bigger than on M0+ — up to **480 external IRQs** in the architecture (most parts ship far fewer), priority bits up to 8 (most ship 2–4). Each IRQ is **bankable** — assigned to either secure or non-secure state. A non-secure IRQ pends and runs in non-secure state; a secure IRQ pends and runs in secure state, with the core transitioning automatically.
+
+The MPU is the ARMv8-M MPU (see [MPU page](/docs/cortex-m/mpu)) — up to 16 regions, non-power-of-two size, MAIR-indexed attributes. With TrustZone-M enabled, there are **two MPU instances**: one for secure state, one for non-secure state. Each has its own region table. They're configured independently.
+
+Stacks: one MSP and one PSP per state. The secure state's stacks are not visible to non-secure code. On a transition from non-secure to secure (via SG), the core pushes context onto the non-secure stack, switches state, and the secure code uses MSP_S or PSP_S. On return (BXNS), the context comes back from the non-secure stack.
+
+## ISA improvements over M0+
+
+The big wins:
+
+**Hardware divide.** `UDIV` and `SDIV` are 2–12 cycles depending on operand magnitudes (the implementation can early-terminate). On M0+, every divide was 30–40 cycles of libgcc helper. This single change moves the M23 out of the "always avoid division" camp.
+
+**Compare-and-branch.** `CBZ Rn, label` and `CBNZ Rn, label` collapse the common `CMP Rn, #0; BEQ label` pattern into a single 16-bit instruction. The encoding only reaches forward branches up to 126 bytes, but that's almost always enough.
+
+**MOVW/MOVT.** Together they load a 32-bit immediate in 8 bytes (two 4-byte instructions) without a literal pool. On M0+, loading 0xDEAD_BEEF requires `LDR r0, [pc, #literal]` plus a 4-byte literal in the pool — also 8 bytes, but cache-unfriendly. MOVW/MOVT keep code linear.
+
+**Exclusive load/store via LDA/STL (load-acquire / store-release).** v8-M defines explicit memory ordering instructions. The Baseline subset includes `LDA`/`STL` for atomics; full LDREX/STREX is Mainline-only. Most compilers expose these via C11 `<stdatomic.h>` — `atomic_compare_exchange_weak` compiles to a tight LDA/STL pair.
+
+## Memory model
+
+The v8-M memory model is more explicit than v7-M's. The model defines:
+
+- **Normal memory** with cacheability and shareability attributes (defaulted on M23 since there's no cache, but the attributes still affect bus transactions)
+- **Device memory** for peripherals (strongly ordered)
+- **Acquire/release semantics** on LDA/STL — useful for lock-free queues and producer-consumer patterns
+
+For Baseline parts the practical difference is small — M23 has no cache, single AHB bus, and few hardware reordering opportunities — but the explicit ordering primitives let you write portable code that's also correct on the bigger v8-M parts (M33/M55/M85) where ordering matters more.
+
+## Representative parts
+
+| Part | Vendor | Notes |
+|---|---|---|
+| SAML10 | Microchip | M23 *without* TrustZone — ultra-low-power, replaces SAML21 |
+| SAML11 | Microchip | M23 *with* TrustZone — first commercial TrustZone-M part (2018) |
+| M2351 | Nuvoton | TrustZone-M, USB, crypto accelerator, broad IoT positioning |
+| GD32A503 | GigaDevice | M23 with TrustZone, automotive AEC-Q100 grade |
+| RA0E1 | Renesas | M23, broad pin compatibility with RA2 (M23 without TZ) |
+
+## When to choose Cortex-M23
+
+The M23 is a deliberate choice. Reach for it when:
+
+- You need TrustZone-M but the BoM cost rules out M33 (target sale price under ~$1).
+- You're shipping a security-graded sensor node where attestation matters more than throughput.
+- A regulatory regime (FIPS 140-3, PSA Certified) requires a hardware security partition.
+- You'd otherwise use M0+ but need hardware divide or compare-and-branch for hot paths.
+
+Avoid M23 when the BoM allows M33 — the M33's FPU, DSP, IT blocks, and higher clock ceiling are worth the extra dollar in nearly every case.
+
+## Cross-references
+
+- [Cortex-M33](/docs/cortex-m/m33) — the Mainline successor with FPU and DSP
+- [TrustZone-M architecture](/docs/architecture/trustzone) — SAU, IDAU, SG, BXNS
+- [Architecture comparison](/docs/cortex-m/architecture-compare)
+- [MPU](/docs/cortex-m/mpu) — ARMv8-M region descriptors
+- [ARMv7-M vs ARMv8-M](/docs/architecture/memory-model)
+- ARMv8-M Architecture Reference Manual (DDI 0553)

@@ -1,0 +1,170 @@
+---
+title: EV charger power stage
+description: EV charger power electronics — AC-DC PFC, isolated DC-DC LLC, three-phase rectification for >7 kW, CC/CV control, vehicle communication via Control Pilot PLC (J1772/CCS). Cortex-M role in digital control loops.
+order: 13
+updated: 2026-05-13
+tags: [systems, ev, charger, power-electronics, pfc, llc, j1772, ccs]
+---
+
+An EV charger — whether a 7 kW residential wallbox or a 350 kW DC fast charger — is fundamentally three things stacked on top of each other: a power-electronic conversion stage that turns grid AC into a controlled DC current at the battery's voltage, a digital control system that regulates the conversion (running on a Cortex-M4 or M7), and a communication system that negotiates with the vehicle to agree on safe charging parameters. Get any one wrong and the system either fails to deliver power, delivers it inefficiently, or — in the worst case — damages the battery or starts a fire.
+
+This page covers the power-electronics architecture (PFC, LLC, isolation), the control-loop algorithms running on the embedded MCU, and the communication stack (Control Pilot signalling for AC charging, ISO 15118 PLC for DC fast charging).
+
+<SpecSheet
+  title="EV charger at a glance"
+  specs={[
+    { label: 'AC charger (wallbox)', value: 'Single-phase 7.4 kW (32 A @ 230 V) or three-phase 11/22 kW (16/32 A @ 400 V line-line)' },
+    { label: 'DC fast charger', value: '50–400 kW; isolated DC-DC stage delivers 200–1000 V DC at up to 500 A' },
+    { label: 'Connector standards', value: 'AC: Type 1 (J1772, US) / Type 2 (Mennekes, EU); DC: CCS Combo / CHAdeMO / Tesla NACS' },
+    { label: 'PFC topology', value: 'Single-phase: boost (continuous conduction); three-phase: Vienna rectifier or interleaved boost or six-switch active rectifier' },
+    { label: 'DC-DC topology (fast)', value: 'Phase-shifted full bridge or LLC resonant converter with planar transformer; ~95% peak efficiency' },
+    { label: 'Switching frequency', value: 'PFC: 40–100 kHz; LLC: 100–250 kHz; SiC MOSFETs at the high end' },
+    { label: 'Cortex-M role', value: 'Digital current/voltage loops 10–100 kHz; ADC sampling synchronised to PWM; safety supervision' },
+    { label: 'Vehicle comm', value: 'Control Pilot (CP): 1 kHz PWM duty cycle encodes current limit (J1772/IEC 61851); ISO 15118 PLC for plug-and-charge' },
+    { label: 'Isolation', value: 'Mandatory galvanic isolation between mains and vehicle (transformer or capacitive); digital isolators on signal paths' },
+  ]}
+/>
+
+## AC charger architecture
+
+An AC charger ("Level 2" in US terminology, "Mode 3" in IEC) does **not** actually convert AC to DC — the vehicle's onboard charger (OBC) does that. The wallbox is a smart contactor: it negotiates a current limit with the vehicle, switches on the AC supply, monitors the connection for safety, and switches off if anything goes wrong. The "charging" happens inside the car.
+
+The wallbox's tasks:
+
+1. **Authenticate / authorise** the user (RFID, app, plug-and-charge).
+2. **Verify connection** — the vehicle plug is fully seated; the Proximity Pilot pin tells the cable's current rating.
+3. **Negotiate current** — drive the Control Pilot signal at the right duty cycle.
+4. **Close the main contactor** — energise the AC pins.
+5. **Monitor** — current per phase, leakage current via RCD/GFCI, plug temperature, vehicle state changes.
+6. **Disengage safely** — open contactor and signal vehicle if a fault occurs.
+
+The hardware is a Cortex-M0+ or M4 (no DSP performance needed), a high-voltage AC contactor relay, current transformers per phase, a Type-A or Type-B RCD for leakage detection, the CP/PP signal conditioning, and a communication interface (Ethernet, Wi-Fi, cellular for backhaul to the operator's network).
+
+### Control Pilot signalling
+
+The CP pin carries a 1 kHz square wave, 12 V peak-to-peak (+12 V to -12 V), with the **duty cycle encoding the current the wallbox can supply**:
+
+| Duty cycle | Meaning |
+|-----------|---------|
+| 100% (DC +12 V) | No vehicle / standby |
+| 10% to 85% | Vehicle, current available = duty% × 0.6 × 100 A |
+| 5% | Digital communication (PLC for DC charging) |
+| 0% (DC -12 V) | Charger out of service |
+
+For example, 16% duty = 9.6 A available; 50% = 30 A available; the formula is `current_A = duty% × 0.6` valid in the 10-85% range. The vehicle measures the duty cycle and limits its onboard charger to that current.
+
+The CP voltage also encodes vehicle state via the *amplitude* on the negative half-cycle:
+
+| Vehicle voltage on CP- | State |
+|-----------------------|-------|
+| -12 V | A: vehicle not connected |
+| -9 V (vehicle adds 2.7 kΩ to GND) | B: connected, not ready |
+| -6 V (vehicle adds 882 Ω) | C: connected, charging |
+| -3 V | D: charging with ventilation request (lead-acid battery) |
+| 0 V | E or F: error |
+
+The wallbox MCU samples both the positive and negative CP excursions every cycle, detects state transitions, and reacts within ~100 ms.
+
+## DC fast charger architecture
+
+A DC fast charger does the AC-to-DC conversion inside the charger and delivers regulated DC directly to the battery — bypassing the vehicle's onboard charger. This lets you push 50–350+ kW through the cable, far more than any onboard charger.
+
+The power-electronic chain:
+
+```
+Grid 3-phase 400 V AC
+  → EMI filter
+  → 3-phase PFC (Vienna or active rectifier) → 800 V DC bus, PF ≈ 1
+  → DC-DC isolation stage (LLC or PSFB) → 200-1000 V DC output
+  → Output filter + contactors
+  → CCS / NACS connector → vehicle battery
+```
+
+### Three-phase PFC
+
+For powers above ~7 kW, single-phase boost PFC isn't viable — the grid would see large 100 Hz current pulsation. Three-phase PFC is mandatory.
+
+The **Vienna rectifier** is a popular topology: three switches plus six diodes, three-level output, achieves PF > 0.99 and THD < 5%. Each switch operates at 40-100 kHz; the switching is staggered between the three phases to reduce DC-bus ripple. The control loop is:
+
+- **Inner**: per-phase current loop running at the switching frequency. Inputs: phase currents (Hall or shunt), reference from outer loop. Output: switch duty cycle. Bandwidth ~5 kHz.
+- **Outer**: DC-bus voltage loop, ~100 Hz bandwidth, slow enough not to interact with grid 50/60 Hz harmonics. Outputs current reference scaled by sinusoidal phase reference (computed from phase-locked loop on grid voltage).
+
+The PLL on grid voltage is a critical sub-block. It must lock to the fundamental, reject harmonics, and respond to phase jumps (e.g. from grid faults) within a half-cycle. The standard implementation is an SRF-PLL (Synchronous Reference Frame PLL) with a quadrature signal generator.
+
+### Isolated DC-DC
+
+Galvanic isolation is **mandatory** between mains and the vehicle — both for safety (no DC fault current path between vehicle chassis and grid earth) and for regulatory compliance (IEC 61851-23, UL 2202). The isolated DC-DC stage uses a high-frequency transformer for the isolation barrier.
+
+Two dominant topologies:
+
+**LLC resonant converter.** A half-bridge or full-bridge primary drives a resonant tank (L_r, L_m, C_r) feeding the transformer. The resonance lets the switches turn on at zero voltage (ZVS) and zero current (ZCS), eliminating switching losses and reaching ~95-97% peak efficiency. The control variable is switching frequency — operating above resonance gives buck-mode (vehicle voltage < bus / N), below resonance gives boost-mode. Output regulation is via PFM (Pulse Frequency Modulation).
+
+LLC is the dominant choice for new fast-charger designs because of the efficiency at partial load. Limitation: it has limited output-voltage range without burst-mode operation, and at very light load the resonance becomes hard to control.
+
+**Phase-Shifted Full Bridge (PSFB).** Four switches in a full bridge primary; the regulation is by the phase shift between the two half-bridges. Wider output voltage range, slightly lower peak efficiency than LLC. More tolerant of wide-input wide-output operation, used in some fast chargers that need to support both 400 V and 800 V battery packs.
+
+### Multi-stage modular architecture
+
+Real 350 kW chargers don't have one 350 kW LLC stage. They have N × 50 kW modules in parallel, each module being an LLC connected to a shared DC bus and a shared output. A module-level MCU runs the LLC control loop; a charger-level MCU coordinates load-sharing between modules, manages thermal, runs the user interface, and talks to the vehicle.
+
+Module modularity buys:
+
+- **Efficiency at partial power.** At 50 kW out of 350 kW, only one module is active running near peak efficiency. Without modularity, the single big converter would run at 14% load — very inefficient.
+- **Redundancy.** One module failure drops capacity to 6/7 of full, no service outage.
+- **Easier service.** Field-replaceable modules.
+- **Common stack.** Same module across charger sizes.
+
+A 350 kW charger has perhaps 7-8 power modules plus a control panel, each running its own Cortex-M.
+
+## Cortex-M's role in the control loops
+
+The PFC and LLC control loops require:
+
+- **Synchronised ADC sampling.** Sample current and voltage at the PWM cycle boundary, ideally at the midpoint of the switching interval (lowest noise). Cortex-M timers with ADC trigger output handle this; ST's HRTIM on STM32G4 is particularly well-suited.
+- **Tight ISR latency.** The current-loop ISR runs at the switching frequency. At 100 kHz, that's a 10 µs window — the ISR must complete in &lt;2 µs to leave room for the rest of the firmware. Cortex-M4F at 170 MHz handles it comfortably; M0+ at 48 MHz does not.
+- **Floating-point math.** The PLL, the inverse Park, and the PI controllers all benefit from single-precision FPU. Without FPU, fixed-point implementations are tractable but tedious.
+- **DSP instructions.** Park / Clarke transforms use SIN/COS; the ARM DSP extension's MAC and saturating arithmetic accelerate them. The CORDIC accelerator on STM32G4 computes sin/cos in ~50 cycles.
+- **Hardware fault response.** Over-current must shut down PWM within microseconds. The "break input" on advanced timers does this in hardware without CPU involvement — a comparator output drives the timer's BRK pin, the timer immediately outputs the configured safe state.
+
+| MCU | Use in EV charger |
+|-----|-------------------|
+| STM32G4 (Cortex-M4F + HRTIM + CORDIC) | PFC or LLC module controller |
+| STM32F334 / STM32F303 | Lower-cost legacy module controller |
+| TMS320F28379 (TI C2000 — NOT ARM) | Heavyweight legacy choice |
+| STM32H7 | Charger-level supervisor with display |
+| iMX RT1170 (Cortex-M7) | High-end supervisor with HMI and cloud |
+
+## ISO 15118 and Plug & Charge
+
+For DC fast charging, the vehicle and charger must agree on parameters orders of magnitude more sophisticated than the CP duty cycle can carry: target voltage, current ramp profile, SoC, charging stop conditions, payment authentication. The standard is **ISO 15118** — a Layer 7 protocol stack carried over **PLC (Power Line Communication)** on the CP wire.
+
+PLC carries OFDM-modulated data at ~10 Mbit/s on top of the existing 1 kHz CP signal. The vehicle and charger each have a PLC modem (typically Qualcomm QCA7000-family). On the Cortex-M side, the modem appears as a SPI-attached Ethernet bridge; the firmware runs an IPv6 stack (link-local addresses, SLAAC), a TLS 1.3 client, and an EXI-encoded XML protocol parser.
+
+ISO 15118-20 (2022 edition) adds Plug & Charge: the vehicle's contract certificate is provisioned during initial registration with the operator; at each subsequent plug-in, the charger validates the certificate and starts the session without user intervention. The cryptographic stack (X.509 chain validation, ECC P-256 signatures, TLS) lives on the Cortex-M and demands substantial Flash (~500 KB) and CPU.
+
+<Callout type="warn">
+ISO 15118 has accumulated several incompatible profile variants (CCS 1.0 over DIN SPEC 70121, ISO 15118-2, ISO 15118-20). Interoperability between vehicle and charger from different OEMs is a long-running pain point — most chargers implement a "fallback" sequence that tries each protocol in turn. The MCU firmware must handle protocol detection robustly.
+</Callout>
+
+## Safety supervision
+
+A charger is a multi-hundred-amp DC supply running into something that could be a person, an animal, or a slightly damaged battery. Safety supervision is independent of the main control loop, typically running on a separate Cortex-M0+ supervisor that monitors:
+
+- **Insulation resistance** of the DC output relative to chassis — must be > 100 Ω/V; failure latches contactors open.
+- **Pre-charge** of the output capacitance before closing the main contactor — limits in-rush.
+- **Over-current**, hardware-latched.
+- **Over-temperature** at every power component and at the plug.
+- **CP signal continuity** — if the CP duty drops, the vehicle wants to stop; charger must comply within 100 ms.
+- **Watchdog** of the main controller — supervisor will trip the contactors if main control fails to refresh.
+
+These run on a separate MCU because the main controller is allowed to fail; the safety supervisor isn't. In some designs, the safety supervisor uses a TÜV-certified safety-MCU like the [Infineon AURIX](/docs/vendors/aurix), STMicro SPC58 (Power Architecture), or Renesas RH850 — chips with native ASIL-D capability and certified safety manuals.
+
+## Cross-references
+
+- [Motor FOC](/docs/systems/motor-foc) — closely related power-electronics control problem.
+- [STM32 mainstream](/docs/vendors/stm32-mainstream) — G4 with HRTIM and CORDIC is the dominant power-stage MCU.
+- [AUTOSAR](/docs/systems/autosar) — the safety-MCU side runs AUTOSAR Classic in some implementations.
+- [TI Sitara](/docs/vendors/ti-sitara) — alternative for the charger-level supervisor with HMI.
+- IEC 61851-1, -23, -24 — electric vehicle conductive charging standards.
+- ISO 15118-2, -20 — V2G communication protocol.
+- "Vienna Rectifier" reference designs from Infineon, Wolfspeed, Texas Instruments.

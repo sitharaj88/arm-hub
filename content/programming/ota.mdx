@@ -1,0 +1,202 @@
+---
+title: OTA firmware update
+description: Over-the-air update for embedded ARM devices. A/B banks, delta updates, secure transport, rollback safety, FOTA over BLE / Wi-Fi / cellular, and the major IoT cloud update services.
+order: 12
+updated: 2026-05-13
+tags: [programming, ota, fota, mcuboot, update, security]
+---
+
+OTA (Over-The-Air) firmware update is now table stakes for any connected product. Cars get firmware in the driveway, smart-home devices update overnight, industrial gateways patch CVEs without a truck roll. The cost of *not* having OTA is measured in CVE-disclosure-to-mitigation time and field-service dispatches; the cost of getting OTA *wrong* is measured in bricked fleets, recall headlines, and lawsuits. So this is a piece of infrastructure worth building deliberately.
+
+This page covers the full OTA flow: how images move from your build server to a field device, how the device verifies and stages them, how it swaps to the new version while guaranteeing it can revert, and how the major cloud platforms wrap all of this in their managed update services.
+
+<SpecSheet
+  title="OTA at a glance"
+  specs={[
+    { label: 'Update strategy', value: 'A/B (dual-bank), single-bank-with-staging, delta (binary diff), incremental (per-block)' },
+    { label: 'Transport', value: 'HTTPS, CoAP-DTLS, MQTT, BLE GATT, LoRaWAN multicast, cellular (LWM2M)' },
+    { label: 'Image protection', value: 'Signature (ED25519/ECDSA/RSA) + optional encryption (AES-CTR)' },
+    { label: 'Integrity proof', value: 'SHA-256 hash over the whole image, included in signed manifest' },
+    { label: 'Rollback', value: 'Test-and-confirm with boot counter — N failed boots reverts to previous slot' },
+    { label: 'Power-fail safety', value: 'Atomic metadata update via double-buffered magic + CRC' },
+    { label: 'Typical size budgets', value: 'Full image: 100 KB - 2 MB. Delta image: 5%-25% of full.' },
+  ]}
+/>
+
+## The OTA pipeline end-to-end
+
+A complete OTA solution has six stages, each of which can fail and must fail safely.
+
+```
+[Build] -> [Sign] -> [Publish] -> [Download] -> [Verify] -> [Swap] -> [Boot] -> [Confirm]
+   |          |          |             |             |          |         |          |
+   CI/CD    HSM/KMS   CDN/MQTT    Device pulls    Cryptographic Flash    Test     Mark slot
+                     /pushes      image           check         layer    image    good
+```
+
+A bug in any one of these can brick devices. The well-engineered systems prioritise these properties, in this order:
+
+1. **Reliability of revert.** A failed update must always result in a working device, even after power loss mid-flash.
+2. **Authenticity.** The device must only accept images cryptographically authored by you.
+3. **Confidentiality (optional).** Some products encrypt firmware; many don't.
+4. **Efficiency.** Bandwidth, storage, time — important but secondary to the above.
+
+## Update layouts: A/B vs single-bank vs delta
+
+Three families of flash layout cover essentially every product.
+
+### A/B (dual-bank)
+
+Flash is divided into two equal application slots plus a bootloader. The currently-running image lives in slot A; the new image is downloaded into slot B while slot A keeps running. After download + verify, the bootloader is told "boot slot B next." On reboot, slot B runs. If it fails, the bootloader reverts to slot A.
+
+**Pros**: simplest reliable revert. The previous image is still bit-for-bit present in flash. Update can happen while the application is running.
+
+**Cons**: requires 2× the flash for application. On a 1 MB part with a 480 KB application, you have 32 KB bootloader + 480 KB slot A + 480 KB slot B + 32 KB scratch — every byte budgeted.
+
+This is what MCUboot, AWS IoT OTA, Azure Device Update, and most modern designs use.
+
+### Single-bank with staging
+
+There's only one application slot, but a small staging area holds the new image during download. On commit, the bootloader copies staging into the application slot.
+
+**Pros**: cheaper on flash. You only need staging + application, not 2× application. Works on parts with little flash.
+
+**Cons**: copy step is the dangerous moment. Power loss mid-copy leaves an unbootable device. Mitigation: copy block-by-block with a journal of completed blocks; bootloader resumes the copy on next boot if it was interrupted. Complex to get right.
+
+### Delta updates
+
+The new image is shipped as a *diff* against the current version. The device reconstructs the new image by applying the diff to the old. Tools: `bsdiff`, `detools`, `JOJOdiff`, `imgdiff` (Android's). On firmware with mostly-localised changes (a few function bodies, a string table tweak), deltas are typically 5%-15% of the full image.
+
+**Pros**: massive bandwidth savings on cellular or LoRa.
+
+**Cons**: requires keeping the old image *and* the new image in flash during reconstruction, so combined storage requirements are sometimes higher than full updates. Versioning is tricky — you need a delta for each "from→to" pair, or one per supported source version.
+
+| Strategy | Flash needed | CPU work | Risk |
+|----------|--------------|----------|------|
+| A/B full | 2× app + bootloader + scratch | Verify only | Lowest |
+| Single-bank staging | app + staging + bootloader + journal | Verify + copy | Medium — power-fail in copy |
+| Delta (A/B) | 2× app + delta + scratch | Verify + diff apply | Medium — diff apply bugs |
+| Delta (single) | app + staging + delta | Verify + diff apply + copy | Highest |
+
+## Download → verify → swap → boot → confirm
+
+The core sequence inside the device. Let's expand each step.
+
+**Download.** The device fetches the image, usually as a stream — chunks of 512 B to 16 KB depending on transport. Chunks are written to the inactive slot's flash as they arrive. The device tracks progress in a metadata header so a network interruption can resume.
+
+**Verify.** Once the last chunk is in, the device hashes the entire image (SHA-256 is standard) and checks the signature on the hash. If signature verification fails, the slot is marked invalid and discarded. The signature is typically over a manifest that includes the hash, version, target product ID, and revocation epoch.
+
+**Swap.** The bootloader is told "next boot, run slot B." The exact mechanism varies — MCUboot uses a *trailer* at the end of each slot that holds magic values indicating swap state. ST's SBSFU uses a separate metadata sector. The swap operation must be atomic against power loss: writing the trailer is the commit point.
+
+**Boot.** Reset. The bootloader inspects both slots' trailers, picks the one marked "test" or the newer confirmed one, jumps to it.
+
+**Confirm.** The new image runs, exercises some self-check (network connect, sensor read, RTOS heartbeat for N seconds), and writes a "confirmed" flag back to its trailer. If it crashes or reboots before confirming, the bootloader notices on next boot and reverts.
+
+```c
+// In the application, after successful self-check:
+boot_set_confirmed();   // MCUboot API — writes the trailer magic
+```
+
+If `boot_set_confirmed()` is never called, the boot counter (in MCUboot's case, the absence of the trailer flag combined with a reboot) triggers automatic revert. The previous slot is still there, untouched, and a single reset returns to it.
+
+<StateDiagram title="OTA state machine with rollback" width={820} height={300} states={[
+  { id: 'idle',   label: 'Idle', x: 30,  y: 30,  w: 130, h: 56, tone: 'muted', initial: true },
+  { id: 'dl',     label: 'Downloading', x: 200, y: 30, w: 150, h: 56, tone: 'accent' },
+  { id: 'verify', label: 'Verify (SHA + sig)', x: 390, y: 30, w: 170, h: 56, tone: 'primary' },
+  { id: 'swap',   label: 'Swap + reboot', x: 600, y: 30, w: 170, h: 56, tone: 'warning' },
+  { id: 'test',   label: 'Test slot running', x: 600, y: 150, w: 170, h: 56, tone: 'warning' },
+  { id: 'conf',   label: 'Confirmed', x: 390, y: 150, w: 170, h: 56, tone: 'success' },
+  { id: 'rb',     label: 'Rollback', x: 200, y: 150, w: 150, h: 56, tone: 'destructive' },
+]} transitions={[
+  { from: 'idle', to: 'dl', label: 'job received' },
+  { from: 'dl', to: 'verify', label: 'last chunk' },
+  { from: 'dl', to: 'idle', label: 'retry / abort', curve: -50 },
+  { from: 'verify', to: 'swap', label: 'sig ok' },
+  { from: 'verify', to: 'idle', label: 'invalid', curve: -50 },
+  { from: 'swap', to: 'test', label: 'reset' },
+  { from: 'test', to: 'conf', label: 'self-check ok' },
+  { from: 'test', to: 'rb', label: 'watchdog / crash' },
+  { from: 'rb', to: 'idle', label: 'previous slot boots' },
+  { from: 'conf', to: 'idle', label: 'new baseline', curve: 60 },
+]} caption="The download/verify/swap path is the happy case; the test, rollback, and idle-recovery edges are what keep a botched rollout from bricking the fleet." />
+
+<Callout type="warn">
+The most common OTA failure mode is "device boots, runs for a few seconds, crashes — repeatedly". Without test-and-confirm, the device is now stuck rebooting forever. Add a hardware watchdog with a long timeout (30 s), arm it before jumping to the new image, and let the watchdog trigger a "boot count exceeded" revert. Belt-and-braces — both software confirm and hardware watchdog.
+</Callout>
+
+## Power-fail safety with double-buffered metadata
+
+Flash writes are not atomic. A power loss midway through writing a 4 KB sector leaves bytes that are neither the old nor the new value. If the bootloader's slot-selection metadata is in such a half-written sector, the device may be unbootable.
+
+The standard mitigation: **double-buffered metadata with a CRC and a sequence number**.
+
+```
++-----------+ +-----------+
+| Metadata A| | Metadata B|
+| seq: 7    | | seq: 6    |
+| CRC: OK   | | CRC: OK   |
++-----------+ +-----------+
+```
+
+On update, write the new metadata to the *other* buffer (whichever has the older sequence). When the write completes and the CRC matches, the new buffer is committed. On boot, the bootloader picks the buffer with the higher sequence number and valid CRC. If a write is interrupted, one buffer is corrupted (CRC fails) and the other is valid — the device boots fine on the older metadata.
+
+This is the same idea as database WAL (write-ahead log) but for flash sectors. MCUboot's trailer uses a variant: magic values written in a specific order such that any partial state is detectable and recoverable.
+
+## Secure transport
+
+The image must travel from your server to the device without modification. Three layers of protection apply.
+
+**Transport-layer security**: TLS for HTTPS/MQTT, DTLS for CoAP. The device authenticates the server (and ideally vice versa) with X.509 certificates pinned in flash. Mbed TLS and wolfSSL are the common embedded TLS implementations; both run on Cortex-M3+ with about 50 KB of code and 16 KB of RAM.
+
+**Manifest signing**: the image bytes don't need to be encrypted on the wire, but the manifest describing them (hash, version, target, signature) must be authenticated. COSE (CBOR Object Signing and Encryption, RFC 8152) is the modern standard — compact binary, ED25519-friendly, supported by SUIT (Software Update for IoT) which is the IETF standard for IoT manifests.
+
+**Image encryption** (optional): if you need to keep the binary contents secret, encrypt with AES-CTR using a per-device or per-fleet key. The decryption key may be delivered alongside the image, wrapped to the device's public key.
+
+## OTA over BLE, Wi-Fi, cellular, LoRaWAN
+
+The transport constrains your design.
+
+| Transport | Bandwidth | MTU | Suitability |
+|-----------|-----------|-----|-------------|
+| BLE GATT (5.0, 1M PHY) | ~30 KB/s | 247 B (with DLE) | Mobile-companion updates, small images |
+| BLE 5.0 2M PHY | ~70 KB/s | 247 B | Same use case, faster |
+| Wi-Fi 4 | ~1 MB/s+ | 1500 B | Full-image fast updates |
+| Cellular LTE-M | ~100 KB/s | 1280 B (CoAP) | Large fleet, cost-per-byte matters |
+| Cellular NB-IoT | ~25 KB/s | 1280 B | Low-power, tiny deltas only |
+| LoRaWAN multicast | ~5 KB/s aggregate | 51 B | Field broadcast to thousands of nodes — class C devices, deltas mandatory |
+
+**BLE FOTA**: Nordic's nRF Secure DFU is the reference. App on phone, custom GATT service, image streamed in 244-byte fragments. Typical 200 KB image: ~10 seconds at 2M PHY, ~30 seconds at 1M PHY.
+
+**Wi-Fi**: HTTPS pull from a CDN. The device's HTTP client streams the response body straight into flash. Espressif IDF's `esp_https_ota` is the canonical pattern.
+
+**Cellular**: typically managed by an IoT platform. The device connects to AWS IoT or Azure IoT Hub, registers for update jobs, downloads via HTTPS or MQTT-with-streams. LWM2M (Lightweight M2M) has a dedicated firmware update object (object ID 5) that abstracts the transport.
+
+**LoRaWAN**: multicast firmware update via the FUOTA (Firmware Update Over The Air) class B/C profile. The whole class is delta-based — full images are simply not viable on 5 KB/s aggregate bandwidth.
+
+## Managed update services
+
+Most teams use one of the cloud platforms to manage device fleets, image distribution, rollout policy (canary, staged, 1% then 10% then 100%), and telemetry.
+
+**AWS IoT Device Defender / Jobs**: queues a "job" with an image URL; device subscribes to job topic, downloads, reports status. Integrates with S3 for image hosting and CodeSign for signing.
+
+**Azure Device Update**: image hosting in Azure Storage, manifest-driven, rollback automation, group-based rollout.
+
+**Memfault / Mender / hawkBit**: independent platforms, often easier to onboard than the hyperscalers. Memfault adds crash analytics on top.
+
+**NXP EdgeLock 2GO**: provisions secure identity at factory, ties OTA to device certificate. Used in industrial IoT.
+
+**Particle, Golioth, Blynk**: fully managed, opinionated end-to-end for smaller fleets.
+
+<Callout type="tip">
+Whatever you pick, instrument the update path with telemetry: download progress, verify outcome, swap success, post-update boot count, post-update memory/CPU baseline. Without that, you cannot tell whether a v1.2.3 rollout is healthy or whether 5% of your fleet is silently reverting. Memfault and the major IoT clouds all bundle this; if rolling your own, include it from day one.
+</Callout>
+
+## Further reading
+
+- [Bootloaders](/docs/programming/bootloaders) — the bootloader side of OTA
+- [Linker scripts](/docs/programming/linker-scripts) — defining slot layout
+- [TrustZone-M deep dive](/docs/architecture/trustzone-m) — secure boot foundation
+- [FreeRTOS](/docs/rtos/freertos) — AWS IoT OTA agent runs on FreeRTOS
+- MCUboot: docs.mcuboot.com
+- IETF SUIT manifest: datatracker.ietf.org/wg/suit/
+- Memfault firmware update guide: interrupt.memfault.com/tags/firmware-updates

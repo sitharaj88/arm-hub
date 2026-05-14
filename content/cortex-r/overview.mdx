@@ -1,0 +1,98 @@
+---
+title: Cortex-R overview
+description: ARM's real-time application-class cores — built for hard real-time, often in lockstep, with MPUs instead of MMUs and tightly coupled memories.
+order: 1
+updated: 2026-05-12
+tags: [cortex-r, real-time, safety, automotive]
+---
+
+
+Cortex-R is the third ARM profile, sitting between M and A. It looks like A-profile (bigger pipelines, sometimes virtual addressing) but trades the MMU for an MPU, keeps caches but adds **tightly coupled memories (TCMs)** for deterministic access, and most importantly supports **lockstep** — two cores executing the same instructions, with a hardware checker comparing results cycle-by-cycle.
+
+If you've never written Cortex-R code, you probably haven't worked on:
+
+- Hard disk drive controllers.
+- Automotive ECUs needing ISO 26262 ASIL-D certification.
+- 5G basebands (Cortex-R52 ships in essentially every 5G modem).
+- Industrial safety controllers (TÜV-certified PLCs).
+
+## Cortex-R family
+
+| Core         | Year | Notable use                             |
+|--------------|------|-----------------------------------------|
+| Cortex-R4    | 2006 | Mobile baseband; HDD controllers        |
+| Cortex-R5    | 2010 | Workhorse — TI Hercules, Xilinx Zynq's RPU |
+| Cortex-R7    | 2011 | Higher-perf R5                          |
+| Cortex-R8    | 2016 | LTE-Advanced baseband; storage          |
+| Cortex-R52   | 2016 | First ARMv8-R; automotive ASIL-D        |
+| Cortex-R52+  | 2020 | R52 refresh, higher clock               |
+| Cortex-R82   | 2020 | First 64-bit Cortex-R; storage/networking with MMU option |
+
+## Why not just use Cortex-A?
+
+You *can* use Cortex-A for real-time work (RT Linux, Xenomai, baremetal A-core in big.LITTLE). What Cortex-R adds:
+
+- **Deterministic interrupt latency** — no MMU-walk surprises, no cache coherence stalls (except optionally), no speculation.
+- **Lockstep** — the ARM safety story. R5 and R52 implement Dual-Core Lock-Step (DCLS): two cores execute the same instructions, a hardware comparator faults if they diverge.
+- **MPU instead of MMU** — same protection model as Cortex-M (region-based, no translation), just with more regions.
+- **TCMs** — single-cycle memory, no cache jitter, ideal for ISR code and hot data.
+
+Effectively: Cortex-M's predictability with Cortex-A's throughput.
+
+## Lockstep in detail
+
+```
+        ┌────────┐                  ┌────────┐
+        │ Core 0 │─── output ──────│         │
+        └────────┘                  │ Compare │── mismatch → fault
+        ┌────────┐                  │         │
+        │ Core 1 │─── output ──────│         │
+        └────────┘                  └────────┘
+        (delayed N
+         cycles)
+```
+
+The two cores run the *same* program. To prevent common-mode failures (a glitch hitting both cores simultaneously), the second core is delayed by a few cycles — so a glitch causes them to diverge, which the comparator catches.
+
+From software's perspective, **you see one core**. You don't write SMP code. You don't have to think about lockstep. If a bit flips, you get a hardware fault, you reset, you trust the redundancy worked. That's the whole point.
+
+The cost is silicon: two cores worth of area for one logical CPU. Acceptable when the alternative is losing a safety certification.
+
+## ARMv8-R — the new generation
+
+The Cortex-R52 introduced **ARMv8-R**, distinct from ARMv8-M (microcontroller) and ARMv8-A (apps). Key features:
+
+- **Two MPUs** — privileged and unprivileged, allowing nested protection.
+- **EL0 / EL1 / EL2 exception levels** (no EL3, no secure-monitor split — Cortex-R does TrustZone differently).
+- **Hypervisor support** — EL2 can host a Type-1 hypervisor that schedules multiple ASIL-rated OS partitions on the same physical core, with isolation guaranteed by the MPUs.
+- **NEON-style SIMD** (advanced SIMD), shared with A-profile.
+
+Cortex-R82 takes this further by **adding an MMU** to a Cortex-R core for the first time — primarily for high-end storage controllers and 5G networking infrastructure where the workload is real-time but the address space needs paging.
+
+## TCMs on Cortex-R
+
+Same idea as Cortex-M7: tightly coupled SRAM directly attached to the core.
+
+- **ATCM** — Tightly Coupled Memory A. Typically holds the exception vector table and time-critical code.
+- **BTCM** — Tightly Coupled Memory B. Time-critical data structures and DMA descriptors.
+- Some cores split TCMs further per-port (TCM-A0, TCM-A1) for simultaneous access.
+
+A typical safety-critical Cortex-R design copies the ISR vector table from flash to ATCM at boot, then locks the region — preventing any later code from displacing it.
+
+## Where you actually meet Cortex-R
+
+- **TI Hercules TMS570 / RM48** — Cortex-R4/R5 in lockstep with extensive built-in self-test (BIST). Automotive and aerospace controllers.
+- **Xilinx Zynq UltraScale+ MPSoC** — Cortex-A53 cluster *plus* a Cortex-R5 RPU for hard real-time alongside Linux.
+- **NXP S32V / S32G** — Cortex-R52 in vehicle networking gateways.
+- **Renesas RH850** — actually their own ISA, but conceptually similar territory. Renesas's ARM-based automotive is Cortex-R or hybrid.
+- **Infineon AURIX TC4xx** — Tricore-based, but Infineon's newer ARM offerings target the Cortex-R52 niche.
+
+<Callout type="note" title="If your job title contains 'functional safety', you're probably here">
+Cortex-R is the platform for ISO 26262 (automotive), IEC 61508 (industrial), DO-178C (aviation). The certifications are the product; the chip is a means to that end.
+</Callout>
+
+## See also
+
+- [Lockstep & ASIL](/docs/cortex-r/lockstep/) — the functional-safety story in detail.
+- [Cortex-A overview](/docs/cortex-a/overview/) — for comparison.
+- [Cortex-M lineup](/docs/cortex-m/lineup/) — when M-profile suffices.

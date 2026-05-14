@@ -1,0 +1,204 @@
+---
+title: ECC, parity, and fault detection
+description: How Cortex-R parts catch hardware faults — SECDED Hamming on TCMs and caches, parity on bus interfaces, the ESM (Error Signaling Module) in TI TMS570, precise vs imprecise data aborts, and how software-driven error injection drives functional safety tests.
+order: 4
+updated: 2026-05-13
+tags: [cortex-r, ecc, parity, fault-detection, esm, secded, functional-safety]
+---
+
+A Cortex-R part is, fundamentally, a CPU that catches its own mistakes. Single-event upsets from cosmic rays, marginal manufacturing, supply voltage glitches, and pure cold-pile bit-rot all generate transient hardware errors that on a Cortex-A or Cortex-M would silently corrupt data. On a Cortex-R aimed at ISO 26262 ASIL-D or IEC 61508 SIL-3, every storage element is protected with ECC or parity, every bus is parity-checked, and every detected fault routes through a system-level error signal to a watchdog or limp-home logic.
+
+This page covers the mechanisms — what's protected, how the protection works, what the latency and overhead look like, and how production firmware uses software-driven error injection to validate the diagnostic coverage.
+
+<SpecSheet
+  title="Cortex-R fault detection at a glance"
+  specs={[
+    { label: 'SECDED', value: 'Single Error Correct, Double Error Detect — extended Hamming code. 7 ECC bits per 32-bit word, 8 per 64-bit word' },
+    { label: 'Protected storage (typical)', value: 'TCMs (ATCM, BTCM), L1 I-cache, L1 D-cache, MPU region descriptors, register file (on some variants)' },
+    { label: 'Bus parity', value: 'AXI bus interfaces protected with parity per byte lane or per beat. Detection only, not correction' },
+    { label: 'Lockstep delta', value: 'Two-core lockstep detects mismatches in architectural outputs cycle-by-cycle — orthogonal to ECC' },
+    { label: 'Fault types', value: 'Correctable (single-bit ECC), Uncorrectable (double-bit ECC, parity), Bus error (AXI response = SLVERR/DECERR)' },
+    { label: 'CPU response', value: 'Correctable: continue + log. Uncorrectable: synchronous abort (data abort / prefetch abort) or system-level fault interrupt' },
+    { label: 'Precise vs imprecise', value: 'Precise: the faulting instruction is known (CPU can recover). Imprecise: write buffer or bus delay means the originating instruction has retired' },
+    { label: 'TI ESM (Error Signaling Module)', value: 'Aggregates 96+ error sources on TMS570 into two groups (high-priority FIQ, low-priority IRQ) with an external nERROR pin' },
+  ]}
+/>
+
+## SECDED Hamming code
+
+The standard ECC scheme on Cortex-R storage is **SECDED (Single Error Correct, Double Error Detect)**, implemented as an extended Hamming code. For each 32-bit data word, 7 parity bits are computed and stored alongside; on read, the parity is recomputed and compared.
+
+- **0 bits flipped** — the parity match is correct. Data is good.
+- **1 bit flipped (in data or in parity)** — the syndrome (XOR of expected and computed parity) is non-zero and uniquely identifies the failing bit. The hardware corrects it and returns the original data. A "correctable error" interrupt may be raised for logging.
+- **2 bits flipped** — the syndrome is non-zero but doesn't match any single-bit pattern. The hardware flags an uncorrectable error and (typically) aborts the access.
+- **3+ bits flipped** — undetectable. Probability is astronomically low for true random faults but cannot be ruled out architecturally.
+
+The Hamming overhead is ~22% (7 bits of parity per 32 bits of data). For a 128 KB TCM that's ~28 KB of ECC bit storage. Most parts mark this off the user-visible address space — you see 128 KB, the silicon has 128 KB + 28 KB.
+
+<ProtocolFrame
+  title="32-bit data word with SECDED Hamming code"
+  fields={[
+    { name: 'Data[31:0]', bits: 32, tone: 'primary', flexible: true },
+    { name: 'P1', bits: 1, tone: 'accent' },
+    { name: 'P2', bits: 1, tone: 'accent' },
+    { name: 'P4', bits: 1, tone: 'accent' },
+    { name: 'P8', bits: 1, tone: 'accent' },
+    { name: 'P16', bits: 1, tone: 'accent' },
+    { name: 'P32', bits: 1, tone: 'accent' },
+    { name: 'P_all', bits: 1, tone: 'warning' },
+  ]}
+  caption="Six Hamming parity bits over interleaved bit groups uniquely identify any single-bit flip across the 32 data bits or the parity bits themselves; the seventh overall-parity bit raises a SECDED that distinguishes 1-bit errors (correctable) from 2-bit errors (detectable but uncorrectable)."
+/>
+
+For 64-bit accesses, the ECC scheme uses 8 parity bits per 64 bits (12.5% overhead), and the syndrome covers both bit-pairs and single-bit flips. Some Cortex-R variants do 64-bit ECC on the cache and 32-bit ECC on the TCM, simply because the cache line is 64 bits per beat.
+
+## What's protected vs not
+
+The protection map varies by part. A typical Cortex-R5 design from a safety-focused vendor (TI, NXP, ST automotive) protects:
+
+| Element | Protection |
+|---------|-----------|
+| ATCM, BTCM | SECDED ECC, per 32-bit word |
+| L1 I-cache data | Parity (cheap to re-fetch on error) |
+| L1 I-cache tags | Parity or ECC |
+| L1 D-cache data | SECDED ECC |
+| L1 D-cache tags | SECDED ECC |
+| MPU region table | Parity |
+| Register file | SECDED ECC on some variants (TI TMS570 yes, generic R5 no) |
+| AXI bus interface | Parity per byte lane |
+| Vector address register (VIM) | SECDED ECC |
+| System-level SRAM (external) | Optional ECC, configured at the memory controller |
+
+What's *not* protected on most parts:
+
+- Internal pipeline registers
+- The PC, CPSR, SPSR (during execution)
+- Combinational logic
+- Power and clock distribution
+
+Lockstep operation addresses the unprotected logic. Two cores running in delayed lockstep mean a bit flip in one core's combinational logic produces a different output, and the comparator detects it. Together, ECC (for memory) + lockstep (for logic) cover ~99% of the fault tree at the silicon level. The remaining percent is addressed at the system level — voltage monitors, clock comparators, watchdogs.
+
+## Correctable vs uncorrectable handling
+
+When the ECC unit detects a **correctable** (single-bit) error, the CPU continues normal execution — the corrected data was returned from the read. The error is logged into a per-element error register (typically in CP15 or memory-mapped). Software polls or takes an interrupt to count errors and decide whether to act.
+
+A correctable error rate of more than 1 per hour per MB typically indicates a hardware problem (marginal silicon, supply voltage drift, hot environment). Production telemetry collects these counts; field replacement is triggered by trend thresholds.
+
+When the ECC unit detects an **uncorrectable** (double-bit) error, things get more interesting. The CPU has options:
+
+- **Synchronous abort.** The instruction that caused the read takes a data abort or prefetch abort exception immediately. The abort handler can determine the fault address (DFAR/IFAR), log the failure, and decide whether to retry, reset, or enter limp-home mode.
+- **Asynchronous abort.** Some accesses can't be aborted synchronously — typically writes through the write buffer where the originating instruction has already retired. The CPU raises an asynchronous abort exception; the abort handler knows *that* something failed but not exactly *which* instruction.
+
+The architecture distinguishes **precise** vs **imprecise** aborts. Precise aborts can be recovered from (the OS knows exactly what was being attempted); imprecise aborts typically force a system reset because the architectural state is unclear.
+
+<Callout type="warn">
+Don't assume every fault is precise. The CPSR.A bit globally enables asynchronous aborts; if cleared, imprecise aborts are masked and you lose the diagnosis. Production code should leave A=0 (aborts enabled) at all times, with the abort handler distinguishing precise and imprecise via the IFSR/DFSR's Async bit.
+</Callout>
+
+## The TI ESM (Error Signaling Module)
+
+On TI TMS570 and Hercules family, the **Error Signaling Module** is the system-level aggregator. ESM collects up to 96+ error sources from across the chip — CPU ECC errors, peripheral ECC errors, flash ECC, watchdog timeouts, PLL slip, voltage out-of-range — and routes them into two groups:
+
+- **Group 1 (low-priority)** — Latches an interrupt to the CPU (IRQ).
+- **Group 2 (high-priority)** — Latches an interrupt to the CPU (FIQ) *and* drives the external `nERROR` pin.
+- **Group 3 (terminal)** — Drives `nERROR` directly without CPU intervention; used for catastrophic faults where the CPU itself may be compromised.
+
+The `nERROR` pin is a system-level "I'm broken" output, typically wired to a watchdog or to an external safety MCU that takes over (e.g., switching off the high-voltage relay in an EV, or shutting down the engine in an aircraft).
+
+A typical ESM bring-up:
+
+```c
+void esm_init(void) {
+    // Enable each protected error source
+    esmREG->IESR1 = 0xFFFFFFFF;     // group 1 interrupts enabled
+    esmREG->IESR2 = 0xFFFFFFFF;
+    esmREG->IESR3 = 0xFFFFFFFF;
+    esmREG->IEPSR1 = 0xFFFFFFFF;    // group 2 interrupts enabled
+    esmREG->IEPSR2 = 0xFFFFFFFF;
+
+    // Configure group 2 to drive nERROR
+    esmREG->LTCPR = 0x00000005;     // low-time counter preload (1 ms typical)
+
+    // Register the ESM interrupt with the VIM
+    register_irq(ESM_HIGH_IRQ_NUM, esm_high_handler);
+    register_irq(ESM_LOW_IRQ_NUM,  esm_low_handler);
+}
+```
+
+The handler decodes the source register, logs to non-volatile storage, and decides whether to enter a safe state.
+
+## Software error injection
+
+Functional safety standards require *diagnostic coverage* claims — what fraction of possible hardware faults does the detection mechanism catch? You can't measure this with random testing alone; you need to inject known faults and verify they're caught. Cortex-R parts provide explicit error-injection registers for this purpose.
+
+For example, on TMS570:
+
+```c
+// Inject a single-bit error in TCM
+void inject_tcm_correctable(void) {
+    // Map the ECC syndrome address (separate region from data)
+    volatile uint32_t *syndrome = (uint32_t *)(0xFFF7FE00 /* TCM ECC region */);
+
+    // Read current syndrome, flip one bit
+    uint32_t s = syndrome[target_word];
+    syndrome[target_word] = s ^ 0x01;
+
+    // Now read the data word — should be silently corrected, error counted
+    volatile uint32_t data = tcm_data[target_word];
+
+    // Verify the correctable-error counter incremented
+    assert(read_tcm_corr_count() == prev_count + 1);
+}
+```
+
+Similar injection paths exist for caches (via CP15 RAM access), the register file (via ECC error inject bit in vendor registers), and the bus parity (via dedicated test mode).
+
+Production firmware runs an **error injection test** at power-on or periodically during operation to verify the detection paths are still working. If the test fails (an injected error is not detected), the system is itself in an unsafe state and must be reset.
+
+## Coverage and DC (Diagnostic Coverage)
+
+ISO 26262 quantifies the effectiveness of fault detection as DC — the fraction of detected faults among all possible faults. SECDED ECC on TCM gives DC ≈ 99% (single-bit faults always detected, double-bit faults always detected, only 3+ bit faults missed — astronomically rare). Lockstep CPU gives DC ≈ 99% for combinational logic.
+
+Combining them with the rest of the system: bus parity (~95% DC), peripheral ECC (~99%), watchdog (~95%), voltage monitor (~99%) — the cumulative coverage approaches 99.9% of the silicon-level fault tree. That's the threshold for ASIL-D.
+
+The remaining ~0.1% is what makes the system not 100% safe — and is why safety arguments invoke redundancy, defense-in-depth, and human oversight in the wider system.
+
+## Cache error handling specifics
+
+L1 I-cache errors are almost always handled by re-fetch: the line is invalidated, the next instruction fetch goes to L2 or external memory, and the new line is loaded with fresh ECC. No software action needed — the hardware does this automatically. A counter increments so software can detect a high-frequency error pattern indicating a real hardware problem.
+
+L1 D-cache errors are more complex. If the cache line is *clean* (matches external memory), re-fetch is safe — same as I-cache. If the line is *dirty* (modified in cache but not yet written back), the only authoritative copy is in cache; an uncorrectable error means the data is lost. This is reported as a synchronous data abort if the access is in-flight, or as an asynchronous abort if the line was being silently written back.
+
+Cortex-R parts often run with "write-through" caching for safety-critical data — the cache mirrors memory on every write, so dirty lines don't accumulate. This trades performance for fault tolerance and is configurable per MPU region.
+
+## Field telemetry
+
+Production safety-critical systems collect ECC error counts and ship them back to the OEM:
+
+- Correctable error counters per memory region (TCM, cache, peripheral SRAM)
+- Time-since-last-correctable
+- Histogram of error addresses (clustering indicates a specific bad cell)
+- Last uncorrectable error details (timestamp, address, syndrome, fault type)
+
+Aggregated across a fleet, this data drives field-failure-rate models and triggers proactive replacement before in-field failures occur. The ECC infrastructure on the silicon is the data source.
+
+<Callout type="tip">
+Don't disable ECC even if you don't read the counters. Disabled ECC means single-bit errors silently corrupt data; the system functions until the next critical computation, at which point it produces wrong results without warning. Always-on ECC with periodic counter sampling is the standard practice.
+</Callout>
+
+## Comparison to Cortex-M and Cortex-A
+
+Cortex-M parts almost universally lack ECC on their SRAM. Caches, when present, may have parity but not ECC. Cortex-M relies on software techniques (CRC checking, replicated computation, watchdog) for fault tolerance — adequate for low-criticality applications but insufficient for ASIL-D.
+
+Cortex-A server-class parts (Neoverse) often have ECC on caches and DRAM via the memory controller, plus error-reporting through the System Memory Management Unit. But the user-facing software model is different — kernel handles uncorrected errors as a memory corruption event (MCE on x86 terminology), often by killing the affected process or panicking. Real-time error response isn't the design point.
+
+Cortex-R is the only profile where ECC is integral to the architecture, where lockstep is supported, and where software has direct access to inject and observe faults for diagnostic-coverage validation.
+
+## Cross-references
+
+- [MPU & TCM](/docs/cortex-r/mpu-tcm) — TCM ECC bring-up sequence
+- [R52 cluster modes](/docs/cortex-r/r52-cluster) — lockstep mode details
+- [Cortex-R ISA generations](/docs/cortex-r/isa-compare) — fault detection availability per core
+- [Cortex-R interrupts](/docs/cortex-r/interrupts) — abort exception routing
+- ISO 26262-5 — hardware fault metrics and diagnostic coverage
+- TI TMS570 Safety Manual — ESM and error injection procedures

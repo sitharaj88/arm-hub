@@ -1,0 +1,184 @@
+---
+title: ARMv7-R vs ARMv8-R — Cortex-R generations
+description: How the Cortex-R real-time family evolved — R4/R5/R7/R8 on ARMv7-R, the MPU-only memory model, lockstep, V-FIQ, and ARMv8-R's introduction of EL2 hypervisor and (with R82) AArch64 to the real-time domain.
+order: 1
+updated: 2026-05-13
+tags: [cortex-r, isa, armv7-r, armv8-r, r52, r82, real-time]
+---
+
+The Cortex-R line is ARM's real-time architecture profile — neither the deeply embedded simplicity of Cortex-M nor the rich virtual-memory capabilities of Cortex-A. Cortex-R cores ship in automotive ECUs, hard-disk and SSD controllers, baseband modems, industrial control, and avionics — places where the firmware must respond to events in deterministic time, tolerate hardware faults gracefully, and ideally be certifiable under safety standards (ISO 26262 ASIL-D, IEC 61508 SIL 3, DO-178C). The ISA is ARM, the toolchain is ARM, but the design priorities — bounded WCET, fault detection, predictable interrupt latency — drive a completely different set of architectural choices.
+
+This page walks through the two generations of Cortex-R: ARMv7-R (the Cortex-R4 through R8 family) and ARMv8-R (R52 and R82). The deltas are larger than a casual reading suggests — ARMv8-R adds an entire EL2 hypervisor for real-time partitioning, and R82 finally brings AArch64 to the real-time domain.
+
+<SpecSheet
+  title="Cortex-R generations at a glance"
+  specs={[
+    { label: 'ARMv7-R cores', value: 'R4 (2006), R5 (2010), R7 (2011), R8 (2013). Single-precision FPU, MPU, optional TCM, lockstep configurable.' },
+    { label: 'ARMv8-R cores', value: 'R52 (2016), R52+ (2020), R82 (2020). EL2 hypervisor, MPU (R52) or MMU (R82), AArch64 (R82).' },
+    { label: 'Memory model', value: 'ARMv7-R: MPU only (no MMU). ARMv8-R/R52: MPU with optional EL2 stage-2. R82: MMU baseline.' },
+    { label: 'Endianness', value: 'Both: BE-8 or LE configurable at boot via SCTLR.EE. Many automotive parts boot BE.' },
+    { label: 'TCM', value: 'Tightly-Coupled Memory. ATCM (instruction TCM at 0x00000000), BTCM (data TCM). 1-cycle access, no cache fill.' },
+    { label: 'Lockstep', value: 'Dual-core lockstep mode — two cores run identical instruction streams, comparator detects divergence. Available in dedicated SKUs.' },
+    { label: 'V-FIQ', value: 'Vectored FIQ — direct vector lookup for FIQ without software dispatch. R5+ feature.' },
+    { label: 'Cache', value: 'Optional L1 I/D with ECC. R5+ supports cache. Some R4 variants are cache-less.' },
+  ]}
+/>
+
+## What "real-time" means architecturally
+
+Cortex-A is designed around the assumption that virtual memory and large caches are available — performance comes from out-of-order execution overlapping the latency of memory accesses. Cortex-M is designed around the assumption that the application fits in a small flash and SRAM — performance comes from running tightly in cache or TCM. Cortex-R sits between: it has full ARM instruction set capabilities (including FPU and SIMD on the more capable members) but optimizes for *predictable latency*, not average throughput.
+
+Three architectural commitments distinguish Cortex-R:
+
+1. **Bounded interrupt latency.** The longest path from IRQ assertion to handler first instruction must be calculable and small (typically 20–30 cycles). Caches can be configured for deterministic behavior or bypassed via TCMs.
+2. **Fault detection.** Every storage element — caches, TCMs, register file, bus interfaces — supports ECC or parity. Faults are reported synchronously where possible.
+3. **Lockstep operation.** A "delayed lockstep" mode runs two CPU cores in parallel, comparing their outputs cycle-by-cycle, to detect single-event upsets that a single core couldn't catch.
+
+These pushed the ISA design choices: no out-of-order execution (cycle accounting becomes intractable), dual-issue but in-order (R5 onward), and a MPU rather than MMU (page faults destroy WCET).
+
+## ARMv7-R — the R4/R5/R7/R8 family
+
+ARMv7-R uses the same A32/T32 instruction set as ARMv7-A — `LDR`, `STR`, `B`, `BL`, NEON in some configurations, VFP. But the system architecture differs:
+
+- **No MMU.** Cortex-R has an MPU only. Memory access goes directly to physical addresses; the MPU enforces region-based permissions.
+- **Vector table at 0x00000000 or 0xFFFF0000.** Selectable via `SCTLR.V`. The "high vectors" option puts vectors above the address space limit so 32-bit programs don't accidentally fault into them.
+- **Tightly-Coupled Memory (TCM).** Two 64-128 KB banks (ATCM, BTCM) mapped at fixed addresses, single-cycle access, no cache fill required. Critical code and data live in TCM for deterministic latency.
+- **Optional cache.** L1 I-cache and D-cache (32 KB each typical), each with parity or SECDED ECC.
+- **AXI interface.** External memory through an AXI bus, with multiple master IDs for I-fetch, D-load, D-store, and TCM access.
+
+Five exception modes (USR, SVC, IRQ, FIQ, ABT, UND, SYS) with banked registers — same as ARMv7-A AArch32. CPSR holds the mode bits; mode transitions are automatic on exception entry.
+
+**Vectored FIQ (V-FIQ)** on R5+ lets the FIQ vector be looked up from a dedicated table rather than dispatched through software. The standard ARM FIQ vector at offset 0x1C is the most common entry; with V-FIQ enabled, the CPU instead jumps to `VBAR + index*4` where index is supplied by the external interrupt controller. This eliminates a dispatch read and saves ~10 cycles on IRQ entry.
+
+```asm
+@ Without V-FIQ: handler at offset 0x1C dispatches
+fiq_vector:
+    ldr  pc, =fiq_dispatch    @ unconditional jump
+fiq_dispatch:
+    @ read IRQ controller, branch to handler — ~10 cycles overhead
+
+@ With V-FIQ: handler jumps directly
+fiq_vector_table:
+    ldr  pc, =uart_fiq_handler
+    ldr  pc, =timer_fiq_handler
+    ldr  pc, =dma_fiq_handler
+    ...
+```
+
+## Cortex-R5 vs R7 vs R8
+
+Within ARMv7-R, the family stratifies by performance:
+
+| Core | Pipeline | Issue width | Notes |
+|------|----------|-------------|-------|
+| R4 | 8-stage | Single-issue | First Cortex-R. Many ECC-protected. Still in production. |
+| R5 | 8-stage | Dual-issue (limited) | TCM, ECC, lockstep configurable. Most common Cortex-R in field today. |
+| R7 | 11-stage | Dual-issue | Out-of-order completion in limited form. Used in baseband modems. |
+| R8 | 11-stage | Dual-issue | Up to 4 cores in cluster, GIC v2 capable. |
+
+R7 controversially introduced limited out-of-order execution (LSU completes out of order while ALU stays in-order) which complicates WCET analysis. Most automotive and aerospace customers stay on R5 for this reason — R5's in-order completion is much easier to analyze.
+
+## ARMv8-R — adding a hypervisor
+
+ARMv8-R, debuted in **Cortex-R52** (2016), keeps the ARMv8 AArch32 instruction set as the user-visible ISA (no AArch64) but adds:
+
+- **EL2 (Hypervisor exception level)** — for the first time on a Cortex-R. Lets a thin hypervisor partition the CPU between multiple real-time guests.
+- **Stage-2 MPU translation** — guest IPAs (intermediate physical addresses) translate to host PAs via a second-stage MPU table.
+- **GICv3 with affinity routing** — supports more than 8 cores and per-CPU interrupt steering.
+- **Up to 16 MPU regions per core** (vs 8 in older Cortex-R), with v8-M-style flexible region descriptors.
+
+The EL2 hypervisor is the headline feature: in safety-critical systems with mixed criticality, an ASIL-D component (engine control) and an ASIL-A component (HMI) can run in separate VMs on the same Cortex-R52 cluster, with the hypervisor enforcing strict resource and timing isolation. This was previously done with separate ECUs; the R52 lets you consolidate.
+
+## R52 cluster architecture
+
+A single R52 design block is a **cluster** of 1, 2, 3, or 4 cores. Each core can be configured at integration time as:
+
+- **Split mode** — independent core. Two cores in split mode = 2 separate execution contexts.
+- **Lockstep mode** — two cores tied together as one redundant pair, with a comparator detecting any divergence.
+
+A 4-core cluster can be `4 split` (4 independent), `2 split + 1 lockstep pair` (3 contexts, one redundant), or `2 lockstep pairs` (2 contexts, full redundancy). The choice is fixed at integration; software sees the configured topology via the cluster's CFGR register.
+
+R52 is detailed in the [R52 cluster modes page](/docs/cortex-r/r52-cluster).
+
+## Cortex-R82 — AArch64 in real-time
+
+The Cortex-R82 (2020) is the first Cortex-R to support **AArch64**. It also has an **MMU** rather than just an MPU, blurring the line with Cortex-A:
+
+- AArch64 execution state — full 64-bit GPRs, larger immediate ranges, NEON+
+- MMU with full virtual memory, but with deterministic-mode features:
+  - **MPU mode** — the MMU can be configured as a flat MPU for legacy R-class compatibility.
+  - **MMU mode** — full page-tables for Linux-class workloads.
+- Up to 8 cores in a cluster
+- L2 cache shared across the cluster
+- GIC v3 integrated
+
+R82's target market is enterprise SSD controllers and storage processors. These run Linux for the management plane but need real-time-grade firmware for the I/O hot path. Previously this required two separate chips (a Cortex-A for Linux + a Cortex-R for I/O). R82 lets the I/O firmware live in a dedicated core (or pair of cores) with MPU mode, while the management plane runs Linux on other cores with MMU mode — same chip, different memory model per partition.
+
+<Callout type="tip">
+R82 is the bridge between Cortex-R and Cortex-A. If your application can tolerate Linux's worst-case latency on some cores but needs deterministic firmware on others, R82 fits perfectly. If every core needs to be deterministic, R52 is the cleaner choice.
+</Callout>
+
+## Big-endian operation
+
+Real-time embedded code, especially automotive, frequently runs **big-endian** to match the wire format of CAN, FlexRay, and various industrial protocols. ARM cores support endianness as a runtime setting via `SCTLR.EE` (system control register, exception endianness):
+
+- `EE = 0` — little-endian data and instructions.
+- `EE = 1` — big-endian. On ARMv7-R this is **BE-8** (byte-invariant big-endian) — words are stored byte-swapped but instructions remain little-endian.
+
+Booting in big-endian requires the early startup code to detect the desired mode and set EE before any data access. Most BSP startup files include a configuration symbol that the linker sets based on the target endianness.
+
+Code compiled `-mbig-endian` and `-mlittle-endian` is not binary-compatible. Libraries must be built for the target endianness; mixing causes garbage data and silent corruption.
+
+## MPU model evolution
+
+Cortex-R MPUs grew alongside the architecture:
+
+| Family | Region count | Region size | Sub-regions |
+|--------|--------------|-------------|-------------|
+| R4/R5 | 8 or 12 | Power-of-two, ≥32 B, aligned | 8 per region |
+| R7/R8 | 12 or 16 | Power-of-two, aligned | 8 per region |
+| R52 | 16+ | Flexible (v8-style: any 32-byte aligned base + limit) | No sub-regions |
+| R82 | 32+ MPU regions or full MMU | Flexible | No sub-regions |
+
+The newer R52 / R82 MPU is v8-M / v8-A-style: arbitrary 32-byte-aligned base and limit, MAIR-based attribute indirection. This is much easier for RTOS task isolation than the power-of-two-aligned R4 model. Details in the [MPU & TCM page](/docs/cortex-r/mpu-tcm).
+
+## Lockstep configurations
+
+Lockstep operation is the headline safety feature of Cortex-R parts. Two cores run identical instruction streams; a comparator monitors their architectural outputs (register writes, memory accesses) cycle by cycle. Any difference triggers a fault.
+
+Two flavours:
+
+- **Synchronous lockstep** — the cores run in exact phase. Used in early Cortex-R designs.
+- **Delayed (offset) lockstep** — the second core runs 1.5 or 2 cycles behind the first. This catches common-cause failures (single-event upsets that would affect both cores simultaneously) by ensuring different physical state at any given instant.
+
+Modern automotive Cortex-R parts (TI TMS570, NXP S32R, ST SPC58) ship lockstep configurations by default for ASIL-D applications. The software sees a single core; the hardware does the duplicate execution invisibly. Lockstep diagnostics surface as a critical fault interrupt or a system-level error signal.
+
+<Callout type="warn">
+Lockstep does not protect against software bugs — both cores execute the same software, so a divide-by-zero bug bugs both equally. Lockstep protects against *hardware* faults (cosmic-ray bit flips, marginal logic, voltage glitches). For software fault tolerance, use diverse implementations (different algorithms or different compilers) on different cores.
+</Callout>
+
+## Comparing to Cortex-M and Cortex-A
+
+<CoreCompare
+  rows={[
+    { core: 'Cortex-M', notes: '1-2 cycle interrupt latency, NVIC tightly integrated, no MMU, simple privilege model. Up to 600 MHz on M7/M85. Single core typical.' },
+    { core: 'Cortex-R', notes: '15-30 cycle interrupt latency, MPU + TCM + cache, optional EL2 hypervisor (R52+), lockstep. Up to 1.5 GHz on R52. 1-4 cores in cluster.' },
+    { core: 'Cortex-A', notes: '50-200 cycle interrupt latency (deeper pipeline, OoO), full MMU, virtualization, branch predictor. Multi-GHz. 4-192 cores.' },
+  ]}
+/>
+
+## Tooling
+
+The compiler target for ARMv7-R is `-march=armv7-r -mfpu=vfpv3-d16` (or similar based on FPU presence). For R52, `-march=armv8-r`. For R82 in AArch64 mode, `-march=armv8-r+aarch64` (or use the dedicated R82 compiler target if your toolchain provides one).
+
+Real-time toolchains often differ from Linux toolchains: arm-none-eabi-gcc (bare-metal), arm-none-eabi-gcc for safety-certified workflows, IAR Embedded Workbench, and Green Hills Compiler are all common in production safety-critical Cortex-R use.
+
+## Cross-references
+
+- [R52 cluster modes](/docs/cortex-r/r52-cluster) — split vs lockstep within an R52 cluster
+- [MPU & TCM on Cortex-R](/docs/cortex-r/mpu-tcm) — the memory protection and tight-coupled memory model
+- [Cortex-R interrupts](/docs/cortex-r/interrupts) — VIC, VIM, GIC, and FIQ
+- [ECC & parity](/docs/cortex-r/ecc) — fault detection mechanisms
+- [Cortex-M vs Cortex-R vs Cortex-A](/docs/architecture/profile-compare) — when to pick which
+- ARM ARM (DDI 0568) — ARMv8-R architecture
+- ARM ARM (DDI 0406) — ARMv7-R architecture (in the v7-AR document)

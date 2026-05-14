@@ -1,0 +1,152 @@
+---
+title: ARM semihosting
+description: How semihosting lets a target Cortex-M call into the debug host for printf, file IO, and time — the SVC 0xAB trap, the operation table, host implementations, the latency cost, and when to use it instead of a UART.
+order: 16
+updated: 2026-05-13
+tags: [tools, semihosting, debugging, openocd, jlink, libc]
+---
+
+Semihosting is the trick that lets a microcontroller with no UART, no display, and no filesystem still do `printf`, open files, and read the wall clock — by tunneling those calls through the debug probe to the host PC. The mechanism is a single ARM-defined instruction (`BKPT 0xAB` on Thumb, `SVC 0x123456` on AArch64) that the CPU traps on, and a debugger that recognises the trap, reads a service number and parameter block out of CPU registers, performs the operation on the host, writes any reply back, and resumes execution.
+
+It is the canonical "first bring-up" output channel: before USART pins are routed, before clocks are configured, you can `printf("alive\n")` and see it land in the OpenOCD console. It is also, by a wide margin, the slowest output channel on the system. Every call pauses the CPU and round-trips through JTAG/SWD; even a short message takes hundreds of microseconds to milliseconds. This page is the working firmware engineer's guide to using semihosting deliberately — when it is the right tool, when [SWO ITM](/docs/tools/swo) is better, and how to make sure it never ships in production.
+
+<SpecSheet
+  title="Semihosting at a glance"
+  specs={[
+    { label: 'Specification', value: 'ARM Semihosting Specification (semihosting-spec / Arm IHI 0136 in newer editions)' },
+    { label: 'Trap instruction (Thumb)', value: 'BKPT 0xAB' },
+    { label: 'Trap instruction (ARM/A32)', value: 'SVC 0x123456' },
+    { label: 'Trap instruction (AArch64)', value: 'HLT 0xF000' },
+    { label: 'Parameter passing', value: 'r0 = operation number, r1 = pointer to argument block (or single argument)' },
+    { label: 'Return value', value: 'r0 (≥0 success, &lt;0 error or operation-defined)' },
+    { label: 'Latency (typical)', value: '100 µs – 5 ms per call depending on probe + transport (USB-HS J-Link fastest, USB-FS ST-Link slowest)' },
+    { label: 'Host support', value: 'OpenOCD, J-Link (RTT/SEGGER preferred), pyOCD, GDB built-in, Keil µVision, IAR' },
+    { label: 'Newlib hook', value: '_write/_read/_open/_close in libgloss (newlib-nano gloss layer)' },
+    { label: 'Production status', value: 'Must be disabled — a stray BKPT 0xAB with no debugger attached locks the CPU in HardFault' },
+  ]}
+/>
+
+## The trap mechanism
+
+When the CPU hits `BKPT 0xAB` it raises a debug event. With a probe attached the debugger has a choice: handle it as a normal breakpoint (single-step the user back into the program) or recognise the 0xAB immediate as the semihosting marker and service it. The probe reads `r0` to learn which operation, reads `r1` as either a scalar argument or a pointer to a parameter block in target RAM, performs the host-side work, optionally writes results back to that block, then sets the return value in `r0` and advances PC past the BKPT.
+
+The operation number space is sparse — there are about 30 documented operations covering streams (`SYS_WRITE0`, `SYS_WRITEC`, `SYS_READC`, `SYS_WRITE`, `SYS_READ`), files (`SYS_OPEN`, `SYS_CLOSE`, `SYS_SEEK`, `SYS_FLEN`, `SYS_TMPNAM`, `SYS_REMOVE`, `SYS_RENAME`), time (`SYS_TIME`, `SYS_CLOCK`, `SYS_TICKFREQ`, `SYS_ELAPSED`), process control (`SYS_EXIT`, `SYS_GET_CMDLINE`), and metadata (`SYS_ISERROR`, `SYS_ISTTY`, `SYS_HEAPINFO`).
+
+| Op | Number | r1 layout | Purpose |
+|----|--------|-----------|---------|
+| SYS_OPEN | 0x01 | pointer to `{filename, mode, name_len}` | Open file, returns handle |
+| SYS_CLOSE | 0x02 | pointer to `{handle}` | Close handle |
+| SYS_WRITEC | 0x03 | pointer to single char | Write one byte to stdout |
+| SYS_WRITE0 | 0x04 | pointer to NUL-terminated string | Write C string to stdout |
+| SYS_WRITE | 0x05 | pointer to `{handle, buffer, count}` | Write bytes |
+| SYS_READ | 0x06 | pointer to `{handle, buffer, count}` | Read bytes |
+| SYS_ISTTY | 0x09 | pointer to `{handle}` | Is handle a terminal? |
+| SYS_SEEK | 0x0A | pointer to `{handle, offset}` | Seek absolute |
+| SYS_FLEN | 0x0C | pointer to `{handle}` | File length |
+| SYS_CLOCK | 0x10 | none | Centiseconds since program start |
+| SYS_TIME | 0x11 | none | Unix epoch seconds (host clock) |
+| SYS_EXIT | 0x18 | reason code (or `{reason, exit_code}` on later spec) | Terminate program |
+| SYS_ELAPSED | 0x30 | pointer to `{low, high}` | 64-bit tick count |
+
+Handles 0, 1, 2 (stdin, stdout, stderr) are not preassigned in the original spec — you must `SYS_OPEN(":tt", mode)` with the special `:tt` filename to get a TTY handle. Most libgloss implementations open these three handles in their `_initialize` hook and cache them.
+
+## Wiring it into newlib
+
+GCC's standard C library on Cortex-M is newlib (or newlib-nano). Newlib provides the high layers of `printf`, `fopen`, `time` — but the low-level system calls (`_write`, `_read`, `_open`, `_close`, `_lseek`, `_fstat`, `_isatty`, `_kill`, `_getpid`, `_exit`, `_sbrk`, `_gettimeofday`) are *not* implemented; you provide them. The "libgloss" sub-library is a collection of canned implementations for various targets, and the `rdimon` flavour is the semihosting one.
+
+Linking against rdimon:
+
+```bash
+arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfloat-abi=hard \
+    --specs=rdimon.specs --specs=nano.specs \
+    main.c -o firmware.elf
+```
+
+`--specs=rdimon.specs` swaps in the semihosting syscall implementations. You must also initialise the host-side IO in `main` or in a constructor:
+
+```c
+extern void initialise_monitor_handles(void);  // from libgloss/arm/rdimon
+int main(void) {
+    initialise_monitor_handles();              // opens :tt for stdin/out/err
+    printf("Hello from %s\n", "Cortex-M4");
+    return 0;
+}
+```
+
+Without that call the file handle table is empty, the first `printf` calls `_write(1, ...)` with handle 1, and the host-side error handler responds with -1. Result: silent failure.
+
+<Callout type="tip">
+LLVM's picolibc takes a different approach — it provides `__attribute__((weak))` stubs for the syscalls, and you can override `_write` directly with your own semihosting call (or a UART write). For minimum-footprint builds picolibc + a 30-line `_write` is smaller than newlib-nano + rdimon and gives you the same `printf`.
+</Callout>
+
+## Host implementations
+
+Every modern debug probe supports semihosting; the implementation quality varies.
+
+**OpenOCD** — enable per-target with `arm semihosting enable` after `reset halt`. Output appears in the OpenOCD console (the telnet `:4444` port or the GDB-server message stream). OpenOCD must single-step the BKPT, walk the operation table in software, and resume — the round-trip is typically 1–5 ms over USB-FS. Add `arm semihosting_fileio enable` to redirect file ops to the local filesystem; otherwise file calls return -1.
+
+**J-Link (SEGGER)** — `monitor semihosting enable` from GDB. J-Link has two output modes: `ARM` (BKPT 0xAB) and `SEGGER` (their proprietary RTT). RTT is dramatically faster (>10 MB/s with a USB 3.0 probe and a 1 kB buffer) because the CPU never halts; it just writes to a ring buffer in RAM and the probe scrapes it asynchronously. If you have a J-Link, use RTT for high-rate output and reserve semihosting for the rare file IO case.
+
+**pyOCD** — `--semihosting` flag on the gdbserver command line. Implements the common operations; SYS_TIME returns wall-clock, SYS_CLOCK returns elapsed.
+
+**Keil µVision / IAR EWARM** — turn on in the project options. The IDE intercepts the BKPT, services it, and pushes characters to the IDE's console pane.
+
+A trap with no debugger attached results in an unhandled BKPT, which on Cortex-M raises a `DebugMonitor` fault or escalates to `HardFault` — the firmware locks up. This is why production builds **must not contain semihosting calls**.
+
+## Performance: why it is slow
+
+A single `SYS_WRITEC` on OpenOCD with an ST-Link/V2 over USB-FS takes roughly:
+
+| Phase | Time |
+|-------|------|
+| CPU executes BKPT, halts | &lt;1 µs |
+| Probe notices halt over SWD | 100–500 µs |
+| Probe reads r0, r1 over SWD | 200 µs |
+| Probe reads target memory for argument | 200 µs |
+| Host services operation (write to stdout) | 10–50 µs |
+| Probe resumes CPU | 100 µs |
+| **Total** | **~1 ms** |
+
+`printf("counter = %d\n", i)` from newlib expands to many `_write(1, char, 1)` calls (newlib's stdio buffers, then flushes byte-by-byte for a TTY) — so a 20-character line becomes 20 separate BKPTs and ~20 ms of CPU stall. In a control loop running at 1 kHz, a single printf will miss its deadline.
+
+This is why every production firmware enables [SWO ITM stimulus port output](/docs/tools/swo) for runtime logging and reserves semihosting for "one-time bring-up" usage.
+
+<Callout type="warn">
+Newlib's `printf` calls `malloc` the first time it formats — for the format buffer. On a stack-only build without a heap this faults. Use newlib-nano's `iprintf`/`siprintf` family (integer-only, no malloc) or override `_sbrk` to give the allocator a small static heap. The [linker scripts page](/docs/programming/linker-scripts) covers heap placement.
+</Callout>
+
+## Disabling for production
+
+Three layers of defence stop semihosting from leaking into a release build:
+
+1. **Compile-time guard** — wrap the call to `initialise_monitor_handles` and any direct semihosting use with `#ifdef DEBUG`. The library calls (`printf`) still link, but route to a `_write` stub that does nothing or writes to UART.
+
+2. **Linker-time swap** — release builds link against a different `_write` that goes to UART/SWO. The `--specs=nosys.specs` collection provides no-op stubs that just return -1.
+
+3. **Runtime BKPT handler** — install a DebugMonitor handler that, if no probe is attached, simply advances `PC` past the BKPT and ignores it. This is belt-and-braces; production firmware should not contain BKPT 0xAB instructions in the first place.
+
+A quick sanity check: `arm-none-eabi-objdump -d firmware.elf | grep "be ab"` — that byte pattern is `BKPT 0xAB`. If it returns nothing, you're clean.
+
+## When semihosting is the right tool
+
+It earns its place in a few specific scenarios:
+
+- **First-power bring-up**, before any clock or peripheral is configured. The CPU and the SWD pins are the only things you need; semihosting works at reset.
+- **Test harnesses** running under simulation (QEMU's `-semihosting` flag, ARM's Fast Models, Renode). The simulator is the "host" and can satisfy file IO, time, and SYS_EXIT for unit tests that need stdout.
+- **One-shot diagnostic dumps** — pulling a 200 kB log buffer from RAM to a file on the host via `SYS_WRITE` is fine; that's one batch operation, not a hot path.
+- **Coverage** — gcov emits `.gcda` files at program exit; with semihosting fileio enabled, those files land on the host filesystem directly from the target. See [profiling](/docs/tools/profiling) for the workflow.
+
+It is the wrong tool for:
+
+- Production logging — use UART, USB-CDC, or [SWO](/docs/tools/swo).
+- Any timing-critical code path — even with RTT-style optimisations, semihosting can introduce milliseconds of jitter.
+- Field debug — by definition you have no probe attached in the field. RTT or a flash-resident log buffer wins.
+
+## Cross-references
+
+- [SWO and ITM](/docs/tools/swo) — non-halting printf channel that is 100× faster.
+- [OpenOCD](/docs/tools/openocd) — semihosting commands and configuration.
+- [GDB](/docs/tools/gdb) — `monitor arm semihosting enable` from the GDB prompt.
+- [Toolchains](/docs/tools/toolchains) — `--specs=rdimon.specs` and `--specs=nosys.specs` selection.
+- ARM IHI 0136 "Semihosting for AArch32 and AArch64" — authoritative spec.
+- SEGGER RTT manual — the recommended alternative when a J-Link is available.

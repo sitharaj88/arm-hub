@@ -1,0 +1,225 @@
+---
+title: Motor field-oriented control
+description: Field-oriented control of three-phase motors on Cortex-M. Clarke and Park transforms, d-q frame PI controllers, SVPWM, position estimation (encoder or sensorless), 10–20 kHz loop on M4F/M7 with DSP extensions or vendor FOC libraries.
+order: 15
+updated: 2026-05-13
+tags: [systems, motor, foc, bldc, pmsm, svpwm, clarke, park, cortex-m4]
+---
+
+Field-Oriented Control is the dominant algorithm for high-performance control of permanent-magnet synchronous motors (PMSM) and brushless DC motors (BLDC). Unlike trapezoidal six-step commutation — which energises two of three phases at a time in a stepwise pattern — FOC continuously modulates all three phases with sinusoidal waveforms calculated to produce a magnetic field exactly perpendicular to the rotor's field, maximising torque per amp at every instant. The result is smoother rotation, lower torque ripple, higher efficiency at light load, and the ability to operate from zero to maximum speed with the same control law.
+
+The cost is computational. Where trapezoidal commutation runs comfortably on a Cortex-M0+ at 48 MHz, FOC needs the FPU, the DSP extensions, and 10–20 kHz of control-loop bandwidth — a Cortex-M4F at 100+ MHz minimum, ideally a G4 with CORDIC or an M7 with DP-FPU. This page walks through the math, the implementation, the position-estimation strategies, and the vendor libraries that compress all of it to a few hundred lines of source.
+
+<SpecSheet
+  title="FOC at a glance"
+  specs={[
+    { label: 'Control bandwidth', value: 'Current loop: 1–5 kHz. Speed loop: 50–500 Hz. Position loop: 5–50 Hz.' },
+    { label: 'Sample rate', value: '10–20 kHz typical; 50 kHz on high-end servo drives' },
+    { label: 'MCU class', value: 'Cortex-M4F minimum; Cortex-M7 or M55 for multi-axis or high-bandwidth' },
+    { label: 'Vendor libraries', value: 'ST X-CUBE-MCSDK, NXP MC-SDK, TI MotorWare, Microchip motorBench, Renesas MC-RX' },
+    { label: 'Sensor options', value: 'Incremental encoder, absolute encoder (SinCos, BiSS-C, EnDat), Hall sensors, sensorless observer' },
+    { label: 'Phase current sensing', value: 'Three shunts + amp, single shunt (DC bus), Hall current sensors (high-power)' },
+    { label: 'PWM topology', value: 'Three-phase complementary PWM with dead-time, 10-20 kHz switching (audible) or 20-32 kHz (ultrasonic)' },
+    { label: 'Modulation', value: 'Sinusoidal SPWM, Space Vector PWM (SVPWM, ~15% more bus utilisation), DPWM (loss-optimised)' },
+  ]}
+/>
+
+## The d-q frame intuition
+
+A three-phase motor has three windings, 120° apart. Currents flow in them sinusoidally as the rotor turns. The total magnetic field these currents produce — taken as a vector in the stator's two-dimensional plane — is what couples to the rotor's permanent magnet field.
+
+The challenge: in the stator frame (the frame fixed to the chassis), the three-phase currents oscillate at the electrical frequency. PID-controlling them requires a controller bandwidth higher than the highest electrical frequency — at 50 Hz mechanical rotation on an 8-pole motor, that's 200 Hz electrical, which means a current-loop bandwidth of >2 kHz. At 50 kHz electrical (some servo motors), it's impossible.
+
+FOC's insight: transform into a coordinate frame that **rotates with the rotor**. In that frame, what was sinusoidal becomes DC. The currents in the rotating frame are constant for a constant torque demand, and a simple PI controller with modest bandwidth can hold them.
+
+Two transforms get us there:
+
+1. **Clarke**: three-phase (a, b, c) → two-phase orthogonal (α, β), still in the stator frame.
+2. **Park**: (α, β) → (d, q), with d aligned with the rotor flux axis and q perpendicular.
+
+After Park, `Id` represents the field-producing component (which you generally want at zero in surface-PMSMs — any field along the rotor's own field just adds losses without torque), and `Iq` represents the torque-producing component (positive `Iq` produces forward torque, negative produces reverse).
+
+```
+   PI         Iq_setpoint  →  PI → Vq_command
+   ╲─ I_q_meas ─                              
+                                              → inv Park → SVPWM → 3-phase PWM
+   ╲─ I_d_meas ─                              
+   PI         Id_setpoint=0 →  PI → Vd_command
+                              ↑
+                              θ (rotor angle estimate)
+```
+
+The PI controllers in d-q frame see DC error signals, so even a 500 Hz-bandwidth controller delivers good performance.
+
+<BlockDiagram
+  title="Field-oriented control pipeline"
+  width={860}
+  height={360}
+  minWidth={760}
+  nodes={[
+    { id: 'iabc',   x: 40,  y: 44,  w: 140, h: 56, kind: 'sensor',   label: 'Phase current', detail: 'Ia · Ib · Ic' },
+    { id: 'clarke', x: 210, y: 44,  w: 120, h: 56, kind: 'periph',   label: 'Clarke', detail: 'abc → αβ' },
+    { id: 'park',   x: 360, y: 44,  w: 120, h: 56, kind: 'periph',   label: 'Park', detail: 'αβ → dq' },
+    { id: 'pid',    x: 510, y: 44,  w: 140, h: 56, kind: 'core',     label: 'PI current loops', detail: 'Id=0 · Iq=torque' },
+    { id: 'ipark',  x: 680, y: 44,  w: 130, h: 56, kind: 'periph',   label: 'Inverse Park', detail: 'dq → αβ' },
+    { id: 'svpwm',  x: 600, y: 142, w: 210, h: 56, kind: 'periph',   label: 'SVPWM', detail: 'Vα,Vβ → duties' },
+    { id: 'inv',    x: 600, y: 228, w: 210, h: 56, kind: 'periph',   label: '3-phase inverter', detail: '6× MOSFET · dead-time' },
+    { id: 'motor',  x: 310, y: 228, w: 210, h: 56, kind: 'external', label: 'PMSM / BLDC motor' },
+    { id: 'enc',    x: 40,  y: 228, w: 200, h: 56, kind: 'sensor',   label: 'Rotor angle θ', detail: 'encoder / observer' },
+  ]}
+  edges={[
+    { from: 'iabc',  to: 'clarke', label: 'Ia,Ib,Ic' },
+    { from: 'clarke',to: 'park',   label: 'Iα,Iβ' },
+    { from: 'park',  to: 'pid',    label: 'Id,Iq' },
+    { from: 'pid',   to: 'ipark',  label: 'Vd,Vq' },
+    { from: 'ipark', to: 'svpwm',  label: 'Vα,Vβ', tone: 'accent' },
+    { from: 'svpwm', to: 'inv',    label: 'duty[a,b,c]', tone: 'success' },
+    { from: 'inv',   to: 'motor',  arrow: 'both', tone: 'success' },
+    { from: 'enc',   to: 'park',   label: 'θ', tone: 'warning' },
+    { from: 'enc',   to: 'ipark',  label: 'θ', tone: 'warning' },
+    { from: 'motor', to: 'iabc',   label: 'current feedback', tone: 'muted' },
+  ]}
+  caption="Phase currents are sampled, rotated into the dq frame with the rotor angle, regulated to setpoint by two PI loops, rotated back to αβ, modulated by SVPWM, and switched onto the motor by the 3-phase inverter."
+/>
+
+## The transforms in detail
+
+### Clarke (a, b, c → α, β)
+
+```
+Iα = Ia
+Iβ = (Ia + 2·Ib) / √3
+```
+
+If you sense only two phases (cheap), the third comes from Kirchhoff's law: `Ia + Ib + Ic = 0`, so `Ic = -Ia - Ib`.
+
+### Park (α, β → d, q)
+
+```
+Id =  Iα·cos(θ) + Iβ·sin(θ)
+Iq = -Iα·sin(θ) + Iβ·cos(θ)
+```
+
+Where `θ` is the **rotor electrical angle** (the rotor mechanical angle multiplied by pole-pair count).
+
+### Inverse Park (Vd, Vq → Vα, Vβ)
+
+```
+Vα = Vd·cos(θ) - Vq·sin(θ)
+Vβ = Vd·sin(θ) + Vq·cos(θ)
+```
+
+### Inverse Clarke (Vα, Vβ → Va, Vb, Vc)
+
+```
+Va = Vα
+Vb = (-Vα + √3·Vβ) / 2
+Vc = (-Vα - √3·Vβ) / 2
+```
+
+Each transform is a 2×2 or 3×2 matrix-vector multiply with two sin/cos evaluations. On Cortex-M4F: ~30 cycles per transform with the DSP MAC; on STM32G4 with CORDIC: ~50 cycles for both sin/cos plus ~20 cycles for the matrix math. The full FOC current loop fits in 200-400 cycles, leaving plenty of headroom even at 20 kHz.
+
+## SVPWM
+
+Once you have `Vα` and `Vβ`, you need to generate the three PWM duty cycles that produce a voltage vector equal to (`Vα`, `Vβ`) on average over each switching period. Space Vector PWM is the standard approach.
+
+The three-phase inverter can produce 8 distinct switching states (each phase either high or low). Six of these correspond to non-zero voltage vectors (60° apart, forming a hexagon); two correspond to the zero vector (all three high or all three low — output is zero, motor sees average of supply). To produce a voltage vector at an arbitrary angle and magnitude inside the hexagon, dwell appropriate fractions of the period on the two adjacent active vectors and the zero vectors, with the dwell times computed to average to the target.
+
+SVPWM achieves ~15.5% more DC-bus utilisation than sinusoidal SPWM (which simply scales each phase's duty by the sinusoidal Vα or Vβ projection). For a 24 V battery driving a motor with √3-line back-EMF, SVPWM extends max speed by ~15% with no additional hardware cost.
+
+```c
+// Simplified SVPWM
+float v_alpha = ...;
+float v_beta  = ...;
+float v_a = v_alpha;
+float v_b = -0.5f * v_alpha + 0.866f * v_beta;
+float v_c = -0.5f * v_alpha - 0.866f * v_beta;
+float v_max = fmaxf(fmaxf(v_a, v_b), v_c);
+float v_min = fminf(fminf(v_a, v_b), v_c);
+float v_com = -0.5f * (v_max + v_min);   // zero-sequence injection
+duty_a = (v_a + v_com) / V_DC + 0.5f;
+duty_b = (v_b + v_com) / V_DC + 0.5f;
+duty_c = (v_c + v_com) / V_DC + 0.5f;
+```
+
+The "zero-sequence injection" is the trick that gives SVPWM its bus utilisation advantage — shifting all three phases by a common offset doesn't change line-to-line voltage but lets the phase duties stay within `[0, 1]`.
+
+## Rotor angle estimation
+
+FOC depends critically on knowing the rotor electrical angle `θ`. Three approaches:
+
+### Encoder
+
+Cleanest, most precise, most expensive. A magnetic absolute encoder (AS5x47, IC-Haus iC-MU) on the rotor shaft outputs angle directly via SPI or SSI. Resolution typically 12–14 bits per mechanical revolution. The MCU reads encoder, multiplies by pole-pair count, derives electrical angle.
+
+Latency: &lt;10 µs for an SPI read. Pole alignment ("electrical zero") is a one-time calibration — measure the encoder reading when the motor is at electrical zero with a known stimulus.
+
+### Hall sensors
+
+Three Hall-effect sensors on the stator, spaced 120°. Provide 6-bit-per-electrical-revolution resolution — enough for trapezoidal commutation but coarse for FOC. Used as a low-cost fallback or as a startup aid for sensorless schemes.
+
+### Sensorless — back-EMF observer
+
+Most common on cost-sensitive drone ESCs, white-goods compressors, and pumps. The MCU senses phase currents and voltages, models the motor electrically, and **estimates** the rotor angle from the back-EMF signature.
+
+Two prevailing observer designs:
+
+- **Sliding-Mode Observer (SMO).** Robust to model parameter uncertainty. Estimates back-EMF via a non-linear sliding manifold; angle extracted by `atan2(SMO_β, SMO_α)`. Computationally cheap, slightly noisy.
+- **Extended Kalman Filter / Luenberger Observer.** Higher precision; requires accurate motor parameter identification.
+
+Both fail at zero or very low speed (no back-EMF). The startup sequence uses an open-loop ramp ("blind start") — the controller spins the field at a guessed rate, the rotor hopefully catches it, and once the speed exceeds a threshold the observer takes over.
+
+For sensorless schemes that need true zero-speed control (cargo elevators, robot joints holding position), high-frequency injection methods are used — inject a small high-frequency signal on the d-axis, observe its impedance response, infer rotor angle from the saliency. Computationally expensive (extra demodulation), works on motors with rotor-saliency (most non-surface-PMSM).
+
+## Current sensing
+
+Three options, in increasing cost and decreasing common-mode noise:
+
+| Method | Cost | Accuracy | Notes |
+|--------|------|----------|-------|
+| Single shunt on DC bus | Lowest | Modest | Reconstruction algorithm needed; SVPWM patterns chosen for two valid sample windows per cycle |
+| Three shunts on phase low-side | Low | Good | Sampling synchronised to SVPWM low side (zero vector); ground-referenced |
+| Phase-current Hall sensors | High | Very good | Isolation, high bandwidth; used on industrial drives and EV powertrains |
+
+For ESCs and small motors, two- or three-shunt low-side sensing dominates. The shunt voltage (millivolts) is amplified by a current-sense amplifier with a gain of 20–50 V/V, fed to an ADC sampled at the PWM mid-point of the zero-vector slot (when all low-side switches are on, so the shunt sees the actual phase current with no high-side switching noise).
+
+Timing is critical: the ADC must sample within the few microseconds when the zero vector is active. STM32 timer-triggered ADC sampling handles this precisely.
+
+## Vendor FOC libraries
+
+Writing FOC from scratch is doable but error-prone. Most production designs use a vendor library:
+
+- **ST X-CUBE-MCSDK** — ST's Motor Control SDK, free, covers STM32F3/F4/G4/H7. GUI workbench generates a complete project; the runtime is well-optimised.
+- **NXP MC-SDK** — NXP's equivalent for Kinetis/LPC/i.MX RT.
+- **TI MotorWare** — TI's library, originally for C2000, also for Cortex-M Sitara-AM2 family.
+- **Microchip motorBench** — for SAM and dsPIC.
+- **Renesas MC-RX** — for the RX MCU family.
+
+All include the transforms, the SVPWM, the current PI loops, the speed/position loops, observer implementations, and configurators. Customisation usually means tuning gains, choosing the observer, and wiring in the application's torque/speed/position setpoint.
+
+A typical X-CUBE-MCSDK project on an STM32G474 with the integrated CORDIC achieves a 16 kHz current loop with the full FOC pipeline executing in ~3 µs per cycle.
+
+<Callout type="tip">
+For first FOC bring-up, use the vendor's evaluation board (ST P-NUCLEO-IHM03 for a G4-based reference, NXP FRDM-MC-LVMTR for an MC-SDK reference). The motor, gate driver, shunts, and dead-time are all already correct. You write only the application-layer code (torque setpoint, button-driven start/stop, telemetry). The motor-control core is proven.
+</Callout>
+
+## Multi-axis and advanced techniques
+
+Single-motor FOC fills a Cortex-M4F to ~10-15% load. Multi-axis (robot joints, industrial machine tools) runs N axes on one MCU; a 6-axis robot at 20 kHz per axis is feasible on STM32H7 or i.MX RT.
+
+Higher-end techniques:
+
+- **Maximum Torque per Ampere (MTPA).** For interior-PMSM motors with saliency, optimal Id is not zero — adds reluctance torque on top of magnet torque. MTPA looks up the optimal Id for a given Iq from a calibration table.
+- **Field weakening.** Above base speed, apply negative Id to oppose the rotor flux, lowering effective back-EMF and extending speed. Critical for EV traction motors.
+- **Model Predictive Control (MPC).** Replaces the PI controllers with a model-predictive optimiser that solves a constrained optimisation per cycle. Cortex-M7 or M55 territory; 5-50 kHz still feasible.
+- **Vibration cancellation.** Inject a counter-vibration current at known motor harmonic frequencies (cogging, ripple) to reduce torque ripple. Active in some servo and EV applications.
+
+## Cross-references
+
+- [Drone ESC](/docs/systems/drone-esc) — FOC in the small-motor case (AM32 FOC mode).
+- [EV charger power](/docs/systems/ev-charger-power) — adjacent power-electronics control problem.
+- [STM32 mainstream](/docs/vendors/stm32-mainstream) — G4 with CORDIC and HRTIM is the dominant FOC MCU.
+- [Cortex-M4](/docs/cortex-m/m4) — the core with the DSP extensions FOC uses.
+- ST AN4220 — "STM32F302 motor control firmware library architecture".
+- TI's "Field Oriented Control of 3-Phase AC-Motors" application note (SPRA588) — classic reference.
+- Mohan, Undeland, Robbins — "Power Electronics" textbook; chapters on PWM and motor control.

@@ -1,0 +1,219 @@
+---
+title: MPU on Cortex-M
+description: The Memory Protection Unit — how Cortex-M defines memory regions, what attributes they carry, how privileged and unprivileged code see different views, and the rules for stack overflow detection, RTOS task isolation, and execute-never enforcement.
+order: 19
+updated: 2026-05-13
+tags: [cortex-m, mpu, memory-protection, security, rtos]
+---
+
+The MPU is the Cortex-M's lightweight memory protection mechanism — a small table of regions, each with an address range, size, and a set of access permissions. It is *not* a full MMU: there is no virtual-to-physical translation, no page tables, no TLB. Every region maps a contiguous slice of the 4 GB physical address space, and the MPU's only job is to check whether the current access is allowed and to raise a fault if it isn't.
+
+This is plenty for what Cortex-M parts need: stack-overflow detection, RTOS task isolation, write-protecting flash from runaway pointer bugs, marking RAM as execute-never to defeat shellcode, and partitioning a single chip between privileged kernel and unprivileged application code. The MPU is also a hard requirement for security-certified profiles (IEC 61508, ISO 26262, Common Criteria) — without it, you can't make a credible argument that your bootloader and your application don't interfere.
+
+<SpecSheet
+  title="MPU at a glance"
+  specs={[
+    { label: 'Architecture variants', value: 'ARMv7-M MPU (M3, M4, M7) and ARMv8-M MPU (M23, M33, M55, M85) — different register layouts and region rules' },
+    { label: 'Number of regions', value: 'Typically 8 or 16 (implementation-defined). MPU_TYPE.DREGION gives the actual count at runtime' },
+    { label: 'Region size constraints (v7-M)', value: 'Power-of-two, ≥32 B, ≤4 GB, aligned to its own size' },
+    { label: 'Region size constraints (v8-M)', value: 'Any 32-byte-aligned start and limit — no power-of-two restriction' },
+    { label: 'Sub-regions (v7-M only)', value: '8 equal subregions per region, individually disable-able (for sizes ≥256 B)' },
+    { label: 'Default behaviour', value: 'MPU disabled at reset. Until enabled, all memory is accessible per the architectural default memory map' },
+    { label: 'Privilege levels', value: 'Two: privileged (handler mode + thread mode with CONTROL.nPRIV=0), unprivileged (thread mode with CONTROL.nPRIV=1)' },
+    { label: 'Fault on violation', value: 'MemManage fault (synchronous). Faulting address goes to MMFAR' },
+  ]}
+/>
+
+## What the MPU does — and doesn't
+
+The MPU compares every load and store address (and instruction fetch) against its region table. If the access falls inside a region, the region's permissions decide whether it's allowed. If the access falls *outside* every region, the architectural default applies — and, importantly, on Cortex-M the default is "allowed only if executing privileged; deny if unprivileged."
+
+The MPU does **not** translate addresses. A physical address stays a physical address. There is no per-process address space; every "process" (RTOS task) sees the same flat 32-bit memory map. What the MPU does provide is per-context permission masks: by reprogramming the region table at every context switch, an RTOS can give each task its own view of which memory it's allowed to touch.
+
+The MPU is not the same as TrustZone. TrustZone-M partitions memory between *secure* and *non-secure* worlds via the SAU/IDAU. The MPU partitions memory between *privileged* and *unprivileged* execution **within a single world**. Both can be present on an ARMv8-M part; they enforce orthogonal policies.
+
+## Region descriptors — ARMv7-M
+
+On ARMv7-M, each region is described by a triple of registers:
+
+<RegisterMap
+  name="MPU_RNR"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:8', name: '-', access: 'RO', reset: '0', description: 'Reserved.' },
+    { bits: '7:0', name: 'REGION', access: 'RW', reset: '0', description: 'Selects which region the next RBAR/RASR access targets. Write before reading or writing region descriptors.' },
+  ]}
+  caption="MPU_RNR — region number selector. Index for the indirect access pattern."
+/>
+
+<RegisterMap
+  name="MPU_RBAR"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:5', name: 'ADDR', access: 'RW', reset: '0', description: 'Region base address. Must be aligned to the region size (power of 2).' },
+    { bits: '4', name: 'VALID', access: 'WO', reset: '0', description: 'When 1, REGION field in this write overrides MPU_RNR. Lets you select + write base in a single MMIO.' },
+    { bits: '3:0', name: 'REGION', access: 'RW', reset: '0', description: 'Region number when VALID=1. Up to 16 regions.' },
+  ]}
+  caption="MPU_RBAR (v7-M) — region base address. The alignment requirement means a 1 KB region must start on a 1 KB boundary, a 64 KB region on a 64 KB boundary, etc."
+/>
+
+<RegisterMap
+  name="MPU_RASR"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:29', name: '-', access: 'RO', reset: '0', description: 'Reserved.' },
+    { bits: '28', name: 'XN', access: 'RW', reset: '0', description: 'Execute-never. When 1, instruction fetches from this region fault.' },
+    { bits: '27', name: '-', access: 'RO', reset: '0', description: 'Reserved.' },
+    { bits: '26:24', name: 'AP', access: 'RW', reset: '0', description: 'Access permissions: 000=no access, 001=priv RW, 010=priv RW/unpriv RO, 011=full access, 101=priv RO, 110=priv RO/unpriv RO.' },
+    { bits: '23:22', name: '-', access: 'RO', reset: '0', description: 'Reserved.' },
+    { bits: '21:19', name: 'TEX', access: 'RW', reset: '0', description: 'Type extension — selects cacheability/shareability scheme together with S/C/B.' },
+    { bits: '18', name: 'S', access: 'RW', reset: '0', description: 'Shareable.' },
+    { bits: '17', name: 'C', access: 'RW', reset: '0', description: 'Cacheable.' },
+    { bits: '16', name: 'B', access: 'RW', reset: '0', description: 'Bufferable.' },
+    { bits: '15:8', name: 'SRD', access: 'RW', reset: '0', description: 'Subregion disable — 8-bit mask. Each bit disables 1/8th of the region (only for sizes ≥256 B).' },
+    { bits: '7:6', name: '-', access: 'RO', reset: '0', description: 'Reserved.' },
+    { bits: '5:1', name: 'SIZE', access: 'RW', reset: '0', description: 'log2(size) - 1. SIZE=4 → 32 bytes, SIZE=7 → 256 bytes, SIZE=31 → 4 GB.' },
+    { bits: '0', name: 'ENABLE', access: 'RW', reset: '0', description: 'Region enable.' },
+  ]}
+  caption="MPU_RASR (v7-M) — attributes and size. Dense register; the CMSIS macros help you build sane values."
+/>
+
+Setting up a region on v7-M typically uses `ARM_MPU_SetRegion`:
+
+```c
+// 32 KB of RAM at 0x20000000, full access, no execute, normal memory
+ARM_MPU_SetRegion(
+    ARM_MPU_RBAR(0, 0x20000000),                       // region 0, base
+    ARM_MPU_RASR(1, ARM_MPU_AP_FULL, 0, 0, 1, 0, 0,    // XN=1, AP=full, normal mem
+                 ARM_MPU_REGION_SIZE_32KB));
+```
+
+## Region descriptors — ARMv8-M
+
+ARMv8-M reworked the region descriptors to be simpler and less restrictive:
+
+<RegisterMap
+  name="MPU_RBAR (v8-M)"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:5', name: 'BASE', access: 'RW', reset: '0', description: 'Region base address (32-byte aligned).' },
+    { bits: '4:3', name: 'SH', access: 'RW', reset: '0', description: 'Shareability: 00=non-shareable, 10=outer shareable, 11=inner shareable.' },
+    { bits: '2:1', name: 'AP', access: 'RW', reset: '0', description: '00=priv RW/unpriv no, 01=priv RW/unpriv RW, 10=priv RO/unpriv no, 11=priv RO/unpriv RO.' },
+    { bits: '0', name: 'XN', access: 'RW', reset: '0', description: 'Execute-never.' },
+  ]}
+  caption="MPU_RBAR on ARMv8-M — base address and core permissions in one register."
+/>
+
+<RegisterMap
+  name="MPU_RLAR (v8-M)"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:5', name: 'LIMIT', access: 'RW', reset: '0', description: 'Region limit address (inclusive, 32-byte aligned to 0x...0x1F).' },
+    { bits: '4:1', name: 'AttrIndx', access: 'RW', reset: '0', description: 'Index into MAIR0/MAIR1 — selects the memory-attribute set.' },
+    { bits: '0', name: 'EN', access: 'RW', reset: '0', description: 'Region enable.' },
+  ]}
+  caption="MPU_RLAR on ARMv8-M — region limit and attribute index."
+/>
+
+The v8-M MPU replaces v7-M's per-region cacheability bits with a *Memory Attribute Indirection Register* (MAIR0/MAIR1). You define up to 8 memory-attribute types in MAIR, then each region picks one by index. This separation makes it cheaper to change attributes for several regions consistently.
+
+Crucially, v8-M drops the power-of-two-and-aligned constraint. A region can start at any 32-byte boundary and extend to any 32-byte limit. This is the single biggest win for software: you can carve a 13 KB region (not a power of two) without burning an extra region descriptor for the awkward bit.
+
+<Callout type="tip">
+On v7-M, if you need a region that isn't a power of two, use sub-regions. A 64 KB region with `SRD = 0b11110000` disables the upper four 8 KB subregions, giving you a working 32 KB region inside a 64 KB descriptor slot. Subregions consume an MPU slot but no extra programming on context switch.
+</Callout>
+
+## Memory attributes — cacheability and shareability
+
+The MPU also tells the cache hierarchy how to treat each region. The most common combinations on a Cortex-M7 system:
+
+| Type | Use | TEX/C/B (v7-M) | MAIR (v8-M) |
+|------|-----|-----------------|-------------|
+| Normal memory, write-back cacheable | Flash, internal SRAM | TEX=001, C=1, B=1 | 0xFF (inner+outer WB) |
+| Normal, write-through cacheable | Read-mostly data | TEX=000, C=1, B=0 | 0xAA |
+| Normal, non-cacheable | DMA-shared buffers | TEX=001, C=0, B=0 | 0x44 |
+| Strongly ordered | System control regs | TEX=000, C=0, B=0 | 0x04 (device) |
+| Device | Peripherals | TEX=000, C=0, B=1 | 0x04 (device) |
+
+The most common bug here is forgetting to mark DMA buffers as **non-cacheable** on Cortex-M7. The CPU writes data through the cache, but DMA writes go straight to SRAM — the cache holds stale copies. Either invalidate the cache after DMA completes, or mark the buffer region as non-cacheable from the start.
+
+## The two privilege levels
+
+Cortex-M has exactly two privilege levels: privileged (handler mode + thread mode with `CONTROL.nPRIV = 0`) and unprivileged (thread mode with `CONTROL.nPRIV = 1`). Boot starts privileged. To drop privilege:
+
+```c
+__set_CONTROL(__get_CONTROL() | CONTROL_nPRIV_Msk);
+__ISB();  // ensure the change takes effect before the next instruction
+```
+
+Once unprivileged, the thread cannot:
+
+- Access privileged-only MPU regions (per AP bits)
+- Write to system registers like `SCB->VTOR`, `NVIC_ISER`, MPU registers
+- Execute `CPS` instructions to change PRIMASK/FAULTMASK
+- Access the SCB / NVIC / SysTick directly
+
+The thread can come back to privileged only via an exception (SVCall or any IRQ — handler mode is always privileged). RTOSes use this to enforce that task code cannot diddle kernel data: tasks run unprivileged, syscalls escalate via SVC, IRQs are kernel-trusted.
+
+## Stack overflow detection
+
+The headline MPU use-case in an RTOS is **stack overflow detection**. Each task's stack ends at a known address; place an MPU region just below the stack with "no access" attributes. If a function's stack frame grows beyond the boundary, the next push faults — MemManage — and the RTOS can pin the task or reset the system.
+
+For a 4 KB stack starting at `0x20010000` and growing down:
+
+```c
+// Region: 32 bytes at 0x2000FFE0 (just below the stack), no access
+ARM_MPU_SetRegion(
+    ARM_MPU_RBAR(0, 0x2000FFE0),
+    ARM_MPU_RASR(1, ARM_MPU_AP_NONE, 0, 0, 0, 0, 0,
+                 ARM_MPU_REGION_SIZE_32B));
+```
+
+When a task SP drops below `0x20010000`, the next push hits the guard region and faults synchronously. The fault address is in `MMFAR` — log it, then `vTaskDelete` the offender. Without this, stack overflow corrupts the next region of RAM silently and you get bizarre, late-binding crashes that are nearly impossible to debug.
+
+<Callout type="warn">
+The guard region must be at least 32 bytes (the minimum MPU region size). A single-word stack overflow may not hit a smaller guard. Also: place the guard region **above** any descending stack and **below** any ascending stack — direction matters and depends on the AAPCS for your core.
+</Callout>
+
+## RTOS task isolation
+
+Beyond stack overflow, the MPU lets you compartmentalize tasks. The typical pattern:
+
+1. At boot, set up static regions: flash as RO-execute, peripheral region as RW-no-execute, kernel data as priv-only RW.
+2. On context switch, swap in **per-task regions** that grant unprivileged R/W to the task's stack and any task-private data, plus shared regions for IPC.
+3. The kernel itself runs privileged and is not constrained by the task regions.
+
+FreeRTOS MPU support is gated on the `MPU` port. Tasks declared with `xTaskCreateRestricted` get a per-task region list; switching to that task reprograms the MPU. Zephyr's `USERSPACE` feature is the same idea, more fully baked. ThreadX has "modules" with MPU-enforced boundaries.
+
+The cost is a handful of MMIO writes per context switch — a few microseconds on a 100 MHz part. The benefit is that one buggy task cannot scribble over another task's stack, the kernel, or peripheral registers.
+
+## Common bugs
+
+**XN forgotten on RAM.** Without XN=1, RAM is executable. A buffer overflow that overwrites a function pointer can then jump into attacker-controlled bytes. Set XN on every RAM region; only flash should be executable.
+
+**Default-deny background.** If `MPU_CTRL.PRIVDEFENA = 1`, privileged code uses the architectural default memory map for any address not covered by a region. If = 0, even privileged code faults on uncovered regions. Pick deliberately; 1 is more permissive and easier to start with.
+
+**Region order matters.** Higher-numbered regions take priority. A "deny" region at index 1 overridden by an "allow" region at index 4 means the address is allowed. Counter-intuitive; sort guard regions to the high end of the table.
+
+**Forgot the DSB+ISB.** After programming the MPU and before relying on the new permissions, you need a memory barrier:
+
+```c
+MPU->CTRL = MPU_CTRL_ENABLE_Msk | MPU_CTRL_PRIVDEFENA_Msk;
+__DSB();
+__ISB();
+```
+
+Without these, the pipeline may have prefetched an instruction from a region whose permissions are about to change, and you'll get spurious faults.
+
+## Cross-references
+
+- [Exception model](/docs/architecture/exception-model) — MemManage fault details and stacking on fault
+- [TrustZone-M deep dive](/docs/architecture/trustzone-m) — orthogonal security partition (secure/non-secure)
+- [SCB — System Control Block](/docs/cortex-m/scb) — `SHCSR.MEMFAULTENA` enables MemManage as a distinct fault (instead of escalating to HardFault)
+- [Startup & vector table](/docs/programming/startup) — when to set up the MPU during boot
+- ARMv7-M ARM section B3.5 (MPU); ARMv8-M ARM section D1 (MPU)

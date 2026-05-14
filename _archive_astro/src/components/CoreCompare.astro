@@ -1,0 +1,104 @@
+---
+interface Core {
+  name: string;
+  arch: string;
+  pipeline?: string;
+  dmips?: string;
+  fpu?: string;
+  dsp?: boolean;
+  mpu?: boolean;
+  trustzone?: boolean;
+  helium?: boolean;
+  cache?: string;
+  intro?: string;
+  notes?: string;
+}
+
+interface Props { cores?: Core[]; class?: string }
+
+const defaultCores: Core[] = [
+  { name: 'Cortex-M0',  arch: 'ARMv6-M',  pipeline: '3-stage', dmips: '0.84/MHz',  fpu: '—', dsp: false, mpu: false, trustzone: false, helium: false, intro: 'Smallest, lowest-power Cortex-M. ~12k gates.', notes: 'Subset of Thumb-2.' },
+  { name: 'Cortex-M0+', arch: 'ARMv6-M',  pipeline: '2-stage', dmips: '0.95/MHz',  fpu: '—', dsp: false, mpu: true,  trustzone: false, helium: false, intro: 'Shorter pipeline, lower power, optional MPU.', notes: 'Single-cycle I/O port.' },
+  { name: 'Cortex-M3',  arch: 'ARMv7-M',  pipeline: '3-stage', dmips: '1.25/MHz',  fpu: '—', dsp: false, mpu: true,  trustzone: false, helium: false, intro: 'Full Thumb-2, hardware divide, bit-banding.', notes: 'The classic mid-range core.' },
+  { name: 'Cortex-M4',  arch: 'ARMv7E-M', pipeline: '3-stage', dmips: '1.25/MHz',  fpu: 'SP', dsp: true,  mpu: true,  trustzone: false, helium: false, intro: 'DSP extensions + optional single-precision FPU.', notes: 'Most popular general-purpose MCU core.' },
+  { name: 'Cortex-M7',  arch: 'ARMv7E-M', pipeline: '6-stage', dmips: '2.14/MHz',  fpu: 'SP/DP', dsp: true, mpu: true, trustzone: false, helium: false, cache: 'I+D', intro: 'Superscalar, caches, TCM. High performance.', notes: 'Used in i.MX RT, STM32H7.' },
+  { name: 'Cortex-M23', arch: 'ARMv8-M Baseline', pipeline: '2-stage', dmips: '0.99/MHz', fpu: '—', dsp: false, mpu: true, trustzone: true, helium: false, intro: 'M0+ successor with TrustZone.', notes: 'Secure & non-secure worlds.' },
+  { name: 'Cortex-M33', arch: 'ARMv8-M Mainline', pipeline: '3-stage', dmips: '1.50/MHz', fpu: 'SP', dsp: true, mpu: true, trustzone: true, helium: false, intro: 'M4 successor with TrustZone, optional FPU/DSP.', notes: 'Used in nRF53, STM32L5/U5.' },
+  { name: 'Cortex-M55', arch: 'ARMv8.1-M', pipeline: '4-stage', dmips: '1.6/MHz',  fpu: 'SP/DP', dsp: true, mpu: true, trustzone: true, helium: true, cache: 'I+D opt', intro: 'First Helium (MVE) core — ML at the edge.', notes: '4–5× DSP/ML uplift vs. M4.' },
+  { name: 'Cortex-M85', arch: 'ARMv8.1-M', pipeline: '7-stage', dmips: '3.0/MHz',  fpu: 'SP/DP', dsp: true, mpu: true, trustzone: true, helium: true, cache: 'I+D', intro: 'Highest-performing Cortex-M with PACBTI.', notes: 'i.MX RT700, Renesas RA8.' },
+];
+
+const { cores = defaultCores } = Astro.props;
+---
+<div class="not-prose my-8 overflow-hidden rounded-xl border border-line bg-surface/70 shadow-card">
+  <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-2 border-b border-line/70 bg-bg-subtle/70 px-4 py-3">
+    <div class="font-mono text-sm text-ink">Cortex-M lineup</div>
+    <div class="flex flex-wrap items-center gap-1 font-mono text-[0.7rem] text-ink-faint">
+      <span>sort:</span>
+      <button data-sort="name" class="rounded border border-line bg-surface px-1.5 py-0.5 hover:text-ink">name</button>
+      <button data-sort="dmips" class="rounded border border-line bg-surface px-1.5 py-0.5 hover:text-ink">dmips</button>
+      <button data-sort="arch" class="rounded border border-line bg-surface px-1.5 py-0.5 hover:text-ink">arch</button>
+    </div>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="w-full min-w-[920px] text-sm">
+      <thead class="text-left font-mono text-[0.7rem] uppercase tracking-wider text-ink-faint">
+        <tr>
+          <th class="px-4 py-2.5">Core</th>
+          <th class="px-2 py-2.5">Arch</th>
+          <th class="px-2 py-2.5">Pipe</th>
+          <th class="px-2 py-2.5">DMIPS</th>
+          <th class="px-2 py-2.5">FPU</th>
+          <th class="px-2 py-2.5">DSP</th>
+          <th class="px-2 py-2.5">MPU</th>
+          <th class="px-2 py-2.5">TZ</th>
+          <th class="px-2 py-2.5">MVE</th>
+          <th class="px-4 py-2.5">Notes</th>
+        </tr>
+      </thead>
+      <tbody id="cc-body" class="divide-y divide-line/60">
+        {cores.map((c) => (
+          <tr
+            data-name={c.name}
+            data-arch={c.arch}
+            data-dmips={parseFloat((c.dmips ?? '0').toString())}
+            class="hover:bg-surface/60 transition"
+          >
+            <td class="px-4 py-2.5 font-mono text-ink">{c.name}</td>
+            <td class="px-2 py-2.5 font-mono text-xs text-ink-muted">{c.arch}</td>
+            <td class="px-2 py-2.5 font-mono text-xs text-ink-muted">{c.pipeline ?? '—'}</td>
+            <td class="px-2 py-2.5 font-mono text-xs text-ink-muted">{c.dmips ?? '—'}</td>
+            <td class="px-2 py-2.5 font-mono text-xs text-ink-muted">{c.fpu ?? '—'}</td>
+            <td class="px-2 py-2.5">{c.dsp ? <span class="text-ok">●</span> : <span class="text-ink-faint">○</span>}</td>
+            <td class="px-2 py-2.5">{c.mpu ? <span class="text-ok">●</span> : <span class="text-ink-faint">○</span>}</td>
+            <td class="px-2 py-2.5">{c.trustzone ? <span class="text-ok">●</span> : <span class="text-ink-faint">○</span>}</td>
+            <td class="px-2 py-2.5">{c.helium ? <span class="text-accent">●</span> : <span class="text-ink-faint">○</span>}</td>
+            <td class="px-4 py-2.5 text-xs text-ink-muted">{c.notes ?? c.intro ?? ''}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  const body = document.getElementById('cc-body');
+  document.querySelectorAll<HTMLButtonElement>('[data-sort]').forEach((btn) => {
+    let dir = 1;
+    btn.addEventListener('click', () => {
+      if (!body) return;
+      const key = btn.dataset.sort!;
+      const rows = Array.from(body.querySelectorAll<HTMLTableRowElement>('tr'));
+      rows.sort((a, b) => {
+        const av = a.dataset[key] ?? '';
+        const bv = b.dataset[key] ?? '';
+        const an = parseFloat(av);
+        const bn = parseFloat(bv);
+        if (!Number.isNaN(an) && !Number.isNaN(bn)) return (an - bn) * dir;
+        return av.localeCompare(bv) * dir;
+      });
+      dir *= -1;
+      rows.forEach((r) => body.appendChild(r));
+    });
+  });
+</script>

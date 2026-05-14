@@ -1,0 +1,161 @@
+---
+title: big.LITTLE & DynamIQ
+description: ARM's asymmetric multiprocessing — the evolution from big.LITTLE cluster migration through global task scheduling to DynamIQ's mixed-core single-cluster design, with the Linux Energy Aware Scheduler tying it all together.
+order: 7
+updated: 2026-05-13
+tags: [cortex-a, big-little, dynamiq, eas, asymmetric, scheduler]
+---
+
+Phones can't run their cores at full speed for long — the battery dies, the silicon throttles, the user notices. The traditional answer was DVFS (dynamic voltage and frequency scaling) on a homogeneous CPU set: clock down when idle, clock up when busy. ARM's answer was bolder: ship *two* CPU designs in the same SoC — a small, efficient core for low-load work and a big, fast core for bursts — and let the scheduler migrate threads between them.
+
+That idea, **big.LITTLE**, launched with the Cortex-A15 (big) + Cortex-A7 (LITTLE) in 2013 and has driven every subsequent mobile and many automotive ARM SoCs. **DynamIQ**, introduced with Cortex-A75 in 2017, generalizes the idea: rather than two separate clusters, DynamIQ allows up to eight cores of mixed types in a single L3-shared cluster, with finer-grained voltage and frequency control. This page walks through the architecture, the scheduler decisions, and the engineering details that make it work.
+
+<SpecSheet
+  title="Asymmetric multiprocessing on Cortex-A"
+  specs={[
+    { label: 'Original big.LITTLE (2013)', value: 'Cortex-A15 + Cortex-A7. Two separate clusters with CCI-400 between. Same ISA, same memory model.' },
+    { label: 'Modern big.LITTLE', value: 'Cortex-A76 + Cortex-A55, A78 + A55, Cortex-X1 + A78 + A55 (tri-cluster). Mobile SoCs 2018+.' },
+    { label: 'DynamIQ (2017+)', value: 'Cortex-A75 onward. Mixed cores in one DSU cluster, shared L3, per-core DVFS, voltage rails per core type.' },
+    { label: 'Migration modes', value: 'Cluster migration (early), CPU migration (in-kernel switcher, IKS), Global Task Scheduling (GTS), Energy Aware Scheduling (EAS)' },
+    { label: 'L3 cache (DynamIQ)', value: '512 KB – 8 MB, shared across all cores in the DSU cluster' },
+    { label: 'Per-core capacity scaling', value: '/sys/devices/system/cpu/cpuN/cpu_capacity — scheduler-visible capacity number, typically 256–1024' },
+    { label: 'Linux EAS', value: 'Energy Aware Scheduler, mainline since 4.5. Uses an Energy Model from DT or sysfs.' },
+    { label: 'Examples', value: 'Snapdragon 8 Gen 2 (X3+A715+A510), MediaTek Dimensity 9300 (X4+A720), Apple M-series uses similar concept (P+E cores)' },
+  ]}
+/>
+
+## Why asymmetric
+
+The fundamental observation: the curve of "performance per watt" is not linear across CPU designs. A big out-of-order superscalar core delivers high IPC but at a cost — more transistors, more leakage, more switching capacitance per cycle. At low loads, a small in-order core delivers far better perf/W. Plot watts vs. compute throughput for a small core and a big core overlaid, and the small core's curve lies entirely below the big core's curve at low end and the big core dominates above some crossover point.
+
+A homogeneous design picks a single point on that surface. A heterogeneous design lets the OS pick the right core for each thread, dynamically. That's the big.LITTLE bet: matching threads to cores in real time can give 30–60% energy savings at iso-performance, or significantly better burst performance at iso-thermal-budget.
+
+## Generation 1: Cluster Migration
+
+The original big.LITTLE configuration migrated *entire clusters* at a time. When load was low, the big cluster was powered off and all threads ran on LITTLE. When load rose, the big cluster powered up, threads migrated en masse, and the LITTLE cluster powered down.
+
+This was simple but coarse. A single demanding thread would force the entire big cluster online — all four big cores — even though only one was needed. Energy was wasted on idle big cores.
+
+## Generation 2: IKS (In-Kernel Switcher)
+
+The In-Kernel Switcher paired each big core with a LITTLE core: vCPU 0 was either big-core 0 or LITTLE-core 0 depending on load, but never both simultaneously. The kernel saw the system as N "virtual CPUs," each backed by a pair, with the kernel choosing which physical core ran the work.
+
+Still coarse — you couldn't have one big core busy and three LITTLE cores busy at once. But it allowed per-vCPU power tuning.
+
+## Generation 3: Global Task Scheduling (GTS)
+
+GTS was the breakthrough. The kernel sees *all* cores as schedulable resources — 8 cores on a 4+4 system — and chooses for each thread which to run. Threads can be on big and LITTLE simultaneously. The scheduler uses per-CPU load-tracking signals (PELT — Per-Entity Load Tracking, mainline since 3.8) to decide.
+
+GTS exposed the missing piece: the scheduler didn't natively understand that different cores have different *capacities*. A 50%-loaded big core might be doing more work than a 100%-loaded LITTLE core. The scheduler would balance load (say, by RT runqueue length or by raw cycles) without understanding this — leading to suboptimal placement.
+
+## Generation 4: EAS (Energy Aware Scheduling)
+
+EAS, mainline since Linux 4.5 and now baseline for all mobile ARM Linux kernels, gives the scheduler an **Energy Model** of the SoC. The energy model is a table per performance domain (clock-domain typically maps to a CPU type) of `(frequency, capacity, power)` tuples. The scheduler can answer: "if I place this task on this CPU at this frequency, what's the cost in watts?"
+
+```c
+// Simplified EAS placement logic
+for_each_candidate_cpu(cpu) {
+    cap = get_cpu_capacity(cpu);
+    new_util = task_util + cpu_util(cpu);
+    if (new_util > cap) continue;            // exceeds capacity
+    new_freq = required_frequency(new_util, cap);
+    energy = energy_model[cpu][new_freq];
+    if (energy < best_energy) {
+        best_cpu = cpu;
+        best_energy = energy;
+    }
+}
+return best_cpu;
+```
+
+The model is populated from device tree `energy-model` nodes or from sysfs at runtime. Vendor BSPs ship the table for their SoC; mainline Linux's `cpufreq-policy` and EAS framework consume it.
+
+The result: per-task placement that's energy-optimal. A latency-sensitive UI thread runs on the big core; a background sync thread runs on the LITTLE; CPU-bound benchmarks max all cores; the scheduler picks based on the cost-function rather than a heuristic.
+
+<Callout type="tip">
+EAS is opt-in — the `sched_energy_aware` feature flag must be enabled, and at least two performance domains must exist with different per-cap power curves. On a single-cluster homogeneous system EAS is bypassed automatically and CFS load-balancing falls back to standard behaviour.
+</Callout>
+
+## DynamIQ — one cluster, mixed cores
+
+DynamIQ replaces the two-cluster architecture with the **DSU (DynamIQ Shared Unit)**: a single cluster that holds up to eight cores of any mix, sharing an L3 cache and a snoop unit. The CPU types within a single DSU can be heterogeneous — for example, one Cortex-A78 plus three Cortex-A55s plus four more A55s in a single DSU.
+
+Key DynamIQ properties:
+
+- **Shared L3** — typically 1–4 MB, accessed at single-cluster latency by all cores. Avoids the cross-cluster snoop traffic that big.LITTLE had through CCI.
+- **Per-core voltage and frequency** — each core has its own DVFS domain. A single core can boost while others stay idle.
+- **Adaptive cache partitioning** — the L3 can be partitioned per core to limit interference (Cortex-A78+).
+- **Up to 8 cores per cluster** — the DSU-110 supports 8, DSU-120 supports 14, DSU-AE (automotive) supports 16.
+
+The Cortex-X line (X1, X2, X3, X4) is designed as the "biggest" core in a DynamIQ cluster, typically deployed as a 1+3+4 configuration (1×X-class, 3×big, 4×LITTLE). The Cortex-A510 and A520 are the modern LITTLE cores, designed in pairs that share a single L2 cache (one of the more interesting DynamIQ-era choices).
+
+## Per-CPU capacity
+
+Linux exposes per-CPU capacity to the scheduler via:
+
+```sh
+$ cat /sys/devices/system/cpu/cpu0/cpu_capacity
+256
+$ cat /sys/devices/system/cpu/cpu4/cpu_capacity
+1024
+```
+
+Capacity is a relative number scaled so the biggest core in the system has capacity 1024. A Cortex-A55 typically reports ~256 against a Cortex-X1's 1024. The scheduler uses capacity in three places:
+
+1. **Util tracking** — task utilization is normalized against capacity. A 100% utilized A55 is "256 units" of compute, equal to ~25% of an X1.
+2. **Misfit detection** — a task running on an A55 that would benefit from a bigger core is flagged "misfit" and considered for migration.
+3. **Frequency selection** — `schedutil` cpufreq governor uses task utilization to pick the lowest frequency that meets demand on the current CPU.
+
+Vendor kernels often tune these numbers based on workload measurements. Stock Android Common Kernel uses the values from DT.
+
+## DVFS — voltage/frequency tuning
+
+Each performance domain has a list of `<frequency, voltage>` operating points (OPPs). The cpufreq driver (`scmi-cpufreq` or `armada-cpufreq` or vendor-specific) talks to the SCMI firmware or the SoC's PMU to change OPP.
+
+A typical big core OPP table:
+
+| Frequency | Voltage | Power (mW) |
+|-----------|---------|------------|
+| 614 MHz   | 0.6 V   | 90 |
+| 1050 MHz  | 0.65 V  | 250 |
+| 1804 MHz  | 0.75 V  | 720 |
+| 2400 MHz  | 0.85 V  | 1450 |
+| 2900 MHz  | 1.00 V  | 3200 |
+
+The power-frequency curve is roughly cubic — doubling frequency more than doubles power. At the top OPP, the same chip can hit 3 W on one core; running at half frequency at half voltage, it draws 1/8 the power for half the compute — much better perf/W if you can afford the latency.
+
+EAS uses this curve to make decisions like: "running a task on the big core at 1050 MHz costs less than running it on the LITTLE core at 1800 MHz because the LITTLE core would be at its top OPP and burning voltage."
+
+## Frequency-invariant accounting
+
+A subtle but crucial detail: when EAS computes utilization, it does so in **frequency-invariant** units. A task that consumes 100% of one CPU running at 1 GHz is "scaled" against the CPU's maximum frequency — say 3 GHz — and tracked as 33% utilization. If the scheduler decides to migrate it to a CPU with capacity 1024 that's currently running at 1.5 GHz, it knows the task will need (33% × 1.5 GHz) / 3 GHz = 16.7% of that CPU at that frequency.
+
+Without this scaling, the scheduler would think the task "fits" on a small CPU because it only used 33% of its current CPU — but the small CPU might not have the absolute capacity.
+
+The kernel reads the current frequency from the cpufreq driver and divides by max_frequency to compute the scaling factor. Each PELT tick of util is multiplied by both the capacity ratio and the frequency ratio.
+
+<Callout type="warn">
+Frequency-invariant accounting depends on `arch_scale_freq_capacity()` being properly populated. On some older or custom ARM platforms the implementation is a stub returning 1024 (no scaling), which breaks EAS placement decisions. Verify with `cat /sys/kernel/debug/sched_features` for `FIE` and check that `/sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq` actually changes during DVFS transitions.
+</Callout>
+
+## Migration cost
+
+Moving a thread from one core to another has overhead — register state moves, cache state is lost (or re-pulled via coherency), TLB entries are cold. Within a DynamIQ cluster sharing L3, migration is cheap (~5–10 µs typically) because the working set is still in L3. Cross-cluster migration on traditional big.LITTLE is more expensive (~30–50 µs) due to having to re-fetch from the other cluster's L2.
+
+The scheduler tracks migration cost via the `sched_migration_cost_ns` tunable (default 500 µs on most systems). Tasks aren't migrated more often than this even if rebalancing would otherwise suggest it.
+
+## Examples — modern SoCs
+
+**Snapdragon 8 Gen 3**: 1×Cortex-X4 @ 3.3 GHz, 3×A720 @ 3.15 GHz, 2×A720 @ 2.96 GHz, 2×A520 @ 2.27 GHz. Three performance levels, all in one DynamIQ DSU-120 cluster.
+
+**MediaTek Dimensity 9300**: 1×X4, 3×X4 (smaller), 4×A720. *No LITTLE cores at all* — radical departure, with all 8 cores being relatively big. Tuned aggressively with DVFS to manage power.
+
+**Apple M-series (similar concept, different design)**: separates Performance (P) cores from Efficiency (E) cores in distinct clusters, with macOS's QoS classes acting as scheduling hints rather than kernel-driven EAS. The architectural ideas overlap.
+
+## Cross-references
+
+- [SMP & cache coherency](/docs/cortex-a/smp) — cross-cluster snoop traffic and CCI/CMN
+- [TLB & address translation](/docs/cortex-a/tlb) — TLB sizing differences across core types
+- [PMU & profiling](/docs/cortex-a/pmu) — measuring per-CPU utilization
+- [ISA across generations](/docs/cortex-a/isa-compare) — SVE availability differs across LITTLE and big cores
+- Linux kernel: `kernel/sched/fair.c`, `kernel/sched/sched.h`, `Documentation/scheduler/sched-energy.rst`

@@ -1,0 +1,186 @@
+---
+title: AAPCS & calling conventions
+description: How ARM functions pass arguments, return values, preserve registers, align the stack, and interact with FPU / vector state. Covers AAPCS32, AAPCS64, and the variations for VFP and Helium.
+order: 2
+updated: 2026-05-13
+tags: [architecture, abi, aapcs, calling-convention, vfp]
+---
+
+The Procedure Call Standard for the ARM Architecture — AAPCS — is the contract that lets a function written in C, C++, Rust, or hand-rolled assembly call any other function and have the registers, stack, and return value end up in the right places. Everything in your toolchain — the compiler, the linker, the debugger, even GDB's `bt` — relies on AAPCS being honoured. When you write inline assembly or write an ISR by hand, **you're the one who has to honour it**.
+
+This page walks through AAPCS32 (32-bit ARM, all Cortex-M and Cortex-R parts, ARMv7-A in AArch32 mode) and AAPCS64 (Cortex-A in AArch64 mode), the FPU variants, the special exception-entry shape on Cortex-M, and the places where the rules trip people up.
+
+<SpecSheet
+  title="AAPCS at a glance"
+  specs={[
+    { label: 'Full name', value: 'Procedure Call Standard for the ARM 32-bit / 64-bit Architecture' },
+    { label: 'Maintained by', value: 'ARM, public document IHI 0042 (AAPCS32) and IHI 0055 (AAPCS64)' },
+    { label: 'Stack alignment', value: '8-byte at public function entry (AAPCS32); 16-byte (AAPCS64)' },
+    { label: 'Argument registers', value: 'r0..r3 (AAPCS32); x0..x7 (AAPCS64); FPU args use s0..s15 or d0..d7' },
+    { label: 'Return value', value: 'r0 (32-bit), r0+r1 (64-bit), s0/d0 (float), pair in r0/r1 for small structs' },
+    { label: 'Caller-saved (scratch)', value: 'r0..r3, r12, lr (AAPCS32); x0..x18 (AAPCS64); s0..s15 (VFP)' },
+    { label: 'Callee-saved (preserved)', value: 'r4..r11 (AAPCS32); x19..x29 (AAPCS64); s16..s31 (VFP)' },
+    { label: 'Special-purpose', value: 'sp (r13), lr (r14), pc (r15); x29 = FP, x30 = LR, sp on AArch64' },
+  ]}
+/>
+
+## AAPCS32 — the 32-bit ARM/Thumb convention
+
+Every general-purpose register on a 32-bit ARM core has a *role* under AAPCS. Some are scratch (the caller saves them if it cares), some are preserved (the callee saves them if it uses them), some are absolutely sacred.
+
+| Register | Alt. name | Role | Preserved across call? |
+|----------|-----------|------|------------------------|
+| r0       | a1        | Argument 1 / return value | No (caller-saved) |
+| r1       | a2        | Argument 2 / return value upper half | No |
+| r2       | a3        | Argument 3 | No |
+| r3       | a4        | Argument 4 | No |
+| r4–r11   | v1–v8     | Local variables, registers | **Yes (callee-saved)** |
+| r12      | ip        | Intra-call scratch / linker veneer | No |
+| r13      | sp        | Stack pointer | Yes (must be the same on return) |
+| r14      | lr        | Link register (return address) | No across nested call |
+| r15      | pc        | Program counter | — |
+
+A function with five or more arguments passes the first four in `r0..r3` and the rest on the stack, pushed right-to-left so the leftmost overflow argument is at the lowest address. Wider-than-word types follow specific rules:
+
+- **64-bit integers** (`int64_t`, `long long`) take a *pair* of registers, starting from an even-numbered one (`r0+r1` or `r2+r3`), little-endian: low word first.
+- **Structs** smaller than four words are passed in registers; larger ones are passed by hidden pointer (the caller allocates space and passes the pointer in `r0`, shifting the real args by one).
+- **Float/double** depends on the [floating-point variant](#floating-point-variants).
+
+<Callout type="warn">
+Notice the parity constraint on 64-bit args: if `r0..r2` are used for the first two 32-bit args and a 64-bit follows, it goes in `r2+r3` (skipping r1 would break the natural pairing). If `r0..r1` are used and a 64-bit follows, it goes in `r2+r3` directly. This is why some `printf("%d %lld %d", a, b, c)` calls look mysterious in disassembly — they're not what you'd write by hand.
+</Callout>
+
+### Stack alignment
+
+The stack must be **8-byte aligned at every public function boundary**. "Public" means an externally callable function — between two local jumps you can drop alignment, but at any point where another translation unit could enter, the stack must be 8-byte aligned.
+
+GCC enforces this with `push {r4, lr}` (8 bytes — even and aligned) rather than `push {lr}` (4 bytes — leaves SP misaligned). On Cortex-M3 and later, `STKALIGN` in `SCB->CCR` controls whether the hardware *also* aligns SP to 8 bytes on exception entry; it's set by default and you should leave it set.
+
+The 8-byte requirement exists because AAPCS allows 64-bit values (LDRD/STRD on M3+) and a misaligned LDRD aborts on some implementations. AAPCS64 raises this to 16 bytes because AArch64 has 128-bit SIMD/FP operations.
+
+## AAPCS64 — the 64-bit AArch64 convention
+
+AAPCS64 looks very different at first glance but follows the same philosophy: argument registers, callee-saved registers, a frame pointer, and a strict alignment rule.
+
+| Register | Role | Preserved? |
+|----------|------|------------|
+| x0       | Argument 1 / return value (low) | No |
+| x1       | Argument 2 / return value (high) | No |
+| x2–x7    | Arguments 3–8 | No |
+| x8       | Indirect result location (for large struct returns) | No |
+| x9–x15   | Caller-saved (intra-procedure scratch) | No |
+| x16, x17 | IP0, IP1 — used by linker veneers, PLT | No |
+| x18      | Platform register — reserved, OS-specific | — |
+| x19–x28  | Callee-saved | **Yes** |
+| x29 (FP) | Frame pointer | Yes (chained) |
+| x30 (LR) | Link register | No across nested call |
+| sp       | Stack pointer | Yes |
+
+Note the doubling of argument slots (8 vs 4) — AAPCS64 was designed to keep most call sites within registers, since stack traffic on a big out-of-order Cortex-A is expensive relative to a register-bank rename. The frame pointer (x29) chains through stack frames; AArch64 linkers and debuggers walk these chains to unwind, which is faster than DWARF unwinding for most stacks.
+
+Stack must be 16-byte aligned at every function entry; the AAPCS rule is even stricter than AAPCS32's 8.
+
+## Floating-point variants
+
+AAPCS has *two* sub-conventions for floating-point, controlled by the `-mfloat-abi` GCC flag.
+
+<CoreCompare
+  rows={[
+    { core: '-mfloat-abi=soft', notes: 'No FPU. Float args travel in r0..r3 like ints. Calls to libgcc helpers (__aeabi_fadd, __aeabi_dmul, ...) implement IEEE math in software. Largest object code, slowest.' },
+    { core: '-mfloat-abi=softfp', notes: 'FPU present (hardware does the arithmetic) but the ABI still passes floats in core registers. Slow callsite shuffling (vmov), but binary-compatible with soft-float libraries.' },
+    { core: '-mfloat-abi=hard', notes: 'FPU present and floats are passed in VFP registers s0..s15 / d0..d7. Fastest call sites; libraries must be built with matching ABI. Used everywhere on modern Cortex-M4F/M7/M33 builds.' },
+  ]}
+/>
+
+Under hard-float AAPCS:
+
+- **Scalar floats** (`float`) go in `s0`, `s1`, ... up to `s15`.
+- **Scalar doubles** (`double`) go in `d0`, `d1`, ... up to `d7` (which alias `s0..s15`).
+- **VFP vectors** (NEON `float32x4_t`, Helium `int16x8_t`) go in `q0..q7` (Cortex-A NEON) or `Q0..Q7` (Helium on M55/M85).
+- **`s16..s31`** are callee-saved if used.
+
+A function declared `void f(int, float, int, float)` actually consumes `r0`, `s0`, `r1`, `s1` under hard-float — the integer and float "slots" advance independently. This is a frequent source of confusion when reading disassembly of mixed-type functions.
+
+<Callout type="tip">
+ABI mismatch is a classic linker error. If you compile `libfoo.a` with `-mfloat-abi=soft` and your application with `-mfloat-abi=hard`, GCC will emit `Error: bar.o uses VFP register arguments, foo.a does not`. The fix is to rebuild the library with the matching float ABI — or, if it's a vendor blob, use `-mfloat-abi=softfp` to get hardware math with the compatible call site.
+</Callout>
+
+## Special: Cortex-M exception frame
+
+Cortex-M parts have a hardware-defined "exception frame" — a structured layout the CPU pushes on the stack when an exception is taken, *before* the handler runs. This frame is AAPCS-compatible by design: a handler is a normal C function, and the registers it expects are exactly the ones the hardware has stashed.
+
+The basic 8-word frame, low-address-first:
+
+```
+SP +  0:  r0
+SP +  4:  r1
+SP +  8:  r2
+SP + 12:  r3
+SP + 16:  r12
+SP + 20:  lr   (return address from interrupted code)
+SP + 24:  pc   (interrupted PC)
+SP + 28:  xPSR (program status with stacked IPSR)
+```
+
+<ProtocolFrame
+  title="Cortex-M basic exception stack frame — 8 words pushed by hardware"
+  fields={[
+    { name: 'r0', bits: 32, tone: 'accent' },
+    { name: 'r1', bits: 32, tone: 'accent' },
+    { name: 'r2', bits: 32, tone: 'accent' },
+    { name: 'r3', bits: 32, tone: 'accent' },
+    { name: 'r12', bits: 32, tone: 'primary' },
+    { name: 'LR', bits: 32, tone: 'highlight' },
+    { name: 'PC', bits: 32, tone: 'highlight' },
+    { name: 'xPSR', bits: 32, tone: 'success' },
+  ]}
+  caption="The hardware stacks exactly the AAPCS caller-saved set so a plain C function can serve as the handler. Callee-saved r4-r11 are the handler's responsibility, matching the regular function prologue contract."
+/>
+
+That's `r0..r3` and `r12` — the caller-saved registers under AAPCS. The hardware doesn't push `r4..r11` because by AAPCS the handler must save those itself if it uses them. The C compiler obliges: every interrupt handler that touches `r4..r11` generates the appropriate `push {r4, lr}` prologue.
+
+When the FPU is active, the CPU also stashes 17 more words (`s0..s15` plus FPSCR plus an alignment word) — the [extended frame](/docs/cortex-m/fpu). Lazy stacking defers this allocation until the handler actually uses the FPU; eager stacking does it always.
+
+The [stack-frame visualizer tool](/tools/stack-frame) decodes a raw exception dump into the AAPCS register names so you can read a HardFault postmortem at a glance.
+
+## Variadic functions
+
+`printf(const char *fmt, ...)` follows AAPCS too, but with a wrinkle: variadic arguments don't get the float-in-VFP-register treatment. Even under hard-float, `printf("%f", x)` passes `x` in `r0+r1` (a 64-bit value, since `float` promotes to `double` through `...`). This is why `va_arg(args, double)` in libc walks the integer registers and stack, not the VFP file.
+
+A practical consequence: if your printf-like function takes `float` instead of `double` via the `...`, you'll read garbage. Always use `double` for variadic floats — and *always* check that your `_write` or `_putchar` retarget honours the same convention.
+
+## Writing a hand-rolled function
+
+A naked ARM Thumb function that respects AAPCS looks like:
+
+```asm
+    .syntax unified
+    .thumb
+    .global my_add
+    .type my_add, %function
+my_add:
+    @ r0 = a, r1 = b on entry, per AAPCS arg passing
+    adds r0, r0, r1     @ r0 = a + b — also our return value
+    bx lr               @ return; pc <- lr
+```
+
+No prologue needed because we don't touch any callee-saved registers and we don't call anything (so `lr` is unchanged). Add a single nested call and the prologue/epilogue grow:
+
+```asm
+my_caller:
+    push {r4, lr}       @ preserve lr; align stack to 8 bytes
+    mov r4, r0          @ save arg 0 across the nested call
+    bl helper           @ helper may clobber r0..r3, r12, lr
+    add r0, r0, r4      @ combine results
+    pop {r4, pc}        @ restore + return (pc <- popped lr)
+```
+
+The `push {r4, lr}` and `pop {r4, pc}` pattern is the workhorse Thumb-2 epilogue — it pops 8 bytes (8-byte aligned), restores `r4`, and returns. Every C function on a Cortex-M with any nested call uses this shape.
+
+## Cross-references
+
+- [ARM ISA family](/docs/architecture/isa-family) — the bigger picture of Thumb vs Thumb-2 vs A64
+- [Exception model](/docs/architecture/exception-model) — how AAPCS interacts with mode switches
+- [FPU on Cortex-M](/docs/cortex-m/fpu) — the extended frame and lazy stacking
+- [Inline assembly](/docs/programming/inline-asm) — using GCC's `asm volatile` while staying AAPCS-correct
+- ARM document IHI 0042 (AAPCS32) and IHI 0055 (AAPCS64) — the canonical references

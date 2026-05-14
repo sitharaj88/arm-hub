@@ -1,0 +1,183 @@
+---
+title: USB Host & OTG
+description: Acting as a USB host on Cortex-M — enumeration, transfer scheduling, the controller stack from PHY up to class drivers, and the dual-role OTG mechanism that lets a single port flip between host and device based on the ID pin.
+order: 17
+updated: 2026-05-13
+tags: [peripherals, usb, host, otg, tinyusb]
+---
+
+Almost every embedded engineer has implemented a USB device — CDC, HID, MSC, DFU — but acting as a USB **host** is a different ask. The host is in charge of the bus: it provides VBUS, runs enumeration, allocates addresses, schedules transfers, polls interrupt endpoints, and manages bandwidth across all connected devices. On a Cortex-M with an OTG (On-The-Go) peripheral, you can also dual-role — be a device when plugged into a PC, and a host when a memory stick is plugged in. This page walks through what a host has to do, the controller stack, and the practical choice between vendor host stacks and TinyUSB.
+
+<SpecSheet
+  title="USB host on Cortex-M at a glance"
+  specs={[
+    { label: 'Host peripherals on STM32', value: 'OTG_FS (full-speed 12 Mbit/s) on most lines; OTG_HS (high-speed 480 Mbit/s with external PHY) on F4/F7/H7' },
+    { label: 'NXP', value: 'EHCI-compatible USBHS on i.MX RT, KHCI on Kinetis K (full-speed only)' },
+    { label: 'Nordic', value: 'USBD on nRF52840/53 — device only, no host mode' },
+    { label: 'Transfer types', value: 'Control, Bulk, Interrupt, Isochronous — host schedules each on the bus' },
+    { label: 'Host responsibilities', value: 'VBUS supply (with current limit), reset, enumeration, address assignment, configuration, transfer scheduling, NAK handling' },
+    { label: 'OTG role detection', value: 'ID pin grounded = host (A-device); floating = device (B-device); software dual-role via HNP' },
+    { label: 'Power budget', value: 'Default 100 mA per port at enumeration, up to 500 mA after SetConfiguration. Battery-Charging spec adds higher tiers.' },
+  ]}
+/>
+
+## What a USB host actually does
+
+When a device is plugged in, the host detects the attachment (D+ or D- pulled high via the device's 1.5 kΩ resistor — D+ for full/high-speed, D- for low-speed), waits for the line state to stabilize (~100 ms), and starts a sequence:
+
+1. **Reset** — drive both D+ and D- low for ≥10 ms. The device sees this and goes into its reset state, ready to listen on address 0.
+2. **Get Device Descriptor (first 8 bytes)** — control transfer to address 0, endpoint 0. The first 8 bytes are enough to learn the device's `bMaxPacketSize0` (8, 16, 32, or 64 bytes for control endpoint).
+3. **Reset again** — the spec mandates a second reset after first descriptor read.
+4. **Set Address** — assign a unique address (1..127). The device now listens at that address.
+5. **Get Device Descriptor (full 18 bytes)** — at the assigned address, learn idVendor, idProduct, bcdDevice, number of configurations.
+6. **Get Configuration Descriptor** — describes the configuration, its interfaces, and all endpoints. Typically 32–256 bytes.
+7. **Get String Descriptors** — optional human-readable manufacturer/product strings.
+8. **Set Configuration** — activate the chosen configuration. The device becomes ready for class-specific traffic.
+9. **Load class driver** — based on the device's class/subclass/protocol triplet, the host loads HID, MSC, CDC, etc. driver code.
+10. **Begin polling/transfers** — issue IN transactions on interrupt endpoints at the polling interval, schedule bulk transfers on demand.
+
+Enumeration takes 100–500 ms on a clean port. If the device misbehaves (NAKs an enumeration packet, returns garbage descriptors, doesn't respond to reset), the host either retries or declares the device unsupported.
+
+## Transfer scheduling
+
+The four USB transfer types each have their own scheduling rules and the host must implement all four:
+
+| Type | Latency | Bandwidth | Error handling | Use case |
+|------|---------|-----------|----------------|----------|
+| Control | Best-effort | 10% reserved | Retry on NAK | Enumeration, vendor commands |
+| Interrupt | Polled at interval | Reserved bandwidth | Retry on NAK | HID, GPIB-style status |
+| Bulk | Best-effort | Whatever's left | Retry on NAK indefinitely | Mass storage, CDC data |
+| Isochronous | Periodic, no retry | Reserved bandwidth | Drop on error | Audio, video, real-time data |
+
+On full-speed (12 Mbit/s) the bus runs 1 ms frames. The host divides each frame into transactions and schedules them by type:
+
+- Isochronous and interrupt endpoints are scheduled first (their bandwidth is reserved at SetConfiguration time).
+- Control transfers get up to 10% of the frame.
+- Bulk transfers fill the remaining bandwidth.
+
+On high-speed (480 Mbit/s) the bus runs 125 µs microframes, each holding multiple transactions.
+
+The hardware controller (the part on the chip) handles the bit-level transaction. Software (the host controller driver, HCD) provides the schedule.
+
+## STM32 OTG controller
+
+STM32's OTG IP is a Synopsys DesignWare core. It supports host mode, device mode, and OTG dual-role. Key architectural points:
+
+- **Channel-based host mode** — instead of a fixed transaction-list scheduler (like EHCI), the OTG core has 8–16 host channels. Each channel is programmed for one endpoint of one device; the controller cycles through active channels.
+- **Internal FIFOs** — RX FIFO and per-channel TX FIFOs in dedicated RAM (1.25 KB on FS, 4 KB on HS). Software writes to TX FIFOs, controller pulls and packetizes; controller writes to RX FIFO, software reads.
+- **Frame number / microframe number** registers — used for scheduling and isochronous time-stamping.
+- **VBUS sensing and ID pin** — for OTG dual-role detection.
+
+Programming the OTG controller from scratch is dense (the Synopsys USB databook is ~600 pages). Vendor host libraries — ST's `USBH_LIB` — abstract the channels behind a class-friendly API.
+
+```c
+// Conceptual: schedule a Bulk IN transfer on channel 2
+USB_OTG_HC2->HCCHAR = (max_pkt_size << 0)
+                    | (ep_num << 11)
+                    | (USB_OTG_HCCHAR_EPDIR)        // IN direction
+                    | (dev_addr << 22)
+                    | USB_OTG_HCCHAR_CHENA;
+// HCD then waits for HCINT.XFRC (transfer complete) or HCINT.NAK
+```
+
+## OTG dual-role
+
+The On-The-Go specification extends USB so a single port can be either host or device. The hardware mechanism is the **ID pin** in the 5-pin Micro-AB or USB-C connector:
+
+- **ID grounded** (Type-A plug) — the device is the "default host" (A-device).
+- **ID floating** (Type-B plug) — the device is the "default peripheral" (B-device).
+
+For USB-C, the equivalent mechanism is CC-pin resistor sensing. Whoever pulls down on CC with Rd is the sink (device); whoever advertises Rp is the source (host).
+
+Two protocols extend dual-role beyond the static ID pin:
+
+- **SRP** (Session Request Protocol) — a B-device that finds itself plugged into a port where VBUS is off can request the A-device turn VBUS on. Saves power in OTG-to-OTG setups.
+- **HNP** (Host Negotiation Protocol) — the two devices can swap host/peripheral roles mid-session. Rarely implemented in practice; USB-C's PR_Swap message replaces it.
+
+Real-world OTG embedded systems mostly use the static ID-pin model: a header on the board with a strap selects "host mode" or "device mode" at boot.
+
+<Callout type="warn">
+VBUS sourcing is the safety-critical part of host mode. You're delivering 5 V at up to 500 mA (or 900 mA, or 1.5 A in BC1.2). A bad cable or a faulty device can short VBUS to ground; you must have hardware over-current protection (e.g. TPS2051 or similar) that trips before your buck converter overheats. Software detection is too slow.
+</Callout>
+
+## The USB stack layers
+
+A complete USB host implementation has layers from PHY up to application:
+
+| Layer | Function | Typical implementation |
+|-------|----------|------------------------|
+| PHY | Differential transceiver, bit encoding | On-chip (FS) or external ULPI (HS) |
+| Link / TI | SOF, packet framing, CRC | In silicon (controller IP) |
+| Host controller | Scheduling, channel state machines | In silicon (OTG core) |
+| HCD (Host Controller Driver) | Software shim — programs the channels | Vendor library (`USBH_LL_*`) |
+| USB core stack | Enumeration, descriptor parsing, generic class API | Vendor library (`USBH_Core`) |
+| Class drivers | HID, MSC, CDC, Audio, Hub, etc. | Per-class (`USBH_HID`, `USBH_MSC`...) |
+| Application | File I/O, key events, audio playback | Your code |
+
+The "stack" is the middle four layers. Open-source options include:
+
+- **TinyUSB** — modern, MIT-licensed, supports host and device, single codebase across STM32, NXP, RP2040, ESP32-S2/S3. Host-side support is newer; HID and MSC are mature.
+- **STM32 USB Host Library** — vendor-supplied, well-integrated with CubeMX, supports HID, MSC, CDC, Audio, MTP. License is ST's permissive embedded license.
+- **FreeBSD USB** ports — used by some commercial vendors; not commonly seen in MCU work.
+- **Embedded XCore stacks** — proprietary commercial options (Embedded Studio, Express Logic) — used in safety-certified contexts.
+
+For a new design, TinyUSB is the right starting point unless you specifically need a class that only the vendor stack supports (e.g. STM32's MTP host).
+
+## Common host scenarios
+
+### USB mass-storage host
+
+A read/write FAT32 USB-stick interface. The class driver issues SCSI READ_10 / WRITE_10 commands over Bulk-only transport. Above that sits a block-device layer feeding FATFS. Throughput on FS is ~1 MB/s; on HS, up to 35 MB/s if the stick can keep up.
+
+### USB-CDC host (USB-to-serial)
+
+Talk to an FTDI or CP210x USB-UART adapter from an MCU. Requires the **CDC ACM** class driver. ST's library supports this; TinyUSB's CDC host is functional but less polished.
+
+### USB HID host
+
+Read keyboard/mouse/gamepad events. The HID class driver parses the report descriptor and exposes a queue of input reports. Useful for kiosk machines, point-of-sale, industrial input panels.
+
+### USB hub
+
+A USB host that supports hubs lets one host port fan out to multiple devices. The host driver has to:
+
+1. Recognize the hub class descriptor.
+2. Power up each downstream port (`SetPortFeature(PORT_POWER)`).
+3. Detect attachment on each port via the hub's status-change endpoint.
+4. Reset and enumerate the device behind each port.
+5. Track which device is behind which port for power-down sequencing.
+
+Hub support is non-trivial and often the reason a custom host driver exists.
+
+<Callout type="tip">
+For bring-up, plug a known-good USB stick into your host port and aim for "enumerated as device class 0x08 (MSC)" as the first milestone. If you can't enumerate a stick, debugging is hopeless against more complex devices. A USB protocol analyzer (Total Phase Beagle, Ellisys, Lecroy Voyager) is worth the cost for any host-side project — Wireshark + usbmon on a Linux box is the budget alternative.
+</Callout>
+
+## Resource cost
+
+Host mode is substantially heavier than device mode:
+
+| Resource | Device-only | Host (single class) | Host (multi-class with hub) |
+|----------|-------------|---------------------|-----------------------------|
+| Flash | 8–20 KB | 30–50 KB | 60–120 KB |
+| RAM | 2–4 KB | 8–16 KB | 20–40 KB |
+| CPU at peak transfer | 5–10% | 20–40% | 30–60% |
+
+On a small Cortex-M0+ part with 32 KB flash, host mode is impractical. Plan for at least an M4 with 256 KB flash for a USB-MSC host with FAT32.
+
+## Common pitfalls
+
+- **VBUS supplied from the same 5 V rail that runs the MCU** — when a faulty device pulls VBUS down, the MCU browns out and resets. Use a separate power switch.
+- **Forgetting to reset after the first descriptor read** — the second reset is mandatory; skipping it works with some devices and silently fails on others.
+- **NAK storms** — bulk endpoints can NAK indefinitely. The host driver must time-bound bulk retries (e.g. 5 second timeout) or your software hangs forever on a sleepy device.
+- **Cache coherency on H7** — USB DMA buffers must be flushed/invalidated like any other DMA target. The USB libraries handle this on supported chips but only if you've called the right HAL init function.
+- **Insufficient TX FIFO sizing** — the OTG core's FIFO partition is software-configured. A misconfigured TX FIFO causes "endpoint disabled" interrupts mid-transfer.
+
+## Cross-references
+
+- [USB device](/docs/peripherals/usb) — device-mode operation, which shares the same controller
+- [Advanced DMA](/docs/peripherals/dma-advanced) — DMA model used by USB controllers
+- [Memory model](/docs/architecture/memory-model) — Device-memory attributes for USB FIFOs
+- USB 2.0 specification — the canonical reference
+- USB-IF class specifications — HID, MSC, CDC, Audio
+- TinyUSB project (https://github.com/hathach/tinyusb)

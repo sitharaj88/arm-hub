@@ -1,0 +1,248 @@
+---
+title: TrustZone-M deep dive
+description: How TrustZone for ARMv8-M partitions a Cortex-M chip into Secure and Non-secure worlds — SAU, IDAU, NSC regions, the SG gateway instruction, TT probes, SecureFault, and how TF-M ties it together.
+order: 15
+updated: 2026-05-13
+tags: [architecture, trustzone, security, cortex-m33, tf-m, secure-boot]
+---
+
+TrustZone for ARMv8-M is the security extension that partitions a Cortex-M chip into two isolated worlds — **Secure** and **Non-secure** — at the granularity of memory addresses, CPU state, and individual instructions. The headline use case is the same as TrustZone on Cortex-A: keep your cryptographic keys, secure boot machinery, and PSA root-of-trust in the Secure world, and run the (potentially buggy, potentially compromised) application in the Non-secure world. A Non-secure attacker who corrupts the application cannot read the keys or call arbitrary Secure code.
+
+What makes TrustZone-M different from TrustZone-A is that the partitioning is **per-access**, not per-mode. There is no Secure Monitor switching the CPU between worlds; the world is a property of the current code's address. Calls from Non-secure to Secure go through specially marked "gateway" instructions at NSC (Non-secure Callable) addresses. The transition is single-cycle and looks like a function call. This makes TrustZone-M usable for fine-grained, frequent security boundary crossings — exactly what microcontroller workloads need.
+
+<SpecSheet
+  title="TrustZone-M at a glance"
+  specs={[
+    { label: 'Cores', value: 'Cortex-M23, M33, M35P, M55, M85 (all optional — vendor decides)' },
+    { label: 'Security states', value: 'Secure (S), Non-secure (NS). Each combinable with Privileged or Unprivileged.' },
+    { label: 'Memory classification', value: 'Each address is one of: Secure, Non-secure Callable (NSC), Non-secure' },
+    { label: 'Attribution sources', value: 'IDAU (Implementation-Defined AU) — vendor-defined fixed; SAU (Security Attribution Unit) — software-programmable, up to 8 regions' },
+    { label: 'Gateway instruction', value: 'SG — Secure Gateway. Must be the first instruction at any NSC entry point. Mismatch raises SecureFault.' },
+    { label: 'Return instructions', value: 'BXNS, BLXNS — branch / branch-with-link to Non-secure. LR low bit indicates target world.' },
+    { label: 'Permission query', value: 'TT, TTT, TTA, TTAT — TT-Test instructions return SAU/IDAU classification of a pointer' },
+    { label: 'Banked state', value: 'MSP/PSP, MSPLIM/PSPLIM, PRIMASK, FAULTMASK, BASEPRI, CONTROL — Secure and Non-secure variants of each' },
+    { label: 'Stack on transition', value: 'Hardware saves Secure caller state in a special "Secure stack frame"; integrity tag on LR' },
+    { label: 'Fault', value: 'SecureFault — separate vector, fires on illegal transition, mismatched SG, integrity violation' },
+  ]}
+/>
+
+## The two worlds and the three address classes
+
+Every byte of address space on a TrustZone-M chip is classified into one of three buckets:
+
+- **Secure (S)** — accessible only by code running in the Secure state. Holds crypto keys, secure boot, TF-M services, the Secure stack(s).
+- **Non-secure (NS)** — accessible by both Secure and Non-secure code. Holds the application binary, application stacks, peripherals delegated to Non-secure (often USB, USART, GPIO, ADC).
+- **Non-secure Callable (NSC)** — a narrow band of Secure code that Non-secure code is allowed to *enter*. Every entry point in NSC must begin with the `SG` instruction.
+
+The classification is fixed by the IDAU (vendor logic) and refined by the SAU (software-programmable). At reset, all of memory is Secure; the secure boot code (running first, in the Secure world) sets up the SAU to delegate parts of memory to Non-secure for the application to use.
+
+```
+0x00000000 ┌──────────────────┐
+           │   Flash (S)      │  Secure firmware, root of trust
+           ├──────────────────┤
+           │   NSC veneers    │  Trampolines into Secure services
+           ├──────────────────┤
+           │   Flash (NS)     │  Application code
+           ├──────────────────┤  ...
+0x20000000 │   SRAM (S)       │  Secure stacks, key buffers
+           ├──────────────────┤
+           │   SRAM (NS)      │  Application heap, stacks
+           ├──────────────────┤  ...
+0x40000000 │   Peripherals    │  Each peripheral has a "security alias" bit
+           ├──────────────────┤      that decides which world owns it
+0xE0000000 │   PPB            │  Private Peripheral Bus — split: NVIC has
+           └──────────────────┘      Secure and Non-secure views
+```
+
+## The IDAU and SAU
+
+The **IDAU** (Implementation-Defined Attribution Unit) is a chunk of vendor silicon. It looks at the upper bits of an address and emits a fixed classification — "addresses 0x00000000..0x0FFFFFFF are Secure by default," for example. The IDAU is not software-programmable; the vendor wires it for a typical use case.
+
+The **SAU** (Security Attribution Unit) is software-programmable, layered on top of the IDAU. It has up to 8 regions; each region maps an address range to one of:
+- Non-secure (NS)
+- Non-secure Callable (NSC)
+- Secure (implied — anything not matched by SAU and not made Non-secure by IDAU)
+
+The effective classification for an address is the **most secure** of the IDAU and SAU verdicts. If the IDAU says "Non-secure" and the SAU says "Secure," the address is Secure. This means you can use the SAU to "demote" the IDAU's default (making Secure regions Non-secure) but you cannot promote (making Non-secure regions Secure beyond the IDAU's say).
+
+```c
+// At reset (Secure world boot):
+SAU->RNR  = 0;                          // region 0
+SAU->RBAR = 0x20040000;                 // base
+SAU->RLAR = 0x2007FFFF | SAU_RLAR_ENABLE_Msk;
+// Now 0x20040000..0x2007FFFF is Non-secure (per IDAU-Secure default
+// being overridden by SAU NSC=0, NSC bit off → Non-secure).
+
+SAU->RNR  = 1;
+SAU->RBAR = 0x0001F000;
+SAU->RLAR = 0x0001FFFF | SAU_RLAR_NSC_Msk | SAU_RLAR_ENABLE_Msk;
+// 0x0001F000..0x0001FFFF is NSC — Non-secure code may call into here
+// (via SG instructions at the start of each function).
+
+SAU->CTRL = SAU_CTRL_ENABLE_Msk;
+```
+
+## The SG instruction and NSC entries
+
+To call from Non-secure to Secure, Non-secure code executes a normal `BL <address>`. If `<address>` is in an NSC region, and if the byte at that address decodes to an `SG` instruction, the CPU transitions to Secure state and continues executing. If anything is off — wrong region class, no `SG`, or `SG` at a non-aligned address — the CPU raises a **SecureFault**.
+
+A Secure entry point exposed to Non-secure looks like:
+
+```c
+__attribute__((cmse_nonsecure_entry))
+int secure_sign_message(const uint8_t *msg, size_t len, uint8_t *sig) {
+    // ... cryptographic signing ...
+    return 0;
+}
+```
+
+The compiler emits a "veneer" at an NSC address:
+
+```asm
+secure_sign_message_veneer:
+    sg                              @ Secure Gateway — only valid NSC entry
+    b.w  secure_sign_message_impl   @ jump to the real function in Secure flash
+```
+
+GCC's `-mcmse` flag enables the CMSE (Cortex-M Security Extensions) intrinsics and arranges for veneers to land in a special `.gnu.sgstubs` section, which the linker places in NSC memory.
+
+<StateDiagram
+  title="Security state transitions on ARMv8-M"
+  width={780}
+  height={300}
+  states={[
+    { id: 'ns',  label: 'Non-secure',   x: 60,  y: 120, w: 200, h: 70, tone: 'muted',   initial: true },
+    { id: 'nsc', label: 'NSC veneer (SG)', x: 340, y: 120, w: 180, h: 70, tone: 'warning' },
+    { id: 's',   label: 'Secure',       x: 600, y: 120, w: 160, h: 70, tone: 'primary' },
+  ]}
+  transitions={[
+    { from: 'ns',  to: 'nsc', label: 'BL into NSC region' },
+    { from: 'nsc', to: 's',   label: 'SG executes (state switches to S)' },
+    { from: 's',   to: 'ns',  label: 'BXNS / BLXNS (LR bit 0 = 0)', curve: 80 },
+    { from: 'ns',  to: 'ns',  label: 'wrong target → SecureFault', curve: -60 },
+    { from: 's',   to: 's',   label: 'normal Secure call', curve: -50 },
+  ]}
+  caption="Non-secure code can only enter Secure through an SG instruction that sits at the very top of an NSC region; any other branch into Secure addresses raises SecureFault. The reverse path uses BXNS/BLXNS where the low bit of the target encodes the destination world."
+/>
+
+On the Non-secure side, you call the function as you would any other function — but you need a **header file** (built from the Secure-side binary with `arm-none-eabi-objcopy --strip-symbol=...`) that declares the prototypes. The Non-secure link sees the veneer addresses and calls them normally; the SG handles the world switch.
+
+## BXNS / BLXNS — calling Non-secure from Secure
+
+The reverse direction — Secure calls Non-secure (for instance, a Secure service that needs to call a Non-secure callback) — uses `BLXNS Rn` or `BXNS Rn`. The low bit of the target address indicates which world the target lives in: bit 0 = 1 means Thumb code in the current security state; bit 0 = 0 (combined with `BLXNS`) means the target is in the other state.
+
+```c
+typedef void (*ns_callback_t)(void) __attribute__((cmse_nonsecure_call));
+ns_callback_t cb = (ns_callback_t)cb_addr;  // cb_addr has bit 0 = 0
+cb();   // compiles to BLXNS — transitions to NS, runs callback, returns to S
+```
+
+Before BLXNS, the compiler clears all registers except those needed as arguments (to prevent leaking Secure data into Non-secure registers), and the hardware saves Secure caller state on the Secure stack with an integrity tag. After the callback returns (via a normal `BX LR` from Non-secure), the integrity tag is checked and Secure state is restored. If the tag mismatches (NS code corrupted LR), it's a SecureFault.
+
+<Callout type="warn">
+The argument-register clearing before BLXNS is critical. The CMSE intrinsics handle it automatically (`cmse_nonsecure_call` attribute), but if you hand-roll a Secure-to-Non-secure call, you must explicitly clear `r0..r3` (or only set the ones holding real arguments) and `r12`, plus any FPU registers if the FPU is active. Forgetting this leaks Secure stack/heap pointers into the Non-secure register file — directly defeating the isolation.
+</Callout>
+
+## The TT instructions — permission probes
+
+Secure code often needs to ask: "Is this pointer from Non-secure actually in Non-secure memory?" If Non-secure passes a pointer to a Secure service and that pointer points into Secure memory, Secure must reject it — otherwise Non-secure has tricked Secure into reading or writing Secure data on its behalf (the classic "confused deputy" attack).
+
+The `TT`, `TTT`, `TTA`, `TTAT` family of instructions does exactly this:
+
+```asm
+tt      r1, r0      @ r0 = pointer; r1 = SAU/IDAU classification + permissions
+```
+
+The result word holds bits describing the address: is it Secure or Non-secure? Is it executable? What MPU region does it land in? Whether it's accessible with the current privilege.
+
+| Mnemonic | Variant | Asks |
+|----------|---------|------|
+| `TT`  | Plain | What is the classification for the current security state? |
+| `TTT` | Privileged-test | What if I queried as if I were unprivileged? |
+| `TTA` | Alternate-state | What is the classification for the **other** state (S queries NS or vice versa)? |
+| `TTAT` | Alt + priv-test | Both alternate-state and privileged test |
+
+The CMSE intrinsic `cmse_check_address_range(ptr, size, flags)` wraps these into a portable check: "Does this entire range live in Non-secure memory, accessible with at least these permissions?" Every Secure entry point should validate its incoming pointers with this. The CMSE intrinsic header (`<arm_cmse.h>`) provides the wrappers; the compiler emits TT-family instructions under the hood.
+
+```c
+__attribute__((cmse_nonsecure_entry))
+int secure_sign_message(const uint8_t *msg, size_t len, uint8_t *sig) {
+    // Validate that NS caller's pointers actually live in NS memory.
+    if (!cmse_check_address_range((void *)msg, len, CMSE_NONSECURE | CMSE_MPU_READ)) {
+        return -1;  // Pointer not in NS memory — refuse
+    }
+    if (!cmse_check_address_range(sig, 64, CMSE_NONSECURE | CMSE_MPU_READWRITE)) {
+        return -1;
+    }
+    // ... safe to proceed ...
+}
+```
+
+## Banked CPU state
+
+When the world changes, the CPU swaps a chunk of register state. To make this fast and safe, several registers are **banked** — there are two physical copies, one for Secure and one for Non-secure:
+
+- MSP, PSP, MSPLIM, PSPLIM
+- PRIMASK, FAULTMASK, BASEPRI, CONTROL
+- VTOR (Vector Table Offset — each world has its own table)
+
+Switching worlds means transparently using the other bank. This is critical: a Non-secure ISR cannot accidentally corrupt the Secure stack pointer; a Non-secure write to PRIMASK does not affect Secure mask state.
+
+The NVIC, SCB, and SysTick are also partially banked. Each interrupt has a "target security state" bit (in `NVIC_ITNS`) that determines which world's vector table is consulted when it fires. SysTick gets two instances (one per world). The SCB has separate fault-status registers per world.
+
+## Exception entry with TrustZone
+
+When an exception fires, the CPU figures out which world should handle it, then routes accordingly. If the interrupted world differs from the handler's world, an additional **Secure stack frame** is pushed with an integrity tag — so when the handler returns, the hardware can verify the caller state is what was saved.
+
+The exception return value (EXC_RETURN in LR) encodes:
+- Which stack (MSP vs PSP) to pop from
+- Which world to return to
+- Whether the FPU's extended frame is present
+- Whether the caller was Secure or Non-secure (the "S" bit of EXC_RETURN)
+
+If the EXC_RETURN's encoded source world doesn't match the integrity tag stored on the secure stack, the CPU raises a SecureFault and refuses to return. This defeats the "spoofed return" attack where Non-secure code crafts a fake EXC_RETURN to trick the CPU into returning into Secure code.
+
+## TF-M and the PSA architecture
+
+ARM publishes **Trusted Firmware for M-profile (TF-M)** — a reference implementation of a Secure-world runtime built on TrustZone-M. TF-M provides:
+
+- **Secure boot** with image signature verification (BL1, BL2 stages)
+- **Cryptographic services** (PSA Crypto API) — AES, ECDSA, HMAC, RNG
+- **Internal Trusted Storage** for keys (encrypted-at-rest)
+- **Attestation** (PSA Attestation API) for proving the device's identity to a server
+- **Firmware update** (PSA Firmware Update API) with rollback protection
+
+The Non-secure side calls these via the **PSA Functional API** (`psa_sign_message`, `psa_open_key`, etc.). Under the hood each call lands in an NSC veneer, transitions to Secure, and routes through TF-M's IPC layer to the appropriate Secure Partition.
+
+<CoreCompare
+  rows={[
+    { core: 'STM32U5 / STM32H5', notes: 'TF-M reference port. Secure flash partition + Non-secure application partition. RoT measurements via STM32 ICACHE/CRC.' },
+    { core: 'nRF5340 / nRF54L', notes: 'TF-M optional; Nordic supports both bare-metal CMSE and TF-M flows. SPM (Secure Partition Manager) is Nordic\'s lighter alternative.' },
+    { core: 'NXP LPC55Sxx', notes: 'TF-M ports available. PUF-based key storage in Secure world.' },
+    { core: 'Microchip SAM L11', notes: 'Cortex-M23 — lightest TrustZone target. Limited Secure flash space; vendor offers slim TF-M variant.' },
+  ]}
+/>
+
+## Common bugs
+
+**Forgetting to validate Non-secure pointers.** A Secure service that dereferences a Non-secure-supplied pointer without `cmse_check_address_range` is a confused-deputy vulnerability. Always validate.
+
+**Leaking registers across BLXNS.** Forgetting to clear `r4..r11` (or s16..s31) before calling Non-secure leaks Secure stack contents.
+
+**Wrong vector table classification.** If a peripheral is configured as Secure but the IRQ is left targeting Non-secure (or vice versa), the wrong world's handler runs and a SecureFault chains. Configure `NVIC_ITNS` to match the peripheral's security state.
+
+**Non-aligned NSC entries.** SG must sit at an even halfword address inside an NSC region. The compiler handles this for `cmse_nonsecure_entry` functions; hand-rolled veneers must take care.
+
+<Callout type="tip">
+The fastest way to bring up a TrustZone-M design is to start with a vendor template. STM32CubeIDE, NXP MCUXpresso, Nordic nRF Connect, and Microchip Studio all ship "TrustZone enabled" project templates that set up SAU regions, NSC veneers, and TF-M build flow correctly. Hand-rolling from scratch is doable but easy to get wrong.
+</Callout>
+
+## Cross-references
+
+- [ARMv8-M architecture](/docs/architecture/armv8m) — TrustZone in the v8-M context
+- [MPU on Cortex-M](/docs/cortex-m/mpu) — orthogonal privilege/protection within a world
+- [Exception model](/docs/architecture/exception-model) — exception entry with security states
+- [Fault decoder](/tools/fault-decoder) — decode SecureFault status registers
+- ARMv8-M Architecture Reference Manual (ARM DDI 0553) section D
+- Trusted Firmware-M documentation (trustedfirmware.org/projects/tf-m)
+- ARM Platform Security Architecture (PSA) certified.arm.com

@@ -1,0 +1,158 @@
+---
+title: Timers & PWM
+description: General-purpose timers, advanced timers, input capture, output compare, PWM, encoder mode — the most flexible peripheral on the chip.
+order: 7
+updated: 2026-05-12
+tags: [peripherals, timers, pwm]
+---
+
+
+Timers are the most flexible peripheral on a Cortex-M. The same hardware that generates a 1 ms RTOS tick can drive PWM for a brushless motor, count incremental encoder pulses, time-stamp ADC samples, and synchronise itself across multiple instances to drive a three-phase inverter.
+
+## Anatomy of a generic timer
+
+```
+        ┌──────────────┐
+clk ───▶│  Prescaler   │── tick ────────────┐
+        │  (16-bit)    │                    │
+        └──────────────┘                    ▼
+                                ┌────────────────────┐
+                                │      Counter       │── CNT
+                                │   (16- or 32-bit)  │
+                                └────────┬───────────┘
+                                         ▼
+                                ┌────────────────────┐
+                                │  Compare ARR/CCR1..N│
+                                └────────┬───────────┘
+                                         ▼
+                                    UEV / CCx events
+                                    → IRQ, DMA, output
+```
+
+Every STM32 timer has roughly this shape — prescaler, counter, auto-reload (ARR), and one-to-four capture/compare channels (CCR1..CCR4). Advanced timers (TIM1, TIM8) add complementary outputs, dead-time generation, and break input.
+
+## Setting up a 1 kHz periodic interrupt
+
+```c
+RCC->APB1ENR |= RCC_APB1ENR_TIM2EN;
+
+TIM2->PSC  = (SystemCoreClock / 1_000_000) - 1;   // 1 MHz tick
+TIM2->ARR  = 1000 - 1;                             // wrap every 1000 ticks = 1 ms
+TIM2->DIER = TIM_DIER_UIE;                         // update interrupt
+TIM2->CR1  = TIM_CR1_CEN;                          // start
+
+NVIC_EnableIRQ(TIM2_IRQn);
+
+void TIM2_IRQHandler(void) {
+    if (TIM2->SR & TIM_SR_UIF) {
+        TIM2->SR = ~TIM_SR_UIF;     // clear flag (W0C)
+        ticks_1ms++;
+    }
+}
+```
+
+The prescaler-then-counter design separates "tick rate" from "wrap value", so you can have e.g. a 1 µs tick and a 65 ms wrap on a 16-bit timer, or a 1 µs tick and 71 minutes on a 32-bit timer.
+
+## PWM on a single channel
+
+PWM = "set the output high while CNT < CCR; low otherwise". STM32 calls this **PWM Mode 1**:
+
+```c
+TIM3->PSC = 0;                          // full timer clock
+TIM3->ARR = 1000 - 1;                   // 1000-step PWM
+TIM3->CCR1 = 250;                       // 25% duty
+
+TIM3->CCMR1 = (6 << TIM_CCMR1_OC1M_Pos)  // OC1M = 110 = PWM mode 1
+            | TIM_CCMR1_OC1PE;            // preload enable
+TIM3->CCER  = TIM_CCER_CC1E;              // enable output
+TIM3->CR1   = TIM_CR1_ARPE | TIM_CR1_CEN; // ARR preload + enable
+
+// In the GPIO config, set the PWM pin to alternate function for TIM3_CH1
+```
+
+To change the duty cycle, just write `TIM3->CCR1`. The "preload" registers make the new value take effect at the next update event, avoiding mid-cycle glitches.
+
+## Complementary PWM with dead-time (motor control)
+
+For driving a half-bridge, you need two complementary PWM outputs with **dead time** — a small gap when both are off so the high-side and low-side FETs never conduct simultaneously (which would short the power rail and destroy them).
+
+<TimingDiagram title="Center-aligned PWM with dead-time insertion" signals={[
+  { name: 'CNT (triangle)', wave: '01100110', tone: 'muted' },
+  { name: 'OCx (high-side)', wave: '00110011', tone: 'primary' },
+  { name: 'OCxN (low-side)', wave: '11001100', tone: 'accent' },
+  { name: 'Both off',       wave: '01010101', tone: 'destructive' },
+]} markers={[
+  { x: 1, label: 'DTG gap' },
+  { x: 3, label: 'DTG gap' },
+  { x: 5, label: 'DTG gap' },
+]} caption="The BDTR.DTG bits insert a programmable gap at every edge so high-side and low-side FETs are never on simultaneously — without the dead time, the half-bridge shorts the power rail through both transistors." />
+
+```c
+TIM1->BDTR = (50 << TIM_BDTR_DTG_Pos)   // ~50 cycles dead time
+           | TIM_BDTR_MOE;                // main output enable
+
+TIM1->CCMR1 = (6 << TIM_CCMR1_OC1M_Pos);  // PWM mode 1
+TIM1->CCER  = TIM_CCER_CC1E                // OC1 enable
+            | TIM_CCER_CC1NE;              // OC1N (complementary) enable
+```
+
+The Advanced timers (TIM1, TIM8) have a hardware **break input** — pulling it low immediately disables the PWM outputs. Wire it to your overcurrent comparator, and a fault trips the motor off in &lt;100 ns, faster than any software loop.
+
+## Input capture — measuring pulse width
+
+The complement of output compare. CNT runs free; an external edge on TIx samples CNT into CCR.
+
+```c
+TIM2->CCMR1 = (1 << TIM_CCMR1_CC1S_Pos);   // IC1 = TI1
+TIM2->CCER  = TIM_CCER_CC1E;                // enable capture
+TIM2->DIER  = TIM_DIER_CC1IE;               // IRQ on capture
+
+void TIM2_IRQHandler(void) {
+    if (TIM2->SR & TIM_SR_CC1IF) {
+        TIM2->SR = ~TIM_SR_CC1IF;
+        uint32_t edge = TIM2->CCR1;
+        // process the edge
+    }
+}
+```
+
+With two channels capturing rising and falling edges of the same signal, you get pulse width to the resolution of the timer clock — typically nanoseconds. The PWM-input mode automates this for full duty-cycle measurement.
+
+## Encoder mode
+
+Two channels can be put in encoder mode — the timer interprets the two inputs as quadrature signals and increments/decrements CNT automatically.
+
+```c
+TIM3->CCMR1 = TIM_CCMR1_CC1S_0 | TIM_CCMR1_CC2S_0;   // IC1, IC2 = TI1, TI2
+TIM3->SMCR  = 3;                                       // SMS = 011 = encoder mode 3
+TIM3->CR1   = TIM_CR1_CEN;
+// Now TIM3->CNT counts encoder ticks; direction in TIM3->CR1.DIR
+```
+
+No CPU intervention. Read `CNT` whenever you want the position. Combined with a higher-priority timer for velocity sampling, you get a complete motor-control front end with zero software in the fast path.
+
+## One-pulse mode
+
+The timer counts once, generates a pulse of a specified width, then stops. Useful for triggering a single ADC conversion at a precise time, or pulsing a sensor's strobe input.
+
+```c
+TIM2->CR1 = TIM_CR1_OPM;     // one-pulse mode
+TIM2->ARR = pulse_width - 1;
+TIM2->CR1 |= TIM_CR1_CEN;     // arm — fires on next trigger
+```
+
+## Master/slave synchronisation
+
+Multiple timers can be cascaded: TIM1's update event triggers TIM2's start; TIM2's overflow triggers TIM3's update. This lets you build complex synchronised waveforms.
+
+The **TRGO** (Trigger Output) register on each timer selects what event it broadcasts; **SMCR** on each timer selects what it listens to. Used heavily in motor control to keep ADC, PWM, and encoder readings synchronised.
+
+<Callout type="tip" title="If you're driving anything that moves, learn the trigger matrix">
+Most motor-control problems on STM32 are not in the PWM signal itself — they're in *when* you sample the current or the encoder position relative to the PWM edges. The TRGO/SMCR matrix is the language of timing-correct motor control.
+</Callout>
+
+## See also
+
+- [GPIO](/docs/peripherals/gpio/) — alternate function for timer outputs.
+- [DMA](/docs/peripherals/dma/) — DMA-driven waveform generation.
+- [ADC / DAC](/docs/peripherals/adc/) — triggered conversions.

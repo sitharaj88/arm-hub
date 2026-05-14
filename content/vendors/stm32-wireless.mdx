@@ -1,0 +1,159 @@
+---
+title: STM32 wireless — WB and WL
+description: STM32WB dual-core BLE/Thread/Zigbee with a dedicated Cortex-M0+ radio core, STM32WL sub-GHz LoRa with M4 application and M0+ Sub-GHz radio. How the application/network split works, IPC, and coexistence.
+order: 13
+updated: 2026-05-13
+tags: [vendors, stm32, stm32wb, stm32wl, bluetooth, lora, wireless]
+---
+
+STM's STM32WB and STM32WL are the wireless-integrated members of the STM32 family — instead of pairing an external radio (Semtech SX1262, Nordic nRF52840, TI CC2640) with a host MCU over SPI, the radio is on-die, controlled by a dedicated Cortex-M0+ core, leaving the application Cortex-M4 free for everything else. WB is BLE / Thread / Zigbee / 802.15.4 / proprietary 2.4 GHz; WL is Sub-GHz with LoRa, (G)FSK, BPSK modulations. The split-core architecture and the IPC that glues them together are the defining features.
+
+This page covers the silicon, the role of each core, the IPC mailbox, the wireless stacks that ship in the M0+ ROM, and the design considerations when you build product on these parts.
+
+<SpecSheet
+  title="STM32WB / WL at a glance"
+  specs={[
+    { label: 'STM32WB55', value: 'Cortex-M4F @ 64 MHz (app) + Cortex-M0+ @ 32 MHz (radio); BLE 5.4, Thread, Zigbee 3.0, 802.15.4, proprietary 2.4 GHz' },
+    { label: 'STM32WBA52', value: 'Single Cortex-M33 + integrated 2.4 GHz radio; BLE 5.4 only; TrustZone; lower cost, newer architecture' },
+    { label: 'STM32WL55', value: 'Cortex-M4F + Cortex-M0+ + Semtech SX126x radio core; LoRa, (G)FSK, MSK, BPSK; 150 MHz to 960 MHz' },
+    { label: 'STM32WLE5', value: 'Cortex-M4F single-core with the same integrated radio (no M0+); for simpler designs' },
+    { label: 'TX power', value: 'WB: +6 dBm; WL: +22 dBm high-power output, +14 dBm boost mode' },
+    { label: 'RX sensitivity (LoRa SF12)', value: '-148 dBm on STM32WL — competitive with discrete SX1262' },
+    { label: 'Stack location', value: 'M0+ runs the radio stack from system ROM (WB) or shared flash region (WL); upgradeable over the air' },
+    { label: 'IPC mechanism', value: 'Mailbox in SRAM2 with shared memory channels; HW semaphore + IPCC interrupt block' },
+    { label: 'Certifications', value: 'BLE SIG QDID, Zigbee certified, Thread certified, LoRaWAN-CertifiedCM, FCC/CE/IC pre-certified modules' },
+  ]}
+/>
+
+## Architecture — why two cores
+
+A wireless protocol stack has hard real-time requirements that interact poorly with an application that wants to do other work. BLE link-layer interrupts fire at precise 1.25 ms intervals; LoRa receive windows open within microsecond tolerance of an expected packet. Missing one is at best a dropped packet; at worst it breaks the connection or the certified-radio behaviour.
+
+The traditional answer is to give the radio its own MCU and talk to it over SPI. That works but costs another chip, board area, BOM, and CPU cycles on the host for the protocol-level translation (HCI for BLE, AT commands for cellular, custom for proprietary).
+
+STM's answer is to put both MCUs on the same die, with shared RAM and Flash, and give one of them exclusive ownership of the radio block. The application MCU runs whatever — sensor loops, UI, BLE GATT server logic — and exchanges messages with the radio MCU via an IPC mailbox. From the app's perspective, sending a BLE notification is `aci_gatt_update_char_value(...)`, the same library call you'd use against an external BlueNRG chip; under the hood that call writes a command to the mailbox, the radio core picks it up, runs the link layer, and writes the result back.
+
+## STM32WB block diagram
+
+<BlockDiagram
+  title="STM32WB55 — dual-core wireless SoC"
+  width={760}
+  height={420}
+  nodes={[
+    { id: 'm4', x: 60, y: 40, w: 200, h: 60, kind: 'core', label: 'Cortex-M4F @ 64 MHz', detail: 'application core' },
+    { id: 'm0', x: 500, y: 40, w: 200, h: 60, kind: 'core', label: 'Cortex-M0+ @ 32 MHz', detail: 'radio core (BLE/802.15.4)' },
+    { id: 'sram1', x: 60, y: 130, w: 200, h: 50, kind: 'memory', label: 'SRAM1 (192 KB)', detail: 'M4 working memory' },
+    { id: 'sram2', x: 300, y: 130, w: 160, h: 50, kind: 'memory', label: 'SRAM2 (64 KB)', detail: 'shared IPC + radio stack' },
+    { id: 'sram2b', x: 500, y: 130, w: 200, h: 50, kind: 'memory', label: 'SRAM2b (32 KB)', detail: 'M0+ data' },
+    { id: 'flash', x: 60, y: 220, w: 400, h: 50, kind: 'storage', label: 'Flash 1 MB (shared)', detail: 'app code + stack image' },
+    { id: 'rom', x: 500, y: 220, w: 200, h: 50, kind: 'storage', label: 'System ROM', detail: 'M0+ boot, fallback stack' },
+    { id: 'ipcc', x: 300, y: 220, w: 160, h: 50, kind: 'periph', label: 'IPCC + HSEM', detail: 'mailbox + 32 semaphores' },
+    { id: 'radio', x: 500, y: 300, w: 200, h: 60, kind: 'radio', label: '2.4 GHz radio', detail: 'BLE 5.4, 802.15.4, prop. 2 Mbps' },
+    { id: 'ant', x: 540, y: 380, w: 120, h: 30, kind: 'external', label: 'Antenna' },
+    { id: 'peri', x: 60, y: 300, w: 200, h: 60, kind: 'periph', label: 'USB FS, SPI×2, I2C×3, UART×1', detail: 'app peripherals' },
+    { id: 'crypto', x: 60, y: 380, w: 200, h: 30, kind: 'security', label: 'AES-256, TRNG, PKA, HSEM' },
+  ]}
+  edges={[
+    { from: 'm4', to: 'sram1' },
+    { from: 'm4', to: 'sram2', label: 'mailbox' },
+    { from: 'm0', to: 'sram2', label: 'mailbox' },
+    { from: 'm0', to: 'sram2b' },
+    { from: 'm4', to: 'flash' },
+    { from: 'm0', to: 'flash' },
+    { from: 'm0', to: 'rom' },
+    { from: 'm4', to: 'ipcc', tone: 'accent', arrow: 'both' },
+    { from: 'm0', to: 'ipcc', tone: 'accent', arrow: 'both' },
+    { from: 'm0', to: 'radio', label: 'PHY ctrl' },
+    { from: 'radio', to: 'ant' },
+    { from: 'm4', to: 'peri' },
+    { from: 'm4', to: 'crypto' },
+  ]}
+  caption="STM32WB55 — M4 owns the application world (left); M0+ owns the radio. IPCC mailbox and hardware semaphores in SRAM2 are the only shared state. Flash is partitioned: lower region for app, upper region for the network stack binary."
+/>
+
+## The IPC mailbox
+
+The IPCC (IPC Controller) is a 6-channel mailbox: each channel has a "set bit" interrupt for one direction and "clear bit" for ack. The shared SRAM2 region is partitioned into command, event, and ACL data tables; the channels point at table heads. ST provides a thin C library (`shci.h`, `tl_*.h`) that abstracts the tables as command/response queues.
+
+A BLE notification from the app's perspective:
+
+```c
+// M4 application code
+tBleStatus status = aci_gatt_update_char_value(
+    service_handle,
+    char_handle,
+    0, payload_len, payload
+);
+```
+
+What happens under the hood:
+
+1. `aci_gatt_update_char_value` formats an HCI command in the shared command buffer.
+2. Sets IPCC channel 2 (HCI command available).
+3. M0+ wakes, reads the command from SRAM2, runs the BLE link layer's outgoing-notification logic, schedules a TX slot.
+4. M0+ posts an event to the response queue, sets IPCC channel 3.
+5. M4 wakes, reads the event ("command complete"), returns from the function call.
+
+Total round-trip on STM32WB at 64 MHz: ~50 µs for a simple command, ~200 µs if a TX has to be scheduled. That's much faster than an SPI-tethered radio because there's no serial bus in the middle.
+
+<Callout type="warn">
+The radio core is not user-programmable in the traditional sense. The M0+ runs ST's certified radio stack binary, which is loaded from system ROM (WB) or from a fixed Flash region (WL). You cannot write firmware that runs directly on the M0+; you communicate with it through documented mailbox commands. Trying to "borrow" the M0+ for app code voids certifications and isn't supported by the build flow.
+</Callout>
+
+## The radio stack — what comes preloaded
+
+For STM32WB, ST provides several "Coprocessor Binary" releases — each is a precompiled image of a different protocol stack for the M0+:
+
+| Image | Stack | Size | Notes |
+|-------|-------|------|-------|
+| `stm32wb5x_BLE_Stack_full_extended_fw.bin` | BLE 5.4 full | ~210 KB | Central + Peripheral, GAP/GATT, security, DLE, LE Audio |
+| `stm32wb5x_BLE_Stack_light_fw.bin` | BLE 5.4 minimal | ~130 KB | Peripheral-only, no security manager |
+| `stm32wb5x_BLE_Thread_dynamic_concurrent_fw.bin` | BLE + Thread | ~330 KB | Concurrent both stacks |
+| `stm32wb5x_Zigbee_FFD_fw.bin` | Zigbee 3.0 FFD | ~280 KB | Full-Function Device, can be router |
+| `stm32wb5x_BLE_Zigbee_FFD_fw.bin` | BLE + Zigbee | ~360 KB | Dual stack |
+| `stm32wb5x_Mac_802_15_4_fw.bin` | 802.15.4 MAC | ~160 KB | Raw MAC, build your own profile |
+| `stm32wb5x_Phy_802_15_4_fw.bin` | 802.15.4 PHY | ~100 KB | Lowest layer, full custom |
+
+The image is flashed to a reserved high-Flash region by a bootloader called FUS (Firmware Upgrade Service). The app's flash sits in the lower region. Updating the radio stack OTA means delivering the new binary to the app, then asking FUS to verify and install it — the app is not running during the install (FUS takes over briefly).
+
+For STM32WL, the radio stack is simpler — the Semtech SX126x driver lives in the app domain on STM32WLE5 (no M0+), or runs on the M0+ on STM32WL55. LoRaWAN MAC sits in the app on both variants; ST provides the LoRaWAN stack as source.
+
+## STM32WL — Sub-GHz integration
+
+STM32WL is the Sub-GHz variant — integrates a Semtech SX1262-equivalent radio for 150–960 MHz LoRa, (G)FSK, MSK, BPSK. The combination of M4F + integrated radio replaces the two-chip STM32L4 + SX1262 design that was standard before WL shipped.
+
+Notable LoRa-specific characteristics:
+
+- **+22 dBm high-power output** with appropriate matching network. This is at the regulatory limit for 868 MHz EU duty-cycle bands and the standard for US 915 MHz.
+- **-148 dBm sensitivity at SF12 BW=125 kHz**. With +22 dBm TX, this gives ~170 dB link budget — practical range of 10–15 km in suburban, >40 km line-of-sight.
+- **PA selection**: the chip has two PAs — Low-Power (up to +14 dBm, more efficient) and High-Power (up to +22 dBm). External RF switching between them is required; ST provides reference designs.
+- **TCXO requirement at high SF**: LoRa SF11/SF12 demand frequency stability of ±20 ppm; a standard 32 MHz crystal at ±10 ppm is borderline. Most production designs add a TCXO.
+
+The WL55 dual-core option exists for cases where you need to run a non-trivial app stack (LoRaWAN class C with continuous RX, Bluetooth Mesh proxy, plus business logic) without missing radio deadlines. For most LoRaWAN-only end-nodes, WLE5 single-core is sufficient and cheaper.
+
+## STM32WBA — the M33 successor
+
+WBA52 (launched 2023) is the next-generation wireless STM32 — single Cortex-M33 with TrustZone, integrated 2.4 GHz radio, BLE 5.4 only (no Zigbee/Thread yet). The single-core design simplifies the model: no IPC, no separate flash region, the BLE stack runs in non-secure mode on the same core as the app. Trade-off: the M33 must arbitrate between application code and link-layer ISRs in real time. The link layer is high-priority interrupts; if your app keeps interrupts off too long, packets are missed.
+
+WBA suits new BLE-only designs that want TrustZone (for secure boot and key storage) and a lower BOM than WB55. For multi-protocol (BLE + Zigbee, BLE + Thread, Matter) WB55 remains the choice until WBA's stack catalogue catches up.
+
+<Callout type="tip">
+Matter, the cross-vendor smart-home protocol, runs on Thread (802.15.4) as its IPv6 link layer plus Wi-Fi for higher-rate devices. STM32WB55 + Thread stack is the natural Matter bridge; ST publishes a Matter SDK based on the open-source Connected Home over IP repository.
+</Callout>
+
+## Designing a WB/WL product — practical notes
+
+- **Antenna design**. Both parts come with reference matching networks in the datasheet. Deviating requires antenna-port impedance characterisation (network analyser) and re-certification.
+- **Radio coexistence**. WB has a PTA (Packet Traffic Arbitration) pin for coexistence with an external Wi-Fi; without it, simultaneous BLE + 2.4 GHz Wi-Fi on the same product is risky.
+- **FCC/CE certification**. ST publishes modular pre-certifications for reference layouts. Using a different layout requires intentional-radiator certification; budget $20–60k and 6–8 weeks.
+- **Low-power**. WB Stop 2 with BLE advertising at 1 s interval: ~3 µA average. WL Stop 2 with LoRa class A and one TX/hour: ~1.5 µA average. Both competitive with the [STM32L low-power line](/docs/vendors/stm32-lowpower).
+- **OTA**. ST's BLE OTA library uses the FUS region to stage and verify new app images. New app slot, verify CRC + signature, swap pointers, reset.
+
+## Cross-references
+
+- [STM32 mainstream F, G, H](/docs/vendors/stm32-mainstream) — non-wireless STM32 line.
+- [STM32 low-power L, U](/docs/vendors/stm32-lowpower) — battery-oriented family.
+- [Nordic nRF53](/docs/vendors/nordic-nrf53) — dual M33 wireless competitor.
+- [IoT sensor node](/docs/systems/iot-sensor-node) — full system design built on WL or WB.
+- ST RM0434 (WB), RM0453 (WL) — reference manuals.
+- ST AN5289 (WB BLE) and AN5406 (WL LoRa) — application notes for stack integration.

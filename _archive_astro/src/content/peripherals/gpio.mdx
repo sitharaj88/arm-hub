@@ -1,0 +1,150 @@
+---
+title: GPIO
+description: The most fundamental peripheral — push-pull, open-drain, pull-up, pull-down, alternate functions, atomic set-reset, EXTI. Patterns that work on every Cortex-M.
+order: 1
+updated: 2026-05-12
+tags: [peripherals, gpio]
+---
+
+import Callout from '~/components/Callout.astro';
+
+Every Cortex-M starts with GPIO — the LED you blink to prove the toolchain works, the button you poll, the pin you wiggle to bit-bang a protocol that doesn't have a dedicated peripheral. Get GPIO right and the rest of the chip falls into place.
+
+## Pin modes
+
+A GPIO pin on Cortex-M can usually be in one of these modes:
+
+| Mode             | What it does                                             |
+|------------------|----------------------------------------------------------|
+| **Input floating** | High impedance. Voltage on the pin is whatever the external circuit drives. |
+| **Input pull-up**  | Internal ~40 kΩ resistor to VDD. Pin reads 1 if nothing else drives it. |
+| **Input pull-down**| Internal resistor to GND. Pin reads 0 if nothing else drives. |
+| **Analog**         | Disconnects the digital input buffer. Required for ADC inputs (eliminates leakage and Schmitt-trigger noise). |
+| **Push-pull output**| Two transistors — one to VDD, one to GND. Can source and sink. |
+| **Open-drain output** | Only the sink transistor. Pin is either 0 or Hi-Z. Used for I²C, wired-OR signalling, level-shifting through external pull-up. |
+| **Alternate function** | Pin is routed to a peripheral (UART TX, SPI MOSI, timer PWM…). Vendor-defined per-pin. |
+
+<Callout type="tip" title="The 'why doesn't my I²C work' diagnostic">
+On 90% of bring-ups, the answer is **push-pull instead of open-drain**, or **missing external pull-ups**. I²C requires both lines to be open-drain with external pull-ups (typically 4.7 kΩ to 10 kΩ). Internal pull-ups are too weak for typical I²C bus capacitance.
+</Callout>
+
+## Atomic set/reset — BSRR
+
+A classic embedded mistake:
+
+```c
+GPIOA->ODR |= (1 << 5);   // read-modify-write — NOT atomic!
+```
+
+If an ISR fires between the read and the write and also modifies ODR, you lose the ISR's change. The fix on STM32 (and most modern Cortex-M GPIO blocks): a dedicated **Bit Set/Reset Register** (BSRR) that's *atomic* at the hardware level.
+
+```c
+// BSRR — high half clears, low half sets
+GPIOA->BSRR = (1 << 5);          // atomic set of bit 5
+GPIOA->BSRR = (1 << (5 + 16));   // atomic clear of bit 5
+```
+
+The lower 16 bits set their respective ODR bits; the upper 16 bits clear them. Writing 1 to a set bit and a clear bit simultaneously: set wins on most STM32, but check your reference manual. A single write affects multiple pins atomically — handy for parallel data buses.
+
+```c
+// Drive D0..D7 atomically from a single byte
+GPIOA->BSRR = (uint32_t)data | ((uint32_t)~data << 16);
+```
+
+## Speed and slew rate
+
+High-speed GPIO outputs ring. The wire from your MCU pin to whatever's on the other end is a transmission line; if the rise time is faster than the round-trip propagation delay, you get reflections and EMI.
+
+Every Cortex-M GPIO has a **speed** setting:
+
+```c
+// STM32 — set OSPEEDR for pin 5 to "Very High" (≈85 MHz toggle)
+GPIOA->OSPEEDR |= GPIO_OSPEEDR_OSPEED5;
+
+// Or — "Low" (≈8 MHz) for slow signals to reduce EMI
+GPIOA->OSPEEDR &= ~GPIO_OSPEEDR_OSPEED5;
+```
+
+Use the **slowest speed that meets your timing**. A 100 MHz QSPI flash needs fast pins; a status LED on a long PCB trace should be at the lowest speed setting.
+
+## EXTI — external interrupts
+
+GPIO inputs can be routed to the **EXTI** (External Interrupt) controller on STM32 — and equivalent on most vendors. Each GPIO line N (across all ports) can be a source for EXTI line N. You can configure rising-edge, falling-edge, or both, and enable interrupt generation.
+
+```c
+// STM32: PA0 → EXTI0, rising-edge, IRQ-enabled
+SYSCFG->EXTICR[0] = (SYSCFG->EXTICR[0] & ~0xF) | 0x0;   // port A on EXTI0
+EXTI->IMR1  |= (1 << 0);                                // interrupt mask: enable
+EXTI->RTSR1 |= (1 << 0);                                // rising-edge trigger
+NVIC_EnableIRQ(EXTI0_IRQn);
+
+void EXTI0_IRQHandler(void) {
+    if (EXTI->PR1 & (1 << 0)) {
+        EXTI->PR1 = (1 << 0);   // W1C — clear the pending flag
+        on_button_press();
+    }
+}
+```
+
+<Callout type="warn" title="Don't forget to clear the EXTI pending flag">
+EXTI flags are **W1C** — write 1 to clear. If you don't, the NVIC will re-pend your IRQ immediately on handler return, looping forever.
+</Callout>
+
+## Debouncing in software
+
+Mechanical switches bounce for 5–20 ms. A simple debounce:
+
+```c
+volatile uint32_t last_press_tick = 0;
+
+void EXTI0_IRQHandler(void) {
+    EXTI->PR1 = (1 << 0);
+    uint32_t now = HAL_GetTick();
+    if (now - last_press_tick < 20) return;   // bounce
+    last_press_tick = now;
+    button_event();
+}
+```
+
+For high-reliability designs, sample at a fixed rate (e.g. every SysTick) and shift the result into a 8-bit register; treat as "pressed" only when you see eight consecutive 1s.
+
+## A complete blink — STM32F4
+
+```c
+#include "stm32f4xx.h"
+
+int main(void) {
+    // Clock GPIOA
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+
+    // PA5 as output, push-pull, no pull, very high speed
+    GPIOA->MODER   = (GPIOA->MODER & ~GPIO_MODER_MODER5)   | (0b01 << (5 * 2));
+    GPIOA->OTYPER &= ~GPIO_OTYPER_OT5;
+    GPIOA->PUPDR  &= ~GPIO_PUPDR_PUPD5;
+    GPIOA->OSPEEDR|= GPIO_OSPEEDR_OSPEED5;
+
+    while (1) {
+        GPIOA->BSRR = (1 << 5);            // set
+        for (volatile int i = 0; i < 1000000; i++);
+        GPIOA->BSRR = (1 << (5 + 16));     // clear
+        for (volatile int i = 0; i < 1000000; i++);
+    }
+}
+```
+
+No HAL, no abstraction layer. Eight register writes. Worth doing once just to know the metal.
+
+## Alternate functions
+
+When you assign a pin to a peripheral, you set:
+
+1. **MODE** = 0b10 (alternate function).
+2. **AFR** (alternate function register, two nibbles per pin) = the function number (0–15, vendor-defined).
+
+Find the function number in the **datasheet**, not the reference manual. The datasheet has the per-pin alternate function mapping table; the reference manual has the bit definitions.
+
+## See also
+
+- [UART](/docs/peripherals/uart/) — first peripheral after GPIO.
+- [Timers & PWM](/docs/peripherals/timers/) — for GPIO-driven PWM.
+- [NVIC deep dive](/docs/cortex-m/nvic/) — EXTI feeds the NVIC.

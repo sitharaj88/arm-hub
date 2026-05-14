@@ -1,0 +1,152 @@
+---
+title: ARMv7-A vs ARMv8-A vs ARMv9-A
+description: How the Cortex-A instruction set evolved across three architecture generations — AArch32 vs AArch64, register file expansion, the death of conditional execution, NEON to SVE2, and what MTE/PAC/BTI mean for compile-target choices.
+order: 1
+updated: 2026-05-13
+tags: [cortex-a, isa, armv7, armv8, armv9, sve, aarch64]
+---
+
+Cortex-A application cores have lived through three architecture generations in fifteen years, and the deltas are larger than they look from a marketing slide. ARMv7-A is a refinement of the original ARM/Thumb world that ran the iPhone 3GS. ARMv8-A is a near-clean-sheet 64-bit redesign that ships in every modern phone, tablet, and server-class ARM part. ARMv9-A extends v8 with vector and security features that target server, AI, and confidential-compute workloads — but at the user-visible ISA level it remains a superset of v8.
+
+Picking the right compile target matters: get it wrong and you either give up performance (compiling v9 code as v8) or ship a binary that won't boot on half your fleet (compiling v9 code that uses SVE on a Cortex-A55). This page walks through what each generation actually adds and the practical implications.
+
+<SpecSheet
+  title="Architecture generations at a glance"
+  specs={[
+    { label: 'ARMv7-A first cores', value: 'Cortex-A8 (2005), A9, A5, A7, A15, A17 — AArch32 only, NEON v1/v2 optional' },
+    { label: 'ARMv8-A first cores', value: 'Cortex-A53/A57 (2012) — AArch32 + AArch64, 64-bit GPRs, NEON mandatory' },
+    { label: 'ARMv9-A first cores', value: 'Cortex-A510/A710/X2 (2021) — AArch64 first, SVE2 mandatory, MTE/PAC/BTI baseline' },
+    { label: 'Register file (AArch32)', value: '15 GPRs (r0..r14) + PC; 32 single-precision VFP (s0..s31) or 16 double (d0..d15) / 32 (d0..d31 with VFPv3-D32)' },
+    { label: 'Register file (AArch64)', value: '31 GPRs (x0..x30) + sp + zr; 32 SIMD (v0..v31) 128-bit; 8 SVE predicates (p0..p7) for v9 SVE2' },
+    { label: 'Max VA (AArch64)', value: '48 bits standard, 52 bits with ARMv8.2-LPA, 56 bits FEAT_LPA2' },
+    { label: 'Conditional execution', value: 'A32/T32: predication via cond fields and IT blocks. A64: removed — only B.cond and CSEL/CSINC family remain' },
+    { label: 'Compile targets (GCC)', value: '-march=armv7-a / armv8-a / armv8.2-a / armv9-a; -mcpu=cortex-a53/a76/a710' },
+  ]}
+/>
+
+## AArch32 vs AArch64 — the big break
+
+ARMv7-A is a 32-bit machine: 32-bit pointers, 32-bit GPRs, 4 GB virtual address space per process (3 GB user / 1 GB kernel on Linux). ARMv8-A introduced AArch64 — a 64-bit *Execution State* with its own instruction set (A64), 64-bit GPRs, and a 48-bit (sometimes 52-bit) virtual address space. AArch32 still exists as a compatibility mode, but it is being progressively deprecated: ARMv9 cores like Cortex-A510 and the X2 generation drop AArch32 at EL0/EL1, and ARMv9.3 makes AArch64-only configurations the norm for server-class designs.
+
+The two states are not "modes" in the x86 sense — they are entirely different instruction encodings. A64 instructions are always 32 bits wide (no Thumb equivalent); A32 instructions are 32 bits and T32 (Thumb-2) are mostly 16/32-bit mixed. Switching states requires going through an exception (e.g. SVC), so a single process cannot mix A32 and A64 in a single function. The kernel decides at exec-time which state to start the process in, based on the ELF header.
+
+```
+AArch32                              AArch64
+  r0..r12  general-purpose             x0..x30 (w0..w30 for 32-bit views)
+  r13 = SP                             sp (separate, not a GPR)
+  r14 = LR                             x30 = LR
+  r15 = PC                             pc (not a GPR — no direct write)
+  CPSR (status)                        NZCV + DAIF + SPSR_ELx
+  16 banked regs (FIQ, IRQ, SVC...)    no banking — uses ELn separation
+```
+
+Register banking, which v7-A used to give FIQ/IRQ/SVC modes their own r13/r14, is gone. AArch64 instead uses Exception Levels (EL0–EL3) with separate stack pointers (`sp_el0`, `sp_el1`, ...) and separate `spsr_elx` / `elr_elx` for saved state. The exception model is cleaner — no shadow register file to track.
+
+## 30 GPRs (well, 31) in A64
+
+ARMv7-A has 13 truly-general-purpose registers in user mode (r0..r12), plus the special SP/LR/PC. ARMv8-A AArch64 has 31 GPRs (x0..x30) all usable for arithmetic — SP is a separate register, and the program counter is not directly writable. That gives the compiler vastly more elbow room for register allocation, especially in inner loops, leaf functions, and SIMD spill targets.
+
+The extra registers do change calling conventions. AAPCS64 uses x0–x7 for arguments (vs r0–r3 on AAPCS32), x9–x15 as caller-saved scratch, and x19–x28 as callee-saved. Inlined operations that needed `push {r4-r7}` on v7 often need no spill at all on v8.
+
+Practical impact in measured workloads: a recompile of OpenSSL or x264 from `armv7-a` to `armv8-a` typically yields 10–20% speedup just from register pressure relief, before any SIMD changes. Add NEON tuning and the gap widens to 30–50%.
+
+## Immediate ranges and addressing modes
+
+A64 widens immediate fields significantly. `MOV` of a 32-bit value still needs `MOVZ`+`MOVK` pairs (16-bit chunks), but logical immediates use a richer "bitmask immediate" encoding that handles many 64-bit patterns in a single instruction. `ADD/SUB` accept a 12-bit unsigned immediate (optionally shifted by 12) — up to 24 bits effectively, vs the 8-bit-rotated encoding of A32.
+
+PC-relative loads and ADRP/ADR pairs reach ±4 GB in A64, vs ±4 KB in A32's `LDR =literal` pool. That changes how the linker arranges literal pools and PLT/GOT entries — a single ADRP+ADD pair often replaces what would have been a multi-instruction sequence in A32.
+
+## The death of conditional execution
+
+A32 (and T32 within IT blocks) lets you predicate almost any instruction on the flags: `ADDEQ r0, r1, r2` adds only if Z=1. This was a huge code-density and branch-elision win on the early in-order ARM7 and ARM9 cores.
+
+On modern out-of-order Cortex-A cores, predicated instructions are *worse* than branches because:
+
+1. The instruction always reads its source registers (even if it won't write), adding false dependencies.
+2. The instruction always takes a slot in dispatch.
+3. The branch predictor handles short forward branches near-perfectly.
+
+ARMv8 A64 dropped predication except for branches (`B.cond`, `CBZ/CBNZ`) and a small family of conditional select instructions: `CSEL`, `CSINC`, `CSINV`, `CSNEG`. These take two source registers, a condition, and a destination — `CSEL x0, x1, x2, eq` means `x0 = (eq) ? x1 : x2`. That covers the common "select one of two values" idiom without the false-dependency problem.
+
+No more IT blocks either. The T32 `IT` instruction that prefixed up to four conditional Thumb-2 instructions is simply absent from A64 (and from ARMv8-A AArch32 in many configurations — `IT` is deprecated and may not be supported on newer cores).
+
+<Callout type="tip">
+Translating A32 predicated assembly to A64 by hand: replace `ADDEQ r0, r1, r2` patterns with explicit branches if the body is more than one instruction, or with `CSEL`/`CSINC` if it's a single move/add. Compilers handle this automatically — but reviewing the disassembly after a major v7→v8 port is worth doing once for any performance-critical inner loop.
+</Callout>
+
+## NEON evolution
+
+NEON (Advanced SIMD) appeared in ARMv7-A as an optional extension. It defined 32 64-bit `d` registers (or 16 128-bit `q` registers viewed differently) and integer + single-precision-float SIMD ops. ARMv8-A made NEON *mandatory* in AArch64 and reworked the register file to 32 unified 128-bit `v` registers (each viewable as `b`, `h`, `s`, `d`, or `q` lanes). Double-precision SIMD became mandatory too.
+
+| Feature | ARMv7-A NEON | ARMv8-A NEON (A64) |
+|---------|--------------|---------------------|
+| Vector registers | 32×64-bit or 16×128-bit | 32×128-bit |
+| Float precision | Single (FP32) | Single + Double (FP64) |
+| FP semantics | IEEE-ish (flush-to-zero by default) | Full IEEE 754 with rounding modes |
+| Crypto extensions | Optional (rare) | Mandatory in v8.0 + crypto (AES, SHA1, SHA256) |
+
+NEON intrinsics (`<arm_neon.h>`) are largely source-compatible across A32 and A64 — `vaddq_s32` works on both. But the **call ABI** differs: AAPCS64 passes NEON arguments in `v0..v7` (8 slots), AAPCS32 in `q0..q3` (4 slots). And the underlying machine instructions are completely different encodings.
+
+## SVE and SVE2 — variable-length vectors (ARMv9)
+
+ARMv8.2-A introduced the *Scalable Vector Extension* (SVE) as an optional feature targeted at HPC. ARMv9-A makes **SVE2** mandatory for application cores. SVE is the most significant ISA change since AArch64 itself.
+
+The core idea: instead of fixed-width vectors (128 bits in NEON), SVE defines vector registers whose width is *implementation-defined* — 128, 256, 384, 512, ... up to 2048 bits, in 128-bit increments. Code is written without knowing the width; instructions use **predicate registers** (`p0..p15`) to mask off lanes that don't apply. A `WHILELT` instruction generates a predicate that's "true for lanes 0..N-1, false beyond," letting a single loop iteration handle whatever vector length the hardware provides.
+
+```asm
+    // SVE: scale an array x[] by 2.0
+    mov     x0, #0              // index
+    whilelt p0.s, x0, x1        // p0 = lanes where x0+lane < count
+sve_loop:
+    ld1w    z0.s, p0/z, [x2, x0, lsl #2]   // load active lanes
+    fmul    z0.s, z0.s, z0.s    // double via add — illustrative
+    st1w    z0.s, p0, [x2, x0, lsl #2]
+    incw    x0                  // advance by vector length (in words)
+    whilelt p0.s, x0, x1
+    b.first sve_loop
+```
+
+The same binary runs unchanged on a 128-bit SVE implementation, a 256-bit one (Neoverse V1 ships at 256), or a hypothetical 2048-bit one — without recompiling, retesting, or branching on vector length. That's the SVE bet.
+
+SVE2 adds integer dot products, complex arithmetic, string/parsing primitives (for code like memchr, JSON parsers), and crypto. SVE2 subsumes most NEON workloads — a SVE2-tuned codebase often retires its NEON paths.
+
+<Callout type="warn">
+SVE-using binaries do **not** run on v8.0 cores (Cortex-A53, A55, A72, A76 — most pre-2021 silicon). If you compile with `-march=armv9-a` or `-march=armv8.2-a+sve`, the binary will SIGILL on older parts. For phone/embedded distribution, ship runtime-dispatch code: detect SVE at startup (via `getauxval(AT_HWCAP2) & HWCAP2_SVE`) and pick the SVE or NEON path.
+</Callout>
+
+## MTE, PAC, BTI — the ARMv8.3/v8.5/v9 security trio
+
+ARMv8.3-A added **Pointer Authentication** (PAC). Selected upper bits of every pointer carry a cryptographic signature; instructions like `PACIASP` sign LR using a kernel-managed key, `AUTIASP` verifies it. A buffer overflow that overwrites the return address with an attacker-controlled value will fail authentication and trap on the next `RET`. The signature is cheap (single-cycle on most cores) and substantially raises the bar for ROP exploitation.
+
+ARMv8.5-A added **Branch Target Identification** (BTI). Indirect branch instructions can only target a `BTI` landing-pad instruction; anything else faults. This eliminates JOP gadgets — attackers can no longer jump into the middle of a function to chain useful instructions.
+
+ARMv8.5-A also added **Memory Tagging Extension** (MTE). Each 16-byte chunk of memory carries a 4-bit tag in the upper bits of its physical address; pointers carry a 4-bit tag in their high bits; loads/stores check that the pointer tag matches the memory tag. Heap allocators (jemalloc, scudo) randomize tags on `malloc` and re-tag on `free` — use-after-free, buffer overflow, and double-free become trap-on-detect with ~93% probability per access.
+
+ARMv9 makes PAC, BTI, and MTE baseline expectations (though MTE is still implementation-allowed-to-omit on some cores). All three need OS, libc, and compiler cooperation: GCC/Clang flags are `-mbranch-protection=standard` for PAC+BTI, `-fsanitize=memtag` for MTE.
+
+## Picking a compile target
+
+For embedded Linux on a specific Cortex-A SoC, target the exact CPU with `-mcpu=cortex-a72` (or whatever); the compiler enables the right ISA features and tunes the scheduler.
+
+For distribution binaries (Linux distros, app stores), the conservative choice is `-march=armv8-a` with no extension flags — that runs on every AArch64 phone/server shipped since 2014. Add `+crypto` if you want AES instructions; that's been mandatory since v8.0 on real silicon.
+
+For an AI/HPC workload targeting Neoverse or Apple Silicon class hardware, `-march=armv8.6-a+sve` or `-march=armv9-a` unlocks SVE2 and the matrix-multiply primitives. Plan for runtime dispatch if the binary also has to run on older hardware.
+
+<CoreCompare
+  rows={[
+    { core: '-march=armv7-a', notes: 'AArch32 only. Cortex-A7/A9/A15. NEON optional — add +neon-vfpv4. Last-generation phones.' },
+    { core: '-march=armv8-a', notes: 'AArch64 baseline. NEON+crypto mandatory. Cortex-A53/A72/A76 and onward — safest server target.' },
+    { core: '-march=armv8.2-a+sve', notes: 'Adds SVE. Neoverse V1, A64FX. AI/HPC opt-in target.' },
+    { core: '-march=armv9-a', notes: 'SVE2 + PAC + BTI baseline. Cortex-A510/A710/X2/X3 and Neoverse V2. Phone/edge 2022+.' },
+    { core: '-mcpu=cortex-a76', notes: 'Tunes for a specific core. Best perf on that part; binary still runs on compatible parts.' },
+  ]}
+/>
+
+## Cross-references
+
+- [Exception levels & EL2/EL3](/docs/cortex-a/virtualization) — how AArch64 separated privilege from register banks
+- [NEON and SVE/SVE2](/docs/cortex-a/neon-sve) — deep dive on the vector extensions
+- [TLB and address translation](/docs/cortex-a/tlb) — 48-bit VA and page-table walks
+- [AAPCS calling conventions](/docs/architecture/aapcs) — the AAPCS32 and AAPCS64 ABIs
+- ARM ARM (DDI 0487) — the architecture reference manual for v8/v9
+- ARM ARM (DDI 0406) — for v7-A

@@ -1,0 +1,176 @@
+---
+title: Tickless idle
+description: Power-aware RTOS idle. Conventional 1ms tick costs a wakeup every millisecond. Tickless skips ticks when no task is ready, sleeps until the next real deadline. FreeRTOS portSUPPRESS_TICKS_AND_SLEEP, Zephyr CONFIG_TICKLESS_KERNEL, wakeup sources, and catch-up logic.
+order: 5
+updated: 2026-05-13
+tags: [rtos, tickless, low-power, idle, systick, freertos, zephyr]
+---
+
+The traditional RTOS tick is a SysTick interrupt at a fixed rate — 1 kHz on most setups. Every millisecond, the CPU wakes from any sleep state, the scheduler runs, checks the delayed-task list, possibly switches tasks, and goes back to sleep. On a battery-powered device with no real work to do, that's a thousand wakeups per second purely for the sake of "what if a task became ready?" — and each wakeup costs energy.
+
+Tickless idle is the optimisation that removes the periodic wakeup when nothing actually needs it. The idea: if no task will be ready for the next N milliseconds, don't wake every 1 ms — wake exactly once, when N expires. The savings can be enormous: a sensor node that's actually doing work for 1 ms every 30 s spends 99.997% of its time idle, and conventional ticking forces ~30 000 wakeups in that 30 s window, draining the battery to little purpose.
+
+This page covers what tickless does, the wakeup-source choices, FreeRTOS and Zephyr implementations, the catch-up logic on wake, and the pitfalls (mostly involving things that *aren't* on the timer queue but expect ticks to keep coming).
+
+<SpecSheet
+  title="Tickless at a glance"
+  specs={[
+    { label: 'Conventional tick rate', value: 'Typically 1 kHz on Cortex-M, sometimes 100 Hz on Cortex-A. Drives the scheduler\'s delayed-task list.' },
+    { label: 'Cost per tick', value: '~200 cycles SysTick ISR + scheduler pass. At 100 MHz, ~2 µs out of every 1000 µs = 0.2% CPU even idle.' },
+    { label: 'Energy cost', value: 'On nRF52 in deep sleep (1 µA), a wakeup that runs for 10 µs at 5 mA averages to (5 mA × 10 µs)/1 ms = 50 µA — 50× the deep-sleep current.' },
+    { label: 'Tickless wakeup source', value: 'Reprogrammed SysTick (down-counted with longer reload), or a separate low-power timer (RTC, LPTIM, RTOS-specific) that keeps running in deep sleep.' },
+    { label: 'FreeRTOS', value: 'configUSE_TICKLESS_IDLE = 1 or 2. Provides portSUPPRESS_TICKS_AND_SLEEP() — vendor port implements the actual sleep.' },
+    { label: 'Zephyr', value: 'CONFIG_TICKLESS_KERNEL. Default-on for most modern boards. Uses k_cyc_t and the kernel timer driver to schedule wakeups precisely.' },
+    { label: 'ThreadX', value: 'TX_LOW_POWER. Modules can register power-aware tick-suppression callbacks.' },
+  ]}
+/>
+
+## Why the conventional tick is wasteful
+
+Imagine a battery-powered weather station: every 10 minutes, wake up, read sensors, transmit via LoRa, sleep. Between transmissions, all tasks are blocked waiting on `vTaskDelay(pdMS_TO_TICKS(600000))` — 600 000 ticks at 1 kHz.
+
+With a conventional 1 kHz tick, SysTick fires 600 000 times during the sleep interval. Each fire wakes the CPU from deep sleep, runs the SysTick handler (a few hundred cycles to decrement counters and check for ready tasks), confirms nothing is ready, and goes back to sleep. Even with each wakeup taking only 5 µs at 8 mA active current, that's:
+
+```
+600000 wakeups × 5 µs × 8 mA = 24 mA-µs * 600000 / 600 s = 240 µA average
+```
+
+A 600 mAh coin cell drains in 600 mAh / 240 µA = ~2500 hours = ~3.5 months.
+
+With tickless idle, the same workload looks like:
+
+```
+1 wakeup × 5 µs × 8 mA = 8 mA-µs * 1 / 600 s = 13 nA average
+```
+
+Now battery life is limited by the **deep-sleep current** (say 1 µA on nRF52), not by tick overhead. The same coin cell lasts 600 mAh / ~1 µA = 600 000 hours = 68 years (theoretically; calendar life and self-discharge dominate long before then).
+
+That's a four-orders-of-magnitude difference for the same workload, purely from killing the tick.
+
+## How tickless works
+
+Three phases.
+
+**Suspend.** When the scheduler is about to enter the idle task, it asks: "what's the next time any task will become ready?" That's the head of the delayed-task list. If no task is delayed (everyone's blocked on an event), the answer is "infinity." Otherwise, it's some number of ticks T into the future.
+
+If T > some threshold (in FreeRTOS, the `configEXPECTED_IDLE_TIME_BEFORE_SLEEP` macro, typically 2 ticks), the RTOS calls the port's tickless hook: "suppress the next T-1 ticks and sleep."
+
+**Sleep.** The port disables SysTick (or reprograms it for a much longer reload), arms a low-power timer to wake at the target time, and executes `WFI` (Wait For Interrupt) to enter the chosen sleep mode. The CPU stops clocking.
+
+**Resume.** Some interrupt fires — the timer expiring at the target time, or an external event (UART RX, button press, sensor IRQ) that arrived earlier. The CPU wakes. The port reads the timer, figures out how many ticks actually elapsed, and updates the RTOS tick counter accordingly. The scheduler then runs and decides what to do next.
+
+The catch-up is essential: from the rest of the system's perspective, time still passed during the sleep. `xTaskGetTickCount()` must return a value consistent with wall-clock time. The port reads the low-power timer's current value, computes elapsed ticks, and increments the RTOS tick counter in a single bulk update.
+
+## Wakeup sources
+
+The tickless implementation has to choose a clock source that keeps running during sleep. Options on Cortex-M:
+
+| Source | Resolution | Runs during sleep? | Typical drift |
+|--------|-----------|---------------------|---------------|
+| SysTick (default) | CPU clock period | No (clocks off in deep sleep) | None (CPU clock) |
+| LPTIM (STM32) | LSE clock period (~30.5 µs at 32.768 kHz) | Yes, even in STOP mode | ±20 ppm with LSE crystal |
+| RTC wakeup | 1/32768 s = 30.5 µs minimum | Yes, in all sleep modes | ±20 ppm with LSE crystal, ±100 ppm with LSI |
+| nRF RTC | 30.5 µs (32.768 kHz) | Yes | ±20 ppm |
+| Kinetis LPTMR | 30.5 µs typically | Yes in VLPS/STOP | ±50 ppm |
+| External crystal | varies | Configurable | Best (low ppm) |
+
+The trade-off is between resolution and sleep depth. SysTick is high-resolution (cycle-accurate) but stops in deep sleep modes — so on a part that needs aggressive sleep, you must switch to a low-frequency timer. The cost: tick granularity drops from 1 µs (at 1 MHz CPU clock) to ~30 µs (at 32 kHz). For most workloads, this is fine.
+
+FreeRTOS handles the granularity mismatch with `configUSE_TICKLESS_IDLE = 2` — the user provides a `vPortSetupTimerInterrupt` and `vPortSuppressTicksAndSleep` that use whatever clock makes sense. STM32CubeMX generates LPTIM-based tickless ports automatically.
+
+## FreeRTOS implementation
+
+The default tickless port (`configUSE_TICKLESS_IDLE = 1`) uses SysTick reprogrammed for longer reload during sleep. The flow:
+
+```c
+void vPortSuppressTicksAndSleep(TickType_t xExpectedIdleTime) {
+    /* 1. Stop the SysTick */
+    portNVIC_SYSTICK_CTRL_REG &= ~portNVIC_SYSTICK_ENABLE_BIT;
+
+    /* 2. Compute reload value for xExpectedIdleTime ticks */
+    uint32_t reload = (xExpectedIdleTime - 1UL) * ulTimerCountsForOneTick - SysTick->VAL;
+    SysTick->LOAD = reload;
+    SysTick->VAL = 0;
+
+    /* 3. Mask interrupts, check no work appeared while we were preparing */
+    __disable_irq();
+    if (eTaskConfirmSleepModeStatus() == eAbortSleep) {
+        /* something happened — bail out */
+        SysTick->LOAD = ulTimerCountsForOneTick - 1;
+        SysTick->CTRL |= portNVIC_SYSTICK_ENABLE_BIT;
+        __enable_irq();
+        return;
+    }
+
+    /* 4. Enable SysTick, sleep */
+    SysTick->CTRL |= portNVIC_SYSTICK_ENABLE_BIT;
+    __WFI();
+    __enable_irq();
+
+    /* 5. SysTick fired or an external IRQ woke us. Compute elapsed ticks. */
+    uint32_t elapsed_counts;
+    if (SysTick->CTRL & portNVIC_SYSTICK_COUNT_FLAG) {
+        /* full xExpectedIdleTime elapsed */
+        elapsed_counts = (xExpectedIdleTime - 1) * ulTimerCountsForOneTick;
+    } else {
+        /* IRQ woke us early */
+        elapsed_counts = SysTick->LOAD - SysTick->VAL;
+    }
+    uint32_t elapsed_ticks = elapsed_counts / ulTimerCountsForOneTick;
+    vTaskStepTick(elapsed_ticks);
+
+    /* 6. Restore SysTick to normal 1ms reload */
+    SysTick->LOAD = ulTimerCountsForOneTick - 1;
+}
+```
+
+This is roughly what the default ARM Cortex-M port in `port.c` does. For deeper sleep modes that stop SysTick entirely, a custom port using LPTIM/RTC is required — `configUSE_TICKLESS_IDLE = 2` is the hook.
+
+`eTaskConfirmSleepModeStatus()` is the safety net: it returns `eAbortSleep` if a task became ready between the scheduler's decision to sleep and the actual `WFI`. Without this check, you'd miss the readiness event and sleep through it.
+
+## Zephyr implementation
+
+Zephyr's tickless model is more thoroughly baked-in — `CONFIG_TICKLESS_KERNEL` is default-on for most modern boards. The kernel uses a high-resolution timer (`k_cyc_t`) and computes wakeup times in cycles, not ticks. There's no fixed tick rate; the kernel programs the next interrupt for exactly the next deadline.
+
+The kernel's "system clock driver" is a per-SoC layer that knows how to:
+
+- Read the current time in cycles
+- Set the next interrupt at a given cycle count
+- Service the interrupt when it fires
+
+For STM32 in STOP mode, the driver uses LPTIM. For nRF in System OFF, it uses RTC. The kernel layer is the same; only the driver differs.
+
+The advantage of Zephyr's approach: time resolution can be much finer than ticks. A 100 µs deadline can be scheduled exactly, not rounded up to the next tick. The disadvantage: every blocking call computes deadlines in cycles, slightly more arithmetic than a tick-based system.
+
+## Pitfalls
+
+**Code that depends on tick periodicity.** Some libraries assume `vTaskDelay(1)` always waits exactly 1 ms. With tickless and a low-resolution timer, the wait may be quantised to the timer's granularity (30 µs on RTC). If your code needs precise 1 ms delay, use a hardware timer directly or accept the quantisation.
+
+**Statistics and "CPU usage" counters.** If they're driven by the tick, they undercount when ticks are suppressed. FreeRTOS provides `configGENERATE_RUN_TIME_STATS` and a separate high-resolution timer hook for this. Set up the runtime stats timer to keep running during sleep, or your idle measurement will be wrong.
+
+**Peripherals that need a clock.** If you put the CPU in a sleep mode that also stops peripherals, anything mid-transaction (UART transmission, ADC conversion, DMA) is halted. Either don't sleep that deep, or ensure all peripherals are quiescent before sleep.
+
+**Wakeup latency.** Coming out of STOP/Standby on STM32 takes ~5 µs (STOP) to ~600 µs (Standby). For hard real-time, this may be unacceptable — the deepest sleep modes are not suitable for tasks with sub-millisecond deadlines.
+
+<Callout type="warn">
+A common bug: enabling tickless idle without disabling SysTick in the sleep transition. The CPU enters STOP mode, the CPU clock stops, SysTick stops counting, but on wake the SysTick LOAD value is wrong (because it was set for a 1ms tick, not the requested suppression). Result: tick counter is off by hundreds of ticks. Always reprogram the wakeup source in the suppression hook and validate the elapsed-ticks calculation against an independent clock during bring-up.
+</Callout>
+
+## Measuring tickless effectiveness
+
+Three measurements to take after enabling tickless:
+
+1. **Sleep mode current** — measure with a current shunt on a power-profiler kit (Otii, JoulScope, Nordic PPK2). Should match the datasheet sleep-mode spec (typically 1-10 µA).
+2. **Wakeup count per second** — instrument the wakeup hook to log/count. Should match expected event rate, not the old tick rate.
+3. **Average current** — over a representative workload window (say one minute). Compare against the no-tickless baseline.
+
+A typical win on a sensor-node workload: average current drops from 200 µA (with 1 kHz tick keeping CPU partially awake) to 5 µA (idle current with occasional event-driven wakes). A 40× improvement, with no application code changes — just the RTOS configuration flip.
+
+## Further reading
+
+- [RTOS scheduling](/docs/rtos/scheduling) — idle task context
+- [FreeRTOS](/docs/rtos/freertos) — `configUSE_TICKLESS_IDLE`
+- [Zephyr](/docs/rtos/zephyr) — `CONFIG_TICKLESS_KERNEL`
+- [Low-power modes](/docs/peripherals/low-power) — Cortex-M sleep states and what stays on
+- FreeRTOS low-power tickless docs: freertos.org/low-power-tickless-rtos.html
+- Zephyr clock driver subsystem: docs.zephyrproject.org/latest/kernel/timing_functions.html

@@ -1,0 +1,81 @@
+---
+import BaseLayout from '~/layouts/BaseLayout.astro';
+import Terminal from '~/components/Terminal.astro';
+---
+<BaseLayout title="Contributing — armhub" description="How to contribute content, code, or corrections to armhub.dev.">
+  <section class="container-page py-10 sm:py-12 md:py-16 border-b border-line/70">
+    <div class="max-w-2xl">
+      <div class="font-mono text-xs uppercase tracking-wider text-ink-faint">/ contributing</div>
+      <h1 class="mt-2 font-display text-[2rem] sm:text-4xl md:text-5xl font-semibold tracking-tight text-balance leading-tight">Make this better.</h1>
+      <p class="mt-4 text-base sm:text-lg text-ink-muted">
+        armhub is a public reference site built and maintained openly. Found a mistake, want to add a page, have a pattern that should be canonical here?
+        Open an issue, send a PR — we'll review and merge.
+      </p>
+    </div>
+  </section>
+
+  <section class="container-page py-8 sm:py-12 grid gap-8 lg:gap-10 lg:grid-cols-[1.4fr_1fr]">
+    <div class="prose max-w-none">
+      <h2>Quick start</h2>
+      <p>The site is an Astro project. Content pages are MDX in <code>src/content/&lt;section&gt;/</code>. Interactive components live in <code>src/components/</code>. Styling is Tailwind.</p>
+
+      <pre><code>git clone https://github.com/sitharaj88/armhub
+cd armhub
+npm install
+npm run dev          # opens http://localhost:4321
+</code></pre>
+
+      <h2>Adding a page</h2>
+      <p>Create a new MDX file under the appropriate section, e.g. <code>src/content/peripherals/can-fd.mdx</code>:</p>
+      <pre><code>---
+title: CAN-FD
+description: Flexible-Data-Rate CAN — bit-rate switching, framing, controller config.
+order: 10
+updated: 2026-05-20
+tags: [peripherals, can, can-fd]
+---
+
+import Callout from '~/components/Callout.astro';
+import RegisterMap from '~/components/RegisterMap.astro';
+
+Your content here...
+</code></pre>
+
+      <p>The page is automatically picked up and routed at <code>/docs/peripherals/can-fd/</code>. Add it to <code>src/utils/nav.ts</code> if it should appear in the sidebar.</p>
+
+      <h2>Editorial guidelines</h2>
+      <ul>
+        <li><strong>Voice</strong> — confident, dry, technical. Aim for clarity, not enthusiasm.</li>
+        <li><strong>Audience</strong> — working firmware engineers. Don't explain what a register is. Do explain why this register, this way.</li>
+        <li><strong>Show, don't claim</strong> — every claim should have either a code sample or a register reference.</li>
+        <li><strong>No marketing</strong> — never recommend a vendor product without naming alternatives.</li>
+        <li><strong>Length</strong> — pages range 800–2500 words. Less is fine; padding for length is not.</li>
+      </ul>
+
+      <h2>Interactive components available</h2>
+      <ul>
+        <li><code>&lt;RegisterMap /&gt;</code> — bit-field visualiser. See examples in <code>src/content/cortex-m/nvic.mdx</code>.</li>
+        <li><code>&lt;MemoryMap /&gt;</code> — address-space diagram.</li>
+        <li><code>&lt;CoreCompare /&gt;</code> — Cortex-M comparison table.</li>
+        <li><code>&lt;Callout type="..." /&gt;</code> — note / tip / warn / danger / spec.</li>
+        <li><code>&lt;Card title="..." href="..." /&gt;</code> — link card.</li>
+        <li><code>&lt;Terminal /&gt;</code> — terminal-styled code block.</li>
+      </ul>
+
+      <h2>Licensing</h2>
+      <p>Content is licensed CC BY 4.0; code under MIT. By contributing you agree to these licenses.</p>
+    </div>
+
+    <Terminal title="armhub ~ contribute">
+      <div><span class="text-ink-faint">$</span> <span class="text-ink">git checkout -b</span> docs/can-fd</div>
+      <div><span class="text-ink-faint">$</span> <span class="text-ink">$EDITOR</span> src/content/peripherals/can-fd.mdx</div>
+      <div><span class="text-ink-faint">$</span> <span class="text-brand">npm run dev</span></div>
+      <div class="text-ink-muted">→ open localhost:4321/docs/peripherals/can-fd/</div>
+      <br />
+      <div><span class="text-ink-faint">$</span> <span class="text-ink">git add</span> -A &amp;&amp; <span class="text-ink">git commit</span> -m "docs: CAN-FD"</div>
+      <div><span class="text-ink-faint">$</span> <span class="text-ink">git push</span> origin docs/can-fd</div>
+      <div><span class="text-ink-faint">$</span> <span class="text-brand">gh pr create</span></div>
+      <div class="text-ink-muted">→ PR opened. Review within 48h.</div>
+    </Terminal>
+  </section>
+</BaseLayout>

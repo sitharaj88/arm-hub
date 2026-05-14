@@ -1,0 +1,192 @@
+---
+title: Drone IMU subsystem
+description: MEMS gyro and accelerometer for drones — ICM-42688-P, BMI270, magnetometer and barometer fusion. Complementary filter, Madgwick, Mahony, full EKF. Sample rate 8 kHz, low-pass to 100 Hz, gyro-bias tracking.
+order: 11
+updated: 2026-05-13
+tags: [systems, drone, imu, sensor-fusion, ekf, madgwick, gyro]
+---
+
+The IMU is the centre of gravity of any drone flight controller. Everything else — the GPS, the barometer, the magnetometer, the optical flow camera — provides slower, supplementary information; the IMU provides the high-rate attitude derivative that the inner control loop consumes. Lose the IMU for 5 ms and the drone tips. Get the IMU's noise floor wrong by 0.1 °/s and the attitude estimate drifts measurably within a minute. This is the most timing-critical, most noise-critical, most calibration-critical sensor subsystem in the entire vehicle.
+
+This page covers the MEMS sensors that make up a modern drone IMU, the sample-rate / filter / fusion choices, and how the firmware on a Cortex-M7 turns 8 kHz worth of raw gyro samples into a reliable attitude quaternion.
+
+<SpecSheet
+  title="Typical drone IMU subsystem"
+  specs={[
+    { label: 'Gyro / accel chips', value: 'ICM-42688-P (TDK InvenSense), BMI270 (Bosch), ICM-20602 (legacy), LSM6DSO (ST)' },
+    { label: 'Magnetometer', value: 'LIS3MDL (ST), MMC5983MA (MEMSIC), RM3100 (PNI), IST8310' },
+    { label: 'Barometer', value: 'BMP388 / BMP390 (Bosch), MS5611 (TE), DPS310 (Infineon)' },
+    { label: 'Gyro ODR (output data rate)', value: '8 kHz on ICM-42688-P, 6.4 kHz on BMI270 — drives the inner control loop rate' },
+    { label: 'Gyro noise density', value: '~3.5 mdps/√Hz on ICM-42688-P; ~14 mdps/√Hz on BMI270' },
+    { label: 'Accel noise density', value: '~70 µg/√Hz typical' },
+    { label: 'Bus', value: 'SPI at 10–24 MHz; I²C only for slower sensors (mag, baro)' },
+    { label: 'Filter cutoff', value: 'On-chip 1.0–500 Hz programmable LPF; firmware adds harmonic-tracking notch' },
+    { label: 'Fusion algorithm', value: 'Madgwick / Mahony (small drones) or full EKF (PX4 EKF2, ArduPilot EKF3)' },
+    { label: 'Attitude output rate', value: '250 Hz – 1 kHz (depends on fusion complexity)' },
+    { label: 'Cortex-M load', value: '~15-25% on STM32H743 @ 480 MHz including notch filter and full EKF' },
+  ]}
+/>
+
+<BlockDiagram
+  title="Drone IMU subsystem — sensors, fusion, control"
+  width={860}
+  height={400}
+  minWidth={760}
+  nodes={[
+    { id: 'imu1',  x: 40,  y: 40,  w: 200, h: 56, kind: 'sensor',   label: 'Primary IMU', detail: 'ICM-42688-P · SPI 20 MHz' },
+    { id: 'imu2',  x: 40,  y: 112, w: 200, h: 56, kind: 'sensor',   label: 'Redundant IMU', detail: 'BMI270 · SPI' },
+    { id: 'refs',  x: 40,  y: 196, w: 200, h: 72, kind: 'sensor',   label: 'Reference sensors', detail: 'magnetometer · barometer' },
+    { id: 'mcu',   x: 320, y: 78,  w: 220, h: 72, kind: 'core',     label: 'Cortex-M7 @ 480 MHz', detail: 'DMA · FPU · ITCM' },
+    { id: 'notch', x: 320, y: 206, w: 220, h: 56, kind: 'periph',   label: 'Harmonic notch + LPF', detail: 'gyro cleanup' },
+    { id: 'rpm',   x: 320, y: 306, w: 220, h: 44, kind: 'external', label: 'ESC RPM telemetry', detail: 'BBDShot tracking' },
+    { id: 'ekf',   x: 620, y: 78,  w: 200, h: 72, kind: 'periph',   label: '24-state EKF', detail: 'attitude · velocity · bias' },
+    { id: 'fc',    x: 620, y: 206, w: 200, h: 72, kind: 'periph',   label: 'Inner-loop controller', detail: 'PID @ 8 kHz' },
+  ]}
+  edges={[
+    { from: 'imu1',  to: 'mcu',   label: 'SPI 8 kHz', tone: 'accent' },
+    { from: 'imu2',  to: 'mcu',   tone: 'accent' },
+    { from: 'refs',  to: 'mcu',   label: 'I²C', tone: 'muted' },
+    { from: 'mcu',   to: 'notch', label: 'raw gyro' },
+    { from: 'notch', to: 'fc',    label: 'clean gyro', tone: 'success' },
+    { from: 'mcu',   to: 'ekf',   label: 'samples' },
+    { from: 'ekf',   to: 'fc',    label: 'attitude / vel', tone: 'primary' },
+    { from: 'rpm',   to: 'notch', label: 'tracking RPM', tone: 'warning' },
+  ]}
+  caption="Inertial sensors stream to the M7 over SPI/I²C; raw gyro is notch-filtered against motor RPM telemetry, fused in a 24-state EKF, and the resulting attitude drives the 8 kHz inner PID loop."
+/>
+
+## The MEMS gyro — what it measures and what it doesn't
+
+A MEMS gyroscope measures **angular velocity** (degrees or radians per second) around three orthogonal axes. It does *not* directly measure orientation — to know "where is the drone pointing", you integrate angular velocity over time. Integration accumulates error: gyro bias (a small DC offset, typically 0.1–1 °/s) integrates linearly into a heading error of a degree per second of flight. This is why every IMU subsystem also has an accelerometer (provides absolute gravity reference at low frequency) and a magnetometer (provides absolute heading reference, low frequency, magnetically noisy near motors).
+
+The classic combination:
+
+| Sensor | Provides | Time scale |
+|--------|----------|------------|
+| Gyro | Angular velocity | Microseconds to ~1 s of integration |
+| Accel | Gravity vector | Long-term (the average over seconds) |
+| Mag | North vector | Long-term, distorted by motors |
+| Baro | Altitude / vertical position | Slow (~10 Hz useful), drifts |
+| GPS | Position + velocity | ~10 Hz, ~2 m absolute |
+
+The fusion filter weights each sensor by its trust at the relevant frequency: gyro for high-rate change, accel and mag for low-rate correction.
+
+## Why high sample rate matters
+
+A drone propeller turning at 6000 RPM generates vibration at the blade-pass frequency: 100 Hz fundamental, plus harmonics. A 1 kHz gyro samples at the Nyquist limit for the fundamental — too close, aliasing is severe. A 4 kHz or 8 kHz gyro lets the firmware low-pass-filter down to ~250 Hz cleanly, removing the worst of the rotor noise while preserving the bandwidth the control loop needs.
+
+The ICM-42688-P's 8 kHz ODR is enabled by an on-chip oversampling-and-digital-filter architecture: the sensor samples at 32 kHz internally, applies a programmable digital LPF, and decimates to the configured ODR. This decouples the mechanical noise floor from the bus-rate the host sees.
+
+On the SPI bus, an 8 kHz gyro polling pattern from a Cortex-M7:
+
+```c
+// 14-byte read every 125 µs
+spi_dma_read(gyro_buf, 14);   // chip-select pulse, DMA transfer
+// while DMA runs, prior sample is being processed
+process_prior_sample();
+```
+
+The bus transaction at 20 MHz SPI takes ~7 µs; double-buffered DMA overlaps with processing. The CPU never waits on the bus — it's compute-bound, not IO-bound.
+
+## Sensor calibration
+
+Every MEMS gyro and accelerometer has manufacturing tolerances that must be calibrated out before the data is useful for control:
+
+**Gyro bias.** A small static offset on each axis when the sensor is stationary. Measured by averaging readings during initialisation (drone on ground, motors off). Persistent component stored in non-volatile memory; per-power-on component re-measured at every arm.
+
+**Gyro temperature compensation.** Bias drifts with temperature, typically 0.01–0.05 °/s per °C. Sensor temperature is measured on-chip; firmware fits a 2nd-order polynomial of bias vs T from a factory cal sweep. Run-time correction applied per sample.
+
+**Accelerometer bias and scale.** Six-position calibration — sensor placed in each of six orthogonal orientations, each axis aligned with gravity in turn. Bias and scale-factor matrix fitted to the 6 measurements. Typical scale factor error is 0.5–2%; uncorrected, this corrupts the gravity-vector reference for attitude.
+
+**Magnetometer calibration.** This is the harder one. Magnetometers see "hard iron" offsets (DC, from ferromagnetic components on the drone) and "soft iron" distortions (a scaling matrix, from currents and high-permeability materials reshaping the field). The standard calibration is the "sphere fit" — rotate the drone through all orientations while logging mag readings; the data should form a sphere centred at the origin if uncalibrated bias and scale are zero. Fit a 3-axis ellipsoid; invert for the calibration matrix. Some flight stacks run continuous re-calibration during flight.
+
+**Cross-axis sensitivity.** Misalignment of the sensor's internal MEMS axes relative to its package frame, plus misalignment of the package on the PCB. Typically 0.5–1° per axis — corrected via a 3×3 rotation matrix in firmware.
+
+<Callout type="warn">
+A common bring-up trap: forgetting to apply the gyro temperature compensation during warm-up. The drone is sitting on the bench cold; ten minutes into flight, the IMU is at 50 °C and the gyro bias has shifted half a degree per second. Without compensation, the attitude drifts visibly. Always run a 30-second temperature sweep with the IMU bagged in a warming pouch to verify the compensation curve.
+</Callout>
+
+## Filtering — the harmonic notch
+
+Motor-induced vibration is the dominant noise source on most drones. The vibration spectrum is concentrated at the motor RPM frequency (the rotational rate, not the blade-pass) and its first few harmonics. A simple low-pass filter at 100 Hz removes the high-end content but lets the fundamental through; the gyro sees the fundamental, the control loop reacts, the motors modulate, the feedback loop amplifies it — "motor whine" or "wobble" in the air.
+
+The modern fix is a **harmonic notch filter** — a series of narrow notches placed at the motor RPM (read from bidirectional DShot telemetry, see [drone ESC](/docs/systems/drone-esc)) and its first 2–3 harmonics, tracking the RPM as it changes. As the motor speeds up, the notches follow.
+
+```
+gyro_raw → static LPF (250 Hz) → harmonic_notch(rpm_4_motors × 3 harmonics)
+        → output to control loop
+```
+
+PX4 calls this "ESC RPM dynamic notch"; Betaflight calls it "Dynamic Filter"; ArduPilot calls it "Harmonic Notch". The implementation is a bank of biquad IIR filters with coefficients updated every few control cycles as RPM changes. A typical implementation runs 4 motors × 3 harmonics × 3 axes = 36 biquads, each ~10 multiplies per sample at 8 kHz — ~3 MFLOPS, easily handled by Cortex-M7's FPU.
+
+## Sensor fusion algorithms
+
+Three approaches, in increasing complexity:
+
+### Complementary filter
+
+The simplest. High-pass the gyro integral, low-pass the accel-derived tilt, sum them.
+
+```
+attitude_estimate = alpha × (attitude_estimate + gyro × dt) + (1 - alpha) × accel_tilt
+```
+
+Where `alpha = tau / (tau + dt)`, `tau` is the time-constant (~0.5–2 s). Works well in 2D (single-axis pitch/roll), struggles with 3D rotations because adding angles doesn't compose correctly. Used in some simple toys and small racing drones; rare in modern designs.
+
+### Madgwick / Mahony filter
+
+Operate on a quaternion attitude representation. Madgwick (Sebastian Madgwick, PhD thesis 2010) uses gradient descent to drive the estimate toward the gravity-and-magnetic-field references; Mahony uses proportional-integral feedback. Both are ~15 lines of math per axis update, ~5 µs per call on a Cortex-M4. Suitable for any drone where the GPS isn't the primary sensor.
+
+Computational cost: trivial. Tuning: two gains (beta for Madgwick, kp and ki for Mahony). The challenge is choosing the gains for the noise environment.
+
+### Extended Kalman Filter (EKF)
+
+The serious tool. Models a 22- to 24-state vector — quaternion (4), gyro bias (3), accel bias (3), velocity (3), position (3), wind (3), magnetic field (3) — and fuses all sensor inputs with explicit covariance propagation. PX4's `EKF2` and ArduPilot's `EKF3` are both production examples.
+
+Run cost: 500 µs to 2 ms per iteration on Cortex-M7 at 480 MHz, depending on which observations are folded in. Predict step runs at gyro rate (200–250 Hz); correction steps run when a new GPS/accel/mag/baro sample is available.
+
+The EKF gives you, beyond attitude, **gyro bias estimation in flight** — the filter notices that gyro integral + observed accel disagree systematically, attributes the residual to slow bias drift, and continuously updates the bias estimate. This is why a properly-tuned EKF outperforms even a well-calibrated Madgwick: it adapts to thermal bias drift during the flight.
+
+| Algorithm | State size | Compute | Drift in 1 min hover | Drift in 5 min with GPS |
+|-----------|-----------|---------|------------------------|--------------------------|
+| Complementary | 3 angles | < 1 µs | ~5° | n/a |
+| Madgwick | 4 (quat) | ~5 µs | ~1° | n/a (no position) |
+| Mahony | 4 (quat) + 3 bias | ~6 µs | ~0.5° | n/a |
+| EKF (PX4 EKF2) | 24 | ~1 ms | ~0.2° | < 0.5 m position |
+
+## Putting it together — a typical attitude pipeline
+
+```
+IMU sample @ 8 kHz:
+  raw_gyro, raw_accel = spi_read_imu();
+  gyro_T_compensated = temp_comp(raw_gyro, raw_temp);
+  gyro_calibrated = cal_matrix * gyro_T_compensated + bias;
+  gyro_filtered = harmonic_notch(static_lpf(gyro_calibrated), motor_rpm);
+  push_to_inner_loop(gyro_filtered);     // 8 kHz inner PID
+
+EKF update @ 250 Hz:
+  predict_state(gyro_filtered, accel_filtered);
+  if (new_mag_sample) update_mag(mag);
+  if (new_baro_sample) update_baro(baro);
+  if (new_gps_sample) update_gps(gps);
+
+Heartbeat @ 50 Hz:
+  log_attitude(quat);
+  send_telemetry(quat, pos, vel);
+```
+
+The inner PID consumes 8 kHz gyro directly; the EKF runs alongside at 250 Hz feeding velocity and position to the outer position loop at 100 Hz. The control hierarchy is rate → attitude → position, with rates increasing as you go inward.
+
+<Callout type="tip">
+For a new drone bring-up, instrument every stage of this pipeline with [SWO ITM logging](/docs/tools/swo) at a low sample rate (e.g. every 64 IMU samples = 125 Hz). You want to see the raw gyro magnitude, the post-notch magnitude, and the EKF residuals. When something goes wrong (excessive vibration, attitude drift, lost-of-position) the pipeline log tells you which stage failed before the visual symptom appears.
+</Callout>
+
+## Cross-references
+
+- [Drone flight controller](/docs/systems/drone-flight-controller) — the FC that runs this IMU pipeline.
+- [Drone ESC](/docs/systems/drone-esc) — the bidirectional DShot telemetry that feeds RPM into the harmonic notch.
+- [SWO and ITM](/docs/tools/swo) — runtime visibility into the sensor pipeline.
+- [Cortex-M7](/docs/cortex-m/m7) — the core most modern FCs use.
+- Sebastian Madgwick, "An efficient orientation filter for inertial and inertial/magnetic sensor arrays", 2010.
+- PX4 EKF2 documentation; ArduPilot EKF3 wiki.
+- Invensense ICM-42688-P datasheet; Bosch BMI270 datasheet.

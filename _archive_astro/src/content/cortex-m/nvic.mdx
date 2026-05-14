@@ -1,0 +1,160 @@
+---
+title: NVIC deep dive
+description: The Nested Vectored Interrupt Controller — how priorities, preemption, pending, and active states actually interact. With registers and timing analysis.
+order: 8
+updated: 2026-05-12
+tags: [cortex-m, nvic, interrupts]
+---
+
+import Callout from '~/components/Callout.astro';
+import RegisterMap from '~/components/RegisterMap.astro';
+
+The NVIC is tightly coupled to the Cortex-M core — it's not a separate IP block, it shares the bus interface, and exception entry from an NVIC source is part of the processor pipeline, not a software trampoline. That's where the **&lt;12-cycle exception latency** comes from.
+
+## NVIC register block
+
+The NVIC lives in the Private Peripheral Bus at `0xE000_E100`. Every register is **32 bits** and either:
+
+- **Bit-per-IRQ** — one bit per interrupt source. `NVIC_ISER0` covers IRQs 0–31, `NVIC_ISER1` covers 32–63, etc. Up to 8 such registers for 240 IRQs.
+- **Byte-per-IRQ** — for priorities. `NVIC_IPR0` covers IRQs 0–3 (4 bytes), up to 60 IPR registers.
+
+| Offset | Register      | Purpose                          | Width per IRQ |
+|--------|---------------|----------------------------------|---------------|
+| 0x100  | NVIC_ISER0..7 | Interrupt Set-Enable              | 1 bit         |
+| 0x180  | NVIC_ICER0..7 | Interrupt Clear-Enable            | 1 bit         |
+| 0x200  | NVIC_ISPR0..7 | Interrupt Set-Pending             | 1 bit         |
+| 0x280  | NVIC_ICPR0..7 | Interrupt Clear-Pending           | 1 bit         |
+| 0x300  | NVIC_IABR0..7 | Interrupt Active Bit (read-only)  | 1 bit         |
+| 0x400  | NVIC_IPR0..59 | Interrupt Priority                | 8 bits        |
+| 0xF00  | STIR          | Software Trigger Interrupt        | (write IRQ#)  |
+
+<RegisterMap
+  name="NVIC_ISER0"
+  address="0xE000_E100"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:0', name: 'SETENA', access: 'RW', reset: '0x00000000', description: 'Writing 1 to bit N enables external IRQ N. Writing 0 has no effect (use ICERn to disable). Reading returns the enable state of all 32 IRQs.' },
+  ]}
+  caption="Set-Enable register — write 1s to enable interrupts, write 0s have no effect. There are 8 SET/CLEAR pairs to handle up to 240 IRQs."
+/>
+
+## Priority encoding
+
+Each IRQ gets one byte in the IPR registers. ARM mandates that at least the **upper 3 bits** are implemented; vendors choose how many of the remaining 5 to keep. Typical:
+
+| Vendor / family   | __NVIC_PRIO_BITS | Distinct levels |
+|-------------------|------------------|-----------------|
+| STM32F0/L0 (M0)   | 2                | 4               |
+| STM32F1/F2/F4 (M3/M4) | 4            | 16              |
+| STM32F7/H7 (M7)   | 4                | 16              |
+| NXP K-series      | 4                | 16              |
+| nRF52 (M4)        | 3                | 8               |
+
+The implemented bits are always the **most-significant** bits of the priority byte. So with 4 bits, valid priority values are `0x00`, `0x10`, `0x20`, ..., `0xF0`.
+
+### Preemption vs subpriority
+
+`SCB_AIRCR.PRIGROUP` splits each priority byte at a configurable point:
+
+```
+PRIGROUP=0:   [P P P P . | s s s]   4 preempt bits, 3 sub
+PRIGROUP=3:   [P P P P P | . . s]   only effective if 5 bits implemented
+PRIGROUP=7:   [. . . . . | s s s]   no preemption, only subpriority
+```
+
+If two IRQs are pending with the same **preemption priority**, the lower **subpriority** wins; they never preempt each other. This is how you keep two related ISRs serialised without disabling interrupts.
+
+<Callout type="tip" title="When you set up the NVIC, set PRIGROUP first">
+CMSIS `NVIC_SetPriorityGrouping(n)` writes PRIGROUP. Do it before any `NVIC_SetPriority` calls so your priority bytes are interpreted consistently. The default on reset is `0` — full preemption, no subpriority.
+</Callout>
+
+## The four IRQ states
+
+Each external IRQ is in exactly one state:
+
+```
+       set-pending           ┌─────────┐
+   ┌────────────────────────▶│ Pending │──┐
+   │                          └─────────┘  │ taken
+   ┌─────────┐                              ▼
+   │ Inactive│                         ┌─────────┐
+   └─────────┘◀────────return ─────────│ Active  │
+       ▲                                └─────────┘
+       │                                    │
+       │  re-asserted while active          │
+       └────────────────────────────────────┘  → Active + Pending
+```
+
+Both **pending** and **active** are visible bits (ISPR/ICPR/IABR). The "active + pending" combination matters for level-sensitive interrupts that re-assert during their own handler — the NVIC will re-enter the handler when it returns.
+
+## Interrupt latency, exact
+
+The Cortex-M4 takes a non-FPU exception in **12 cycles** worst-case (less if the bus is idle):
+
+```
+1   Recognise interrupt                       1 cycle
+2   Compute vector address                    0 cycle (parallel)
+3   Push 8 words (xPSR, PC, LR, R12, R0–R3)   8 cycles (single-cycle stm)
+4   Fetch vector from VTOR                    2 cycles
+5   Start handler                             1 cycle (refilling pipe)
+                                              ────
+                                              12 cycles
+```
+
+If the FPU was active and lazy stacking is disabled, add **18 more cycles** to push S0–S15 + FPSCR.
+
+**Tail-chaining** (one handler returns directly into the next without unstacking) costs ~6 cycles total. **Late-arriving** (a higher-priority IRQ arrives during stacking — the NVIC switches targets without restacking) also adds ~6 cycles.
+
+## Common gotchas
+
+### Disabling an IRQ vs. clearing pending
+
+`NVIC_DisableIRQ(n)` prevents *new* exceptions from being taken — but doesn't clear the pending bit. If the source re-asserted during the disable window, you'll take the interrupt as soon as you re-enable.
+
+```c
+NVIC_DisableIRQ(SOME_IRQ);
+NVIC_ClearPendingIRQ(SOME_IRQ);   // also clear in case it asserted
+__DSB(); __ISB();                  // make sure the disable is observed
+```
+
+### The peripheral pending vs the NVIC pending
+
+Most peripherals have their own status flags (e.g. UART RXNE). The NVIC sees the *level* of the peripheral's interrupt output line. If you handle the peripheral but forget to clear its status flag, the line stays asserted, and **the NVIC immediately re-pends the IRQ as soon as you return**. The result: an infinite ISR loop.
+
+```c
+void USART2_IRQHandler(void) {
+    if (USART2->ISR & USART_ISR_RXNE) {
+        char c = USART2->RDR;        // reading RDR clears RXNE — perfect
+        ring_push(c);
+    }
+    // No explicit clear needed for level-cleared sources.
+    // For sources that latch (timers, EXTI), you MUST clear the flag:
+    //   EXTI->PR1 = EXTI_PR1_PR0;   // W1C
+}
+```
+
+### Priority inversion with `BASEPRI`
+
+You can mask all interrupts at-or-below a given priority by writing `BASEPRI`. This is *safer* than `PRIMASK` (which masks everything except NMI/HardFault) — RTOSes use it for short critical sections. But: ARMv6-M (M0/M0+) doesn't have `BASEPRI`. Code that uses it doesn't port to Cortex-M0.
+
+## Going software-only — STIR
+
+`NVIC_STIR` at `0xE000_EF00` is write-only. Writing an IRQ number to it pends that interrupt as if hardware had asserted it. Useful for:
+
+- Two-stage interrupt handling — the hardware ISR does the latency-critical bit, then triggers a lower-priority NVIC IRQ to do the cleanup at a more relaxed priority.
+- Software-only "tasks" that ride on the NVIC instead of an RTOS.
+
+```c
+__set_PRIMASK(0);
+NVIC_SetPriority(SoftIRQ_IRQn, 0xE0);   // very low
+NVIC_EnableIRQ(SoftIRQ_IRQn);
+// later, from anywhere:
+NVIC_SetPendingIRQ(SoftIRQ_IRQn);
+```
+
+## See also
+
+- [Exception model](/docs/architecture/exception-model/) — the broader picture.
+- [SysTick & timing](/docs/cortex-m/systick/) — the universal periodic tick.
+- [Memory model](/docs/architecture/memory-model/) — barriers around NVIC writes.

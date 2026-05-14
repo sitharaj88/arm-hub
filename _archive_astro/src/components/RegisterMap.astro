@@ -1,0 +1,162 @@
+---
+// Interactive 32-bit register bit-field viewer.
+// Pass `fields` as an array of { bits: "31:24" | "5" | "n", name, access, reset, description }
+// Bits are MSB→LSB, the component computes layout, click a field to highlight it and read its description.
+
+interface Field {
+  bits: string;
+  name: string;
+  access?: 'RW' | 'R' | 'W' | 'RO' | 'WO' | 'W1C' | 'RES';
+  reset?: number | string;
+  description: string;
+}
+
+interface Props {
+  name: string;
+  address?: string;
+  width?: 32 | 16 | 8;
+  fields: Field[];
+  reset?: string;
+  caption?: string;
+}
+
+const { name, address, width = 32, fields, reset, caption } = Astro.props;
+
+function parseRange(s: string): [number, number] {
+  if (s.includes(':')) {
+    const [hi, lo] = s.split(':').map((n) => parseInt(n.trim(), 10));
+    return [hi, lo];
+  }
+  const v = parseInt(s.trim(), 10);
+  return [v, v];
+}
+
+const bits = Array.from({ length: width }, (_, i) => width - 1 - i); // MSB first
+
+// Build a lookup: bit -> field index
+const bitField = new Array<number>(width).fill(-1);
+fields.forEach((f, idx) => {
+  const [hi, lo] = parseRange(f.bits);
+  for (let b = lo; b <= hi; b++) {
+    if (b >= 0 && b < width) bitField[b] = idx;
+  }
+});
+
+const palette = [
+  'bg-brand/18 text-brand border-brand/40',
+  'bg-accent/18 text-accent border-accent/40',
+  'bg-ok/18 text-ok border-ok/40',
+  'bg-err/15 text-err border-err/35',
+  'bg-warn/18 text-warn border-warn/40',
+  'bg-violet-500/15 text-violet-700 dark:text-violet-300 border-violet-500/30',
+  'bg-sky-500/15 text-sky-700 dark:text-sky-300 border-sky-500/30',
+  'bg-pink-500/15 text-pink-700 dark:text-pink-300 border-pink-500/30',
+];
+
+const colorFor = (i: number) => (i < 0 ? 'bg-surface/40 text-ink-faint border-line' : palette[i % palette.length]);
+
+const uid = `rm-${name.toLowerCase().replace(/[^a-z0-9]/g, '-')}-${Math.random().toString(36).slice(2, 7)}`;
+---
+<figure class={`not-prose my-8 rounded-xl border border-line/70 bg-surface/50 overflow-hidden`}>
+  <div class="flex flex-wrap items-baseline justify-between gap-3 border-b border-line/70 bg-bg-subtle/70 px-4 py-3">
+    <div class="font-mono text-sm">
+      <span class="text-ink">{name}</span>
+      {address && <span class="text-ink-faint"> · {address}</span>}
+    </div>
+    <div class="font-mono text-xs text-ink-faint">
+      {width}-bit{reset ? ` · reset ${reset}` : ''}
+    </div>
+  </div>
+
+  <div class="overflow-x-auto p-4">
+    <div class="min-w-[640px]">
+      <div class="mb-2 grid font-mono text-[0.65rem] text-ink-faint" style={`grid-template-columns: repeat(${width}, minmax(0,1fr))`}>
+        {bits.map((b) => (
+          <div class="text-center">{b % 4 === 0 ? b : ''}</div>
+        ))}
+      </div>
+      <div class="grid" style={`grid-template-columns: repeat(${width}, minmax(0,1fr))`}>
+        {bits.map((b) => {
+          const fi = bitField[b];
+          const f = fi >= 0 ? fields[fi] : null;
+          return (
+            <button
+              type="button"
+              data-rm={uid}
+              data-field={fi}
+              class:list={[
+                'group relative h-10 border-l border-y first:border-l-0 last:border-r font-mono text-[0.7rem] flex items-center justify-center transition',
+                colorFor(fi),
+                'hover:brightness-125 focus:outline-none focus:z-10 focus:ring-2 focus:ring-brand/60',
+              ]}
+              aria-label={f ? `${f.name} (bit ${b})` : `Reserved bit ${b}`}
+            >
+              <span class="truncate px-0.5">{f?.name?.[0] ?? '·'}</span>
+            </button>
+          );
+        })}
+      </div>
+      <div class="mt-1 grid font-mono text-[0.6rem] text-ink-faint" style={`grid-template-columns: repeat(${width}, minmax(0,1fr))`}>
+        {bits.map((b) => (
+          <div class="text-center">{b % 8 === 0 ? `b${b}` : ''}</div>
+        ))}
+      </div>
+    </div>
+  </div>
+
+  <div class="border-t border-line/70 bg-bg-subtle/50 overflow-x-auto">
+    <table class="w-full min-w-[640px] text-sm">
+      <thead>
+        <tr class="text-left font-mono text-[0.7rem] uppercase tracking-wider text-ink-faint">
+          <th class="px-4 py-2 w-20">Bits</th>
+          <th class="px-2 py-2 w-32">Name</th>
+          <th class="px-2 py-2 w-14">Acc</th>
+          <th class="px-2 py-2 w-14">Reset</th>
+          <th class="px-4 py-2">Description</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-line/60">
+        {fields.map((f, i) => (
+          <tr
+            data-rm={uid}
+            data-row={i}
+            class:list={['transition hover:bg-surface/60', i % 2 ? 'bg-bg/20' : '']}
+          >
+            <td class="px-4 py-2 font-mono text-xs"><span class={`inline-block rounded border px-1.5 py-0.5 ${colorFor(i)}`}>{f.bits}</span></td>
+            <td class="px-2 py-2 font-mono text-xs text-ink">{f.name}</td>
+            <td class="px-2 py-2 font-mono text-xs text-ink-muted">{f.access ?? '—'}</td>
+            <td class="px-2 py-2 font-mono text-xs text-ink-muted">{f.reset ?? '—'}</td>
+            <td class="px-4 py-2 text-ink-muted">{f.description}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+  {caption && <figcaption class="border-t border-line/70 px-4 py-2 font-mono text-xs text-ink-faint">{caption}</figcaption>}
+</figure>
+
+<script define:vars={{ uid }}>
+  const selector = `[data-rm="${uid}"]`;
+  document.querySelectorAll(selector).forEach((el) => {
+    el.addEventListener('mouseenter', () => highlight(el));
+    el.addEventListener('focus', () => highlight(el));
+    el.addEventListener('mouseleave', () => clear());
+    el.addEventListener('blur', () => clear());
+  });
+  function indexOf(el) {
+    return el.dataset.field ?? el.dataset.row;
+  }
+  function highlight(el) {
+    const i = indexOf(el);
+    document.querySelectorAll(selector).forEach((other) => {
+      const j = indexOf(other);
+      if (j === i) other.classList.add('ring-2', 'ring-brand/70', 'ring-offset-1', 'ring-offset-bg');
+      else other.classList.add('opacity-40');
+    });
+  }
+  function clear() {
+    document.querySelectorAll(selector).forEach((other) => {
+      other.classList.remove('ring-2', 'ring-brand/70', 'ring-offset-1', 'ring-offset-bg', 'opacity-40');
+    });
+  }
+</script>

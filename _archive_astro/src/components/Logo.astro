@@ -1,0 +1,16 @@
+---
+interface Props { class?: string }
+const { class: cls = '' } = Astro.props;
+---
+<a href="/" class={`group inline-flex items-center gap-2.5 ${cls}`} aria-label="armhub home">
+  <span class="relative grid h-8 w-8 place-items-center rounded-lg border border-line bg-bg-raised">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" class="h-5 w-5 text-brand">
+      <path d="M3 18 L3 6 L8 6 A4 4 0 0 1 8 14 L3 14 M8 14 L13 18 M14 6 L14 18 M14 11 L19 6 M14 11 L20 18" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <span class="pointer-events-none absolute inset-0 rounded-lg ring-1 ring-brand/0 group-hover:ring-brand/40 transition" />
+  </span>
+  <span class="font-display text-[1.05rem] font-semibold tracking-tight">
+    arm<span class="text-brand">hub</span>
+    <span class="text-ink-faint">.dev</span>
+  </span>
+</a>

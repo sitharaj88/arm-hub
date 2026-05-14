@@ -1,0 +1,203 @@
+---
+title: SWO and ITM tracing
+description: Serial Wire Output and the Instrumentation Trace Macrocell — non-halting printf, exception tracing, PC sampling and DWT counters streamed over a single pin at multi-megabit rates.
+order: 17
+updated: 2026-05-13
+tags: [tools, swo, itm, dwt, trace, debugging]
+---
+
+SWO (Serial Wire Output) is the second pin of the Serial Wire Debug interface. SWD itself uses two pins — `SWCLK` and `SWDIO` — for bidirectional probe-to-target control; SWO is the optional third pin that the target uses to **stream trace data out** asynchronously, without ever halting the CPU. Combined with the Instrumentation Trace Macrocell (ITM) and the Data Watchpoint and Trace unit (DWT), it gives you a near-zero-overhead `printf`, exception tracing, periodic PC sampling, and DWT counter snapshots — all over one wire, all at multi-megabit rates.
+
+For any Cortex-M3, M4, M7, or M33 design that has an SWO pin wired to the debug header, SWO/ITM is the default channel for runtime telemetry. It replaces semihosting (which halts the CPU per call) and frees the UART for protocol traffic.
+
+<SpecSheet
+  title="SWO and ITM at a glance"
+  specs={[
+    { label: 'Available on', value: 'Cortex-M3, M4, M7, M33, M55, M85 (any part with DWT + ITM macrocells)' },
+    { label: 'Not on', value: 'Cortex-M0, M0+, M23 — no ITM; use RTT or UART' },
+    { label: 'Pin', value: 'SWO (often shared with JTAG TDO on the debug header); single output, no clock' },
+    { label: 'Output encoding', value: 'Manchester or UART NRZ (TPIU.SPPR selects)' },
+    { label: 'Typical bit-rate', value: '2 MBit/s default; up to ~30 MBit/s on STM32H7 with careful PCB and a fast probe' },
+    { label: 'ITM stimulus ports', value: '32 channels (ITM->PORT[0..31]), independently maskable' },
+    { label: 'DWT counters', value: 'CPI, EXC, SLEEP, LSU, CYCCNT, FOLDCNT — overflow events emitted as trace packets' },
+    { label: 'Exception trace', value: 'Entry, exit, and return tagged with cycle stamp' },
+    { label: 'PC sampling', value: 'DWT periodic sample of PC, every 64..16384 cycles — statistical profiling' },
+    { label: 'Host tools', value: 'OpenOCD tpiu config, J-Link SWO Viewer, ST-Link Utility, ozone, orbuculum, itm-tools, RTT not via SWO' },
+  ]}
+/>
+
+## Why SWO instead of UART
+
+A UART `printf` costs:
+
+- An interrupt-safe lock on the TX buffer.
+- Bytes pushed into a software ring buffer (or blocked until the hardware TX FIFO drains).
+- One TX pin and one RX pin you could use for protocol traffic.
+
+SWO `ITM_SendChar` costs:
+
+- A polling loop on `ITM->PORT[ch].u32 == 0` (usually one read).
+- A single 32-bit write to `ITM->PORT[ch].u8` (or u16/u32 for batched output).
+- No interrupt, no buffer, no shared lock — the ITM macrocell handles framing, packetisation, and rate-limiting.
+
+On a 100 MHz Cortex-M4 with 2 Mbit/s SWO, a single byte write costs around 6 cycles in the CPU and a few microseconds in wire time — the CPU is free again long before the bit hits the pin. Because the TPIU has a small internal FIFO that drains asynchronously, the CPU never waits for the wire.
+
+## Hardware path
+
+```
+[CPU core] --> [ITM] --> [TPIU] --> [SWO pin] --> [probe] --> [host PC]
+                  ^
+                  |
+              [DWT events: exceptions, PC samples, counter overflows]
+```
+
+The ITM has 32 stimulus ports (`ITM->PORT[0..31]`), each a single 32-bit MMIO address. Writing to one inserts a 1/2/4-byte trace packet tagged with the port number into the trace stream. The DWT separately injects packets for periodic PC samples, exception entry/exit, and counter overflows. The TPIU (Trace Port Interface Unit) serialises everything onto the single SWO pin using either Manchester encoding (self-clocking, 1.5× bandwidth overhead, works with no shared reference clock) or UART NRZ encoding (cleaner, but requires the host to be configured to the exact bit-rate).
+
+## Bring-up: configuring SWO on STM32
+
+The STM32 family routes SWO through the `DBGMCU` block. Enabling it from firmware requires four steps — and the order matters.
+
+```c
+// 1. Tell DBGMCU to keep trace clock running through low-power modes (optional)
+DBGMCU->CR |= DBGMCU_CR_TRACE_IOEN;
+
+// 2. Configure TPIU
+//    SPPR = 2 -> UART (NRZ); SPPR = 1 -> Manchester
+TPI->SPPR = 0x00000002;
+TPI->ACPR = (SystemCoreClock / 2000000) - 1;  // 2 MBaud SWO
+
+// 3. Unlock and configure ITM
+ITM->LAR = 0xC5ACCE55;                         // unlock magic
+ITM->TCR = ITM_TCR_TraceBusID_Msk & (0x01 << 16)  // trace bus ID = 1
+         | ITM_TCR_DWTENA_Msk                    // forward DWT packets
+         | ITM_TCR_SYNCENA_Msk                   // periodic sync packets
+         | ITM_TCR_ITMENA_Msk;                   // enable ITM
+ITM->TPR  = 0x0000000F;                          // unprivileged access to ports 0..3
+ITM->TER  = 0xFFFFFFFF;                          // enable all 32 ports
+
+// 4. Configure DWT for exception trace + PC sampling
+DWT->CTRL = (1 << DWT_CTRL_CYCCNTENA_Pos)        // run cycle counter
+          | (0xF << DWT_CTRL_POSTPRESET_Pos)     // PC sample / 4096 cycles
+          | (1 << DWT_CTRL_PCSAMPLENA_Pos)
+          | (1 << DWT_CTRL_EXCTRCENA_Pos)
+          | (1 << DWT_CTRL_CYCEVTENA_Pos)
+          | (1 << DWT_CTRL_SYNCTAP_Pos);
+```
+
+The host side (OpenOCD example):
+
+```
+tpiu config internal swo.log uart off 100000000 2000000
+itm port 0 on
+```
+
+`100000000` is the CPU clock rate (must match), `2000000` is the desired SWO baud. After this, every write to `ITM->PORT[0].u8` lands in `swo.log` as raw bytes.
+
+<Callout type="warn">
+The TPIU's `ACPR` is a clock divider — the actual SWO baud rate is `CPU_CLOCK / (ACPR + 1)`. Get this wrong and the probe sees garbage. Tools like `orbuculum` can auto-detect the rate by analysing edge timing, but most probes need to be told explicitly. On dynamic clock systems (CPU clock changes at runtime), reconfigure `ACPR` after every clock switch or trace breaks.
+</Callout>
+
+## Using the stimulus ports
+
+A minimal `printf` redirect via ITM:
+
+```c
+int _write(int fd, const char *buf, int len) {
+    for (int i = 0; i < len; i++) {
+        while ((ITM->PORT[0].u32 & 1) == 0) { /* FIFO full */ }
+        ITM->PORT[0].u8 = buf[i];
+    }
+    return len;
+}
+```
+
+That's the whole runtime cost — a poll loop and a byte write per character. The poll only spins if the TPIU FIFO is full, which happens when you exceed the SWO bit-rate. For typical 2 Mbit/s SWO that's ~200 kBytes/s; for 30 Mbit/s on H7-class parts that's ~3 MBytes/s.
+
+Multi-channel use lets you separate streams without parsing the wire:
+
+| Channel | Use |
+|---------|-----|
+| 0 | `printf` / general log |
+| 1 | High-rate sensor dump |
+| 2 | RTOS task switch events |
+| 3 | Custom protocol trace |
+| 4..27 | Per-subsystem channels |
+| 28..31 | Reserved by some tools (Keil, J-Link) |
+
+Tools that consume ITM streams know how to demultiplex: J-Link SWO Viewer assigns a column per port; orbuculum dispatches each port to a different fifo or socket.
+
+## DWT exception trace
+
+The DWT macrocell can emit a packet on every exception entry, exit, and return-to-thread transition. The packet carries the exception number and a delta cycle count from the last packet. With this stream you reconstruct the entire interrupt timeline of the firmware after the fact:
+
+```
+T = 12340: ENTRY exception 16 (TIM2)
+T = 12382: EXIT  exception 16
+T = 14002: ENTRY exception 17 (USART1)
+T = 14041: EXIT  exception 17
+T = 14041: ENTRY exception 16 (TIM2, tail-chained)
+T = 14081: EXIT  exception 16
+T = 14081: RETURN to thread
+```
+
+This is exactly what tools like SystemView, Tracealyzer, and Ozone visualise. You see ISR durations, tail-chain optimisations, preemption depth, and starvation patterns at a glance.
+
+## PC sampling — statistical profiling for free
+
+Set `DWT->CTRL.POSTPRESET` and the DWT periodically sniffs the CPU's program counter and emits it as a trace packet — every 64, 128, 256, ..., 16384 cycles depending on the divider. Aggregate enough samples and you have a histogram of where the CPU spends its time, just like `perf record` on Linux. No instrumentation, no halts, no recompile.
+
+`orbuculum` + `orbtop` will render this in real time:
+
+```
+$ orbtop -e firmware.elf
+ 38.2% main_loop
+ 18.7% xQueueGenericReceive
+ 12.4% pid_update
+  6.1% spi_dma_isr
+  ...
+```
+
+A typical 12 kHz sample rate on a 120 MHz core gives statistically useful profiles within a few seconds. See [profiling](/docs/tools/profiling) for the full workflow.
+
+## Cycle and event counters
+
+DWT's hardware counters are visible to the trace stream:
+
+| Counter | Trigger | Use |
+|---------|---------|-----|
+| CPI | Cycles per instruction overage | Measures pipeline stalls |
+| EXC | Cycles in exception handlers | Interrupt overhead |
+| SLEEP | Cycles in WFI/WFE | Idle profiling |
+| LSU | Cycles waiting on load/store | Bus contention |
+| FOLD | Folded-instruction count | IT-block efficiency |
+| CYCCNT | Free-running 32-bit cycle count | Wall-clock measurements |
+
+Each overflows after ~256 cycles of activity and emits a trace packet — the host aggregates them into "10% of cycles were exception handlers" style readouts.
+
+## Synchronous trace and the trace port
+
+For higher bandwidth than SWO can support (>30 Mbit/s), Cortex-M parts can switch the TPIU to **synchronous parallel mode**: a 4-bit `TRACEDATA[3:0]` bus plus `TRACECLK`, driven at half the CPU clock. This is the trace port that probes like J-Trace and ULINKpro plug into. Bandwidth jumps to ~500 Mbit/s — enough to stream full instruction trace from the ETM (Embedded Trace Macrocell), not just ITM packets.
+
+You don't get the trace port on most production boards because it costs four extra pins; designs that need full instruction trace usually put a dedicated 20-pin Cortex-Debug+ETM header next to the SWD header.
+
+<Callout type="tip">
+For Cortex-M0/M0+ parts that have no ITM, SEGGER's RTT (Real-Time Transfer) is the equivalent: a ring buffer in RAM that the probe polls via SWD without halting the CPU. Bandwidth comparable to fast SWO, runs on any ARM core, requires a J-Link.
+</Callout>
+
+## Common failure modes
+
+- **No output, configuration looks right.** Check that the SWO pin is muxed correctly in your GPIO alternate-function table. STM32 SWO is usually `PB3` and needs `AFR` set, even though it's a debug-MCU function.
+- **Garbled output, looks like wrong baud.** `ACPR = (CPU_CLOCK / SWO_BAUD) - 1`. After any clock change (PLL switch, sleep mode), re-program.
+- **Output dies after sleep.** The TPIU's clock is gated in stop mode. Either keep run mode for tracing, or set `DBGMCU->CR.DBG_STOP` to keep debug clocks alive.
+- **Probe sees data but tool decodes nothing.** ITM packets are framed by sync sequences (0x00 followed by 0x80). If the probe joined the stream mid-packet, it stays out of sync until the next periodic sync (controlled by `DWT->CTRL.SYNCTAP`). Enable periodic sync.
+- **Production firmware locks up.** ITM writes block when the FIFO is full and the host isn't draining (no probe attached). Always check `ITM->TCR.ITMENA` before writing, or guard with `if ((ITM->TER & 1) != 0)`.
+
+## Cross-references
+
+- [Semihosting](/docs/tools/semihosting) — slower alternative for parts without ITM.
+- [Profiling](/docs/tools/profiling) — PC sampling and statistical profilers.
+- [OpenOCD](/docs/tools/openocd) — `tpiu config` and `itm port` commands.
+- [GDB](/docs/tools/gdb) — `monitor itm port 0 on` from inside GDB.
+- [NVIC priority](/docs/cortex-m/nvic-priority) — exception trace shows preemption patterns.
+- ARMv7-M Architecture Reference Manual, appendix D6 (Trace).
+- "Coresight Components Technical Reference Manual" — the authoritative document for ITM, DWT, and TPIU register layouts.

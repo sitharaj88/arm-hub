@@ -1,0 +1,51 @@
+---
+// Visual memory map for ARM Cortex-M (or a generic AArch32) address space.
+// Bands are stacked top-down, addresses MSB → LSB.
+
+interface Region {
+  start: string;   // e.g. "0x2000_0000"
+  end: string;     // e.g. "0x3FFF_FFFF"
+  name: string;
+  detail?: string;
+  kind?: 'code' | 'sram' | 'periph' | 'external' | 'system' | 'reserved';
+}
+
+interface Props {
+  title?: string;
+  regions: Region[];
+}
+
+const { title = 'Address space', regions } = Astro.props;
+
+const colorMap: Record<string, string> = {
+  code:     'from-brand/20 to-brand/0 border-brand/30 text-brand',
+  sram:     'from-accent/20 to-accent/0 border-accent/30 text-accent',
+  periph:   'from-ok/20 to-ok/0 border-ok/30 text-ok',
+  external: 'from-violet-500/20 to-violet-500/0 border-violet-500/30 text-violet-700 dark:text-violet-300',
+  system:   'from-pink-500/20 to-pink-500/0 border-pink-500/30 text-pink-700 dark:text-pink-300',
+  reserved: 'from-line/50 to-line/0 border-line text-ink-faint',
+};
+---
+<figure class="not-prose my-8 overflow-hidden rounded-xl border border-line bg-surface/70 shadow-card">
+  <div class="border-b border-line/70 bg-bg-subtle/70 px-4 py-3 font-mono text-sm text-ink-muted">{title}</div>
+  <div class="grid divide-y divide-line/60">
+    {regions.map((r) => {
+      const c = colorMap[r.kind ?? 'reserved'];
+      return (
+        <div class={`group relative grid grid-cols-1 sm:grid-cols-[10.5rem_minmax(0,1fr)] items-stretch bg-gradient-to-r ${c} hover:brightness-110 transition`}>
+          <div class="flex items-baseline gap-3 border-b sm:border-b-0 sm:border-r border-line/60 bg-bg-subtle/40 px-4 py-2 sm:py-3 font-mono text-xs">
+            <div class="text-ink">{r.start}</div>
+            <div class="text-ink-faint">– {r.end}</div>
+          </div>
+          <div class="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 px-4 py-3">
+            <div class="min-w-0 flex-1">
+              <div class="text-sm font-medium">{r.name}</div>
+              {r.detail && <div class="text-xs text-ink-muted">{r.detail}</div>}
+            </div>
+            {r.kind && <span class="pill font-mono text-[0.65rem] uppercase tracking-wider shrink-0">{r.kind}</span>}
+          </div>
+        </div>
+      );
+    })}
+  </div>
+</figure>

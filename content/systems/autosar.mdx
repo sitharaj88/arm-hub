@@ -1,0 +1,224 @@
+---
+title: AUTOSAR Classic and Adaptive
+description: AUTOSAR — the automotive software architecture standard. Application layer, RTE, BSW (MCAL, ECU abstraction, services), communication and diagnostics stacks. Adaptive AUTOSAR on Cortex-A with POSIX and ara::com.
+order: 14
+updated: 2026-05-13
+tags: [systems, autosar, automotive, ecu, rte, bsw, mcal, classic, adaptive]
+---
+
+AUTOSAR — AUTomotive Open System ARchitecture — is the standardised software framework that lives inside almost every electronic control unit in a modern vehicle. It defines a layered architecture, a configuration toolchain, communication protocols, diagnostic services, and software-component interfaces, with the goal of letting an OEM (BMW, Stellantis, Toyota, etc.) buy ECU hardware from one Tier-1 supplier, application software from another, and basic software from a third, with all three integrating without rewriting their parts. It is what makes automotive software development a hundred-vendor ecosystem rather than each OEM rolling their own from scratch.
+
+There are two AUTOSAR variants: **Classic** for traditional MCU-based ECUs (Cortex-M, AURIX, RH850, Power Architecture), and **Adaptive** for high-performance ECUs running POSIX-compliant operating systems on Cortex-A class hardware. This page covers both, the layered architecture, the major stack modules, and what AUTOSAR looks like in practice on an ARM-based ECU.
+
+<SpecSheet
+  title="AUTOSAR at a glance"
+  specs={[
+    { label: 'Classic AUTOSAR', value: 'Statically configured, MCU-based ECUs; OSEK-based RTOS; fixed memory layout; deterministic real-time' },
+    { label: 'Adaptive AUTOSAR', value: 'Dynamic, Linux/POSIX-based; Cortex-A or higher; service-oriented (SOME/IP); designed for ADAS / autonomous driving' },
+    { label: 'Versioning', value: 'Classic: R3.x (2009) → R4.0 → R4.4 → R20-11 → R23-11; Adaptive: R17-03 → R23-11' },
+    { label: 'Standardisation body', value: 'AUTOSAR Consortium — BMW, Bosch, Continental, Daimler, Ford, GM, PSA Peugeot Citroën, Toyota, Volkswagen + ~270 partners' },
+    { label: 'Cortex-M presence', value: 'Almost every modern automotive Cortex-M ECU runs Classic AUTOSAR — body control, lighting, HVAC, BMS' },
+    { label: 'Tool vendors', value: 'Vector (MICROSAR + DaVinci), Elektrobit (EB tresos), ETAS (RTA-CAR + ISOLAR), KPIT Sphinx, AISIN ALAN' },
+    { label: 'Key concepts', value: 'SWC (Software Component), Port, Interface, Runnable, RTE-generated glue, BSW modules' },
+    { label: 'Typical ECU configuration size', value: '5,000-50,000 parameters across 100+ BSW modules; tens of thousands of generated source lines' },
+  ]}
+/>
+
+## Why AUTOSAR exists
+
+In the late 1990s, an automotive ECU was a Tier-1's proprietary codebase, fused to that supplier's microcontroller and their RTOS. Adding a feature (rain-sensing wipers, adaptive headlights) meant either getting the existing supplier to add it — expensive — or replacing the whole ECU with a competitor's, which had its own proprietary everything. OEMs were locked in.
+
+The AUTOSAR Consortium formed in 2003 to standardise the interfaces inside the ECU. The goal: the application "rain-sensing wipers" software component should be independent of the hardware, the RTOS, the communication stack, the diagnostic service implementation. Plug an instance of that component into any AUTOSAR-conformant ECU and it works.
+
+This is achieved by defining strict layers, with rigid interfaces between each. Application code on top, hardware drivers on the bottom, communication stacks and OS services in the middle. Each layer's interface is specified down to the function signature, the timing, and the error-code semantics. Tools generate the glue.
+
+## The Classic AUTOSAR stack
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  Application Layer                                       │
+│  (SWCs: rain-sensing wipers, door lock, dashboard, ...) │
+├──────────────────────────────────────────────────────────┤
+│  RTE — Runtime Environment (auto-generated)              │
+├──────────────────────────────────────────────────────────┤
+│  Services Layer (BSW)                                    │
+│   Com, PduR, IpduM, CanIf, CanTp, LinIf, EthIf           │
+│   Dcm (diagnostic), Dem (event manager), FiM (function   │
+│   inhibition), NvM (non-volatile memory), Crypto, ...    │
+├──────────────────────────────────────────────────────────┤
+│  ECU Abstraction Layer (BSW)                             │
+│   Driver wrappers, abstract sensor & actuator interfaces │
+├──────────────────────────────────────────────────────────┤
+│  MCAL — Microcontroller Abstraction Layer (BSW)          │
+│   GPT, ADC, SPI, CAN, FlexRay, Pwm, Gpt, Watchdog, ...   │
+├──────────────────────────────────────────────────────────┤
+│  Microcontroller                                         │
+│   Cortex-M4, Cortex-M7, AURIX, RH850, Power Arch         │
+└──────────────────────────────────────────────────────────┘
+```
+
+The OS sits beside the BSW (it's a service used by both BSW and application). It's an OSEK-derived statically-scheduled real-time kernel — task priorities, periods, and events are fixed at build time. No dynamic memory after init.
+
+<BlockDiagram title="AUTOSAR Classic layered architecture" width={780} height={400} nodes={[
+  { id: 'app',     x: 30,  y: 30,  w: 720, h: 56, kind: 'core',     label: 'Application Layer', detail: 'SWCs: wipers, doors, lights, dashboard, BMS controller' },
+  { id: 'rte',     x: 30,  y: 100, w: 720, h: 48, kind: 'security', label: 'RTE (Runtime Environment)', detail: 'auto-generated glue, ports, runnables, OS hooks' },
+  { id: 'svc',     x: 30,  y: 162, w: 720, h: 56, kind: 'periph',   label: 'Services (BSW)', detail: 'Com, PduR, CanTp, Dcm, Dem, NvM, Crypto, FiM' },
+  { id: 'ecuab',   x: 30,  y: 232, w: 720, h: 48, kind: 'periph',   label: 'ECU Abstraction (BSW)', detail: 'IoHwAb, abstract sensor/actuator wrappers' },
+  { id: 'mcal',    x: 30,  y: 294, w: 720, h: 48, kind: 'io',       label: 'MCAL', detail: 'GPT, ADC, SPI, CAN, Pwm, Wdg drivers' },
+  { id: 'mcu',     x: 30,  y: 356, w: 720, h: 38, kind: 'core',     label: 'Microcontroller', detail: 'Cortex-M / R / AURIX / RH850' },
+]} edges={[
+  { from: 'app', to: 'rte', tone: 'primary' },
+  { from: 'rte', to: 'svc', tone: 'accent' },
+  { from: 'svc', to: 'ecuab', tone: 'accent' },
+  { from: 'ecuab', to: 'mcal', tone: 'default' },
+  { from: 'mcal', to: 'mcu', tone: 'success' },
+]} caption="The strict layering is what lets an OEM source the application from one Tier-1 and the BSW from another — the RTE is generated from the SWC contracts, and every layer below it only talks to the layer immediately beneath." />
+
+### Application layer and SWCs
+
+Application code is structured as **Software Components (SWCs)**. Each SWC declares:
+
+- **Ports** — typed input/output connection points.
+- **Interfaces** — what data types and operations the ports expose.
+- **Runnables** — the actual C functions that implement behaviour; mapped to OS tasks.
+- **Events** — what triggers each runnable (timer tick, port write, init/exit).
+
+Configuration of these is done in AUTOSAR XML (ARXML) files, edited by tools like Vector DaVinci Configurator or EB tresos Studio. Application code itself is plain C, but the entry points (the runnables) and the data access patterns are constrained by what the configuration declared.
+
+A runnable accesses port data via RTE-generated macros:
+
+```c
+// inside SWC_RainSensor.c
+void SWC_RainSensor_Sample_50ms(void) {
+    Std_ReturnType ret;
+    uint16_t adc_raw;
+
+    // read input port (gets ADC sample from MCAL via ECU abs)
+    ret = Rte_Read_pIn_RawAdc(&adc_raw);
+    if (ret != E_OK) return;
+
+    rain_intensity_t intensity = classify(adc_raw);
+
+    // write output port (RTE will route to wiper SWC)
+    Rte_Write_pOut_RainIntensity(intensity);
+}
+```
+
+The `Rte_Read_*` and `Rte_Write_*` functions are auto-generated by the RTE generator from the ARXML configuration. The SWC source itself never names a specific OS task, a specific signal name in CAN, a specific ADC channel — those are all bound at integration time. Same SWC source ports to any vehicle program with the right ARXML mapping.
+
+### BSW — Basic Software
+
+BSW is the bulk of the code: the OS, the communication stacks, the diagnostic services, the NVM driver, the crypto services, and the MCAL (chip-specific drivers). It is supplied either as source from a vendor (Vector MICROSAR, EB tresos, ETAS RTA-CAR) or generated from configuration plus a vendor-supplied "module" library.
+
+Major BSW modules an ECU integrator interacts with:
+
+| Module | Function |
+|--------|----------|
+| **Os** | OSEK-derived task scheduler |
+| **MCU**, **GPT**, **ADC**, **SPI**, **PWM**, **DIO**, **Can**, **Lin**, **Eth**, **FlexRay** | MCAL drivers — chip-specific |
+| **CanIf**, **LinIf**, **EthIf** | Bus interface — protocol-agnostic |
+| **CanTp**, **LinTp** | Transport protocol layer (ISO-TP for diagnostics, multi-frame) |
+| **PduR** | PDU Router — routes communication units between buses and stacks |
+| **IpduM** | I-PDU Multiplexer — packs multiple signals into one CAN frame |
+| **Com** | Top of the communication stack — signal pack/unpack, gateway logic |
+| **Dcm** | Diagnostic Communication Manager — UDS server (ISO 14229) |
+| **Dem** | Diagnostic Event Manager — DTC (Diagnostic Trouble Code) storage |
+| **FiM** | Function Inhibition Manager — based on faults, inhibit which SWC runnables run |
+| **NvM** | Non-Volatile Memory — EEPROM/Flash data persistence |
+| **MemIf**, **Fee**, **Ea** | NvM lower layers — EEPROM emulator, flash management |
+| **Crypto**, **CryIf**, **CryptoStack** | Crypto services — AES, RSA, ECC, MAC |
+| **WdgM**, **WdgIf** | Watchdog Manager — alive supervision per runnable |
+| **EcuM** | ECU State Manager — startup, sleep, wake-up, shutdown |
+| **BswM** | BSW Mode Manager — coordinates BSW modes (e.g., normal operation, OEM-flashing) |
+| **StbM** | Synchronised Time Base Manager — distributes time across buses |
+
+Each module has hundreds of configuration parameters in ARXML. The integrator's job is largely *configuration* of these modules, not writing module code.
+
+### Communication stack flow
+
+When a SWC writes a port whose data goes out on CAN:
+
+```
+SWC writes RTE port
+  → RTE marshals into a "signal"
+  → Com packs into an "I-PDU" (Interaction PDU)
+  → IpduM multiplexes if needed
+  → PduR routes to CanIf
+  → CanIf prepares the L-PDU and calls Can driver
+  → Can MCAL writes to hardware FIFO
+  → CAN frame on the wire
+```
+
+This six-layer journey is fully configurable: which signal is in which PDU, which PDU is on which CAN ID, which CAN ID is on which controller. ARXML specifies all of it. Change a signal's CAN ID by editing one ARXML field and regenerating — no code change required.
+
+### Diagnostic stack
+
+A vehicle's diagnostic protocol is UDS (Unified Diagnostic Services, ISO 14229). It's the protocol a workshop scanner speaks to the ECU: read DTCs, clear DTCs, read parameter X, execute test Y, security access (challenge-response unlock), reflash via service 34/36/37, etc.
+
+AUTOSAR's Dcm module is a configurable UDS server: configure which services are supported, which DIDs (Data Identifiers) map to which SWC ports, which routines exist. The Dem module logs DTCs as they occur with timestamp, freeze frame data, and aging counters. OBD-II reporting (mandatory in US/EU emissions-related ECUs) sits on top of Dem.
+
+## Cortex-M targets
+
+Most automotive Cortex-M ECUs run Classic AUTOSAR. Representative examples:
+
+| ECU type | MCU | Notable BSW config |
+|----------|-----|--------------------|
+| Body Control Module | NXP S32K144 (M4F) | LIN bus, lighting control, central locking |
+| Door Module | STM32F4 or RH850 | LIN bus only, simple SWCs |
+| HVAC | Renesas RH850 | CAN, LIN, sensor inputs, fan PWM |
+| Battery Management System | NXP S32K3 (M7) | Functional Safety enabled, ASIL-D portions |
+| Vehicle Charger Controller | TI TMS320F28x (NOT ARM) or NXP S32K | ISO 15118 stack on top |
+
+The MCAL is the chip-specific layer. Vector, EB, and ETAS all sell separate "ECU configurator + MCAL" bundles per silicon vendor. Switching from an STM32 to a NXP S32K means re-importing the AUTOSAR project against a new MCAL set — but the application SWCs and most of the upper BSW stay the same.
+
+## Adaptive AUTOSAR
+
+Adaptive AUTOSAR (R17-03 first release, ongoing development) targets the higher-performance ECUs needed for ADAS and autonomous driving: Cortex-A53 / A72 cluster running Linux or QNX, gigabit Ethernet, SOME/IP service-oriented messaging, ROS-style dynamic discovery.
+
+Where Classic is static (everything bound at build), Adaptive is dynamic:
+
+- **Service discovery** — components find each other via SOME/IP-SD at runtime.
+- **Dynamic linking** — applications load and link at startup.
+- **POSIX-compliant API** — the OS exposes pthread, sockets, files; Adaptive runs on Linux, QNX, PikeOS, or VxWorks.
+- **Persistence** — apps store state in a managed persistence subsystem.
+
+The standardised API for Adaptive is **ara::** — `ara::com` (communication), `ara::diag`, `ara::exec`, `ara::log`, `ara::per` (persistence), etc. Applications are C++17 (not C) and use these libraries.
+
+Adaptive does not replace Classic — they coexist. A modern E/E architecture has Classic AUTOSAR on every Cortex-M ECU (motor control, body, comfort) and Adaptive AUTOSAR on the central compute platform (Cortex-A clusters running the ADAS / vehicle compute). They communicate via Ethernet (SOME/IP) or gateways.
+
+| Aspect | Classic AUTOSAR | Adaptive AUTOSAR |
+|--------|-----------------|-----------------|
+| Target | Cortex-M, AURIX, RH850 | Cortex-A, x86 server-class |
+| OS | OSEK-based static | POSIX (Linux, QNX, ...) |
+| Memory | Static | Dynamic allocation allowed |
+| Communication | CAN, LIN, FlexRay, basic Ethernet | Ethernet (SOME/IP), service-oriented |
+| Software components | SWC (C) | Application (C++17) |
+| Update model | Reflash with full image | Per-application install/update |
+| Use case | Body, powertrain, chassis | ADAS, V2X, infotainment, central compute |
+
+## Tooling and workflow
+
+A typical AUTOSAR ECU project:
+
+1. OEM defines the **system architecture** — which ECUs, which SWCs run where, which signals on which CAN ID. Output: system-level ARXML.
+2. Tier-1 receives the system ARXML and **configures the ECU** — assigns SWC instances, maps ports to OS tasks, configures BSW modules.
+3. Run **code generators** — RTE generator emits the RTE C source; BSW configurators emit BSW C sources from configuration.
+4. Application engineers **implement runnables** as C functions.
+5. Build, link, flash to ECU.
+6. **HIL test** — close-loop test with simulated vehicle environment.
+
+The tooling licences are five-figure annual costs per seat. Vector DaVinci Configurator Pro is the market leader; EB tresos Studio and ETAS ISOLAR-EVE are alternatives.
+
+<Callout type="warn">
+AUTOSAR's reputation for complexity is earned. A simple "blink LED on CAN message" ECU might involve 30 BSW modules and 8,000 configuration parameters. The justification is reuse across multi-vehicle programs over decades — the same SWC source goes into your company's body controller for the next 12 years across 7 vehicle lines. For one-off projects, plain Zephyr or FreeRTOS is dramatically cheaper.
+</Callout>
+
+## Cross-references
+
+- [AURIX](/docs/vendors/aurix) — most common ASIL-D-capable AUTOSAR target.
+- [EV charger power](/docs/systems/ev-charger-power) — adjacent system using AUTOSAR for vehicle communication.
+- [Motor FOC](/docs/systems/motor-foc) — motor-drive ECUs use AUTOSAR Classic.
+- [Industrial gateway](/docs/systems/industrial-gateway) — Adaptive AUTOSAR territory.
+- AUTOSAR Classic Platform: layered software architecture (PDF on autosar.org).
+- AUTOSAR Adaptive Platform: explanatory documents.
+- "AUTOSAR Compendium" by Oliver Scheid, useful supplementary reference.

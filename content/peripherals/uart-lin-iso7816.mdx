@@ -1,0 +1,166 @@
+---
+title: UART — LIN & ISO 7816 modes
+description: Two specialist protocols layered on top of the same USART hardware — LIN for low-cost automotive networking and ISO 7816 for contact smartcards. Frame structure, hardware support on STM32, and the timing rules that matter in production.
+order: 12
+updated: 2026-05-13
+tags: [peripherals, uart, lin, iso7816, smartcard, automotive]
+---
+
+The USART block on every modern Cortex-M part can do far more than 8N1 async UART. The same hardware — same baud generator, same shift register, same FIFO — can drive **LIN** (Local Interconnect Network, the cheap automotive bus that sits below CAN in the cost hierarchy) and **ISO 7816** (the synchronous half-duplex protocol used by every contact smartcard, SIM, and CCID reader on the planet). Both modes reuse the wire but rearrange the framing, parity, and error-handling so substantially that the vendor-supplied HAL exposes them as separate APIs.
+
+This page covers what changes from plain UART to LIN and to 7816, what hardware actually helps you (versus what's just a marketing claim), and the practical gotchas in each protocol.
+
+<SpecSheet
+  title="LIN & ISO 7816 at a glance"
+  specs={[
+    { label: 'LIN baud rate', value: '1, 2.4, 9.6, 10.4, 19.2 kbit/s — fixed steps; 19.2 is the modern default' },
+    { label: 'LIN topology', value: 'Single-wire (LIN bus), 12 V automotive, master/slave with deterministic schedule' },
+    { label: 'LIN frame', value: 'Sync break (≥13 bits low) + sync field (0x55) + PID + 1..8 data + checksum' },
+    { label: 'ISO 7816 baud rate', value: 'Derived from card clock CLK and the ETU (Elementary Time Unit). Typical Fi/Di = 372/1, giving CLK/372 bit-time' },
+    { label: 'ISO 7816 framing', value: '8-bit data + parity + guard time; half-duplex on a single I/O wire (no separate RX)' },
+    { label: 'ISO 7816 retry', value: 'Receiver pulls I/O low during the guard time to signal parity error; transmitter retransmits the byte' },
+    { label: 'STM32 USART modes', value: 'Async, sync, single-wire, IrDA, LIN, Smartcard (7816), Modbus — all share the same kernel block' },
+  ]}
+/>
+
+## LIN — the cheap automotive bus
+
+LIN was specified in 1999 by a consortium of car-makers (Audi, BMW, Daimler, Volvo, VW, Volcano) as a sub-bus to classic CAN. CAN at 500 kbit/s with full controllers in every node was overkill for body-control functions like seat motors, mirror folding, sun roofs, and interior lights — LIN delivers the same functionality at roughly 1/10th the per-node cost by using:
+
+- **Single wire** with a 30 kΩ pull-up to V_bat — the bus is dominant low, recessive high.
+- **No bit-stuffing, no arbitration** — a single **master** schedules every frame; slaves only transmit when asked.
+- **UART-style 8N1 framing** at 19.2 kbit/s, so any cheap MCU with a USART can be a slave.
+- **No crystal required** on slaves — they re-sync to the master's clock every frame via the **sync field**.
+
+A LIN cluster is one master and up to 15 slaves on a 40 m bus. Frame schedule is fully deterministic — the master broadcasts a header every N ms (per the LDF — LIN Description File), addressed to a known slave that must respond within a tight time window. The master uses CAN for high-bandwidth body traffic and runs a LIN gateway for the low-bandwidth peripherals.
+
+### LIN frame structure
+
+```
+| BREAK (≥13 bits low) | DELIMITER (1 bit high) | SYNC (0x55) | PID | DATA(1..8 bytes) | CHECKSUM |
+  master always sends          master              master      master   slave (or master)   slave
+```
+
+- **BREAK** — at least 13 bit-times of dominant low. UARTs detect this as a framing error; LIN-aware USARTs flag it as a *break-detected* event instead.
+- **SYNC** field — `0x55` (alternating 0/1), so the slave can measure five bit-times and compute the master's actual baud rate. This is what lets slaves run without a crystal.
+- **PID** (Protected Identifier) — 6-bit frame ID + 2 parity bits. Identifies which message and therefore which slave responds.
+- **DATA** — 1, 2, 4, or 8 bytes, sent by either the master or one designated slave (per LDF).
+- **CHECKSUM** — modulo-256 sum of all bytes (and PID in "enhanced" checksum mode, which is the default since LIN 2.0).
+
+### STM32 LIN hardware support
+
+STM32 USARTs in LIN mode (CR2.LINEN=1) do the protocol-specific work in silicon:
+
+- **Break generation** — `USART_CR1.SBKRQ` triggers a programmable-length break (10 or 11 bits, selectable via `CR2.LBDL`).
+- **Break detection** — when an incoming sequence of low bits exceeds the threshold, `ISR.LBDF` (LIN Break Detected Flag) fires regardless of the data being received.
+- **Auto baud-rate detection** — `CR2.ABREN` plus `ABRMOD` set to "0x55 falling edges" measures the sync field and reloads `BRR` automatically. Without this you would have to detect the sync field in software and reprogram baud mid-frame — possible, but the auto-baud hardware does it in &lt;1 bit-time.
+
+Slave code structure typically looks like:
+
+```c
+// Configure USART for LIN slave
+USART1->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
+USART1->CR2 = USART_CR2_LINEN | USART_CR2_ABREN
+            | (1 << USART_CR2_ABRMODE_Pos);    // detect 0x55
+USART1->CR3 = 0;
+USART1->BRR = SYSCLK / 19200;                  // initial guess
+
+// On LBDF interrupt:
+//   1. wait for sync byte 0x55 — ABR locks the rate
+//   2. read PID
+//   3. if PID is "my" response slot, transmit DATA + checksum
+//   4. if PID is "my" listen slot, capture DATA + checksum, verify
+```
+
+<Callout type="warn">
+LIN slaves must respond within a tight window — typically the master allows 1.4× the nominal frame length before declaring a timeout. RTOS-driven slaves on heavy systems often miss this. Either give the LIN ISR the highest priority or implement the entire slave state machine inside the USART ISR, not in a task.
+</Callout>
+
+### LIN gateway considerations
+
+A real automotive ECU running LIN is almost always also running CAN — the LIN frames carry sensor data that has to land on the CAN backbone. Gateway tasks have to deal with:
+
+- **Frame buffering** — a 20 ms LIN schedule means 1500 LIN frames per minute; a buffer of 4–8 frames is usually plenty if CAN transmission is reliable.
+- **Frame-loss diagnostics** — LIN has no retransmission. A slave that misses a frame may go silent for one cycle (50 ms); after N consecutive losses you raise a DTC (Diagnostic Trouble Code).
+- **Wake-up signalling** — LIN has a defined wake pattern (dominant for ≥250 ms then bus idle); the master must respond by issuing a header within 100 ms or the cluster goes back to sleep.
+
+## ISO 7816 — smartcard interface
+
+ISO 7816-3 specifies the electrical and low-level protocol for contact smartcards: bank chip cards, SIMs, ID cards, electronic passports. The card is a tiny chip on six pads; the reader provides VCC, GND, CLK (clock), RST, and a single bidirectional I/O line (the sixth pad is VPP for legacy EEPROM cards, no longer used).
+
+The protocol is **half-duplex async** on a single wire, with parity and a clever retry mechanism that the USART implements directly. Bytes are exchanged at a baud rate derived from CLK and a divider `F/D` (default 372/1, so baud = CLK/372 — at CLK = 4 MHz, baud ≈ 10.75 kbit/s, but cards routinely negotiate up to 1 Mbit/s).
+
+### Character convention
+
+7816 has two parity-and-bit-order conventions:
+
+- **Direct** — LSB first, even parity. Used by most modern cards.
+- **Inverse** — MSB first, inverted polarity, even parity. Legacy; you'll only see it on very old French banking cards.
+
+The card announces its convention in the first byte of the Answer-To-Reset (ATR) — `0x3B` for direct, `0x3F` for inverse. The reader detects and configures accordingly.
+
+### Half-duplex on a single wire
+
+There is no separate TX and RX line — the I/O pin is shared and the protocol is strictly turn-taking. The STM32 USART supports this via:
+
+- **Single-wire half-duplex mode** (`CR3.HDSEL=1`) — disables the RX pin and routes TX through an open-drain buffer with internal switching between drive and receive.
+- **Open-drain output** with an external pull-up — required by the card-side electrical spec.
+
+The card pulls I/O low when it has data; the reader switches between drive and high-impedance.
+
+### Parity retry
+
+This is the killer feature that justifies the dedicated hardware mode. When a receiver detects a parity error in 7816, instead of dropping the byte, it pulls I/O low **during the guard time** (the extra-stop-bit period after the data byte). The transmitter sees this NACK and automatically retransmits the same byte. The USART (CR3.NACK=1) does the entire retry transaction in hardware — software sees a correctly received byte or, after N retries, a `RXNE`-with-error flag.
+
+| Hardware mechanism | Software equivalent without HW support |
+|--------------------|-----------------------------------------|
+| Guard-time NACK detection | Poll RX during guard, react in software within 1 ETU |
+| Auto-retransmit on NACK | Re-queue the failed byte and re-trigger TX |
+| Retry counter | Per-byte software counter |
+
+The hardware does it in O(1 ETU); software at 9.6 kbit/s baud has 100 µs to react, achievable but fragile.
+
+### STM32 Smartcard mode
+
+`CR3.SCEN=1` puts the USART into 7816 mode. Combined with:
+
+- `CR2.STOP = 11` — 1.5 stop bits (the standard 7816 guard time).
+- `CR2.CLKEN = 1` — drive the synchronous CK pin to the card's CLK input. The USART generates the card clock as a divided version of its kernel clock.
+- `CR3.NACK = 1` — enable the parity-NACK retry mechanism.
+- `GTPR` register — sets the guard time and the prescaler for CK.
+
+The HAL `SMARTCARD_HandleTypeDef` API wraps these settings. CCID-class USB readers using STM32 (e.g. ST's reference designs) layer a USB CCID transport on top of a smartcard-mode USART.
+
+<Callout type="tip">
+Bring-up tip: before testing with a real card, loop the I/O line back through a 10 kΩ pull-up and verify your ATR sequence on a scope. The ATR is a known 1–33-byte sequence the card transmits within 40 000 clock cycles after RST release. Most bring-up failures are clock-related — the card is not running at the rate you think.
+</Callout>
+
+## Other USART specialist modes
+
+For completeness — the same USART block on most STM32 supports several other specialist modes:
+
+| Mode | Purpose | Key bit |
+|------|---------|---------|
+| IrDA SIR | Slow infrared, 9.6–115.2 kbit/s, RZI encoding | `CR3.IREN` |
+| Modbus | RS-485 with auto direction control via DE/RE pin | `CR3.DEM`, `CR3.DEP`, `CR1.M1` for 9-bit |
+| Single-wire | Half-duplex on one TX pin (open-drain) | `CR3.HDSEL` |
+| Multiprocessor | 9-bit framing with address-bit wake-up | `CR1.WAKE`, `MR` |
+| Auto-baud | Detect rate from start-bit edge or 0x55 pattern | `CR2.ABREN` |
+| DMA RX/TX | Burst transfers with optional half-buffer interrupts | `CR3.DMAR`, `CR3.DMAT` |
+
+You will not see these on every part — Nordic UARTE, for instance, supports async UART and EasyDMA but has no LIN or 7816 modes; you have to do those in software using GPIOTE/PPI tricks.
+
+## Common pitfalls
+
+- **LIN slaves without auto-baud** — running a slave from an internal RC oscillator with ±5% drift will work for a while and then start corrupting frames as temperature changes. Use ABR or move to a crystal.
+- **7816 mode without the right OTYPER** — single-wire half-duplex *requires* open-drain on the I/O pin. Push-pull will fight the card and damage one or both pads.
+- **Mixing LIN and CAN slaves on the same MCU** — the LIN bus voltage (12 V) and the CAN bus voltage (5 V differential) need separate transceivers; never wire LIN pull-ups to a 3.3 V rail.
+- **Treating LIN PIDs as 6-bit IDs** — the upper two bits are parity. Mask with `0x3F` before comparing to your message table.
+
+## Cross-references
+
+- [UART](/docs/peripherals/uart) — async serial fundamentals on top of which LIN and 7816 are built
+- [CAN](/docs/peripherals/can) and [CAN-FD](/docs/peripherals/can-fd) — the higher-tier automotive bus that LIN sub-buses connect to
+- [Automotive ECU](/docs/systems/automotive-ecu) — system context for LIN
+- ISO 17987 — LIN 2.2A standard
+- ISO 7816-3 — physical and protocol layer for smartcards

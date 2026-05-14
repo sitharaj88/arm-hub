@@ -1,0 +1,179 @@
+---
+title: The ARM ISA family
+description: A field guide to ARM's instruction set architectures — from ARMv6-M on tiny microcontrollers to ARMv9-A on flagship phones — and how the modern Cortex lineup maps onto them.
+order: 1
+updated: 2026-05-12
+tags: [architecture, isa, fundamentals]
+---
+
+
+ARM doesn't sell one ISA — it sells a *family* of them, each tuned for a different power/performance/safety profile. If you've ever wondered why a Cortex-M0 can't run Linux but a Cortex-A53 can, or why Cortex-R cores have lockstep but Cortex-M cores have NVIC, this is the page.
+
+<SpecSheet
+  title="ARM ISA family — at a glance"
+  specs={[
+    { label: 'Original ARM', value: 'ARM1 (1985, Acorn) — 32-bit RISC, "ARM mode" instructions, no Thumb' },
+    { label: '32-bit instruction sets', value: 'A32 (the 32-bit fixed-width "ARM mode" encoding), T32 / Thumb-2 (mixed 16-bit + 32-bit encoding)' },
+    { label: '64-bit instruction set', value: 'A64 — fixed 32-bit encoding, 31 GPRs, integrated SIMD; the only ISA in AArch64 state' },
+    { label: 'M-profile ISAs', value: 'ARMv6-M (T16 subset), ARMv7-M / v7E-M (full T32 + DSP), ARMv8-M Baseline / Mainline, ARMv8.1-M (+ Helium)' },
+    { label: 'A-profile ISAs', value: 'ARMv7-A (A32 + T32 + NEON), ARMv8-A (A32 + T32 + A64 + AdvSIMD), ARMv9-A (A64 mandatory + SVE2 + MTE + CCA)' },
+    { label: 'R-profile ISAs', value: 'ARMv7-R (A32 + T32), ARMv8-R (AArch32 or AArch64 variants), ARMv8-R AArch64 with TrustZone for R' },
+    { label: 'Vector extensions', value: 'NEON / AdvSIMD (128-bit, A-profile), Helium / MVE (128-bit over FP regs, M-profile), SVE / SVE2 (variable 128-2048 bit, A-profile)' },
+    { label: 'Modes', value: 'AArch32 (A32 + T32, up to 16 GPRs visible), AArch64 (A64 only, 31 GPRs); selectable per exception level on v8-A' },
+  ]}
+/>
+
+## The three profiles
+
+Modern ARM cores are partitioned into three application profiles, each with its own ISA:
+
+| Profile  | ISA family       | What it targets                              | Examples                       |
+|----------|------------------|----------------------------------------------|--------------------------------|
+| **M** (Microcontroller) | ARMv6-M, ARMv7-M, ARMv8-M, ARMv8.1-M | Real-time, deterministic, deeply embedded | Cortex-M0 through M85          |
+| **A** (Applications)    | ARMv7-A, ARMv8-A, ARMv9-A          | Rich OS, MMU, SMP, virtualisation        | Cortex-A53, A78, A720, X4      |
+| **R** (Real-time)       | ARMv7-R, ARMv8-R                   | Hard real-time, safety-critical          | Cortex-R5, R52                 |
+
+<Callout type="note" title="A quick mnemonic">
+**M** for *micro* — kilobytes of RAM, single chip, no MMU.
+**A** for *applications* — gigabytes of RAM, runs Linux/Android.
+**R** for *real-time* — predictable latency, often lockstep for ASIL-D.
+</Callout>
+
+## The M-profile family tree
+
+Almost everyone reading this is here for Cortex-M. The lineage:
+
+```
+ARMv6-M ──── Cortex-M0   (2009, smallest)
+        └─── Cortex-M0+  (2012, 2-stage pipe, MPU optional)
+        └─── Cortex-M1   (FPGA-targeted)
+
+ARMv7-M ──── Cortex-M3   (2004, the classic)
+ARMv7E-M ─── Cortex-M4   (2010, +DSP, optional FPU)
+        └─── Cortex-M7   (2014, superscalar, caches)
+
+ARMv8-M Baseline ── Cortex-M23  (2016, M0+ class + TrustZone)
+ARMv8-M Mainline ── Cortex-M33  (2016, M4 class + TrustZone)
+              └─── Cortex-M35P (M33 + tamper resistance)
+
+ARMv8.1-M ─────── Cortex-M55  (2020, Helium / MVE)
+              └── Cortex-M85  (2022, highest perf Cortex-M, PACBTI)
+              └── Cortex-M52  (2023, M55 little-sibling)
+```
+
+<CoreCompare />
+
+## Thumb, Thumb-2, and why your code is 16/32-bit mixed
+
+A defining feature of M-profile is that it runs **only Thumb code** — the compact 16-bit instruction encoding (with Thumb-2 mixing 16- and 32-bit instructions for full coverage). There is no "ARM mode" on Cortex-M.
+
+- **ARMv6-M** (Cortex-M0/M0+): a *subset* of Thumb-2. ~56 instructions. No hardware divide on M0.
+- **ARMv7-M** (Cortex-M3): full Thumb-2, hardware divide, bit-banding, `WFI`/`WFE`.
+- **ARMv7E-M** (Cortex-M4/M7): adds **DSP** instructions (SIMD on 16/8-bit lanes packed into 32-bit registers) and **optional FPU** (single-precision on M4, single+double on M7).
+- **ARMv8-M Baseline / Mainline**: adds **TrustZone-M**, stack limit registers, and the new `BLXNS`/`BXNS` non-secure-call instructions.
+- **ARMv8.1-M**: adds **Helium / MVE** (M-profile Vector Extension — 128-bit vector ops over the FPU register file), **PACBTI** (pointer auth + branch target ID), and low-overhead loop instructions.
+
+<Callout type="tip" title="Why this matters in practice">
+When you set `-mcpu=cortex-m4`, the compiler enables the ARMv7E-M ISA and DSP intrinsics. Add `-mfpu=fpv4-sp-d16 -mfloat-abi=hard` and it generates VFP instructions; omit it and floats are emulated via soft-float helpers, costing ~50× the cycles.
+</Callout>
+
+## A-profile in one paragraph
+
+Cortex-A cores implement ARMv7-A or ARMv8/9-A. They have **MMUs** (paging, virtual memory), large **L1/L2/L3 caches**, and run rich operating systems. They have multiple **exception levels** (EL0 user → EL1 kernel → EL2 hypervisor → EL3 secure monitor), not the NVIC. They're what's in your phone, your Raspberry Pi, your AWS Graviton instance. armhub covers them under [Cortex-A](/docs/cortex-a/overview/), but most of this site lives in the M-profile.
+
+## R-profile in one paragraph
+
+Cortex-R cores look superficially like A-profile (they used to use the A32/T32 ISA, now ARMv8-R has its own) but trade the MMU for an **MPU**, add **tightly coupled memories** (TCMs) for predictable access latency, and often run in **lockstep** (two cores executing the same instructions; a checker compares results cycle-by-cycle). They're the cores you'll find in automotive ECUs, hard drives, and 5G baseband. See [Cortex-R](/docs/cortex-r/overview/).
+
+## The instruction-set lineage end to end
+
+The full ARM family tree, with the major instruction-class additions per architecture:
+
+```
+ARM1 (1985)                  — A32, 32-bit fixed encoding, no MUL
+  └─ ARM2 / ARM3             — adds 32x32 multiply, 4 KB cache
+       └─ ARMv4              — Thumb-1 (T16) added on ARM7TDMI in 1995
+            └─ ARMv5TE       — DSP saturated arithmetic, signed mul-acc
+                 └─ ARMv6    — SIMD (8/16-bit packed in 32-bit regs), unaligned access
+                      └─ ARMv6-M  — Thumb-2 subset for Cortex-M0/M0+/M1
+                      └─ ARMv7    — branches into A, R, M profiles
+                            ├─ ARMv7-A   — VFPv3, NEON, LPAE (40-bit phys)
+                            ├─ ARMv7-R   — MPU + TCM, no MMU
+                            └─ ARMv7-M   — Thumb-2 only, NVIC, bit-banding
+                                 └─ ARMv7E-M  — DSP + optional VFP (M4)
+                                      └─ Cortex-M7 — adds caches, dual-issue
+                            └─ ARMv8-A   — adds AArch64 + A64 + AdvSIMD merge
+                                 └─ v8.2-A — half-precision FP, MTE prep
+                                 └─ v8.3-A — PAC (pointer auth)
+                                 └─ v8.4-A — Nested virt, secure-EL2
+                                 └─ v8.5-A — MTE (memory tagging), BTI
+                                 └─ v8.6-A — bfloat16, ECV
+                                 └─ ARMv9-A — SVE2 mandatory, CCA
+                            └─ ARMv8-M Baseline (M23) / Mainline (M33)
+                                 └─ ARMv8.1-M — Helium (MVE), low-overhead loops, PACBTI
+```
+
+A few non-obvious lineage facts worth knowing:
+
+- **A32** is the modern name for what used to be called "ARM mode" — the 32-bit fixed-width encoding. The new name resolves the ambiguity of "ARM mode" since the family includes profiles that don't have it.
+- **T32** is the modern name for Thumb-2 — the mixed 16-bit / 32-bit encoding that's the only instruction set on every M-profile core today.
+- **A64** is a clean-slate ISA. It is not a 64-bit extension of A32 or T32; it has a different encoding, different register file (31 GPRs not 16), and a different addressing model. It debuts in ARMv8-A.
+- **AArch64 vs A64**: AArch64 is the *execution state* (64-bit registers, 64-bit PC, 64-bit virtual addresses); A64 is the only *instruction set* that runs in AArch64. Per-EL configuration on v8-A lets EL0 run AArch32 user code on top of an AArch64 EL1 kernel.
+
+## Profile-to-ISA mapping
+
+| Profile | Available instruction sets | Execution states |
+|---------|----------------------------|-------------------|
+| Cortex-M0 / M0+ / M1 (ARMv6-M) | T16 (Thumb-1 subset) only | Thumb only |
+| Cortex-M3 (ARMv7-M) | T32 (Thumb-2) only | Thumb only |
+| Cortex-M4 / M7 (ARMv7E-M) | T32 + DSP + (optional) VFPv4 | Thumb only |
+| Cortex-M23 (ARMv8-M Baseline) | T32 Baseline subset | Thumb only |
+| Cortex-M33 / M35P (ARMv8-M Mainline) | T32 full + DSP + VFP | Thumb only |
+| Cortex-M52 / M55 / M85 (ARMv8.1-M) | T32 + Helium (MVE) + LOL | Thumb only |
+| Cortex-R5 / R7 / R8 (ARMv7-R) | A32 + T32 | AArch32 |
+| Cortex-R52 (ARMv8-R AArch32) | A32 + T32 | AArch32 |
+| Cortex-R82 (ARMv8-R AArch64) | A64 | AArch64 |
+| Cortex-A7 / A9 / A15 (ARMv7-A) | A32 + T32 + NEON | AArch32 |
+| Cortex-A53 / A55 / A72 / A76 / A78 (ARMv8-A) | A32 + T32 + A64 + NEON | AArch32 + AArch64 |
+| Cortex-A510 / A520 / A720 / X3 / X4 (ARMv9-A flagships) | A64 + SVE2 | AArch64 only on flagships |
+
+## NEON, Helium, SVE, SVE2 — when to use which
+
+A senior firmware engineer often gets asked "which vector extension does our chip have?" The map is easier than it looks:
+
+- **NEON** (also called AdvSIMD) — 128-bit fixed-width SIMD, A-profile, on every Cortex-A core since the Cortex-A8. Has its own 32 x 128-bit register file (or 32 x 64-bit on v7-A) separate from the FPU. Used by ffmpeg, OpenCV, glibc memcpy, glibc memchr.
+- **Helium / MVE** — 128-bit SIMD on M-profile, v8.1-M only. Reuses the FPU register file rather than adding a new one (saves area). Predicated execution by default; tail-handling free. Used by CMSIS-DSP, CMSIS-NN, TensorFlow Lite Micro Helium kernels.
+- **SVE** — variable-length SIMD, 128 to 2048 bits in 128-bit increments, A-profile only. Introduced on Fujitsu A64FX (HPC) and on Cortex-A510 / A715 / X3 / X4 server / mobile cores. Code is written in a length-agnostic style — a single binary runs on a 128-bit SVE chip and a 512-bit SVE chip with no recompilation.
+- **SVE2** — SVE plus the integer / multimedia instructions that were missing in SVE1. Mandatory in ARMv9-A.
+
+<Callout type="note" title="Why M-profile got Helium instead of NEON">
+NEON would have doubled the register file area on a Cortex-M55, which is the whole point of the cost-sensitive M-profile. Helium reuses the existing FPU registers (S0-S31 viewed as Q0-Q7), adds predication for tail handling, and shares decode logic with the scalar FPU pipeline. The result is roughly 80% of NEON's throughput at roughly 30% of the silicon cost. For edge ML on a battery, that trade-off is the right one.
+</Callout>
+
+## When the ISA distinction actually bites
+
+For most firmware engineers most of the time, the ISA distinctions are invisible — the compiler picks the right instruction set from `-mcpu=` and `-march=` flags. The cases where it leaks into your day:
+
+- **Linker scripts**: Thumb interworking requires the LSB of every function pointer to be set; A32 / Thumb mode bits are encoded in branch targets. The linker handles this if you tell it `-mthumb`.
+- **Inline assembly**: writing `.arm` versus `.thumb` directives in a hand-rolled startup file. Wrong mode = the chip executes garbage.
+- **Hand-written SIMD intrinsics**: the same C code does not compile against NEON, Helium, and SVE — different intrinsics namespaces (`__neon_`, `__arm_vmem`, `__sve_`).
+- **Porting v7-M code to v8-M**: most works unchanged, but anything that touches the MPU register layout, the stack-overflow detection path, or fault-handler vectors needs adjustment.
+
+## Where to go from here
+
+- The [exception model](/docs/architecture/exception-model/) — how interrupts, faults, and supervisor calls actually work.
+- The [memory model](/docs/architecture/memory-model/) — ordering, barriers, and why `dmb` exists.
+- [TrustZone](/docs/architecture/trustzone/) — secure/non-secure worlds on M-profile and A-profile.
+- Or jump straight into a core: [Cortex-M4](/docs/cortex-m/m4/), [Cortex-M33](/docs/cortex-m/m33-m23/), [Cortex-M85](/docs/cortex-m/m55-m85/).
+
+## Cross-references
+
+- [Cortex-M lineup](/docs/cortex-m/lineup/) — picking between M0 through M85.
+- [Cortex-A overview](/docs/cortex-a/overview/) — A-profile mission and core selection.
+- [Cortex-R overview](/docs/cortex-r/overview/) — R-profile lockstep and safety.
+- [ARMv7-M vs ARMv8-M](/docs/architecture/armv7m-armv8m/) — the M-profile generational jump.
+- [TrustZone](/docs/architecture/trustzone/) — orthogonal to ISA, applies to v8-M and v8/9-A.
+- [CMSIS](/docs/programming/cmsis/) — how CMSIS abstracts ISA differences.
+- [NVIC priority](/docs/cortex-m/nvic-priority/) — same model across every M-profile ISA.
+- [MPU on Cortex-M](/docs/cortex-m/mpu/) — different register layout per ISA.
+- [QEMU & Renode](/docs/tools/sim/) — picking an emulator per ISA target.

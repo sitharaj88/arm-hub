@@ -1,0 +1,169 @@
+---
+title: Cortex-M85
+description: The highest-performance Cortex-M — ~3.0 CoreMark/MHz, Helium, branch prediction, PAC/BTI security, and the de-facto M7 replacement for new high-performance MCUs.
+order: 6
+updated: 2026-05-13
+tags: [cortex-m, cortex-m85, armv8.1-m, helium, pac, bti]
+---
+
+The Cortex-M85 is the top of the Cortex-M line as of 2026. It targets the niche the Cortex-M7 has owned for years — high-frequency, deeply-pipelined, performance-first MCU work — and brings it forward into the ARMv8.1-M era with TrustZone-M, Helium MVE, pointer authentication (PAC), and branch-target identification (BTI). At ~**3.0 CoreMark/MHz** and clock targets pushing 750 MHz on modern processes, the M85 is the single fastest Cortex-M core ARM has ever shipped.
+
+The M85 is positioned by ARM as **the replacement for the M7** in new designs. Both are high-performance, both have caches and TCM, both ship in similar power envelopes — but the M85 is on a newer architecture profile, gets all the security features the M7 lacks, and the microarchitecture (7-stage pipeline, dual-issue, real branch prediction) is meaningfully better in single-thread throughput on the same clock. The M7 will keep shipping in established product lines (STM32H7, NXP i.MX RT, MIMXRT117x) for years, but every vendor's *next* high-performance MCU is M85-based.
+
+<SpecSheet
+  title="Cortex-M85 at a glance"
+  specs={[
+    { label: 'Architecture', value: 'ARMv8.1-M Mainline' },
+    { label: 'Pipeline', value: '7-stage in-order, dual-issue scalar + vector' },
+    { label: 'Branch prediction', value: 'Yes — full dynamic predictor (BTB, return-address stack, direction predictor)' },
+    { label: 'Helium MVE', value: 'Optional (most M85 implementations include it)' },
+    { label: 'FPU', value: 'FPv5-SP and FPv5-DP (both single and double precision)' },
+    { label: 'TrustZone-M', value: 'Optional' },
+    { label: 'PAC (Pointer Authentication)', value: 'Yes — first Cortex-M with PAC. Signs LR before push, verifies on pop' },
+    { label: 'BTI (Branch Target Identification)', value: 'Yes — indirect branches must land on a BTI instruction' },
+    { label: 'Cache', value: 'I-cache 4–64 KB, D-cache 4–64 KB, 32-byte lines' },
+    { label: 'TCM', value: 'ITCM and DTCM, each up to 16 MB' },
+    { label: 'DMIPS/MHz', value: '~3.13 (Dhrystone 2.1)' },
+    { label: 'CoreMark/MHz', value: '~3.0' },
+    { label: 'Typical clock', value: '400–750 MHz silicon target on TSMC 22nm and below' },
+    { label: 'Typical parts', value: 'Renesas RA8M1 (480 MHz), Alif Balletto, AT32A4xx, future STM32 H8 series' },
+  ]}
+/>
+
+## Why the M85 exists
+
+The M7 was first announced in 2014. It's been a great success — flagship MCUs from STM, NXP, Microchip, and others all use it — but it's an ARMv7-M part. No TrustZone, an older MPU model, no Helium, no PAC/BTI. ARM needed a successor that kept the high-performance positioning while bringing the v8.1-M security and SIMD story forward.
+
+The M85 is that successor. Same general architectural shape (deep pipeline, caches, TCM, separate I/D buses), much better microarchitecture (real branch prediction, dual-issue, MVE), full v8.1-M ISA.
+
+| Feature | M7 | M85 |
+|---|---|---|
+| Architecture | ARMv7E-M | ARMv8.1-M Mainline |
+| Pipeline stages | 6 | 7 |
+| Dual issue | Yes (limited) | Yes (broader) |
+| Branch prediction | Static + small dynamic | Full dynamic with BTB |
+| Helium MVE | No | Optional |
+| TrustZone-M | No | Optional |
+| PAC / BTI | No | Yes |
+| FPU | FPv5-SP, FPv5-DP optional | FPv5-SP and FPv5-DP |
+| DMIPS/MHz | 2.14 | 3.13 |
+| CoreMark/MHz | 2.50 | 3.00 |
+
+## Microarchitecture
+
+### Seven-stage pipeline
+
+F1 → F2 → D1 → D2 → I → E → WB. Two fetch stages hide flash latency, two decode stages handle the dual-issue logic, an issue stage picks instructions for the execution units, and execute + writeback close out. Most simple ALU ops execute in E and write back the same cycle; loads have a 2- or 3-cycle latency depending on cache hit.
+
+### Dual issue
+
+Two instructions can issue per cycle. The pairing rules:
+
+- Scalar + scalar: most ALU and load/store pairs work.
+- Scalar + MVE: nearly always works — the MVE pipe is separate.
+- MVE + MVE: only if both are independent and one is a load/store.
+- Branch + anything: the branch fills slot 1, the other instruction fills slot 0.
+
+Real-world IPC on hot loops sits between 1.4 and 1.8, sometimes hitting 2.0. On branchy control code, IPC drops to ~1.1 — still better than M7's ~1.0.
+
+### Branch prediction
+
+This is the biggest single-thread win. The M85 has:
+
+- **BTB (Branch Target Buffer)**: 64-entry, fully associative. Caches the target of recently-taken indirect branches.
+- **Direction predictor**: gshare-style, 2-bit saturating counters per entry.
+- **Return-address stack**: 4-entry. Predicts the target of `BX LR` / `POP {pc}` from the actual call site, not from the BTB.
+
+A correctly-predicted branch is **0-cycle penalty**. A mispredict is **5–7 cycles** depending on where the bubble lands. Indirect branches (function pointers, virtual calls, switch jumps) become tractable for the first time on a Cortex-M — the BTB nails them on the second visit.
+
+<Callout type="tip" title="C++ virtual calls finally make sense on Cortex-M">
+Virtual function dispatch on M7 has a typical cost of ~6 cycles (load vtable pointer, load function pointer, branch indirect — and the indirect branch is always mispredicted). On M85 with a warm BTB, the same dispatch costs 1–2 cycles. C++ codebases that previously paid a hefty virtual-call tax become competitive with hand-rolled function-pointer dispatch.
+</Callout>
+
+## Helium MVE
+
+Same MVE as the [M55](/docs/cortex-m/m55). 128-bit vectors, dual-issue with scalar, low-overhead loops with tail predication. The M85 implementation tends to be slightly more efficient per cycle because the wider issue width can keep both lanes fed more often.
+
+For ML inference, the M85 (with MVE) at 600 MHz is in the same throughput league as the M55 at 400 MHz — about 1.5× the work. The trade is that the M85 doesn't typically pair with an Ethos-U; vendors who want NPU-assisted ML go M55 + Ethos-U. M85 + MVE is for "pure software" ML inference and for general DSP.
+
+## PAC and BTI
+
+Pointer authentication (PAC) and branch target identification (BTI) are the new security primitives.
+
+**PAC** signs return addresses before they're pushed to the stack. The function prologue executes `PAC R12, LR, SP` which combines LR, SP, and a per-process key to produce a signed pointer; the signed pointer is pushed. The epilogue executes `AUT R12, LR, SP` which verifies the signature. If LR has been tampered (e.g., by a stack-overflow exploit that overwrites the return address), the verification fails and the core raises an exception.
+
+```c
+// GCC -mbranch-protection=pac-ret enables PAC return signing.
+// Prologue:
+//   PUSH {r4, lr}
+//   becomes
+//   PACBTI    -- PAC LR using SP as modifier
+//   PUSH {r4, lr}
+// Epilogue:
+//   POP {r4, lr}
+//   AUT       -- verify, fault if tampered
+//   BX lr
+```
+
+PAC adds ~2 cycles per function call. Negligible on most workloads, well worth the ROP-attack mitigation.
+
+**BTI** marks all valid indirect-branch targets with a `BTI` instruction (16-bit, encoded as a NOP on cores that don't implement BTI). The core enforces that every indirect branch lands on a BTI instruction or it raises a UsageFault. This defeats JOP-style code-reuse attacks where the attacker gerrymanders existing instruction sequences.
+
+```asm
+my_func:
+    BTI         @ valid indirect target
+    push {r4, lr}
+    ...
+```
+
+BTI is binary-compatible with cores that don't implement it (BTI executes as NOP), so libraries built with BTI work everywhere. Together, PAC + BTI provide a credible hardware-enforced control-flow integrity mechanism — the first time this is available on a Cortex-M.
+
+## Cache and TCM
+
+Similar story to M7 and M55. Optional I-cache and D-cache, each 4–64 KB, 32-byte lines. D-cache is write-back by default and write-through configurable. **DMA coherency is not automatic** — see [cache & TCM](/docs/cortex-m/cache-tcm).
+
+ITCM and DTCM are optional but ubiquitous on M85 silicon. ITCM is aliased to address 0x0000_0000 (the "ITCM alias") for boot-time access; DTCM is aliased to 0x2000_0000. Code placed in ITCM runs at single-cycle latency with no cache management; data in DTCM is similarly single-cycle and is the right place for DMA buffers and performance-critical scalars.
+
+## TrustZone-M
+
+Same model as M33 / M55. SAU, IDAU, NSC regions, banked NVIC, MPU, SysTick. PAC and BTI both have **separate keys per security state**, so a non-secure-side ROP gadget cannot forge return addresses for secure code.
+
+## NVIC and exception handling
+
+Up to 480 IRQs, up to 8 priority bits. With banked NVIC under TrustZone-M, secure and non-secure code can each define up to ~256 priority levels in practice. Tail-chaining works across security domains with the extended stack frame to preserve signing.
+
+Exception latency: typically 12 cycles uncached (more with flash wait states), 9 cycles best-case from ITCM-resident handlers. The branch predictor helps slightly — predicted-correctly tail-chain return is faster than M7's.
+
+## Representative parts
+
+| Part | Vendor | Clock | NPU? |
+|---|---|---|---|
+| RA8M1 | Renesas | 480 MHz | No |
+| RA8D1 | Renesas | 480 MHz, graphics-focused | No |
+| Alif Balletto | Alif | 400 MHz M85 + M55 + Ethos-U55 | Yes |
+| AT32A4xx | Artery | 400 MHz | No |
+| HPM6800 | HPMicro | 600 MHz | No |
+
+ARM's reference numbers suggest 750+ MHz is achievable on TSMC 22ULL and similar nodes; silicon-shipping parts as of 2026 are mostly in the 400–500 MHz range. Expect the upper bound to climb as vendors gain experience with the macro.
+
+## When to choose Cortex-M85
+
+The M85 is the right pick when:
+
+- You need maximum single-thread throughput in a Cortex-M envelope (3.0 CoreMark/MHz at high MHz)
+- TrustZone-M is required for security certification
+- The workload benefits from branch prediction (any C++-heavy codebase, RTOS scheduling, network packet processing, parsing)
+- You want PAC/BTI for hardware-enforced control-flow integrity
+- Helium MVE matters for DSP / ML, but you don't want a separate Ethos-U
+
+Avoid M85 if you don't need the performance — M33 is dramatically smaller and lower-power. Pick M55 + Ethos-U for ML-dominant workloads where the NPU does the heavy lifting.
+
+## Cross-references
+
+- [Cortex-M55](/docs/cortex-m/m55) — sibling, MVE-focused, pairs with Ethos-U
+- [Cortex-M7](/docs/cortex-m/m7) — predecessor, still widely shipping
+- [Architecture comparison](/docs/cortex-m/architecture-compare)
+- [Cache and TCM](/docs/cortex-m/cache-tcm)
+- [TrustZone-M architecture](/docs/architecture/trustzone)
+- [FPU](/docs/cortex-m/fpu) — FPv5-DP details
+- ARMv8.1-M Architecture Reference Manual (DDI 0553B)

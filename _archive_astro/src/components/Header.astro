@@ -1,0 +1,132 @@
+---
+import Logo from './Logo.astro';
+import { sections } from '~/utils/nav';
+const path = Astro.url.pathname;
+const isActive = (key: string) => path.startsWith(`/docs/${key}`);
+const primary = sections.slice(0, 6);
+---
+<header class="sticky top-0 z-40 border-b border-line/70 bg-bg/80 backdrop-blur supports-[backdrop-filter]:bg-bg/60">
+  <div class="container-page flex h-14 items-center gap-4">
+    <Logo />
+    <nav class="hidden md:flex items-center gap-1 text-sm">
+      {primary.map((s) => (
+        <a
+          href={s.links[0]?.href ?? `/docs/${s.key}/`}
+          class:list={[
+            'rounded-md px-3 py-1.5 transition',
+            isActive(s.key)
+              ? 'bg-surface text-brand'
+              : 'text-ink-muted hover:text-ink hover:bg-surface/60',
+          ]}
+        >
+          {s.title}
+        </a>
+      ))}
+      <a href="/learn/" class="rounded-md px-3 py-1.5 text-ink-muted hover:text-ink hover:bg-surface/60 transition">Learn</a>
+      <a href="/cheatsheets/" class="rounded-md px-3 py-1.5 text-ink-muted hover:text-ink hover:bg-surface/60 transition">Cheatsheets</a>
+    </nav>
+    <div class="ml-auto flex items-center gap-2">
+      <button
+        id="search-trigger"
+        type="button"
+        class="group inline-flex h-9 items-center justify-center gap-3 rounded-lg border border-line bg-surface/60 px-0 sm:px-3 py-1.5 text-sm text-ink-muted hover:border-brand/40 hover:text-ink transition w-9 sm:w-auto"
+        aria-label="Search the site"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-4 w-4">
+          <circle cx="11" cy="11" r="7" />
+          <path d="m20 20-3.5-3.5" stroke-linecap="round" />
+        </svg>
+        <span class="hidden sm:inline">Search</span>
+        <span class="hidden sm:flex items-center gap-0.5 ml-6">
+          <kbd class="kbd">⌘</kbd>
+          <kbd class="kbd">K</kbd>
+        </span>
+      </button>
+      <button
+        id="theme-toggle"
+        type="button"
+        class="group relative inline-flex h-9 w-9 items-center justify-center rounded-lg border border-line bg-surface/60 text-ink-muted hover:text-ink hover:border-brand/40 transition"
+        aria-label="Toggle light/dark theme"
+        title="Toggle theme (T)"
+      >
+        <svg class="absolute h-4 w-4 transition-all rotate-0 scale-100 dark:-rotate-90 dark:scale-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79Z"/>
+        </svg>
+        <svg class="absolute h-4 w-4 transition-all rotate-90 scale-0 dark:rotate-0 dark:scale-100" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="4"/>
+          <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+        </svg>
+      </button>
+      <a
+        href="https://github.com/sitharaj88/armhub"
+        target="_blank"
+        rel="noopener"
+        class="inline-flex h-9 w-9 items-center justify-center rounded-lg border border-line bg-surface/60 text-ink-muted hover:text-ink hover:border-brand/40 transition"
+        aria-label="GitHub repository"
+      >
+        <svg viewBox="0 0 24 24" fill="currentColor" class="h-4 w-4">
+          <path d="M12 .5A11.5 11.5 0 0 0 .5 12a11.5 11.5 0 0 0 7.86 10.92c.58.1.79-.25.79-.55v-1.93c-3.2.7-3.88-1.54-3.88-1.54-.53-1.33-1.28-1.68-1.28-1.68-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.03 1.76 2.7 1.25 3.36.96.1-.75.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.68 0-1.25.45-2.27 1.18-3.07-.12-.29-.51-1.46.11-3.04 0 0 .97-.31 3.18 1.18.92-.26 1.91-.39 2.9-.39s1.97.13 2.9.39c2.2-1.49 3.17-1.18 3.17-1.18.63 1.58.23 2.75.12 3.04.74.8 1.18 1.82 1.18 3.07 0 4.41-2.69 5.38-5.25 5.66.41.36.78 1.06.78 2.14v3.17c0 .3.21.66.79.55A11.5 11.5 0 0 0 23.5 12 11.5 11.5 0 0 0 12 .5Z"/>
+        </svg>
+      </a>
+      <button
+        id="menu-toggle"
+        class="md:hidden inline-flex h-9 w-9 items-center justify-center rounded-lg border border-line bg-surface/60 text-ink-muted"
+        aria-label="Toggle menu"
+        aria-expanded="false"
+      >
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-5 w-5">
+          <path d="M4 6h16M4 12h16M4 18h16" stroke-linecap="round" />
+        </svg>
+      </button>
+    </div>
+  </div>
+  <div id="mobile-menu" class="hidden border-t border-line/70 md:hidden">
+    <nav class="container-page grid grid-cols-2 gap-1.5 py-4 text-sm">
+      {sections.map((s) => (
+        <a href={s.links[0]?.href ?? `/docs/${s.key}/`} class="flex min-h-11 items-center rounded-md px-3 py-2.5 text-ink-muted hover:bg-surface hover:text-ink">{s.title}</a>
+      ))}
+      <a href="/learn/" class="flex min-h-11 items-center rounded-md px-3 py-2.5 text-ink-muted hover:bg-surface hover:text-ink">Learn</a>
+      <a href="/cheatsheets/" class="flex min-h-11 items-center rounded-md px-3 py-2.5 text-ink-muted hover:bg-surface hover:text-ink">Cheatsheets</a>
+    </nav>
+  </div>
+</header>
+
+<script>
+  const menuBtn = document.getElementById('menu-toggle');
+  const menu = document.getElementById('mobile-menu');
+  menuBtn?.addEventListener('click', () => {
+    const open = menu?.classList.toggle('hidden') === false;
+    menuBtn.setAttribute('aria-expanded', String(open));
+  });
+
+  // Theme toggle — persists the user's choice, falls back to system preference
+  function applyTheme(theme: 'light' | 'dark') {
+    if (theme === 'dark') document.documentElement.classList.add('dark');
+    else document.documentElement.classList.remove('dark');
+    document.querySelector('meta[name="theme-color"]:not([media])')?.setAttribute(
+      'content', theme === 'dark' ? '#0d0f12' : '#ffffff'
+    );
+  }
+  function toggleTheme() {
+    const isDark = document.documentElement.classList.contains('dark');
+    const next = isDark ? 'light' : 'dark';
+    try { localStorage.setItem('theme', next); } catch {}
+    applyTheme(next);
+  }
+  document.getElementById('theme-toggle')?.addEventListener('click', toggleTheme);
+  // Keyboard shortcut: T toggles theme (when not in an input)
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 't' && e.key !== 'T') return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const tag = (document.activeElement?.tagName || '').toUpperCase();
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || (document.activeElement as HTMLElement | null)?.isContentEditable) return;
+    e.preventDefault();
+    toggleTheme();
+  });
+  // React to system theme changes only if user hasn't expressed a preference
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+    try {
+      if (localStorage.getItem('theme') === null) applyTheme(e.matches ? 'dark' : 'light');
+    } catch {}
+  });
+</script>

@@ -1,0 +1,163 @@
+---
+title: Inline assembly
+description: When and how to use inline assembly on Cortex-M — GCC syntax, clobbers, the LLVM extended-asm rules, and what assembly actually buys you.
+order: 7
+updated: 2026-05-12
+tags: [programming, assembly, asm]
+---
+
+import Callout from '~/components/Callout.astro';
+
+You don't write much assembly on a modern Cortex-M. The compiler is good; CMSIS intrinsics cover the system instructions; everything else compiles to fast Thumb-2 by itself. But three situations still call for inline asm: **system instructions the compiler doesn't emit**, **tight loops where you don't trust the scheduler**, and **special-purpose code (startup, exception entry)** that has to do specific things in a specific order.
+
+## GCC extended-asm — the syntax
+
+```c
+int result;
+asm volatile (
+    "mov %0, %1, lsl #2"          // assembly template
+    : "=r" (result)                // output: any register, write-only
+    : "r" (value)                  // input:  any register
+    :                              // clobbers
+);
+```
+
+Four sections separated by colons:
+
+1. **Template** — the assembly text. `%0`, `%1` refer to operands.
+2. **Outputs** — what the asm writes. `=r` = write-only general register. `+r` = read-write.
+3. **Inputs** — what the asm reads. `r` = general register. `i` = immediate constant.
+4. **Clobbers** — what the asm trashes that *isn't* in the input/output lists: `"cc"` (condition codes), `"memory"` (any memory), or specific registers like `"r0"`, `"r1"`.
+
+The `volatile` keyword prevents the compiler from optimising the asm away or hoisting it out of loops.
+
+## Constraints reference
+
+| Constraint | Meaning                                  |
+|-----------|------------------------------------------|
+| `r`       | Any general-purpose register             |
+| `l`       | Low register (r0–r7)                     |
+| `h`       | High register (r8–r15) — Cortex-M3+      |
+| `i`       | Compile-time integer constant            |
+| `n`       | Same, but the value is fixed             |
+| `m`       | Memory operand                           |
+| `=`       | Output (write-only)                      |
+| `+`       | Input + output                           |
+| `&`       | Early-clobber output (assigned before all inputs are read) |
+
+`l` (low registers) matters on Cortex-M0/M0+ — most 16-bit Thumb-1 instructions can only address r0–r7. If you write asm that does arithmetic, constrain operands to `l`.
+
+## CMSIS intrinsics first
+
+Before writing inline asm, check if CMSIS already wraps the instruction:
+
+```c
+__DSB();        // data sync barrier
+__ISB();        // instruction sync barrier
+__WFI();        // wait for interrupt
+__NOP();        // no-op
+__CLZ(x);       // count leading zeros
+__REV(x);       // byte-reverse
+__SSAT(x, 12);  // saturate to signed 12 bits
+__SMLAD(a, b, acc);   // dual MAC (Cortex-M4+)
+```
+
+`<arm_acle.h>` (ARM C Language Extensions) wraps essentially all the DSP and Helium instructions as intrinsics. Use them; they let the compiler schedule and optimise around them.
+
+You drop to inline asm when:
+
+- You need a specific instruction sequence the compiler won't generate.
+- You need a system instruction CMSIS doesn't wrap (rare).
+- You're writing the bottom of an OS or boot ROM.
+
+## Examples
+
+### Reading a special-purpose register
+
+```c
+uint32_t read_psp(void) {
+    uint32_t result;
+    asm volatile ("mrs %0, psp" : "=r" (result));
+    return result;
+}
+```
+
+`MRS` reads from a system register. CMSIS provides `__get_PSP()`, but if you want to write it yourself or read a less common register (`CONTROL`, `FAULTMASK`, `BASEPRI`), this is how.
+
+### A naked function for the exception entry
+
+```c
+__attribute__((naked))
+void PendSV_Handler(void) {
+    asm volatile (
+        "mrs r0, psp                \n"   // get process stack pointer
+        "stmdb r0!, {r4-r11}        \n"   // save callee-saved
+        "ldr r1, =current_task      \n"
+        "ldr r2, [r1]               \n"
+        "str r0, [r2]               \n"   // save sp into current_task->sp
+        "bl scheduler               \n"   // pick next task
+        "ldr r0, [r2]               \n"
+        "ldmia r0!, {r4-r11}        \n"   // restore callee-saved
+        "msr psp, r0                \n"
+        "bx lr                      \n"   // EXC_RETURN
+    );
+}
+```
+
+`__attribute__((naked))` tells the compiler "don't add prologue/epilogue — I'm doing everything myself". You can't access C locals or arguments by name in a naked function; the assembly is the entire function body.
+
+### A spin loop that the compiler isn't allowed to elide
+
+```c
+static inline void delay_cycles(uint32_t n) {
+    asm volatile (
+        "1: subs %0, %0, #1 \n"
+        "   bne 1b          \n"
+        : "+r" (n)
+        :
+        : "cc"
+    );
+}
+```
+
+`1:` is a local label; `1b` means "branch backward to label 1". `+r` makes `n` an input/output so the compiler doesn't assume the asm preserved the value.
+
+### A barrier that prevents reordering
+
+```c
+static inline void compiler_barrier(void) {
+    asm volatile ("" ::: "memory");
+}
+```
+
+An empty asm with `"memory"` clobber tells the compiler: "I might have read or written any memory". It can't move loads/stores across this. Useful for sequencing access to volatile + non-volatile data.
+
+This is **only a compiler barrier**, not a CPU barrier. For ordering across the bus, use `__DMB()` / `__DSB()`.
+
+## LLVM/clang differences
+
+LLVM's inline asm is largely compatible with GCC's. The main differences:
+
+- LLVM is stricter about constraints — it'll fail loudly where GCC silently accepted ambiguity.
+- Some GCC-specific constraints (`X`, `g`) aren't supported.
+- LLVM's modifier letters (`%c0`, `%a0`) differ slightly for some quirky cases.
+
+For Cortex-M code, you can usually write asm once and it works on both.
+
+## What you shouldn't do
+
+- **Don't replicate the compiler's job.** A `for (int i = 0; i < n; i++) sum += a[i];` compiles to as-good asm as you'd write by hand.
+- **Don't write asm to "optimise"** without a benchmark. The compiler's scheduling on a dual-issue Cortex-M7 is almost always better than yours.
+- **Don't forget memory clobber.** Asm that touches memory other than its operands must include `"memory"` or you'll get baffling miscompiles where the compiler reuses a cached value.
+- **Don't assume register allocation.** Use constraints to ask for what you need. Hardcoding `r0`, `r1` works but is brittle.
+
+<Callout type="tip" title="Look at the disassembly">
+For any inline asm you've written, do `arm-none-eabi-objdump -d firmware.elf` and confirm the surrounding scheduling is what you expected. Pay attention to where the compiler put loads/stores around your asm — that's often where it doesn't do what you thought.
+</Callout>
+
+## See also
+
+- [Embedded C patterns](/docs/programming/embedded-c/) — `volatile`, atomicity.
+- [CMSIS](/docs/programming/cmsis/) — intrinsics catalogue.
+- [Startup & vector table](/docs/programming/startup/) — where asm is essentially required.
+- ARM ACLE documentation (external) — every intrinsic.

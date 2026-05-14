@@ -1,0 +1,165 @@
+---
+title: Cortex-A overview
+description: ARM's applications-class cores — what makes them different from Cortex-M, and what a firmware engineer needs to know when stepping up to A-profile.
+order: 1
+updated: 2026-05-12
+tags: [cortex-a, fundamentals]
+---
+
+
+Cortex-A cores are designed to run **rich operating systems** — Linux, Android, QNX, FreeBSD. The whole machinery (MMU, multi-level caches, large register files, multi-issue out-of-order pipelines on bigger cores) exists to make virtual memory and multi-tenant workloads fast. As a result, an A-profile chip looks more like a small SoC than a microcontroller.
+
+<SpecSheet
+  title="Cortex-A profile — quick reference"
+  specs={[
+    { label: 'Mission', value: 'Run a general-purpose OS with virtual memory, multi-process scheduling, demand paging, and SMP across multiple cores' },
+    { label: 'Current ISAs', value: 'ARMv7-A (32-bit only), ARMv8-A (AArch32 + AArch64), ARMv9-A (AArch64 + SVE2 + CCA)' },
+    { label: 'Execution states', value: 'AArch64 (64-bit registers, 31 GPRs, A64 ISA) and AArch32 (legacy A32 / T32, available on most v8-A cores)' },
+    { label: 'Address translation', value: 'MMU with 4 KB / 16 KB / 64 KB page granules; up to 48-bit virtual address (52-bit with v8.2-LPA)' },
+    { label: 'Caches', value: 'Always present. Typically L1 split I/D 32-64 KB per core, L2 shared per cluster (256 KB - 4 MB), L3 system level 1-32 MB' },
+    { label: 'SIMD / FP', value: 'NEON (AdvSIMD) baseline on all v8-A; SVE / SVE2 on v8.2+ server cores and v9-A flagships (variable vector length 128-2048 bits)' },
+    { label: 'Exception levels', value: 'EL0 (user), EL1 (kernel), EL2 (hypervisor), EL3 (secure monitor / TF-A)' },
+    { label: 'Interrupt controller', value: 'GIC v2 / v3 / v4 — distributor + redistributors + per-PE CPU interface, supports MSI via ITS' },
+    { label: 'Boot chain', value: 'BL1 (ROM) → BL2 (platform init) → BL31 (EL3 runtime / TF-A) → BL32 (OP-TEE, optional) → BL33 (U-Boot / UEFI) → kernel' },
+  ]}
+/>
+
+## What's different from Cortex-M
+
+| Feature                | Cortex-M                  | Cortex-A                          |
+|------------------------|---------------------------|-----------------------------------|
+| Memory protection      | MPU (region-based)        | MMU (paged virtual memory)        |
+| Caches                 | optional, small, no coherency | always present, multi-level, coherent across cores |
+| Interrupt controller   | NVIC                      | GIC (Generic Interrupt Controller) |
+| Privilege levels       | 2 (thread/handler × priv/unpriv) | 4 EL levels (EL0 user → EL3 monitor) |
+| Boot                   | flat — from address 0     | multi-stage — BL1 → BL2 → BL31 → OS |
+| Floating point         | optional, single-precision typical | always present, double-precision, NEON SIMD |
+| Time-of-day            | external RTC chip         | on-chip generic timer + RTC       |
+| Typical core count     | 1 (sometimes 2 hetero)    | 4–8+ (often big.LITTLE)           |
+
+If you're coming from Cortex-M, the mental shift is: **you no longer own the whole chip**. You write code that runs on top of an operating system, in a virtual address space, scheduled by a kernel you don't control. The good news: most of the firmware-engineer instincts (DMA coherency, interrupt latency, bit-twiddling registers) still apply — just one layer deeper.
+
+## The Cortex-A family
+
+Modern Cortex-A cores split into three performance tiers:
+
+- **Efficiency cores** — Cortex-A55, A510, A520. In-order or simple OoO, low-power, big.LITTLE little-cluster role.
+- **Mid cores** — Cortex-A75, A77, A715. Performance-oriented, balanced area/power.
+- **Big cores** — Cortex-A78, A720, X1/X2/X3/X4. High-IPC OoO, large reorder buffer, the "performance cluster" in phones.
+
+Older ARMv7-A cores (Cortex-A7, A8, A9, A15, A17) are still everywhere in industrial — Raspberry Pi 3, 4, 5; embedded SBCs; legacy automotive.
+
+## Exception levels
+
+A-profile has four EL levels:
+
+```
+EL0   ── user space (applications)
+EL1   ── kernel (Linux)
+EL2   ── hypervisor (KVM, Xen, Hyper-V)
+EL3   ── secure monitor (TF-A) — gates secure-world entry/exit
+```
+
+Each level has its own SP, PC, and most system registers. Higher EL can read/write lower-EL state; lower EL can only enter higher EL via a trap (SVC, HVC, SMC).
+
+## The GIC
+
+A-profile interrupts go through the **Generic Interrupt Controller**, which is much more sophisticated than the NVIC:
+
+- Routes interrupts to specific cores (per-PE routing).
+- Distinguishes SGI (software-generated, used for inter-core messaging), PPI (per-PE peripheral), and SPI (shared peripheral).
+- Supports message-signaled interrupts (MSI) via the ITS in GICv3.
+- Has its own priority encoding, distinct from EL priorities.
+
+A Linux driver doesn't touch the GIC directly — it goes through `request_irq()`. But the GIC is where the kernel-level interrupt plumbing lives, and you'll see references to GIC distributor / redistributor / CPU interface registers when reading kernel source.
+
+## MMU in one paragraph
+
+Every memory access goes through a page table walk: virtual address → page table → physical address. The translation result is cached in TLBs. Page tables can be multi-level (typically 4 levels for AArch64 with 4 KB pages), and the cost of a TLB miss is a page-table walk in physical memory — fast but not free. The MMU also enforces access permissions (RWX per page) and memory type (Normal/Device/Strongly-ordered) — same vocabulary as Cortex-M, broader configuration.
+
+## Boot in one paragraph
+
+A typical ARMv8-A boot chain:
+
+```
+ROM → BL1 → BL2 → BL31 (TF-A runtime) ──── BL32 (optional: OP-TEE)
+                                       └─── BL33 (U-Boot or UEFI)
+                                                  │
+                                                  ▼
+                                                Linux kernel
+```
+
+Each stage validates the next via signed images. By the time Linux runs, you're in EL1, in MMU-on virtual memory, with TF-A providing PSCI services (CPU on/off, system reset) and OP-TEE providing TrustZone services. See [boot flow & EL levels](/docs/cortex-a/boot-and-exception-levels/).
+
+<Callout type="note" title="Why armhub covers Cortex-A">
+Most embedded engineers don't *only* write Cortex-M firmware. You'll hit Cortex-A when you bring up a Raspberry Pi, port a vendor BSP, or debug a TF-A boot failure. Knowing one layer above is often what makes you the engineer who can actually ship the product.
+</Callout>
+
+## ARMv7-A versus ARMv8-A versus ARMv9-A
+
+The three application-profile ISAs in production today differ in ways that matter when you're picking silicon or porting code. ARMv7-A is 32-bit only (A32 and Thumb-2 / T32 instruction sets), uses LPAE for physical addresses up to 40 bits, and runs on cores like the Cortex-A7, A9, A15, A17 that ship in millions of Raspberry Pi 3 and earlier units, plus legacy automotive infotainment. ARMv8-A introduced AArch64 with a clean-slate A64 ISA — 31 general-purpose 64-bit registers, fixed 32-bit instruction encoding, integrated NEON, and removal of many v7-A oddities (no conditional execution outside of `csel`, no banked registers, simpler exception model). Most v8-A cores still support AArch32 for backwards compatibility, configurable per exception level.
+
+ARMv9-A is the current architecture roadmap. It mandates AArch64 (no AArch32 support in EL0/EL1 on flagship v9-A cores — affects Cortex-A715, X3, X4), introduces **SVE2** (vector instructions on top of v8-A's NEON), **MTE** (Memory Tagging Extension for hardware-assisted use-after-free detection), **CCA** (Confidential Compute Architecture — realms separate from secure / non-secure worlds), and **BTI** + **PAC** for control-flow integrity. The mobile and server worlds are converging on v9-A; the embedded Linux world is still mostly v8-A.
+
+| Feature | ARMv7-A | ARMv8-A | ARMv9-A |
+|---------|---------|---------|---------|
+| AArch64 | no | yes | yes (mandatory) |
+| AArch32 support | yes | yes (optional from v8.4) | dropped on flagship cores |
+| Virtual address bits | 32 (40 phys with LPAE) | 48 (52 with v8.2-LPA) | 48-52 |
+| SIMD | NEON | NEON | NEON + SVE2 |
+| Pointer authentication | no | yes (v8.3) | yes |
+| Memory tagging (MTE) | no | optional (v8.5) | yes |
+| Confidential compute (CCA) | no | no | yes |
+| Example cores | A7, A9, A15, A17 | A53, A55, A72, A76, A78, A510 | A520, A715, A720, X3, X4 |
+
+## The Cortex-A core lineup — efficiency, mid, big
+
+ARM partitions modern Cortex-A cores into three tiers that roughly correspond to phone-SoC big.LITTLE roles:
+
+- **Efficiency cores** target battery life and area. **Cortex-A53** (v8-A, 2012, in-order dual-issue 8-stage pipeline) was the original; **Cortex-A55** (2017, slight OoO, branch prediction improvements, faster L2) replaced it; **Cortex-A510** (v9-A, 2021, paired-core "complex" sharing FP/SIMD) and **Cortex-A520** (2023, single-core complex variant with TF-M compatible secure boot) are current. These are what you find in Raspberry Pi 5 (A76 + A55 on BCM2712 — actually a mix), in low-end IoT gateways, and as the LITTLE cluster of phone chips.
+- **Mid cores** balance IPC and power. **Cortex-A72** (2015, the Raspberry Pi 4 core), **Cortex-A75/A76/A77**, and now **Cortex-A715** (2022). Three-wide to five-wide OoO; ~3x the IPC of A53 at similar clock.
+- **Big cores** prioritise peak performance. **Cortex-A78** (2020), and the X-series flagships — **X1, X2, X3, X4**. Wide OoO (8-wide on X4), large reorder buffers (320+ on X3), SVE2 with up to 512-bit vectors, deep branch prediction. The X-series sits at the top of every flagship Android phone.
+
+Older 32-bit Cortex-A cores (**A7, A8, A9, A15, A17**) remain everywhere in industrial and embedded — Raspberry Pi 3, BeagleBone Black, NXP i.MX 6, TI Sitara AM335x. They run plain Linux fine; they cannot run a current-generation Android.
+
+## Boot flow and exception levels in detail
+
+The four exception levels are not symmetric. EL3 is the most privileged and most peripherals are accessible only from there. EL1 is the Linux kernel; EL0 is user space. EL2 hosts a Type-1 hypervisor (KVM in the Linux kernel uses EL2 with the **VHE** — Virtualisation Host Extensions — option to let Linux itself run at EL2 directly, which simplifies the KVM trap path).
+
+```
+ROM (BL1)
+  └─ verifies BL2 against ROTPK
+BL2 (platform init — DRAM training, PLL setup, fuse reads)
+  └─ verifies BL31 (TF-A runtime)
+BL31 — Trusted Firmware-A, runs at EL3 forever
+  ├─ provides PSCI services (CPU on/off, system reset, system suspend)
+  ├─ routes SMC calls from EL1/EL2 to OP-TEE if installed
+  └─ hands off to BL33 in EL2 or EL1
+BL32 (optional) — OP-TEE OS, runs in Secure-EL1
+BL33 — Non-secure bootloader (U-Boot or UEFI/EDK2)
+  └─ loads and verifies the Linux kernel
+Linux kernel — EL2 with VHE, or EL1 if no virtualisation
+  └─ user space at EL0
+```
+
+Each stage verifies the next via a chain of signed images. The Root of Trust Public Key (ROTPK) hash lives in OTP fuses; everything downstream signs against keys derived from there. A failed signature halts the chain; a successful chain ends in attestation tokens that prove to a remote relying party that the entire boot was verified.
+
+## big.LITTLE, DynamIQ, and AArch64 vs AArch32
+
+big.LITTLE is the cluster-pair design where two coherent CPU clusters (typically a "big" cluster of high-IPC cores and a "LITTLE" cluster of efficiency cores) share an outer cache and a coherent interconnect. **DynamIQ Shared Unit (DSU)** is ARM's modern replacement — instead of cluster pairs, you have a single DSU that can host up to 8 cores of any mix, with finer-grained migration. A typical 2024 phone chip has 1× Cortex-X4 + 5× Cortex-A720 + 2× Cortex-A520 inside one DSU.
+
+The scheduler (in Linux: **EAS — Energy-Aware Scheduling**) decides which core to run each task on. The default policy aims for "small fast on big when latency-sensitive, otherwise on LITTLE." Getting this right is more art than science; phone vendors ship custom kernel patches.
+
+AArch64 versus AArch32 inside the same core matters when you're porting legacy code. v8-A and earlier v9-A cores can run AArch32 user-space on top of an AArch64 kernel (mixed-bit-width Android), letting old apps coexist with new ones. Flagship v9-A cores (X3, X4, A720) drop AArch32 entirely. If you ship a userland binary, target AArch64; the AArch32 escape hatch is going away.
+
+- [Boot flow & EL levels](/docs/cortex-a/boot-and-exception-levels/) — the full chain.
+- [MMU & paging](/docs/cortex-a/mmu/) — page tables in detail.
+- [Caches & coherency](/docs/cortex-a/caches/) — multi-level cache hierarchies.
+- [ARM ISA family](/docs/architecture/isa-family/) — where v7-A, v8-A, v9-A fit in.
+- [TrustZone](/docs/architecture/trustzone/) — A-profile secure / non-secure world split.
+- [Cortex-M lineup](/docs/cortex-m/lineup/) — when to step down to M-profile instead.
+- [Cortex-R overview](/docs/cortex-r/overview/) — when a hard-real-time MPU-based core is the right answer.
+- [Renesas](/docs/vendors/renesas/) — RZ/G2L Cortex-A55 SoC.
+- [NXP](/docs/vendors/nxp/) — i.MX 8 / i.MX 9 Cortex-A SoCs.
+- [STMicro](/docs/vendors/stm/) — STM32MP1 / MP2 heterogeneous A + M parts.
+- [QEMU & Renode](/docs/tools/sim/) — QEMU `virt` machine for AArch64 Linux bring-up.

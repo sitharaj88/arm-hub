@@ -1,0 +1,63 @@
+---
+title: Renesas RA / RX / RZ
+description: Renesas's ARM portfolio — the RA family (modern Cortex-M from the Synergy line) and RZ (Cortex-A/R) for industrial.
+order: 5
+updated: 2026-05-12
+tags: [vendors, renesas]
+---
+
+Renesas is a Japan-based semiconductor giant that historically pushed its own architectures (RX, RL78, RH850). After acquiring Dialog (BLE, audio) and IDT (timing, memory), they've doubled down on ARM-based products. The **RA** family is now their flagship general-purpose Cortex-M line.
+
+## RA — Renesas Advanced
+
+The RA family covers Cortex-M23 through M85, with strong analog and security peripherals. Inherited from the older "Synergy" line, but the SDK (FSP — Flexible Software Package) is now much improved.
+
+| Group | Core           | Position                                    |
+|-------|----------------|---------------------------------------------|
+| RA2   | M23            | Entry, low-power, low-cost                  |
+| RA4   | M33            | Mainstream IoT, TrustZone                   |
+| RA6   | M33            | Higher-perf M33, more memory and peripherals |
+| RA8   | M85 (or M33)   | Highest-perf — RA8M1, RA8D1 with Helium      |
+
+The **RA8** line is currently one of the few production Cortex-M85 silicons available — competing with NXP's RT700 in the edge-ML space.
+
+## FSP — Flexible Software Package
+
+Renesas's SDK. Apache 2.0 licensed, CMake-buildable, includes:
+
+- e² studio (Eclipse-based IDE).
+- HAL drivers for every peripheral.
+- FreeRTOS support out of the box.
+- TrustZone-aware project templates.
+
+The IDE is the standard Eclipse experience; CLI builds via the FSP CMake files work fine and are recommended for production.
+
+## RX — Renesas's own architecture
+
+Not ARM. Renesas's proprietary 32-bit ISA, popular in industrial automation, automotive, white goods. Different toolchain (CC-RX or GCC-RX) and different ecosystem. Mentioned here only to disambiguate when you see "Renesas RX" in a job description — it's *not* an ARM part.
+
+## RZ — Cortex-A and Cortex-R for industrial
+
+The RZ family runs Cortex-A and Cortex-R cores for higher-performance industrial:
+
+- **RZ/A** — Cortex-A9 with on-chip SRAM (no SDRAM needed), good for HMI.
+- **RZ/G** — Cortex-A55/A53, runs Linux.
+- **RZ/T** — Cortex-R52, real-time industrial (motor control, EtherCAT).
+- **RZ/V** — Cortex-A + vision DRP-AI accelerator.
+
+For mixed Linux + real-time designs, RZ/T2M (R52) and RZ/G2L (A55) are common picks.
+
+## When you'd pick Renesas
+
+- **Industrial / automotive Tier 1 supplier** with existing Renesas relationships.
+- **Need Cortex-M85** — RA8M1 is one of the few in production.
+- **Japanese market** — Renesas has stronger distribution there.
+- **Strong analog requirements** + ARM ISA — the RA family's analog peripherals are first-tier.
+
+For most greenfield projects elsewhere, ST or NXP have stronger ecosystems. Renesas catches up in specific niches.
+
+## See also
+
+- [Cortex-M85 / M55](/docs/cortex-m/m55-m85/) — what RA8 is built on.
+- [Cortex-R](/docs/cortex-r/overview/) — what RZ/T uses.
+- [Renesas RA SDK on GitHub](https://github.com/renesas/fsp) (external).

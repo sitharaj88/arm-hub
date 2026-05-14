@@ -1,0 +1,71 @@
+---
+title: Silicon Labs (EFM32 / EFR32)
+description: Silicon Labs's energy-friendly Cortex-M parts — and their EFR32 wireless line that owns much of the Zigbee / Thread / Matter market.
+order: 8
+updated: 2026-05-12
+tags: [vendors, silicon-labs, silabs]
+---
+
+Silicon Labs (SiLabs) built their brand on **energy-friendly** microcontrollers. The "Gecko" lineup of EFM32 chips have long led the low-power benchmarks, and the EFR32 wireless line is dominant in **Zigbee, Thread, Matter, and now BLE** — particularly in smart home and connected lighting.
+
+## EFM32 — pure MCU
+
+| Series           | Core             | Position                                  |
+|------------------|------------------|-------------------------------------------|
+| EFM32 Zero Gecko | Cortex-M0+       | Lowest-power M0+                          |
+| EFM32 Happy Gecko| Cortex-M0+       | USB-equipped M0+                          |
+| EFM32 Tiny Gecko | Cortex-M3        | Low-cost M3                               |
+| EFM32 Gecko      | Cortex-M3        | Mainstream M3                             |
+| EFM32 Pearl Gecko| Cortex-M4F       | Performance + low-power M4F               |
+| EFM32 Jade Gecko | Cortex-M3        | Mid-range M3                              |
+| EFM32 Series 2   | Cortex-M33       | Modern TrustZone M33                      |
+
+The "Gecko" branding has multiple generations. Series 2 (newer) is the recommended path for new MCU designs.
+
+## EFR32 — wireless
+
+This is where SiLabs really wins. EFR32 chips combine a Cortex-M33 with a 2.4 GHz radio supporting multiple protocols.
+
+| Series           | Protocols                                            |
+|------------------|------------------------------------------------------|
+| EFR32 BG (Blue Gecko) | BLE                                            |
+| EFR32 MG (Mighty Gecko) | Zigbee, Thread, Bluetooth Mesh               |
+| EFR32 FG (Flex Gecko) | proprietary 2.4 GHz / sub-GHz                  |
+| EFR32 ZG         | Zigbee-only                                          |
+| EFR32 SG         | Sub-GHz proprietary                                  |
+| EFR32 xG24       | Multi-protocol (BLE + 802.15.4 + AI/ML)              |
+
+The **EFR32xG24** is currently SiLabs's flagship — Cortex-M33 with Matter support, AI/ML accelerator, dual-bank flash for OTA. It ships in Amazon Sidewalk endpoints, Philips Hue lights, Aqara sensors, and a long list of similar consumer products.
+
+## Energy modes
+
+SiLabs's defining feature: a granular set of low-power modes, going beyond ARM's standard sleep states.
+
+| Mode  | Active                                | Wake source                |
+|-------|---------------------------------------|----------------------------|
+| EM0   | CPU active                            | —                          |
+| EM1   | CPU sleep, peripherals on, RAM active | any peripheral             |
+| EM2   | Most peripherals off, RTCC running    | RTCC, GPIO                 |
+| EM3   | RTCC off, only Burtcc + GPIO          | Burtcc, GPIO               |
+| EM4S  | RAM retained, ultra-low                | Wake pin, Burtcc           |
+| EM4H  | No RAM retention, just pin wake       | Wake pin                   |
+
+A SiLabs design typically operates in **EM2** (around 1.5 µA) the vast majority of the time, waking briefly to EM0 to handle events. Battery life of 5+ years on a CR2032 is routine.
+
+## Simplicity Studio
+
+SiLabs's vendor IDE. Eclipse-based, integrates board management, energy profiler, network analyser (for the EFR32 lines), and an OTA flash debugger. Better than most vendor IDEs, particularly the **energy profiler** — it shows you per-µs current consumption correlated with your code, so you can see exactly which function call costs how many microcoulombs.
+
+For non-wireless EFM32 work, command-line CMake + arm-none-eabi-gcc + their HAL works fine.
+
+## When you'd pick SiLabs
+
+- **You need Matter / Thread / Zigbee** — the EFR32 family is arguably the most mature for these protocols.
+- **Energy budget is critical** — SiLabs's deep-sleep modes are reliably class-leading.
+- **Smart home / connected lighting product** — you'll find more relevant reference designs at SiLabs than anywhere else.
+
+## See also
+
+- [Cortex-M33 / M23](/docs/cortex-m/m33-m23/) — EFR32 / EFM32 Series 2 core.
+- [Cortex-M0+](/docs/cortex-m/m0-m0plus/) — older Gecko core.
+- [Silicon Labs Gecko SDK](https://github.com/SiliconLabs/gecko_sdk) (external).

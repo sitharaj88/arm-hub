@@ -1,0 +1,215 @@
+---
+title: Startup & vector table
+description: Writing the code that runs before main — vector table layout, Reset_Handler, .data/.bss init, C++ static constructors, and what newlib needs.
+order: 4
+updated: 2026-05-12
+tags: [programming, startup, reset]
+---
+
+
+When the processor comes out of reset, none of your C code has run. The stack pointer is uninitialised. The C runtime doesn't exist. The .bss is full of random bits. Every Cortex-M startup file is the bridge between "raw silicon" and "main() is about to be called" — typically 100–300 lines that you'll write once and rarely touch again.
+
+## The vector table
+
+The first two words of the vector table are special:
+
+1. **Word 0** — initial Main Stack Pointer.
+2. **Word 1** — Reset_Handler address.
+
+The hardware reads these at power-on, sets MSP from word 0, and branches to word 1.
+
+<StateDiagram title="Reset to main() boot flow" width={920} height={180} states={[
+  { id: 'reset', label: 'Reset', x: 20, y: 70, w: 110, h: 50, tone: 'destructive', initial: true },
+  { id: 'vtor',  label: 'Relocate VTOR', x: 160, y: 70, w: 140, h: 50, tone: 'warning' },
+  { id: 'bss',   label: 'Zero .bss', x: 330, y: 70, w: 120, h: 50, tone: 'accent' },
+  { id: 'data',  label: 'Copy .data', x: 480, y: 70, w: 130, h: 50, tone: 'accent' },
+  { id: 'ctor',  label: 'C++ ctors', x: 640, y: 70, w: 110, h: 50, tone: 'primary' },
+  { id: 'main',  label: 'main()', x: 780, y: 70, w: 110, h: 50, tone: 'success' },
+]} transitions={[
+  { from: 'reset', to: 'vtor', label: 'MSP loaded' },
+  { from: 'vtor', to: 'bss', label: 'SystemInit' },
+  { from: 'bss', to: 'data', label: 'flash to SRAM' },
+  { from: 'data', to: 'ctor', label: '__libc_init_array' },
+  { from: 'ctor', to: 'main', label: 'jump' },
+]} caption="The six steps every Cortex-M part takes between power-on and the first line of main() — Reset_Handler is the glue that owns this whole sequence." />
+
+```c
+__attribute__((section(".isr_vector"), used))
+void (* const vector_table[])(void) = {
+    (void(*)(void))(&_estack),         // 0: MSP
+    Reset_Handler,                      // 1: reset
+
+    NMI_Handler,                        // 2: NMI
+    HardFault_Handler,                  // 3: HardFault
+    MemManage_Handler,                  // 4
+    BusFault_Handler,                   // 5
+    UsageFault_Handler,                 // 6
+    0, 0, 0, 0,                         // 7-10 reserved
+    SVC_Handler,                        // 11
+    DebugMon_Handler,                   // 12
+    0,                                  // 13 reserved
+    PendSV_Handler,                     // 14
+    SysTick_Handler,                    // 15
+
+    // External IRQs — vendor-specific from here
+    WWDG_IRQHandler,                    // 16
+    PVD_IRQHandler,                     // 17
+    // ... usually ~80–240 more
+};
+```
+
+The vector table must be placed at the start of flash (`0x08000000` on STM32, etc.), pinned by the linker script's `.isr_vector` section. The `KEEP(*(.isr_vector))` in the linker script prevents the linker's `--gc-sections` from discarding it.
+
+## Reset_Handler
+
+```c
+extern uint32_t _sidata;        // .data load address (in flash)
+extern uint32_t _sdata, _edata; // .data destination range (in RAM)
+extern uint32_t _sbss, _ebss;   // .bss range (in RAM)
+
+extern void SystemInit(void);
+extern void __libc_init_array(void);
+extern int main(void);
+
+__attribute__((naked, noreturn))
+void Reset_Handler(void) {
+    // 1. Copy .data from flash to RAM
+    uint32_t *src = &_sidata;
+    uint32_t *dst = &_sdata;
+    while (dst < &_edata) *dst++ = *src++;
+
+    // 2. Zero .bss
+    dst = &_sbss;
+    while (dst < &_ebss) *dst++ = 0;
+
+    // 3. Vendor-specific clock setup (PLL, flash wait states, voltage scaling)
+    SystemInit();
+
+    // 4. C++ static constructors (.preinit_array, .init_array)
+    __libc_init_array();
+
+    // 5. Hand off to main
+    main();
+
+    // 6. main() should never return, but if it does:
+    while (1) {}
+}
+```
+
+`__attribute__((naked))` is *only* needed if you're writing this in assembly within a C function — for a pure C handler that does what's above, you can drop it. The Cortex-M exception entry already saves caller-saved registers; Reset_Handler is called *as if it were* an exception, so it has the same calling convention as a C function.
+
+<Callout type="warn" title="SystemInit runs before .data is initialized — be careful">
+If `SystemInit()` reads any global variable expecting an initialiser, the variable will still be uninitialised. Vendor `SystemInit` implementations are typically careful to use only literals — but watch this if you customise.
+</Callout>
+
+## What `SystemInit` does
+
+The default CMSIS `SystemInit` for most STM32 chips:
+
+1. Enables the FPU (if present) — clears `CPACR.CP10/CP11` to permit FPU access.
+2. Configures `VTOR` to the start of flash (in case the bootloader left it elsewhere).
+3. *Doesn't* typically configure clocks — that's left to your `main()` or a separate `SystemClock_Config()`.
+
+```c
+void SystemInit(void) {
+    #if (__FPU_PRESENT == 1) && (__FPU_USED == 1)
+        SCB->CPACR |= ((3UL << 10*2) | (3UL << 11*2));   // full access to CP10, CP11
+    #endif
+    SCB->VTOR = (uint32_t)&vector_table;
+}
+```
+
+Some vendor versions also bring up the watchdog, configure the cache (on M7), or set up the MPU.
+
+## C++ static constructors
+
+If you compile C++ code with global objects, those objects need their constructors run before `main()`. The linker collects all the constructor function pointers into `.init_array`, and `__libc_init_array` walks the array calling each:
+
+```c
+extern void (*__preinit_array_start[])(void);
+extern void (*__preinit_array_end[])(void);
+extern void (*__init_array_start[])(void);
+extern void (*__init_array_end[])(void);
+
+void __libc_init_array(void) {
+    for (void (**f)(void) = __preinit_array_start; f < __preinit_array_end; f++) (*f)();
+    for (void (**f)(void) = __init_array_start; f < __init_array_end; f++) (*f)();
+}
+```
+
+newlib ships this. If you're not using C++ and want a smaller binary, you can replace it with an empty stub.
+
+The linker script must provide the symbols:
+
+```ld
+.preinit_array :
+{
+  PROVIDE_HIDDEN(__preinit_array_start = .);
+  KEEP(*(.preinit_array*))
+  PROVIDE_HIDDEN(__preinit_array_end = .);
+} > FLASH
+
+.init_array :
+{
+  PROVIDE_HIDDEN(__init_array_start = .);
+  KEEP(*(SORT(.init_array.*)))
+  KEEP(*(.init_array*))
+  PROVIDE_HIDDEN(__init_array_end = .);
+} > FLASH
+```
+
+## newlib syscalls
+
+If you link against newlib (the standard libc for embedded), it expects certain syscall stubs:
+
+- **`_write(fd, buf, len)`** — used by `printf`. Forward to UART.
+- **`_read(fd, buf, len)`** — used by `getchar`. Block until UART byte.
+- **`_sbrk(incr)`** — used by `malloc` to grow the heap. Return current heap top, increment by `incr`.
+- **`_exit(code)`** — used by `exit()`. Halt.
+- **`_kill`, `_getpid`, `_close`, `_lseek`, `_fstat`, `_isatty`** — stub implementations returning errors.
+
+A typical `_sbrk`:
+
+```c
+extern char _end[];           /* defined by linker script — end of .bss */
+extern char _heap_end[];      /* also from linker script */
+static char *heap = _end;
+
+void *_sbrk(int incr) {
+    char *prev = heap;
+    if (heap + incr > _heap_end) {
+        errno = ENOMEM;
+        return (void *) -1;
+    }
+    heap += incr;
+    return prev;
+}
+```
+
+If you avoid `malloc`, you can stub `_sbrk` to return `-1` and save a few hundred bytes.
+
+## Customising for your application
+
+The startup file is the place to:
+
+- Disable the watchdog if your bootloader enabled it (some vendors do).
+- Set the cache configuration on M7.
+- Configure the MPU before any code that depends on protection runs.
+- Relocate the vector table if you're chained from a bootloader.
+
+```c
+void Reset_Handler(void) {
+    // Run from a bootloader? Relocate vector table.
+    SCB->VTOR = (uint32_t)&vector_table;
+    __DSB(); __ISB();
+
+    // ... rest of init ...
+    main();
+}
+```
+
+## See also
+
+- [Linker scripts](/docs/programming/linker-scripts/) — paired companion.
+- [Exception model](/docs/architecture/exception-model/) — what the vector table actually does.
+- [CMSIS](/docs/programming/cmsis/) — `SystemInit` and friends.

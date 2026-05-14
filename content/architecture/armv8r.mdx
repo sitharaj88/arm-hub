@@ -1,0 +1,172 @@
+---
+title: ARMv8-R architecture
+description: The real-time R-profile — MPU-based memory protection (no MMU), hypervisor support for real-time virtualization, lockstep, EL0/EL1/EL2 exception levels. Cortex-R52 and the AArch64 R82.
+order: 13
+updated: 2026-05-13
+tags: [architecture, armv8r, cortex-r52, cortex-r82, real-time, functional-safety]
+---
+
+ARMv8-R is the real-time profile of the ARMv8 architecture — the same ISA family as ARMv8-A (Cortex-A applications cores) and ARMv8-M (microcontrollers), but tuned for deterministic, hard-real-time, safety-critical workloads. The two production cores are **Cortex-R52** (AArch32 only) and **Cortex-R82** (AArch64). They run automotive ECUs, industrial motor controllers, robotic actuators, hard-disk controllers, and baseband modems — places where missing a deadline is a system failure, not a glitch.
+
+The defining architectural choice of the R-profile is **MPU-based protection, not MMU**. There is no virtual-address translation, no TLB, no page tables. Every memory access goes straight to the physical address, gated by a fast, deterministic protection check. That keeps load latency bounded and pipeline behavior predictable — the bedrock of real-time analysis.
+
+<SpecSheet
+  title="ARMv8-R at a glance"
+  specs={[
+    { label: 'Cores', value: 'Cortex-R52 (ARMv8-R AArch32), Cortex-R82 (ARMv8-R AArch64), Cortex-R52+ (refresh)' },
+    { label: 'Memory protection', value: 'MPU-based — no MMU, no virtual memory in EL0/EL1. R82 EL2 adds a 2-level MPU for hypervisor.' },
+    { label: 'Exception levels', value: 'EL0 (unprivileged), EL1 (kernel/RTOS), EL2 (hypervisor/safety monitor)' },
+    { label: 'Pipeline', value: '8-stage in-order, dual-issue (R52). Higher-performance OOO on R82.' },
+    { label: 'Caches', value: 'L1 I-cache + L1 D-cache, optional L2. Cache-line lockdown for deterministic access.' },
+    { label: 'Lockstep', value: 'Optional dual-core lockstep (DCLS) for ISO 26262 ASIL-D / IEC 61508 SIL3' },
+    { label: 'TCM', value: 'Tightly-coupled memory (ATCM, BTCM, CTCM) for deterministic low-latency code/data' },
+    { label: 'Interrupt controller', value: 'GIC-v3 or GIC-v4 — far more capable than Cortex-M NVIC' },
+    { label: 'Use cases', value: 'Automotive ECUs (Infineon AURIX, NXP S32R, Renesas RH850 successors), HDD controllers, 5G baseband, motor control' },
+  ]}
+/>
+
+## R-profile vs M-profile vs A-profile
+
+A useful mental model for the three ARMv8 profiles:
+
+<CoreCompare
+  rows={[
+    { core: 'A-profile (Cortex-A)', notes: 'MMU + virtual memory. Runs Linux, Android, full OSes. Optimized for throughput, branch prediction, deep caches. Non-deterministic by design.' },
+    { core: 'R-profile (Cortex-R)', notes: 'MPU only. Runs RTOSes (AUTOSAR, VxWorks, QNX, Integrity). Optimized for bounded WCET, deterministic behavior, lockstep for safety. Some caches but with lockdown options.' },
+    { core: 'M-profile (Cortex-M)', notes: 'MPU optional. Runs bare-metal or small RTOSes (FreeRTOS, Zephyr, ThreadX). Optimized for power, code density, low interrupt latency. Tiny address space, no TLB.' },
+  ]}
+/>
+
+The R-profile sits between A and M: it has a fully featured exception model with EL0/EL1/EL2, a real interrupt controller (GIC), caches, and a large physical address space (the R82 has 40-bit physical addressing). But it pointedly skips the MMU. The trade-off is that you cannot run general-purpose OSes that demand virtual memory — Linux, in particular, requires an MMU and will not run on a Cortex-R without significant reworking.
+
+## Why MPU-based, not MMU-based?
+
+The MMU's worst-case behavior is hard to bound. A TLB miss costs hundreds of cycles for the page-table walk; on a real-time path that's catastrophic. Worse, the page-table walk timing depends on which page tables are cached, which entries were recently used, and (on a shared cache) on what other cores are doing. Worst-case execution time analysis on an MMU-based system is dominated by these unpredictable misses.
+
+An MPU has none of that. Each memory access compares against 16–32 region descriptors in a deterministic constant time — typically 1 cycle, hidden in the load pipeline. There's no walk, no miss, no TLB shootdown. Worst-case is the same as average case.
+
+For real-time analysis (RTA), this means a Cortex-R system can prove bounded latency for every interrupt and task, end-to-end. That's exactly what ISO 26262 (automotive functional safety) and IEC 61508 (industrial safety) demand for high-integrity functions.
+
+## The exception levels: EL0, EL1, EL2
+
+ARMv8-R inherits the A-profile exception-level model:
+
+| Level | Privilege | Typical use |
+|-------|-----------|-------------|
+| EL0 | Unprivileged | Application code, RTOS tasks |
+| EL1 | Privileged kernel | RTOS kernel, AUTOSAR OS, device drivers |
+| EL2 | Hypervisor / safety monitor | Real-time hypervisor, safety partition manager |
+
+EL3 (Secure Monitor in A-profile) does not exist in R-profile — R-profile uses its own security extensions (TrustZone-R, present in some configs) but routes them through EL2 rather than a dedicated mode.
+
+The EL2 addition is the big change versus older R-profile. Earlier Cortex-R cores (R5, R7) had just two privilege levels. EL2 in ARMv8-R lets you run a **real-time hypervisor** that partitions the CPU between multiple guests — typically an AUTOSAR Classic Platform guest and a Linux/Android guest on the same chip — with deterministic CPU time slicing. The QNX Hypervisor, the Hightec/PikeOS hypervisor, and several proprietary OEM stacks use EL2 on Cortex-R52.
+
+EL2's MPU is a second-level protection: the hypervisor at EL2 sets up its own MPU region table that further constrains the guest OS's MPU at EL1. This is conceptually similar to nested page tables on Cortex-A — but using MPU regions, deterministically.
+
+## Lockstep — the safety mechanism
+
+Cortex-R cores often ship in **Dual-Core Lockstep (DCLS)** configuration: two identical core instances run the same code in parallel, and a comparator checks every cycle that they produce identical outputs. If they diverge — say, an SEU (single-event upset) flips a bit in one core's pipeline — the comparator raises a fault. This is the workhorse mechanism for ASIL-D and SIL3 certification.
+
+The configurations vendors ship:
+
+- **Split-lock** — a pair of cores can run in DCLS for high-integrity, or split into two independent cores for higher throughput on lower-integrity tasks. NXP S32R44 supports this.
+- **Always-lockstep** — the cores are permanently paired. The cluster looks like one core to software. Infineon AURIX TC3xx (which is TriCore, not ARM, but the pattern is the same).
+- **Triple-modular redundancy (TMR)** — three cores vote on every output. Rare; only used in space-grade systems.
+
+Lockstep is *physical*: the two cores have their pipelines staggered by a small number of cycles (to make EMI-induced errors visible — the same single-event would hit them at different pipeline stages). Software is identical to a single-core view; the lockstep is transparent except for the fault output.
+
+<Callout type="warn">
+Lockstep does not protect against systematic faults (bugs in the design replicated in both cores). It only protects against random hardware faults (cosmic rays, EMI, wear-out). For functional-safety certification you still need a software safety case for the system, plus diverse-redundancy at the algorithmic level (e.g., compute the same control output two ways and compare). Lockstep is one component, not the whole answer.
+</Callout>
+
+## TCM — tightly-coupled memory
+
+Every Cortex-R core has **tightly-coupled memory** (TCM) — a chunk of SRAM directly attached to the core, accessed in a single cycle with no cache hierarchy in the way. There are typically three TCMs:
+
+- **ATCM** — code TCM, holds latency-critical handlers and routines.
+- **BTCM** — data TCM, holds latency-critical data (control-loop state, IRQ stacks).
+- **CTCM** — secondary code TCM (optional).
+
+A Cortex-R52 system that needs a 200-cycle hard deadline puts the IRQ handler and its working data in TCM. The cache miss problem evaporates — there is no cache between the core and TCM. Sizes are typically 16 KB to 1 MB per TCM, configurable per design.
+
+TCMs are typically mapped to fixed addresses (e.g., 0x00000000 for ATCM, 0x20000000 for BTCM on Cortex-R52). The MPU still gates access — TCMs are not magic, just fast.
+
+## The Cortex-R82 — AArch64 in R-profile
+
+Cortex-R82 (2020) is the first R-profile core to support **AArch64**. It executes the same 64-bit instruction set as Cortex-A77 / A78 / A510, has 8 GB+ physical address space, and includes a NEON-style SIMD/FP unit. It can be configured to optionally run Linux in EL0/EL1 (without an MMU) using a **firmware-managed translation** — TCM-resident page tables managed by the runtime — but performance is constrained.
+
+The killer Cortex-R82 use case is storage controllers: an NVMe SSD with 32 cores of Cortex-R82 runs the FTL (Flash Translation Layer), the host-side NVMe protocol stack, error correction, and storage analytics — all on one chip, all in real time, all with deterministic latency. The Marvell Bravera and the Western Digital RapidGate SSD controllers use Cortex-R82 clusters.
+
+## The interrupt controller — GIC
+
+R-profile cores use the **Generic Interrupt Controller** (GIC), the same family used on Cortex-A. GIC-v3 supports up to 1020 interrupt IDs, message-signaled interrupts (LPIs/MSIs from PCIe), per-CPU interrupt routing, and software-generated inter-processor interrupts (SGIs).
+
+| Feature | NVIC (M-profile) | GIC-v3 (R/A-profile) |
+|---------|------------------|----------------------|
+| Max IRQ count | 240 (typical) | 1020 + LPIs (millions of MSIs) |
+| Priority bits | 2–8 (typical 4) | 4–8 (typical 5) |
+| Per-CPU routing | No (single-core) | Yes — affinity routing, broadcast |
+| MSI / LPI support | No | Yes via ITS (Interrupt Translation Service) |
+| Programming model | Direct register access | System registers (MSR/MRS) on AArch64 + memory-mapped distributor |
+| Vector table | Single table at VTOR | Per-priority dispatch — handler resolves IRQ ID via GICC_IAR |
+
+The shift from NVIC to GIC is significant. On NVIC the hardware dispatches you straight to a vector slot for IRQn. On GIC you take a single IRQ vector, read the IRQ ID from GICC_IAR (the interrupt acknowledge register), dispatch yourself, and write to GICC_EOIR (end-of-interrupt) when done. The vendor's HAL hides this, but the latency is noticeably higher than NVIC — typically 30–50 cycles to enter an IRQ on Cortex-R, versus ~12 on Cortex-M.
+
+## Hypervisor support and partitioning
+
+EL2 on ARMv8-R enables real-time hypervisors. The standard pattern is:
+
+```
+┌─────────────────────────────────────────────────┐
+│                  EL2 — Hypervisor                │
+│  (PikeOS, QNX Hypervisor, Hightec, ...)         │
+├──────────────────────┬──────────────────────────┤
+│      EL1 — Guest 1   │      EL1 — Guest 2       │
+│   AUTOSAR Classic    │     Linux (limited)      │
+│   (hard real-time)   │   (best-effort)          │
+├──────────────────────┼──────────────────────────┤
+│      EL0 — Apps      │      EL0 — Apps           │
+└──────────────────────┴──────────────────────────┘
+```
+
+The hypervisor's MPU table at EL2 partitions physical memory between guests. Inter-guest communication goes through shared memory regions configured by EL2. CPU time-slicing uses a system timer routed through the GIC.
+
+This is the architecture behind modern **Software Defined Vehicles**: one Cortex-R52 cluster runs the safety-critical AUTOSAR partition (powertrain, ABS, airbag) and the QNX/Linux partition (infotainment, OTA, gateway) on the same SoC, with the hypervisor enforcing that the AUTOSAR partition cannot be starved by the non-critical one.
+
+<Callout type="tip">
+A common confusion: ARMv8-R has EL2 but **no virtualization of memory translation** — there's no second-stage page-table walk because there's no first-stage page-table walk. EL2's MPU is the only translation/protection mechanism. This is much simpler (and faster) than ARMv8-A's hypervisor MMU, at the cost of less flexibility for memory layouts.
+</Callout>
+
+## Programming model differences from Cortex-M
+
+If you're coming from Cortex-M, the surprises:
+
+- **Reset entry runs at EL1 or EL2** depending on the configuration. There's no "thread mode" — the closest analog is EL0.
+- **No AAPCS exception frame**. The CPU doesn't push r0..r3 for you. Handlers save what they use, AAPCS-style, in software.
+- **Banked SP** per exception level — each EL has its own SP. EL0 uses SP_EL0, EL1 uses SP_EL1, etc.
+- **System registers via MSR/MRS** rather than memory-mapped. `MRS X0, CurrentEL`, `MSR DAIFSet, #15`, etc. — like AArch64.
+- **No NVIC** — use GIC distributor and CPU interface registers.
+- **No vector table by IRQ**. One vector each for sync exception, IRQ, FIQ, and SError, per EL.
+
+This means a typical M-profile driver (vector-table-direct IRQ, AAPCS-stacked frame, NVIC enable bit) does not port to R-profile. You write a generic IRQ handler that reads `GICC_IAR`, looks up its own dispatch table, runs the handler function, and writes `GICC_EOIR`. The CMSIS-Core for Cortex-R52 and the vendor BSPs provide this scaffolding.
+
+## Toolchain flags
+
+```
+# Cortex-R52 (ARMv8-R AArch32)
+arm-none-eabi-gcc -mcpu=cortex-r52 -marm -mfpu=neon-fp-armv8 -mfloat-abi=hard
+
+# Cortex-R82 (ARMv8-R AArch64)
+aarch64-none-elf-gcc -mcpu=cortex-r82 -march=armv8-r
+```
+
+Note `-marm`, not `-mthumb` — Cortex-R52 runs in ARM mode, not Thumb (it can support Thumb but typically doesn't run there). Cortex-R82 is AArch64 and uses a different toolchain entirely (`aarch64-none-elf-`).
+
+## Cross-references
+
+- [ARM ISA family](/docs/architecture/isa-family) — R-profile in the broader landscape
+- [ARMv8-M architecture](/docs/architecture/armv8m) — the microcontroller cousin
+- [Exception model](/docs/architecture/exception-model) — exception entry on M-profile, for contrast
+- [PMU](/docs/architecture/pmu) — performance counters on R-profile (richer than M-profile DWT)
+- ARMv8-R Architecture Reference Manual (ARM DDI 0568)
+- Arm Cortex-R52 Technical Reference Manual (ARM 100026)

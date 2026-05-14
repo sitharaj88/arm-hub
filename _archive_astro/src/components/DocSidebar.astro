@@ -1,0 +1,36 @@
+---
+import { sections, type NavSection } from '~/utils/nav';
+interface Props { current?: string }
+const { current } = Astro.props;
+const path = Astro.url.pathname;
+---
+<aside class="hidden lg:block">
+  <nav class="sticky top-16 max-h-[calc(100vh-4rem)] overflow-y-auto scrollbar-thin pr-4 py-6 text-sm">
+    {sections.map((s: NavSection) => (
+      <div class="mb-5">
+        <div class="mb-2 flex items-center gap-2 font-mono text-[0.7rem] uppercase tracking-wider text-ink-faint">
+          <span class="text-brand/70">▸</span> {s.title}
+        </div>
+        <ul class="space-y-0.5 border-l border-line/70 pl-3">
+          {s.links.map((l) => {
+            const active = path === l.href || path.startsWith(l.href);
+            return (
+              <li>
+                <a
+                  href={l.href}
+                  class:list={[
+                    'flex items-center justify-between rounded-md px-2 py-1.5 transition',
+                    active ? 'bg-brand/10 text-brand' : 'text-ink-muted hover:bg-surface/70 hover:text-ink',
+                  ]}
+                >
+                  <span>{l.title}</span>
+                  {l.badge && <span class="ml-2 rounded bg-surface px-1.5 py-0.5 text-[0.65rem] uppercase tracking-wide text-ink-faint">{l.badge}</span>}
+                </a>
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    ))}
+  </nav>
+</aside>

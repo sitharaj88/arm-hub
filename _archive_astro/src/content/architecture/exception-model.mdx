@@ -1,0 +1,138 @@
+---
+title: The exception model
+description: How Cortex-M handles interrupts, faults, and supervisor calls — vector tables, exception priorities, stack frames, and tail-chaining.
+order: 2
+updated: 2026-05-12
+tags: [architecture, exceptions, nvic]
+---
+
+import Callout from '~/components/Callout.astro';
+import RegisterMap from '~/components/RegisterMap.astro';
+
+On Cortex-M, *everything that isn't your main thread* is an exception. Reset, hard faults, system calls (`SVC`), interrupts from the NVIC, the SysTick, even the debug monitor — they all enter the processor through the same exception machinery. Understanding it pays off every time you debug a HardFault.
+
+## Exception numbers
+
+Every exception has a number, and that number indexes into the vector table:
+
+| #  | Name              | Class       | Notes                              |
+|----|-------------------|-------------|------------------------------------|
+| 1  | Reset             | system      | First instruction after power-up   |
+| 2  | NMI               | system      | Non-maskable, vendor wires source  |
+| 3  | HardFault         | fault       | Catch-all when other faults disabled |
+| 4  | MemManage         | fault       | MPU access violation               |
+| 5  | BusFault          | fault       | Bus error                          |
+| 6  | UsageFault        | fault       | Undefined instruction, div-by-zero, etc. |
+| 7–10 | *reserved*      |             |                                    |
+| 11 | SVCall            | system      | `SVC #imm` — supervisor call       |
+| 12 | DebugMonitor      | debug       | Software debug                     |
+| 13 | *reserved*        |             |                                    |
+| 14 | PendSV            | system      | Used by RTOSes for context switch  |
+| 15 | SysTick           | system      | 24-bit downcounter                 |
+| 16+ | External IRQs    | NVIC        | Up to 240, vendor-defined          |
+
+<Callout type="note" title="Why PendSV?">
+PendSV is *pending* SuperVisor — it's an interrupt you can set from anywhere that runs only when no higher-priority work is pending. RTOSes use it to do context switches *after* the highest-priority ISR has returned, avoiding the "switch in the middle of an ISR" problem.
+</Callout>
+
+## The vector table
+
+At reset, the Cortex-M reads two 32-bit words from the start of memory:
+
+1. **Word 0** — the initial main stack pointer (MSP).
+2. **Word 1** — the address of the Reset handler.
+
+Then it fetches handler addresses for each subsequent exception from words 2..N. By default the vector table lives at `0x00000000`, but you can relocate it at runtime by writing the `VTOR` (Vector Table Offset Register) at `0xE000_ED08`.
+
+```c
+// Typical Cortex-M startup — the vector table sits at the start of flash
+__attribute__((section(".isr_vector")))
+void (* const vector_table[])(void) = {
+    (void(*)(void)) &_estack,   // 0: initial MSP
+    Reset_Handler,              // 1: reset
+    NMI_Handler,                // 2
+    HardFault_Handler,          // 3
+    MemManage_Handler,          // 4
+    BusFault_Handler,           // 5
+    UsageFault_Handler,         // 6
+    0, 0, 0, 0,                 // 7-10 reserved
+    SVC_Handler,                // 11
+    DebugMon_Handler,           // 12
+    0,                          // 13
+    PendSV_Handler,             // 14
+    SysTick_Handler,            // 15
+    // External IRQs follow, vendor-specific
+};
+```
+
+## The exception entry sequence
+
+When an exception fires, the processor automatically:
+
+1. **Stacks 8 words** onto the current stack (xPSR, PC, LR, R12, R3, R2, R1, R0). If an FPU is present and active, it also stacks S0–S15 + FPSCR.
+2. **Loads the handler address** from the vector table.
+3. **Updates LR with EXC_RETURN** — a magic value (`0xFFFF_FFFx`) encoding which stack to unstack from and which mode to return to.
+4. **Sets IPSR** to the exception number.
+5. **Branches to the handler**.
+
+This entire process is hardware-driven and takes **~12 cycles** on most Cortex-M cores. There is no ABI prologue — your C handler is called with a normal AAPCS calling convention, because the stacked R0–R3 + R12 cover the caller-saved registers.
+
+<Callout type="tip" title="Tail-chaining">
+If a second exception is pending when one is finishing, the processor doesn't unstack-then-restack — it leaves the frame in place and jumps straight to the next handler. This **tail-chaining** saves ~6 cycles per back-to-back exception and is a defining Cortex-M latency feature.
+</Callout>
+
+## Priority and preemption
+
+Cortex-M priorities are **inverted**: smaller number = higher priority. Reset, NMI, and HardFault have fixed priorities (-3, -2, -1 respectively — they always preempt everything). All other exceptions take their priority from configurable registers.
+
+Each priority byte is split into **preemption priority** (upper bits) and **subpriority** (lower bits) by `SCB_AIRCR.PRIGROUP`. Same-preemption-priority exceptions don't interrupt each other; subpriority only breaks ties between simultaneous pending exceptions.
+
+The number of priority bits actually implemented is vendor-defined (typically 3–4 on Cortex-M3/M4, up to 8 on M7). CMSIS exposes it as `__NVIC_PRIO_BITS`.
+
+<RegisterMap
+  name="NVIC_IPR0"
+  address="0xE000_E400"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:24', name: 'PRI_3', access: 'RW', reset: '0x00', description: 'Priority of IRQ 3. Only the upper __NVIC_PRIO_BITS bits are implemented.' },
+    { bits: '23:16', name: 'PRI_2', access: 'RW', reset: '0x00', description: 'Priority of IRQ 2.' },
+    { bits: '15:8',  name: 'PRI_1', access: 'RW', reset: '0x00', description: 'Priority of IRQ 1.' },
+    { bits: '7:0',   name: 'PRI_0', access: 'RW', reset: '0x00', description: 'Priority of IRQ 0.' },
+  ]}
+  caption="There are NVIC_IPR0..NVIC_IPR59 — 240 IRQs × 8 bits each = 1920 bits = 60 × 32-bit registers."
+/>
+
+## Returning from an exception
+
+You don't write `bx lr` like a regular function. You branch to **EXC_RETURN** — the magic value the hardware left in LR. The bottom byte encodes:
+
+- bit 0: reserved
+- bit 2: return stack (0 = MSP, 1 = PSP)
+- bit 3: return mode (0 = handler, 1 = thread)
+- bit 4: FPU frame present (ARMv7E-M+)
+
+In C, you almost never see this — the compiler emits `bx lr` and it Just Works because LR still holds the EXC_RETURN value. In hand-written assembly, *don't* clobber LR before returning.
+
+## Debugging HardFaults
+
+When a fault you didn't enable fires, it escalates to **HardFault**. The Configurable Fault Status Register (`SCB_CFSR` at `0xE000_ED28`) tells you why. The minimum-effort debugger trick:
+
+```c
+void HardFault_Handler(void) {
+    volatile uint32_t cfsr = SCB->CFSR;   // what happened
+    volatile uint32_t hfsr = SCB->HFSR;   // hardfault flags
+    volatile uint32_t mmfar = SCB->MMFAR; // mem-fault address (if valid)
+    volatile uint32_t bfar  = SCB->BFAR;  // bus-fault address (if valid)
+    __asm volatile ("BKPT #0");           // halt in debugger
+    while (1) {}
+}
+```
+
+When you hit the breakpoint, inspect those volatiles and decode them against ARMv7-M ARM §B3.2.15.
+
+## Where to go from here
+
+- [NVIC deep dive](/docs/cortex-m/nvic/) — every NVIC register, plus latency analysis.
+- [SysTick & timing](/docs/cortex-m/systick/) — the universal 24-bit tick.
+- [Startup & vector table](/docs/programming/startup/) — writing your own startup file from scratch.

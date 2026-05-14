@@ -1,0 +1,171 @@
+---
+title: Raspberry Pi RP2040 / RP2350
+description: The hobbyist-friendly Cortex-M from Raspberry Pi — dual-core, PIO, excellent docs, and now the dual-Arm/RISC-V RP2350.
+order: 4
+updated: 2026-05-12
+tags: [vendors, raspberry, rp2040, rp2350]
+---
+
+
+Raspberry Pi's RP-series chips have rapidly become the go-to for hobbyist and education — and increasingly for production. Open documentation, dual-core architecture, $1 BOM cost, and the **PIO** (Programmable I/O) peripheral that's like having a small FPGA built into the chip.
+
+<SpecSheet
+  title="RP2040 vs RP2350 — at a glance"
+  specs={[
+    { label: 'RP2040 cores', value: 'Dual Cortex-M0+ at up to 133 MHz, no FPU, no DSP, ARMv6-M' },
+    { label: 'RP2350 cores', value: 'Dual Cortex-M33 OR dual Hazard3 RISC-V at 150 MHz, single-precision FPU, ARMv8-M Mainline with TrustZone' },
+    { label: 'RP2040 SRAM', value: '264 KB on-chip, partitioned into six independent banks for arbitration-free DMA' },
+    { label: 'RP2350 SRAM', value: '520 KB on-chip plus optional external PSRAM via QMI controller' },
+    { label: 'Internal flash', value: 'None — execute-in-place from external QSPI flash, 16 KB XIP cache' },
+    { label: 'PIO state machines', value: '8 on RP2040, 12 on RP2350; each runs a 9-instruction program with single-cycle GPIO' },
+    { label: 'HSTX (RP2350 only)', value: 'High-Speed Serial TX — dedicated 1.5 Gbps serial generator for DVI, parallel LCD, custom high-rate links' },
+    { label: 'Documentation', value: '600+ page chip datasheet, 350+ page SDK reference, 200+ page hardware design guide — all CC-BY-SA' },
+  ]}
+/>
+
+## RP2040 (2021)
+
+- **Dual Cortex-M0+** at up to 133 MHz.
+- **264 KB SRAM**, **no internal flash** — external QSPI flash via memory-mapped XIP.
+- **Eight PIO state machines** — programmable hardware bit-bangers.
+- **30 GPIO**, 12-bit ADC, USB 1.1 device/host, 2× UART, 2× SPI, 2× I²C, 16 PWM channels.
+
+The lack of internal flash is unusual — every RP2040 board has an external QSPI flash chip (typically 2–16 MB Winbond). The chip's XIP cache makes this transparent for code execution.
+
+## RP2350 (2024)
+
+- **Dual-core, runtime-switchable between Cortex-M33 and Hazard3 (RISC-V)**.
+- 150 MHz, **520 KB SRAM** + **PSRAM support**.
+- **Twelve PIO state machines**.
+- **TrustZone**.
+- **PIO interpolator improvements** (HMC mode, etc.).
+
+The dual-architecture trick is real: each core can boot as M33 *or* as a RISC-V core, selectable in software. Useful for experimenting with RISC-V without changing hardware, or shipping an M33 product while keeping a RISC-V escape hatch.
+
+## PIO — the killer feature
+
+The PIO is **eight (RP2040) or twelve (RP2350) tiny state machines** that run a custom assembly language, each driving GPIO with single-cycle precision. They can implement:
+
+- A WS2812 (NeoPixel) driver (the canonical first example).
+- SPI / I²C / UART at non-standard speeds.
+- An HDMI / DVI signal generator.
+- A SDIO interface.
+- A custom serial protocol your sensor needs.
+
+```
+.program ws2812
+.side_set 1
+
+.wrap_target
+bitloop:
+    out x, 1       side 0 [2]
+    jmp !x do_zero side 1 [1]
+do_one:
+    jmp bitloop    side 1 [4]
+do_zero:
+    nop            side 0 [4]
+.wrap
+```
+
+Six instructions drive 800 kHz timing-perfect NeoPixel output, with the CPU streaming data via DMA. The PIO takes maybe a week to learn well and replaces a small FPGA for protocol bit-banging.
+
+## The SDK
+
+The official [pico-sdk](https://github.com/raspberrypi/pico-sdk) is **excellent**:
+
+- **Clean CMake build system** — modern, modular, well-documented.
+- **Comprehensive HAL** — every peripheral has typed APIs, examples.
+- **Multicore primitives** — mutexes, FIFOs, lockouts.
+- **TinyUSB** integrated for USB stacks.
+- **No vendor IDE required** — designed for VS Code or any editor.
+
+It's so well-designed that newcomers using it as their first Cortex-M project have a much smoother experience than someone hitting STM32CubeIDE for the first time.
+
+## Documentation
+
+Raspberry Pi's documentation game is unmatched:
+
+- **RP2040 datasheet** — 600+ pages, well-written, with circuit diagrams and PIO programs.
+- **"Getting started with Pico"** — a friendly book-length introduction.
+- **"Hardware design with RP2040"** — schematic-level guide, with copy-paste-able reference designs.
+- **"C/C++ SDK reference"** — every function documented.
+
+If you're teaching embedded, RP2040 is the recommended target. Everything is open, every API is documented, every example is buildable.
+
+## When NOT to pick RP2040
+
+- **Very low power**. RP2040 is "good enough" but not great at deep sleep. Nordic, STMicro L-series, and Silicon Labs do significantly better. RP2350 improves this but is still not the best low-power choice.
+- **High analog performance**. Only one 12-bit ADC, no DAC. STM32G4 or NXP Kinetis are better for analog-heavy designs.
+- **Mass production cost optimisation**. The required external flash adds BOM. STM32C0 or NXP LPC8xx have internal flash at a similar net cost.
+- **Mature certifications**. RP2040 is too new for many automotive / medical / aerospace certification paths.
+
+## Production lessons
+
+The RP2040 has been used in real products: keyboards (lots of these), education kits, audio gear, scientific instruments, IoT gateways. Things to know:
+
+- **Reset is via BOOTSEL + USB**. Holding BOOTSEL while plugging in USB exposes a UF2-format mass-storage device for drag-and-drop firmware updates. Convenient for users; ensure your bootloader path handles it.
+- **The dual Cortex-M0+** cores **share** flash and most peripherals. You'll spend more time on coordination than on actually leveraging the second core for most applications.
+- **The on-chip 3.3 V regulator** is buck-mode and reasonable, but for low-noise analog designs, an external LDO is preferred.
+
+<Callout type="tip" title="If you've never used PIO, start with the WS2812 example">
+The pico-examples repo has a WS2812 PIO program that's annotated line-by-line. Read it, change one delay value, observe the effect on a logic analyser. It's the gentlest possible introduction to PIO and pays off for the rest of your time on the chip.
+</Callout>
+
+## RP2350 — what the dual-architecture trick actually means
+
+The RP2350's "either M33 or RISC-V" claim is real but more subtle than it first reads. The chip contains two M33 cores **and** two Hazard3 RISC-V cores; only two of them are active at any moment, selected by the boot ROM at reset by reading a single OTP fuse and a sticky software bit. You cannot mix — both online cores must be the same architecture — but the choice is per-boot, not per-die. Useful patterns:
+
+- Ship an M33 product but reserve the option to fall back to RISC-V if Arm licensing terms change.
+- Distribute the same hardware to both an Arm and a RISC-V development team.
+- Run experimental RISC-V firmware on the same dev board you used for M33 work.
+
+The Hazard3 cores are a low-area RV32IMACB implementation with M-mode and U-mode, custom CSRs for power management, and a small data-watchpoint unit. They're not as fast as the M33s on most workloads (no FPU, simpler pipeline), but they're more than competitive on integer code at the same clock. For a senior engineer, the practical takeaway is that RP2350 makes RISC-V a low-risk experiment.
+
+The **TrustZone** support on the M33 path is genuine — SAU regions, secure gateway veneers, banked stack pointers, all the v8-M Mainline machinery. The IDAU on RP2350 statically partitions the address space so secure flash and non-secure flash live at fixed offsets. The boot ROM verifies a signed image against a per-chip OTP-fused public-key hash; the chain meets ARM PSA Level 1, with PSA Level 2 attestation possible via the on-chip OTP and RNG.
+
+## PIO state machines — a senior engineer's mental model
+
+The PIO is **not** a tiny CPU. It is a deterministic finite-state machine with nine-instruction program memory, configurable input/output shift registers (ISR/OSR), two scratch registers (X/Y), and a single condition tested each instruction. Each state machine runs at the system clock or any integer fraction of it (down to 1/65536 via a clock divider with fractional second-order delta-sigma dither), executes exactly one instruction per cycle, and drives or samples a contiguous range of GPIO pins.
+
+This makes PIO an ideal home for *protocol* implementation: anything that's deterministic, bit-banged, and timing-critical fits naturally. WS2812, DVI signal generation, custom SPI variants, parallel-port LCD interfaces, even a software UART at non-standard baud rates. It is *not* a good place for control flow or arithmetic — there is no add, no compare with immediate, no real conditional logic beyond "if X is non-zero, jump."
+
+| Resource | RP2040 PIO | RP2350 PIO |
+|----------|------------|------------|
+| Blocks | 2 | 3 |
+| State machines per block | 4 | 4 |
+| Instruction memory per block | 32 instructions, shared | 32 instructions, shared |
+| GPIO mapping | any of 30 pins | any of 48 pins |
+| Auto-pull / auto-push | yes | yes + side-set widening |
+| FIFO depth | 4 words RX, 4 words TX (joinable to 8) | 4 RX, 4 TX, also joinable; new HMC (high-mass-storage co-sim) mode |
+| Interpolator | 2 per core | 2 per core, with additional clamp/blend modes |
+
+Coupling DMA to PIO is the killer pattern: a single 32-bit `STR` into the PIO TX FIFO from a DMA channel — itself chained to the next channel — drives an entire frame of pixel data, an HDMI scanline, or an SD card transfer with zero CPU involvement.
+
+<Callout type="note" title="HSTX on RP2350 is the easier path for DVI">
+RP2040 famously bit-bangs HDMI through PIO at 250 MHz, which works but consumes both PIO blocks and most of the CPU's headroom. RP2350 adds **HSTX** — a dedicated serial output running at up to 1.5 Gbps — which generates DVI, parallel LCD timings, or custom protocols without touching the PIOs. PIOs are then free for other peripheral roles. If you're starting a new RP2350 design that needs a display, use HSTX.
+</Callout>
+
+## Design trade-offs versus STM32 and Nordic
+
+A few honest comparisons a senior engineer will run into:
+
+- **Versus STM32G0/STM32C0** at the same price point: STM32 has internal flash, more analog peripherals, mature low-power modes, but no PIO and a steeper SDK learning curve.
+- **Versus Nordic nRF52/nRF53** for BLE: Pico W has CYW43439 WiFi/BT but the BLE stack is software-on-Pico, not a dedicated radio. Nordic is the clear pick for serious BLE work.
+- **Versus ESP32-C3/C6**: ESP32 has WiFi and BT integrated; Pico does not (Pico W has an external chip). ESP32 has a worse documentation reputation.
+- **Versus STM32H5/U5** for performance: STM32 wins on raw clock and peripheral richness; RP2350 wins on cost, PIO flexibility, and the dual-architecture safety net.
+
+## Boot, flash, and the second-stage bootloader
+
+Because there is no internal flash, every RP2040/RP2350 board boots via a two-stage process. Stage 1 is the on-die ROM: it reads the first 256 bytes of external QSPI flash into SRAM, then jumps to it. That 256-byte payload is the **second-stage bootloader** (boot2) — its job is to configure the QMI / XIP controller for the specific flash chip's speed and command set (continuous read mode, dummy cycles, etc.), enable the XIP cache, and jump to the user image at `0x10000100`.
+
+The pico-sdk ships boot2 variants for the common flash families (W25Q080, IS25LP080, etc.). Picking the wrong one boots but runs at fall-back speed (typically 25 MHz instead of 133 MHz), which is a subtle performance bug to chase if you're not aware of it.
+
+- [Cortex-M0+](/docs/cortex-m/m0-m0plus/) — RP2040 core.
+- [Cortex-M33 / M23](/docs/cortex-m/m33-m23/) — RP2350 ARM path.
+- [TrustZone](/docs/architecture/trustzone/) — partitioning model on RP2350.
+- [SysTick & timing](/docs/cortex-m/systick/) — common across both RP cores.
+- [CMSIS](/docs/programming/cmsis/) — pico-sdk wraps CMSIS-Core under its own API.
+- [STMicro](/docs/vendors/stm/) — STM32G0/C0 comparisons.
+- [Nordic](/docs/vendors/nordic/) — BLE comparisons.
+- [QEMU & Renode](/docs/tools/sim/) — QEMU has an experimental `raspi-pico` machine target.
+- [Interrupt latency tool](/tools/interrupt-latency) — visualise dual-core IRQ contention.

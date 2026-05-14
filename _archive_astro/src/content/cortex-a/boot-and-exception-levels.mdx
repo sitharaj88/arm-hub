@@ -1,0 +1,145 @@
+---
+title: Boot flow & EL levels
+description: From silicon reset to Linux init — the multi-stage boot chain on ARMv8-A, and what runs in each Exception Level.
+order: 2
+updated: 2026-05-12
+tags: [cortex-a, boot, tf-a, el-levels]
+---
+
+import Callout from '~/components/Callout.astro';
+
+ARMv8-A boots through a *chain* of binaries, each signed and verified by the previous. The chain isn't optional — even unsecured platforms typically run TF-A as BL31. Understanding the stages is the difference between *"it just boots"* and being able to diagnose a boot hang.
+
+## The canonical chain
+
+```
+              ┌──────┐
+   silicon ──▶│ ROM  │   BL1 — vendor's mask ROM, runs at EL3
+              └──┬───┘   Loads BL2 from boot media, verifies signature.
+                 ▼
+              ┌──────┐
+              │ BL1  │   (Reset vector → trampoline → BL2 entry)
+              └──┬───┘
+                 ▼
+              ┌──────┐
+              │ BL2  │   Loads BL31 (and optionally BL32, BL33),
+              └──┬───┘   sets up DRAM, hands control to BL31.
+                 ▼
+              ┌──────┐
+              │ BL31 │   ── EL3 secure monitor (TF-A runtime).
+              └─┬─┬──┘   Provides PSCI, runs forever in the background.
+                │ │
+                │ └────▶ BL32 (e.g. OP-TEE OS at EL1-S)
+                ▼
+              ┌──────┐
+              │ BL33 │   ── EL2/EL1 normal-world bootloader (U-Boot / UEFI / coreboot).
+              └──┬───┘   Loads the OS image and jumps into it.
+                 ▼
+              ┌──────┐
+              │ OS   │   ── EL1 (or EL2 if KVM) — Linux, Android, BSD, etc.
+              └──────┘
+```
+
+## What lives where
+
+### BL1 — vendor mask ROM (EL3)
+
+Built into silicon, **cannot be updated**. It runs immediately after reset, configures the minimum hardware needed to load the next stage (often just the boot SPI/eMMC), and verifies a signature against a public key fused into OTP.
+
+### BL2 — trusted boot firmware (EL3, then EL1-S)
+
+Runs out of internal SRAM (DRAM isn't trained yet). Trains DDR, brings up the rest of the boot media, loads BL31/BL32/BL33 into their target addresses, and validates signatures. Then drops to BL31. Vendor-specific — Rockchip's ddr-init, NXP's PBL, NVIDIA's MB1/MB2 etc. all live here.
+
+### BL31 — secure monitor (EL3 runtime)
+
+[Trusted Firmware-A](https://www.trustedfirmware.org/projects/tf-a/) is the reference implementation. Once started, it **never exits** — it sits at EL3 for the rest of system uptime, servicing:
+
+- **PSCI calls** — `CPU_ON`, `CPU_OFF`, `SYSTEM_OFF`, `SYSTEM_RESET`, the standard ARM power-state coordination interface.
+- **SMC dispatching** — routes SMC calls from EL1 to either the platform (PSCI), the secure partition (BL32/OP-TEE), or vendor SiP services.
+- **GICv3 redistributor setup**, **CPU interface saving on power-down**, **errata workarounds**.
+
+### BL32 — trusted OS (EL1-S, optional)
+
+Typically **OP-TEE**. Hosts trusted applications that handle DRM keys, biometric templates, secure storage. Loaded by BL2, started by BL31, runs in parallel with Linux.
+
+### BL33 — non-secure bootloader (EL2 or EL1)
+
+The bootloader your firmware engineer talks to:
+
+- **U-Boot** — historically dominant on embedded Linux. Configurable, scriptable, supports network boot, USB boot, FAT/ext4.
+- **UEFI** (TianoCore EDK2) — server-class ARM (AWS Graviton, Ampere) and Windows on ARM.
+- **coreboot** — increasingly used on Chromebooks and homelab boxes.
+
+BL33 loads the kernel (`.Image` on Linux), the device tree blob, and the initramfs, then jumps to the kernel entry with a specific register convention (DTB pointer in x0).
+
+## What lives at each EL
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ EL0:  user space — apps, daemons                          │
+├──────────────────────────────────────────────────────────┤
+│ EL1:  kernel — Linux, Android, BSD                        │
+├──────────────────────────────────────────────────────────┤
+│ EL2:  hypervisor — KVM (when virtualization is on), Xen  │
+├──────────────────────────────────────────────────────────┤
+│ EL3:  secure monitor — TF-A (BL31)                       │
+└──────────────────────────────────────────────────────────┘
+
+         ─────────────── orthogonal ──────────────
+
+┌──────────────────────────────────────────────────────────┐
+│ Secure world:                                             │
+│   EL1-S: trusted OS (OP-TEE)                              │
+│   EL0-S: trusted applets (TAs)                            │
+└──────────────────────────────────────────────────────────┘
+```
+
+EL3 is **always non-secure-blind** — code at EL3 is the only code that can see both worlds. Transitioning from non-secure to secure (or vice versa) goes through an `SMC` to EL3 which dispatches to the right side.
+
+## PSCI — Power State Coordination
+
+PSCI is *the* standardised ARM API. Every modern ARMv8-A OS calls PSCI through `SMC` (or `HVC` on virtualised guests) to manage power. The function IDs:
+
+| Function          | What it does                                       |
+|-------------------|----------------------------------------------------|
+| `CPU_ON`          | Power on a secondary core; pass it an entry point  |
+| `CPU_OFF`         | Power off the calling core                         |
+| `CPU_SUSPEND`     | Enter a CPU-local idle state                       |
+| `SYSTEM_OFF`      | Full system poweroff                               |
+| `SYSTEM_RESET`    | Reboot                                             |
+| `AFFINITY_INFO`   | Query whether a CPU is on                          |
+
+The kernel's `arm,psci-0.2` device-tree binding describes how to invoke it. Linux's `arch/arm64/kernel/psci.c` is what makes a `shutdown -h now` actually power off the board.
+
+## Debugging a boot failure
+
+A boot failure tells you *which stage* hung by *where the UART output stops*:
+
+- **No output at all** → BL1 didn't even start. Boot media misconfiguration, fuse problem, bad signature on BL2.
+- **Vendor banner but no TF-A banner** → BL2 loaded BL31 but BL31 panicked (often missing DDR config).
+- **TF-A banner but no U-Boot prompt** → BL33 didn't load or jumped to the wrong address.
+- **U-Boot prompt but no kernel boot** → device tree / kernel image mismatch, missing initramfs.
+
+```
+NOTICE:  Booting Trusted Firmware
+NOTICE:  BL2: v2.10.0(release):v2.10.0
+INFO:    BL2: Doing platform setup
+INFO:    DDR training succeeded
+INFO:    BL31: Initializing GICv3
+INFO:    BL31: Initializing PSCI
+INFO:    Entering BL33
+NOTICE:  
+U-Boot 2024.04 ...
+```
+
+Each `NOTICE` and `INFO` is a checkpoint you can correlate against TF-A source.
+
+<Callout type="tip" title="Get a serial console first, always">
+On bring-up, the very first thing to wire is the EL3-routed UART. TF-A's `plat_crash_console_*` functions write to it on panic. Without it you're guessing.
+</Callout>
+
+## See also
+
+- [Cortex-A overview](/docs/cortex-a/overview/) — the broader picture.
+- [TrustZone](/docs/architecture/trustzone/) — secure/non-secure mechanics on A-profile.
+- [Trusted Firmware-A docs](https://trustedfirmware-a.readthedocs.io/) — the canonical TF-A reference (external).

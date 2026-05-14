@@ -1,0 +1,133 @@
+---
+title: I²C
+description: The two-wire bus — addressing, clock stretching, multi-master, 7-bit and 10-bit addresses, and why your I²C peripheral hung again.
+order: 4
+updated: 2026-05-12
+tags: [peripherals, i2c]
+---
+
+import Callout from '~/components/Callout.astro';
+
+I²C trades raw speed for cabling simplicity — two wires, both open-drain with external pull-ups, every device on the bus shares them. You can hang 50 sensors off the same two pins. You can also lose three days debugging a stuck bus because one of those sensors held SDA low forever.
+
+## Electrical fundamentals
+
+- **SCL** (clock) and **SDA** (data) — both **open-drain**.
+- Both lines pulled high through external resistors (typically 4.7 kΩ for 100/400 kHz, 1–2 kΩ for 1 MHz).
+- Logical 0 = pulled low actively by a device. Logical 1 = released, pull-up brings it high.
+- **Any device can hold either line low** — that's how clock stretching and arbitration work.
+
+Internal MCU pull-ups are typically 40 kΩ — too weak for I²C bus capacitance. **Always use external pull-ups**.
+
+## The protocol — START to STOP
+
+```
+SDA  ────╲___ data ___data ___ ack ___ data ___ ack ___╱──
+              ▲       ▲        ▲       ▲       ▲
+              start  bit 7..0  bit ack data    bit ack stop
+SCL  ─────╲___╱╲_╱╲_╱╲_╱╲_╱╲_╱╲_╱╲_╱╲_╱╲_╱╲_╱╲_╱╲_╱╲_╱──
+              clock  clock     clock   clock   clock
+```
+
+- **START** — SDA goes low while SCL is high.
+- **Address byte** — 7 bits of slave address + 1 R/W bit. The addressed slave must ACK by pulling SDA low on the 9th clock.
+- **Data bytes** — 8 bits MSB first, each followed by an ACK (or NACK to terminate).
+- **STOP** — SDA goes high while SCL is high.
+- **Repeated START** — START without intervening STOP; used to switch direction mid-transaction.
+
+## Speed grades
+
+| Speed mode      | Bit rate     | Common use          |
+|-----------------|--------------|---------------------|
+| Standard        | 100 kHz      | Slow sensors, EEPROM |
+| Fast            | 400 kHz      | Most modern sensors  |
+| Fast-mode Plus  | 1 MHz        | High-end IMUs        |
+| High-speed      | 3.4 MHz      | Rare; tight timing   |
+| Ultra-fast      | 5 MHz (unidirectional) | LED drivers |
+
+400 kHz is the practical default. Above 1 MHz, signal integrity becomes a meaningful constraint and you need shorter wires + tighter pull-ups.
+
+## 7-bit and 10-bit addresses
+
+Most devices use 7-bit addresses (so up to 128 unique addresses minus a few reserved ones). The address byte format:
+
+```
+[ A6 A5 A4 A3 A2 A1 A0 | R/W ]
+```
+
+Confusingly, many datasheets quote the address shifted into the high 7 bits. The Bosch BMP280 datasheet says "address 0x76" — that's the 7-bit value. When you write it to a left-justified address register on an STM32 with `OAR1`, you may need `0x76 << 1`. Always check whether the HAL function takes left-justified or right-justified.
+
+10-bit addresses exist (LSB of address byte = 1, top 5 bits = `11110`, the rest of the 10-bit address follows in a second byte). Rarely used outside niche industrial chips.
+
+## Clock stretching
+
+A slave can hold SCL low to delay the next bit. This is **clock stretching** — used when the slave needs more time (e.g. an EEPROM doing an internal write). The master must wait. If your master doesn't honour clock stretching, the slave's data is corrupted.
+
+**Some MCUs have buggy clock-stretching support.** The Raspberry Pi BCM2835 I²C peripheral (in older revisions) had hardware bugs that ignored stretching at certain bit rates, breaking communications with Sensirion sensors. Always check errata.
+
+## A complete master-write-read
+
+```c
+// Read N bytes from slave at addr, starting from register `reg`
+HAL_StatusTypeDef i2c_read_reg(uint8_t addr, uint8_t reg, uint8_t *buf, uint16_t len) {
+    HAL_StatusTypeDef st;
+    st = HAL_I2C_Master_Transmit(&hi2c1, addr << 1, &reg, 1, 100);
+    if (st != HAL_OK) return st;
+    return HAL_I2C_Master_Receive(&hi2c1, addr << 1, buf, len, 100);
+}
+```
+
+The "write register address, then read" pattern is so common that I²C HAL libraries usually expose a dedicated **memory-read** function that handles the repeated-START internally:
+
+```c
+HAL_I2C_Mem_Read(&hi2c1, addr << 1, reg, I2C_MEMADD_SIZE_8BIT, buf, len, 100);
+```
+
+## The "stuck bus" recovery
+
+The most common I²C failure mode: a slave got into a weird state mid-transaction (often during a glitched power-on) and is holding SDA low forever, expecting more clocks. The bus is stuck — your master can't generate a START because SDA is already low.
+
+**The fix**: switch SCL to GPIO output, manually clock 9–16 pulses, then issue a STOP condition. This makes the stuck slave finish whatever byte it thought it was receiving, NACK, and release SDA.
+
+```c
+void i2c_bus_recover(void) {
+    // Switch SCL and SDA to GPIO output
+    GPIOB->MODER = (GPIOB->MODER & ~(GPIO_MODER_MODER6 | GPIO_MODER_MODER7))
+                 | (0b01 << (6 * 2)) | (0b01 << (7 * 2));
+
+    // SDA high (release)
+    GPIOB->BSRR = (1 << 7);
+    HAL_Delay(1);
+
+    // Clock SCL up to 16 times until SDA is released
+    for (int i = 0; i < 16; i++) {
+        GPIOB->BSRR = (1 << (6 + 16));   // SCL low
+        HAL_Delay(1);
+        GPIOB->BSRR = (1 << 6);           // SCL high
+        HAL_Delay(1);
+        if (GPIOB->IDR & (1 << 7)) break; // SDA released
+    }
+
+    // Manual STOP: SDA low, SCL high, SDA high
+    GPIOB->BSRR = (1 << (7 + 16));        // SDA low
+    HAL_Delay(1);
+    GPIOB->BSRR = (1 << 6);                // SCL high
+    HAL_Delay(1);
+    GPIOB->BSRR = (1 << 7);                // SDA high — STOP
+
+    // Re-enable I²C alternate function
+    MX_I2C1_Init();
+}
+```
+
+This belongs in your bring-up code, called whenever an I²C operation times out.
+
+## SMBus and PMBus
+
+**SMBus** is I²C with stricter timing, defined timeouts (so a hung slave gets reset), and protocols for power management and battery monitoring. Most server power-management chips speak SMBus. **PMBus** is SMBus with a defined command set for DC-DC converter monitoring/control.
+
+## See also
+
+- [GPIO](/docs/peripherals/gpio/) — open-drain configuration.
+- [SPI](/docs/peripherals/spi/) — the speed-vs-simplicity alternative.
+- [DMA](/docs/peripherals/dma/) — for high-throughput sensor reads.

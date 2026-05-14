@@ -1,0 +1,313 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* ─── Light theme ────────────────────────────────────────
+     Layered greys so cards (white) visibly sit ABOVE the page (cool gray),
+     and recessed surfaces (code blocks) sit BELOW it. */
+  :root {
+    color-scheme: light;
+    --bg:            220 22% 96%;   /* page bg — subtle cool gray */
+    --bg-subtle:     220 22% 92%;   /* recessed (code blocks, terminal chrome bg) */
+    --bg-raised:     0 0% 100%;     /* tiny raised bits (kbd) */
+    --surface:       0 0% 100%;     /* cards — pure white pops on the gray bg */
+    --surface-hover: 220 18% 92%;
+    --line:          220 14% 82%;   /* clearly visible borders */
+    --line-subtle:   220 16% 88%;
+    --line-strong:   220 13% 60%;
+    --ink:           220 35% 9%;    /* near-black with a cool tint */
+    --ink-muted:     220 14% 30%;   /* readable body-secondary */
+    --ink-faint:     220 10% 44%;   /* still legible at xs */
+    --brand:         178 76% 30%;   /* readable teal on white */
+    --brand-soft:    173 60% 38%;
+    --brand-deep:    178 78% 20%;   /* inline code text */
+    --accent:        22 88% 42%;    /* readable amber on white */
+    --accent-soft:   24 88% 55%;
+    --ok:            142 60% 30%;
+    --warn:          30 92% 38%;
+    --err:           0 72% 45%;
+    --shadow-panel:
+      0 1px 2px 0 hsl(220 30% 30% / 0.06),
+      0 12px 28px -12px hsl(220 30% 25% / 0.15);
+    --shadow-card:   0 1px 2px 0 hsl(220 30% 30% / 0.04);
+    --radial-fade-color: hsl(178 76% 36% / 0.10);
+    --body-glow:
+      radial-gradient(1200px 600px at 15% -10%, hsl(178 76% 40% / 0.06), transparent 60%),
+      radial-gradient(900px  500px at 85% -20%, hsl(28  90% 50% / 0.05), transparent 60%);
+    --selection-bg: hsl(178 76% 60% / 0.30);
+    --selection-fg: hsl(220 35% 9%);
+    --kbd-inset:    hsl(220 14% 78%);
+  }
+
+  /* ─── Dark theme — bumped contrast on subtle/surface/line so cards and
+     code blocks visibly separate from the page background. ──────────── */
+  .dark, html.dark {
+    color-scheme: dark;
+    --bg:            220 14% 6%;
+    --bg-subtle:     220 13% 9%;
+    --bg-raised:     220 13% 12%;
+    --surface:       220 13% 13%;
+    --surface-hover: 220 12% 16%;
+    --line:          220 11% 22%;
+    --line-subtle:   220 11% 16%;
+    --line-strong:   220 11% 32%;
+    --ink:           210 14% 92%;
+    --ink-muted:     218 12% 68%;
+    --ink-faint:     220 10% 50%;
+    --brand:         173 80% 55%;
+    --brand-soft:    173 65% 70%;
+    --brand-deep:    178 75% 35%;
+    --accent:        35 95% 60%;
+    --accent-soft:   35 90% 75%;
+    --ok:            142 70% 55%;
+    --warn:          38 95% 60%;
+    --err:           0 75% 62%;
+    --shadow-panel:
+      0 1px 0 0 hsl(220 11% 16%) inset,
+      0 30px 60px -30px hsl(220 50% 2% / 0.7);
+    --shadow-card:   none;
+    --radial-fade-color: hsl(173 80% 55% / 0.18);
+    --body-glow:
+      radial-gradient(1200px 600px at 15% -10%, hsl(173 80% 50% / 0.08), transparent 60%),
+      radial-gradient(900px  500px at 85% -20%, hsl(35  95% 60% / 0.06), transparent 60%);
+    --selection-bg: hsl(173 80% 55% / 0.35);
+    --selection-fg: hsl(0 0% 100%);
+    --kbd-inset:    hsl(220 11% 8%);
+  }
+
+  html {
+    @apply bg-bg text-ink antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply min-h-screen bg-bg text-ink font-sans;
+    background-image: var(--body-glow);
+  }
+
+  ::selection { background: var(--selection-bg); color: var(--selection-fg); }
+
+  h1, h2, h3, h4, h5 { @apply font-display tracking-tight; }
+  h1 { @apply text-4xl md:text-5xl; }
+  h2 { @apply text-2xl md:text-3xl; }
+  h3 { @apply text-xl md:text-2xl; }
+
+  code { font-feature-settings: "ss01", "ss02", "zero", "calt" off; }
+
+  a { @apply text-brand hover:text-brand-soft transition-colors; }
+
+  hr { @apply border-line; }
+
+}
+
+/* ─── Shiki rules ──────────────────────────────────────────────────────
+   Outside @layer so Tailwind's purger doesn't drop them — the .astro-code
+   class is emitted by Shiki at render time and never appears in source
+   files, so the content scanner doesn't recognise it.
+
+   With shikiConfig.defaultColor=false, Shiki sets --shiki-light and
+   --shiki-dark CSS vars on each span (and on the <pre>); we bridge them
+   to actual `color` via the rules below. */
+
+pre.astro-code,
+.astro-code {
+  border-radius: 0.75rem;
+  border: 1px solid hsl(var(--line));
+  background-color: hsl(var(--bg-subtle));
+  padding: 1rem;
+  overflow-x: auto;
+  font-size: 0.86rem;
+  line-height: 1.6;
+  margin: 1.25rem 0;
+  color: var(--shiki-light);
+}
+.dark pre.astro-code,
+.dark .astro-code {
+  color: var(--shiki-dark);
+}
+/* spans inherit color from <pre> via CSS — no per-span rule needed */
+
+/* Stop the prose plugin's own <pre> styling from fighting the block above. */
+.prose :where(pre.astro-code):not(:where([class~="not-prose"] *)) {
+  background-color: hsl(var(--bg-subtle)) !important;
+  color: var(--shiki-light) !important;
+}
+.dark .prose :where(pre.astro-code):not(:where([class~="not-prose"] *)) {
+  color: var(--shiki-dark) !important;
+}
+
+@layer components {
+  .container-page { @apply mx-auto w-full max-w-7xl px-5 sm:px-8; }
+
+  .surface {
+    @apply rounded-xl border border-line bg-surface/80 backdrop-blur-sm min-w-0;
+    box-shadow: var(--shadow-card);
+  }
+
+  /* Terminals are deliberately always dark — they're a stylistic island.
+     The `.dark` class on the wrapper (added by the Terminal component) makes
+     descendant utility classes resolve to the dark theme inside it. */
+  .terminal {
+    @apply font-mono text-[0.78rem] sm:text-[0.92rem] leading-relaxed text-ink overflow-x-auto;
+    overflow-wrap: anywhere;
+    background:
+      linear-gradient(180deg, hsl(220 14% 7%) 0%, hsl(220 14% 5%) 100%);
+  }
+
+  .terminal-chrome {
+    @apply flex items-center gap-1.5 border-b border-line/70 bg-bg-subtle/80 px-4 py-2.5;
+  }
+
+  .terminal-dot { @apply h-2.5 w-2.5 rounded-full; }
+
+  .pill {
+    @apply inline-flex items-center gap-1.5 rounded-full border border-line bg-surface/70 px-2.5 py-1 text-xs font-medium text-ink-muted;
+  }
+
+  .pill-brand {
+    @apply border-brand/30 bg-brand/10 text-brand;
+  }
+
+  .pill-accent {
+    @apply border-accent/30 bg-accent/10 text-accent;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg border border-line bg-surface px-4 py-2 text-sm font-medium text-ink transition;
+  }
+  .btn:hover { @apply border-brand/40 bg-surface-hover text-brand; }
+
+  .btn-primary {
+    @apply inline-flex items-center justify-center gap-2 rounded-lg border border-brand/40 bg-brand/15 px-4 py-2 text-sm font-semibold text-brand transition;
+  }
+  .btn-primary:hover { @apply border-brand bg-brand/25 text-brand-soft; }
+
+  .kbd {
+    @apply inline-flex h-5 min-w-5 items-center justify-center rounded-md border border-line bg-bg-raised px-1.5 font-mono text-[0.7rem] text-ink-muted;
+    box-shadow: inset 0 -1px 0 0 var(--kbd-inset);
+  }
+
+  .caret::after {
+    content: '▌';
+    @apply ml-0.5 text-brand animate-caret-blink;
+  }
+
+  .heading-anchor {
+    @apply opacity-0 group-hover:opacity-100 ml-2 text-ink-faint transition;
+  }
+
+  .grid-bg {
+    background-image:
+      linear-gradient(to right, hsl(var(--line) / 0.6) 1px, transparent 1px),
+      linear-gradient(to bottom, hsl(var(--line) / 0.6) 1px, transparent 1px);
+    background-size: 48px 48px;
+    background-position: -1px -1px;
+    mask-image: radial-gradient(ellipse 70% 50% at 50% 0%, black 40%, transparent 80%);
+  }
+
+  /* Prose tweaks */
+  .prose :where(pre):not(:where([class~="not-prose"] *)) {
+    @apply !bg-bg-subtle border border-line rounded-xl my-6;
+  }
+
+  /* Inline code — distinguishable from running text in both themes. */
+  .prose :where(code):not(:where([class~="not-prose"] *, pre *)) {
+    @apply rounded-md px-[0.4em] py-[0.18em] text-[0.86em] font-medium border before:content-none after:content-none;
+    background: hsl(var(--brand) / 0.08);
+    border-color: hsl(var(--brand) / 0.18);
+    color: hsl(var(--brand-deep));
+  }
+  .dark .prose :where(code):not(:where([class~="not-prose"] *, pre *)) {
+    background: hsl(var(--brand) / 0.10);
+    border-color: hsl(var(--brand) / 0.22);
+    color: hsl(var(--brand-soft));
+  }
+
+  /* Headings — explicit weight, tracking, scroll-margin. */
+  .prose :where(h2, h3, h4):not(:where([class~="not-prose"] *)) {
+    @apply scroll-mt-24 font-display tracking-tight text-ink;
+  }
+  .prose :where(h2):not(:where([class~="not-prose"] *)) {
+    @apply text-2xl md:text-[1.7rem] font-semibold mt-12 mb-4 pb-2 border-b border-line-subtle;
+  }
+  .prose :where(h3):not(:where([class~="not-prose"] *)) {
+    @apply text-xl md:text-[1.35rem] font-semibold mt-8 mb-3;
+  }
+  .prose :where(h4):not(:where([class~="not-prose"] *)) {
+    @apply text-base md:text-lg font-semibold mt-6 mb-2;
+  }
+  .prose :where(p):not(:where([class~="not-prose"] *)) {
+    @apply my-4 leading-relaxed text-ink;
+  }
+  .prose :where(strong):not(:where([class~="not-prose"] *)) {
+    @apply text-ink font-semibold;
+  }
+  .prose :where(a):not(:where([class~="not-prose"] *)) {
+    @apply text-brand font-medium underline decoration-brand/40 underline-offset-2 hover:decoration-brand;
+  }
+  /* Markdown tables: scroll horizontally when they overflow the content column.
+     `display: block` lets the table become a scrollable container; the browser
+     generates anonymous table boxes for the inner rows/cells, so the visual
+     layout still renders as a proper table. */
+  .prose :where(table):not(:where([class~="not-prose"] *)) {
+    @apply text-sm block overflow-x-auto rounded-lg border border-line;
+    width: max-content;
+    max-width: 100%;
+    -webkit-overflow-scrolling: touch;
+  }
+  .prose :where(thead):not(:where([class~="not-prose"] *)) {
+    @apply bg-bg-subtle border-b border-line;
+  }
+  .prose :where(th):not(:where([class~="not-prose"] *)) {
+    @apply px-3 py-2 text-left font-medium text-ink;
+  }
+  .prose :where(td):not(:where([class~="not-prose"] *)) {
+    @apply px-3 py-2 align-top border-t border-line-subtle;
+  }
+  .prose :where(tbody tr:first-child td):not(:where([class~="not-prose"] *)) {
+    border-top: 0;
+  }
+  .prose :where(td, th):not(:where([class~="not-prose"] *)) {
+    word-break: normal;
+  }
+
+  /* Lists: clearer bullets, consistent indent, tighter spacing on tight lists. */
+  .prose :where(ul):not(:where([class~="not-prose"] *)) {
+    @apply pl-6;
+    list-style-type: disc;
+  }
+  .prose :where(ol):not(:where([class~="not-prose"] *)) {
+    @apply pl-6;
+    list-style-type: decimal;
+  }
+  .prose :where(li):not(:where([class~="not-prose"] *)) {
+    @apply my-1.5 pl-1;
+  }
+  .prose :where(li)::marker {
+    color: hsl(var(--ink-faint));
+    font-variant-numeric: tabular-nums;
+  }
+  .prose :where(li > ul, li > ol):not(:where([class~="not-prose"] *)) {
+    @apply my-2;
+  }
+
+  /* Horizontal rule */
+  .prose :where(hr):not(:where([class~="not-prose"] *)) {
+    @apply border-line my-10;
+  }
+  .prose :where(blockquote):not(:where([class~="not-prose"] *)) {
+    @apply border-l-2 border-brand/50 bg-bg-subtle px-4 py-3 my-6 rounded-r-lg not-italic font-normal text-ink-muted;
+  }
+}
+
+@layer utilities {
+  .text-balance { text-wrap: balance; }
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--line-strong)) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+  .scrollbar-thin::-webkit-scrollbar-thumb { background: hsl(var(--line-strong)); border-radius: 8px; }
+}

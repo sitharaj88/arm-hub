@@ -1,0 +1,219 @@
+---
+title: Zephyr
+description: The Linux-Foundation RTOS — device tree, Kconfig, west, drivers, networking. The whole-OS approach to embedded.
+order: 3
+updated: 2026-05-12
+tags: [rtos, zephyr]
+---
+
+
+Zephyr is closer to a small Linux than to FreeRTOS. It has a kernel, device tree, Kconfig, build system, package manager, and 400+ in-tree drivers. The learning curve is steeper, but for any project that needs networking, BLE, USB, or sensor drivers, you save weeks of work by adopting Zephyr's existing code.
+
+## The mental model
+
+In FreeRTOS, you write `main()` and call `xTaskCreate`. In Zephyr, your `main()` is just another task in a larger system that came up before your code ran.
+
+```
+                ┌─────────────────────────────────┐
+                │  Zephyr kernel                   │
+                │   - scheduler                    │
+                │   - timer subsystem              │
+                │   - logging                      │
+                │   - power management             │
+                ├─────────────────────────────────┤
+                │  Subsystems (drivers, net, bt)   │
+                ├─────────────────────────────────┤
+                │  Your application (main + threads)│
+                └─────────────────────────────────┘
+```
+
+By the time `main` runs:
+- Device tree has been parsed.
+- Drivers have been instantiated.
+- The console (UART) is up.
+- All other init priorities have run.
+
+<BlockDiagram title="Zephyr layered architecture" width={760} height={340} nodes={[
+  { id: 'app',    x: 30,  y: 30,  w: 700, h: 50, kind: 'core',     label: 'Application', detail: 'main thread + your threads + workqueues' },
+  { id: 'subsys', x: 30,  y: 100, w: 340, h: 60, kind: 'periph',   label: 'Subsystems', detail: 'Bluetooth, IP stack, USB, shell, settings, logging' },
+  { id: 'drv',    x: 390, y: 100, w: 340, h: 60, kind: 'periph',   label: 'Drivers', detail: '400+ in-tree, device-tree instantiated' },
+  { id: 'kernel', x: 30,  y: 180, w: 700, h: 60, kind: 'security', label: 'Kernel', detail: 'scheduler, timers, sync primitives, mem mgmt, PM' },
+  { id: 'arch',   x: 30,  y: 260, w: 340, h: 60, kind: 'core',     label: 'Arch layer', detail: 'Cortex-M / R / A / RISC-V port' },
+  { id: 'hal',    x: 390, y: 260, w: 340, h: 60, kind: 'external', label: 'Vendor HAL', detail: 'STM32Cube, nrfx, ESP-IDF HAL, NXP MCUX' },
+]} edges={[
+  { from: 'app', to: 'subsys', tone: 'primary' },
+  { from: 'app', to: 'drv', tone: 'primary' },
+  { from: 'subsys', to: 'kernel', tone: 'accent' },
+  { from: 'drv', to: 'kernel', tone: 'accent' },
+  { from: 'kernel', to: 'arch', tone: 'default' },
+  { from: 'kernel', to: 'hal', tone: 'default' },
+]} caption="Zephyr layers the way Linux does — your app sits on top of subsystems and drivers, which call into a portable kernel that delegates CPU specifics to the arch layer and chip specifics to the vendor HAL." />
+
+## west — the meta build tool
+
+`west` manages multi-repo projects (Zephyr itself plus your application plus your dependencies). Workspace looks like:
+
+```
+my-workspace/
+├── .west/
+│   └── config
+├── zephyr/                    # the Zephyr tree (managed)
+├── modules/                    # auto-fetched dependencies (LVGL, mcuboot, ...)
+└── my-app/
+    ├── CMakeLists.txt
+    ├── prj.conf
+    ├── west.yml
+    ├── boards/
+    └── src/main.c
+```
+
+```bash
+west init -l my-app/           # initialise workspace
+west update                     # fetch zephyr + modules per west.yml
+west build -b nucleo_h745zi_q my-app/
+west flash
+```
+
+## Kconfig — the configuration system
+
+Same Kconfig as Linux. Every subsystem has its own configuration options; your `prj.conf` enables what you need:
+
+```
+CONFIG_GPIO=y
+CONFIG_UART_CONSOLE=y
+CONFIG_LOG=y
+CONFIG_LOG_DEFAULT_LEVEL=3
+CONFIG_BT=y
+CONFIG_BT_PERIPHERAL=y
+CONFIG_NETWORKING=y
+CONFIG_NET_IPV6=y
+```
+
+`west build` translates this into compile-time defines (`CONFIG_BT=1`) and which source files get built. Disabled features are *not compiled in*, so unused subsystems cost zero flash.
+
+## Device tree — describing your board
+
+Zephyr inherits device tree from Linux. A board has a `.dts` file describing the hardware:
+
+```dts
+/ {
+    chosen {
+        zephyr,console = &usart3;
+        zephyr,sram = &sram0;
+    };
+
+    leds {
+        compatible = "gpio-leds";
+        led_green: led_0 {
+            gpios = <&gpiob 0 GPIO_ACTIVE_HIGH>;
+            label = "Green LED";
+        };
+    };
+};
+
+&usart3 {
+    status = "okay";
+    current-speed = <115200>;
+};
+```
+
+Your application source then uses node references:
+
+```c
+#define LED_NODE DT_ALIAS(led0)
+static const struct gpio_dt_spec led = GPIO_DT_SPEC_GET(LED_NODE, gpios);
+
+int main(void) {
+    gpio_pin_configure_dt(&led, GPIO_OUTPUT_ACTIVE);
+    while (1) {
+        gpio_pin_toggle_dt(&led);
+        k_msleep(500);
+    }
+    return 0;
+}
+```
+
+No magic numbers. Move the LED to a different pin, change one line in the device tree, rebuild — the C code is unchanged.
+
+## Threads in Zephyr
+
+```c
+K_THREAD_DEFINE(blink_id, 512, blink_thread, NULL, NULL, NULL,
+                7, 0, 0);
+
+void blink_thread(void *a, void *b, void *c) {
+    while (1) {
+        toggle_led();
+        k_msleep(500);
+    }
+}
+```
+
+`K_THREAD_DEFINE` is a macro that statically allocates the thread stack and TCB at build time, and registers the thread to start automatically. No `xTaskCreate` call at runtime; the thread just starts.
+
+You can also create threads dynamically with `k_thread_create()` for cases where you don't know the thread set at compile time.
+
+## Synchronisation primitives
+
+```c
+K_SEM_DEFINE(my_sem, 0, 1);
+K_MUTEX_DEFINE(my_mutex);
+K_MSGQ_DEFINE(my_msgq, sizeof(struct msg), 10, 4);
+K_TIMER_DEFINE(my_timer, expiry_fn, stop_fn);
+K_WORK_DEFINE(my_work, work_handler);
+```
+
+All statically allocated. Run-time creation variants exist (`k_sem_init`, etc.) but the static macros are idiomatic.
+
+The **work queue** primitive (`k_work`) is unique to Zephyr — it lets you submit short pieces of work for asynchronous execution in a system thread, useful for ISR bottom halves and deferred processing.
+
+## The driver model
+
+Drivers are described by **bindings** (YAML files in `dts/bindings/`) and instantiated by macros in `DEVICE_DT_INST_DEFINE`. From your application:
+
+```c
+const struct device *uart = DEVICE_DT_GET(DT_NODELABEL(usart3));
+if (!device_is_ready(uart)) return -1;
+uart_poll_out(uart, 'H');
+```
+
+You request a device by its device-tree label. The framework returns a `struct device *` you call into via the subsystem's standard API (`uart_*`, `gpio_*`, `i2c_*`, `spi_*`, ...). Drivers from different vendors are interchangeable as long as they implement the same subsystem API.
+
+## Logging
+
+```c
+#include <zephyr/logging/log.h>
+LOG_MODULE_REGISTER(my_module, LOG_LEVEL_DBG);
+
+LOG_INF("Hello %d", value);
+LOG_ERR("Something broke: %s", reason);
+```
+
+The logging subsystem is deferred — `LOG_INF` writes a binary record to a ring buffer, and a background thread does the formatting and output. ISR-safe by construction.
+
+## Networking and BLE
+
+Where Zephyr really shines: full IPv6/IPv4 stack, MQTT, HTTP, CoAP, mDNS, DHCP, DNS — all in-tree. Bluetooth host + Mesh + Bluetooth-controller — also in-tree. To talk MQTT over WiFi on a Cortex-M33, you turn on the right `CONFIG_*` and write your application logic. The networking just works.
+
+```c
+struct mqtt_client client;
+mqtt_client_init(&client);
+mqtt_connect(&client);
+mqtt_publish(&client, &param);
+```
+
+## When Zephyr is the wrong choice
+
+- **Ultra-constrained chips** — < 32 KB flash, < 8 KB RAM. Zephyr's minimum useful footprint is around 25 KB flash; if you can't afford that, use FreeRTOS or bare-metal.
+- **You have an existing vendor SDK + FreeRTOS codebase** — switching to Zephyr is a rewrite, not a port. Stick with what works.
+- **You need bit-perfect timing** — Zephyr's HALs add a small amount of overhead compared to direct register access. For 100 MHz+ bit-banging, you may want to drop to bare metal even inside a Zephyr app.
+
+<Callout type="tip" title="The device tree is the steepest part">
+First Zephyr project: don't try to make a new board. Start from an in-tree board that's close to your hardware, get a blinky working, then incrementally edit the device tree.
+</Callout>
+
+## See also
+
+- [Zephyr docs](https://docs.zephyrproject.org/) (external) — canonical reference.
+- [FreeRTOS](/docs/rtos/freertos/) — for comparison.
+- [Tools / Build systems](/docs/tools/build/) — how `west` fits the broader CMake story.

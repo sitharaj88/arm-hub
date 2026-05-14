@@ -1,0 +1,67 @@
+---
+title: The Cortex-M lineup
+description: Every Cortex-M core from M0 to M85 — what changed, what it costs, when to pick it.
+order: 1
+updated: 2026-05-12
+tags: [cortex-m, cores, selection]
+---
+
+import CoreCompare from '~/components/CoreCompare.astro';
+import Callout from '~/components/Callout.astro';
+
+The Cortex-M family spans almost two orders of magnitude in performance, from ~12k-gate M0 cores fit for power-budget-constrained sensors all the way to the superscalar M85 running edge ML inference. The trick is matching a core to the product.
+
+<CoreCompare />
+
+## Quick selector
+
+- **Battery-powered sensor, microamp budget** → Cortex-M0+ or M23
+- **General-purpose firmware, plenty of headroom** → Cortex-M4 (or M33 if you need TrustZone)
+- **DSP / audio / motor control** → Cortex-M4 (DSP) or Cortex-M7 (more memory + caches)
+- **Networking, USB host, multi-protocol stacks** → Cortex-M7
+- **Edge ML, voice activation, sensor fusion** → Cortex-M55 or M85 (Helium)
+- **Automotive ECU with ASIL-B / ASIL-D** → look at Cortex-R, not Cortex-M
+
+## Generational shifts
+
+### v6-M → v7-M (M0/M0+ → M3)
+
+The jump from Cortex-M0+ to M3 is the *biggest* in the lineup. M3 gains the full Thumb-2 ISA (~150 more instructions), hardware divide, bit-banding, and the full 256-priority NVIC. Performance roughly doubles per MHz. If you're choosing between an M0+ and an M3 at the same clock, the M3 will out-perform it on almost any non-trivial code.
+
+### v7-M → v7E-M (M3 → M4)
+
+Adds DSP (SIMD on packed 8/16-bit lanes in 32-bit registers) and optional single-precision FPU. Same pipeline, same NVIC, same memory model — drop-in for most code. Costs ~30% more silicon area than M3.
+
+### v7E-M scalar → v7E-M superscalar (M4 → M7)
+
+Cortex-M7 widens to a 6-stage dual-issue pipeline, adds L1 I+D caches, ITCM/DTCM tightly coupled memories, and double-precision FPU. ~70% faster per MHz than M4. The trade-off: caches make timing analysis harder and bring coherency questions back into the picture (DMA needs invalidation/cleanup).
+
+### v7E-M → v8-M (M4 → M33)
+
+Same approximate scalar performance, but adds **TrustZone-M**, stack-limit registers, and a refreshed exception model. The big reason to pick M33 over M4 is when you need attestable secure boot and key isolation.
+
+### v8-M → v8.1-M (M33 → M55 / M85)
+
+Adds **Helium / MVE** (vector extension), low-overhead loops, **PACBTI**. M85 also bumps the scalar pipeline to 7-stage dual-issue and ships with branch prediction. For non-vector code, M85 is ~2× M33; for DSP/ML, M55 alone is ~4–5× M4.
+
+## What about Cortex-M1, M7TCM, M35P, M52?
+
+- **Cortex-M1** — an FPGA-optimised Cortex-M (ARMv6-M). Rarely used outside Xilinx soft-core designs.
+- **Cortex-M35P** — a Cortex-M33 with added physical security countermeasures (tamper, anti-side-channel). Niche secure-element use.
+- **Cortex-M52** — a baby sibling of M55 (2023): Helium + TrustZone in a smaller footprint, aimed at high-volume IoT.
+- **Cortex-M7 + double-precision** — note that on M7 you can configure single-only or single+double FPUs; vendors choose at synthesis time.
+
+<Callout type="tip" title="The pragmatic shortcut">
+80% of new general-purpose MCU designs end up on a Cortex-M4 or Cortex-M33. Pick M4 if you want maximum ecosystem maturity; pick M33 if you want TrustZone or are starting a 10-year product where M4 may be EoL'd.
+</Callout>
+
+## Bus and system width
+
+All Cortex-M cores have a 32-bit AHB interface. Higher-end cores (M7, M55, M85) have separate buses for instruction/data/system, allowing simultaneous flash fetch + SRAM data access — critical for sustaining their higher IPC.
+
+## See also
+
+- [Cortex-M4](/docs/cortex-m/m4/) — the workhorse.
+- [Cortex-M7](/docs/cortex-m/m7/) — caches, TCM, and the bus topology.
+- [Cortex-M33 / M23](/docs/cortex-m/m33-m23/) — the v8-M cores.
+- [Cortex-M55 / M85](/docs/cortex-m/m55-m85/) — Helium and PACBTI.

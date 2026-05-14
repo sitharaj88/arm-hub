@@ -1,0 +1,187 @@
+---
+title: RTOS scheduling
+description: Real-time scheduling theory and practice. Priority-based preemptive vs cooperative, rate-monotonic analysis, the Liu-Layland bound, deadline-monotonic, EDF, time-slicing, and how to assign priorities to a real workload.
+order: 2
+updated: 2026-05-13
+tags: [rtos, scheduling, rma, edf, priority, real-time]
+---
+
+The scheduler is the single most consequential design choice in any RTOS — it decides which task runs next, when it gets preempted, and whether your hard deadlines can be met under worst-case load. Most embedded engineers learn one scheduling algorithm (fixed-priority preemptive, with priorities they assigned by intuition) and stop there. That's enough for many systems, but understanding *why* it works — and when it doesn't — separates the engineers who hit deadlines from those who chase intermittent late-task bugs for months.
+
+This page covers the theory you actually need: fixed-priority vs dynamic-priority scheduling, the rate-monotonic theorem and its famous Liu-Layland bound, deadline-monotonic for non-harmonic periods, earliest-deadline-first as the dynamic alternative, and the practical question of "I have these eight tasks with these periods — what priorities do I assign?"
+
+<SpecSheet
+  title="Scheduling at a glance"
+  specs={[
+    { label: 'Most common RTOS scheduler', value: 'Fixed-priority preemptive with FIFO or round-robin within same priority' },
+    { label: 'Cooperative', value: 'Task runs until it yields. Used in tiny systems and event-driven designs. No preemption overhead, no priority inversion, but a long task starves everything else.' },
+    { label: 'Rate-monotonic assignment', value: 'Shortest period gets highest priority. Optimal among fixed-priority for periodic tasks with deadlines = periods.' },
+    { label: 'Liu-Layland utilisation bound', value: 'U ≤ n(2^(1/n) - 1) → ln(2) ≈ 0.693 as n→∞. If total CPU utilisation is below this, RMA guarantees schedulability.' },
+    { label: 'Deadline-monotonic', value: 'Shortest deadline gets highest priority. Generalises RMA when deadline ≠ period.' },
+    { label: 'Earliest Deadline First (EDF)', value: 'Dynamic priority. Optimal: schedulable iff U ≤ 1. Rarely used in embedded RTOSes — implementation complexity.' },
+    { label: 'Time-slicing', value: 'Same-priority tasks share CPU in N-tick rounds. FreeRTOS configUSE_TIME_SLICING. Useful for fairness, not for hard deadlines.' },
+  ]}
+/>
+
+## Scheduler taxonomies
+
+Three orthogonal axes describe any scheduler.
+
+**Priority structure**: fixed vs dynamic. Fixed priorities are decided at task-creation time and never change (except for priority inheritance — see [priority inversion](/docs/rtos/priority-inversion)). Dynamic priorities recompute at every scheduling decision based on some current property like remaining deadline or laxity.
+
+**Preemption**: preemptive vs cooperative. Preemptive schedulers can switch tasks at any instruction boundary when a higher-priority task becomes ready. Cooperative schedulers only switch when the current task explicitly yields (or blocks on a wait).
+
+**Selection within a priority**: FIFO, round-robin (time-sliced), shortest-job-first, etc. Within a single priority level, what tiebreaker decides who runs?
+
+Almost every commercial RTOS — FreeRTOS, Zephyr, ThreadX, RT-Thread, VxWorks, QNX — is **fixed-priority preemptive with optional round-robin within priority**. The reasons: it's simple, fast (priority lookup is O(1) with a bitmap), deterministic, and amenable to formal analysis (rate-monotonic analysis works on it).
+
+## Cooperative scheduling
+
+In a cooperative system, the scheduler only runs at well-defined yield points. A task can hold the CPU for as long as it wants; nothing preempts it. Yield points are typically calls to the RTOS API that explicitly block (`vTaskDelay`, `xQueueReceive`) or yield (`taskYIELD`).
+
+This sounds dangerous — and it can be — but it has a few real advantages:
+
+- **No race conditions between tasks** at any non-yield instruction. Critical sections are free.
+- **No priority inversion** (since nothing preempts).
+- **Tiny RTOS footprint** — no need for the preemption machinery, BASEPRI manipulation, or context save/restore in interrupts.
+- **Easy reasoning** — you can read the code and know exactly where the scheduler can intervene.
+
+Where cooperative scheduling falls down is mixed-deadline workloads. A "long" task (say a flash write taking 50 ms) blocks every other task during its run. If you have a 1 ms control loop, cooperative scheduling cannot meet it without restructuring the long task to yield periodically.
+
+Examples: protothreads, TinyOS, some uC/OS-II configurations, many event-loop frameworks (Mongoose, lwIP raw API). Many event-driven embedded designs are essentially cooperative without anyone calling them that.
+
+## Fixed-priority preemptive scheduling
+
+The dominant model. Every task has a numeric priority. The scheduler always runs the highest-priority ready task. When a higher-priority task becomes ready (an ISR releases a semaphore, a timer fires, an event flag is set), the current task is preempted at the next instruction and the higher one runs.
+
+Within a single priority level, two policies are common:
+
+- **FIFO** — first task to become ready runs to completion (or until it blocks). Others at the same priority wait.
+- **Round-robin** — tasks at the same priority share the CPU in fixed time slices (typically 1 RTOS tick = 1 ms). The OS rotates the runnable queue at each slice.
+
+Round-robin within priority is useful for "fairness" workloads (multiple worker tasks of equal importance) but adds nondeterminism — a task may be preempted after one slice. For hard real-time, FIFO within priority is preferable so that you know a given task will finish before any peer runs.
+
+FreeRTOS exposes this as `configUSE_PREEMPTION` (preemption on/off) and `configUSE_TIME_SLICING` (round-robin or FIFO within priority).
+
+## Rate-monotonic analysis (RMA)
+
+Now the theory. Given a set of periodic tasks, can fixed-priority preemptive scheduling meet all their deadlines? Liu and Layland (1973) proved two foundational results.
+
+**Result 1 (priority assignment)**: Among all fixed-priority assignment policies, **rate-monotonic** — assigning the highest priority to the task with the shortest period — is optimal. If any fixed-priority assignment can meet all deadlines, then rate-monotonic can.
+
+**Result 2 (utilisation bound)**: A set of n periodic tasks with periods equal to deadlines is schedulable under rate-monotonic if total CPU utilisation U satisfies:
+
+```
+U ≤ n × (2^(1/n) - 1)
+```
+
+For specific n:
+
+| n (tasks) | Bound | As fraction |
+|-----------|-------|-------------|
+| 1 | 1.000 | 100% |
+| 2 | 0.828 | 82.8% |
+| 3 | 0.780 | 78.0% |
+| 5 | 0.743 | 74.3% |
+| 10 | 0.718 | 71.8% |
+| ∞ | ln 2 ≈ 0.693 | 69.3% |
+
+This bound is **sufficient but not necessary**. A task set that exceeds the bound may still be schedulable — the bound is the worst case over all possible period combinations. Many real task sets are schedulable up to 100% utilisation under RMA (e.g., harmonic period sets where each period divides the next).
+
+**Utilisation** is computed as: U = Σ(Cᵢ / Tᵢ), where Cᵢ is the worst-case execution time (WCET) of task i and Tᵢ is its period. So a task with WCET 200 µs and period 5 ms contributes 0.04 (4%) to utilisation.
+
+<TimingDiagram
+  title="Rate-monotonic interleaving — three periodic tasks"
+  signals={[
+    { name: 'Task A (T=2)', wave: '10101010', tone: 'destructive' },
+    { name: 'Task B (T=4)', wave: '01001000', tone: 'warning' },
+    { name: 'Task C (T=8)', wave: '00010001', tone: 'accent' },
+    { name: 'CPU running',  wave: '10101010', tone: 'primary' },
+  ]}
+  markers={[
+    { x: 0, label: 'A,B,C all release' },
+    { x: 2, label: 'A re-releases, preempts' },
+    { x: 4, label: 'B re-releases' },
+  ]}
+  caption="Shortest period gets highest priority — Task A always wins, Task B runs in the gaps between A's slots, Task C only runs when both A and B are idle. As long as total utilisation stays below the Liu-Layland bound, every deadline is met."
+/>
+
+<Callout type="tip">
+The 69% bound is the conservative one. For a real fixed task set, run **response-time analysis (RTA)**: for each task, compute its worst-case response time as the time from release until the latest possible completion, accounting for preemption by higher-priority tasks. If WCRT ≤ deadline for every task, the set is schedulable. RTA is exact (necessary and sufficient) where Liu-Layland is sufficient only.
+</Callout>
+
+## Deadline-monotonic — when deadline ≠ period
+
+RMA assumes deadline = period. In many real systems, a task has period T but must finish within deadline D < T (e.g., a control loop with phase-lead requirements). The generalisation is **deadline-monotonic scheduling (DMS)**: assign priorities by deadline, shortest deadline gets highest priority.
+
+DMS is optimal among fixed-priority assignments for constrained-deadline task sets. The utilisation bound is more complicated than RMA's; in practice you use response-time analysis directly on the constrained-deadline task set rather than appealing to a closed-form bound.
+
+## Earliest Deadline First (EDF)
+
+EDF is a **dynamic-priority** scheduler. At every scheduling decision, the task with the earliest absolute deadline runs. Liu and Layland also proved that EDF is optimal among all preemptive schedulers — including dynamic ones — and a task set is schedulable under EDF iff total utilisation U ≤ 1.
+
+This is a huge result: EDF can schedule any task set that's even theoretically schedulable. So why don't we all use EDF?
+
+- **Implementation cost.** Maintaining a sorted deadline queue at every release adds overhead. Insert and remove are O(log n).
+- **Cascading failure on overload.** When utilisation exceeds 1, RMA fails the lowest-priority task first (predictable). EDF can fail any task — once any deadline misses, the system can spiral into "domino effect" failures.
+- **No mature commercial support.** FreeRTOS, Zephyr, ThreadX are all fixed-priority. SCHED_DEADLINE exists in Linux (since 3.14) but is rarely used.
+
+EDF is studied heavily in academic real-time research; in practice, embedded systems use fixed-priority because the failure mode is more predictable and the implementation is simpler.
+
+## Time-slicing within priority
+
+Round-robin among same-priority tasks is the "soft" part of an otherwise hard-real-time scheduler. It's useful for:
+
+- Multiple worker tasks of equal importance (process N work items in parallel)
+- Avoiding starvation when several tasks of the same priority compete
+- "Fair" CPU sharing in non-real-time portions of the system
+
+The time slice length is configurable; typical values are 1 to 10 ticks (1-10 ms). Shorter slices mean more switching overhead; longer slices mean more latency for waiting peers. FreeRTOS does it at every tick that has equal-priority ready peers, which works out to 1-tick slices.
+
+| Scheme | Pros | Cons |
+|--------|------|------|
+| FIFO within priority | Deterministic, no surprise preemptions | Can starve equal-priority peers |
+| Round-robin within priority | Fair, no starvation | Adds jitter, complicates WCET |
+| No same-priority tasks | Simplest analysis | Forces priority hierarchy you may not want |
+
+## Idle hook
+
+Every RTOS has an idle task that runs when nothing else is ready. It's the lowest-priority task in the system (priority 0 in FreeRTOS, K_IDLE_PRIO in Zephyr). The idle task's job is usually one of:
+
+- Spin waiting for the next tick (simplest, wastes power)
+- Call `WFI` (Wait For Interrupt) to put the CPU into a low-power state until the next interrupt
+- Invoke a user-provided idle hook for housekeeping (memory pool cleanup, statistics)
+
+Tickless idle (see [Tickless idle](/docs/rtos/tickless)) goes one step further: skip the periodic tick entirely if no task needs servicing soon.
+
+## Practical: assigning priorities to a real task set
+
+Consider eight tasks:
+
+| Task | Period | WCET | Utilisation | Priority (RMA) |
+|------|--------|------|-------------|----------------|
+| Motor commutation IRQ | 100 µs | 20 µs | 20% | Highest (handler) |
+| Audio buffer | 1 ms | 100 µs | 10% | 1 (highest task) |
+| Sensor sample | 2 ms | 200 µs | 10% | 2 |
+| Control loop | 5 ms | 800 µs | 16% | 3 |
+| Display refresh | 10 ms | 1.5 ms | 15% | 4 |
+| Network poll | 100 ms | 5 ms | 5% | 5 |
+| Logger flush | 1 s | 50 ms | 5% | 6 |
+| Idle | — | — | — | 0 |
+
+Total utilisation: 81%. Liu-Layland bound for n=7 is ~73%, so we exceed the conservative bound — but response-time analysis confirms all deadlines are met because the period set is roughly harmonic. The shortest-period task always wins priority.
+
+A common pitfall: assigning priority by "importance" rather than by period. The display refresh might *feel* important, but if it has a 10 ms deadline and the control loop has 5 ms, the control loop has to be higher priority — otherwise the display preempts it and the control loop misses its deadline. RMA tells you to ignore feelings and follow the math.
+
+<Callout type="warn">
+When task periods are nearly equal, the priority order is debatable but not very impactful — small swaps don't change schedulability much. When periods differ by a factor of 10+, getting the order wrong is fatal. Always sort by period (or deadline) first, then break ties with engineering judgement.
+</Callout>
+
+## Further reading
+
+- [Priority inversion](/docs/rtos/priority-inversion) — the dark side of fixed-priority preemption
+- [RTOS landscape](/docs/rtos/landscape) — which RTOSes use which schedulers
+- [FreeRTOS](/docs/rtos/freertos) — scheduler internals
+- [Tickless idle](/docs/rtos/tickless) — power-aware extension
+- Liu, C.L. & Layland, J.W. (1973) "Scheduling Algorithms for Multiprogramming in a Hard Real-Time Environment", JACM 20(1)
+- Buttazzo, *Hard Real-Time Computing Systems* — the standard textbook

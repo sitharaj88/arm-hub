@@ -1,0 +1,128 @@
+---
+title: Infineon (XMC, PSoC, AURIX)
+description: Infineon's Cortex-M lines — XMC (industrial), PSoC (programmable analog + digital), and the TriCore-based AURIX for automotive.
+order: 9
+updated: 2026-05-12
+tags: [vendors, infineon, psoc, xmc]
+---
+
+Infineon (formerly Siemens Semiconductor) is a German power and automotive specialist. After acquiring **Cypress in 2020**, their MCU portfolio doubled in size and breadth. The ARM-relevant lines are **XMC** (their own Cortex-M industrial chips) and **PSoC** (Cypress's programmable analog/digital line, now Infineon).
+
+<SpecSheet
+  title="Infineon ARM portfolio — at a glance"
+  specs={[
+    { label: 'XMC line', value: 'XMC1000 (Cortex-M0 industrial entry), XMC4000 (Cortex-M4F industrial mainstream), XMC7000 (dual Cortex-M7, ex-Cypress Traveo II)' },
+    { label: 'PSoC line (ex-Cypress)', value: 'PSoC 4 (Cortex-M0/M0+), PSoC 5LP (Cortex-M3), PSoC 6 (Cortex-M4F + Cortex-M0+ dual-core)' },
+    { label: 'Automotive ARM', value: 'TRAVEO II / T2G (Cortex-M4F + M7), AURIX TC4xx (TriCore + Cortex-R52 cluster for ADAS)' },
+    { label: 'Non-ARM auto flagship', value: 'AURIX TriCore (TC3xx/TC4xx) — Infineon proprietary, not ARM' },
+    { label: 'Security IP', value: 'OPTIGA Trust M / Trust Charge / TPM 2.0 (separate secure element ICs); on-die: PSoC 6 PUF, SECURE-BOOT, eFuse' },
+    { label: 'SDK', value: 'ModusToolbox (unified across PSoC, XMC, AIROC, AURIX-Cortex-R) — VS Code + Eclipse, CMake-buildable' },
+    { label: 'AIROC wireless', value: 'CYW20xxx / CYW43xxx (Wi-Fi, BLE, combo) — ex-Cypress radio line, now combined with PSoC 6 as PSoC 6 AIROC' },
+    { label: 'PSoC standout', value: 'Programmable analog blocks (opamps, switched-cap filters, comparators, DACs) and UDBs (Universal Digital Blocks) — configurable at runtime' },
+  ]}
+/>
+
+## XMC — industrial Cortex-M
+
+| Series | Core               | Position                                |
+|--------|--------------------|-----------------------------------------|
+| XMC1000| Cortex-M0          | Cost-optimised entry                    |
+| XMC4000| Cortex-M4F         | Industrial mainstream — motor control, power, communication |
+| XMC7000| Cortex-M7 (dual)   | High-perf industrial (was Cypress Traveo) |
+
+Infineon's XMC line targets **industrial motor control, power conversion, and field-bus communication** (PROFINET, EtherCAT, CANopen). Strong analog peripherals (high-resolution PWM, fast ADCs).
+
+## PSoC — programmable analog + digital
+
+The PSoC story is unique. Cypress (acquired by Infineon) built MCUs with **programmable digital and analog blocks** — like an FPGA fabric and a tiny mixed-signal IC alongside the CPU.
+
+| Series           | Core               | What's special                         |
+|------------------|--------------------|----------------------------------------|
+| PSoC 4           | Cortex-M0 / M0+    | Programmable analog blocks + UDBs (Universal Digital Blocks) |
+| PSoC 4 BLE       | Cortex-M0 + radio  | BLE + programmable analog              |
+| PSoC 5LP         | Cortex-M3          | Most analog blocks; 12+ programmable blocks |
+| PSoC 6           | Cortex-M4F + M0+   | Dual-core, TrustZone-class isolation   |
+| PSoC 6 BLE       | M4F + M0+ + BLE    | Dual-core wireless                     |
+
+In PSoC, you can describe an analog filter graphically in the IDE (PSoC Creator or ModusToolbox) and the tool wires up real analog blocks — opamps, switched-cap filters, ADCs — to implement it. Then the CPU just reads the result. It's between an MCU and a programmable analog/digital IC.
+
+This makes PSoC a *very* productive platform for mixed-signal prototypes and small-volume specialty products, but the productivity tax is that the parts are pricier than equivalent fixed-function MCUs.
+
+## ModusToolbox
+
+Infineon's modern SDK, now used across PSoC and XMC. CMake-based, supports VS Code and Eclipse, comes with BSPs for many dev boards. Reasonable but smaller community than ST or Nordic.
+
+## AURIX — TriCore, not ARM
+
+Infineon's flagship automotive MCU line, the **AURIX TC3xx / TC4xx**, runs on TriCore — Infineon's proprietary architecture, not ARM. Mentioned only to clear up potential confusion: if someone says "Infineon automotive MCU", they probably mean AURIX/TriCore, not XMC/ARM.
+
+For automotive **near** AURIX — radar, ADAS — Infineon does use ARM cores: the **TC4xx** series adds a Cortex-R52 alongside the TriCore. The **PSoC 4 Auto** is ARM Cortex-M0+ for automotive body electronics.
+
+## When you'd pick Infineon
+
+- **Industrial motor control / power conversion** — XMC4000 is genuinely strong here.
+- **Mixed-signal prototyping** — PSoC's programmable analog is uniquely productive.
+- **Automotive radar / ADAS** — Infineon's RF and DSP IP is best-in-class.
+- **You're already an Infineon power IC customer** — supply chain coherence.
+
+## The Cypress acquisition and what it brought
+
+Infineon closed the Cypress acquisition in April 2020, paying USD 9 billion to fold an MCU portfolio that arguably had more brand recognition in the embedded community than Infineon's own XMC line. The result is that "Infineon ARM" today means three distinct technology lineages — XMC (Siemens-era), PSoC + AIROC (ex-Cypress), and Traveo (also ex-Cypress, automotive). The unification of tooling under **ModusToolbox** has been the most visible integration effort; the underlying silicon and reference designs still bear their origins.
+
+For a senior engineer the practical mapping is:
+
+- Greenfield industrial design needing motor control, power conversion, field-bus: **XMC4000** or **XMC7000**.
+- Greenfield design needing mixed-signal flexibility and willing to pay a per-unit premium: **PSoC 6** with its dual-core M4F + M0+ split.
+- Wi-Fi or Bluetooth combo without writing a complete BLE stack: **PSoC 6 AIROC** (PSoC 6 plus a CYW43012 / CYW4343 radio on the same package).
+- Automotive body electronics with ARM ISA: **Traveo II** (Cortex-M4F + Cortex-M7 dual-core).
+- Automotive safety-critical / ADAS: **AURIX TC4xx** (TriCore + Cortex-R52 cluster). The Cortex-R52 cluster handles the ARM TrustZone-for-Cortex-R workloads while TriCore handles the deterministic safety paths.
+
+## PSoC 6 — the dual-core architecture in detail
+
+PSoC 6 is genuinely unusual. It packs a **Cortex-M4F** application processor at up to 150 MHz and a **Cortex-M0+** at 100 MHz onto the same die, plus the Cypress programmable analog/digital fabric, plus an integrated radio option, plus a hardware security subsystem. The M0+ is *not* a helper for compute; it is the dedicated low-power "always-on" core that runs the secure boot, BLE controller (when configured), and sensor-polling workloads while the M4F sleeps. Inter-core communication uses an IPC mailbox peripheral with hardware semaphores; CM0+ to CM4F wake-up takes about 20 microseconds.
+
+| Block | PSoC 6 capability |
+|-------|-------------------|
+| CM4F | 150 MHz, single-precision FPU, full Thumb-2 + DSP |
+| CM0+ | 100 MHz, runs the bootloader, BLE controller, sensor monitor |
+| Programmable analog | 4 opamps, 2 SAR ADCs, 12-bit DACs, comparators, switched-cap filters |
+| UDBs (digital fabric) | 12 universal digital blocks — Verilog-style state machines + PLDs |
+| Crypto | AES, SHA, ECC, TRNG, PUF — accessed only from CM0+ in TrustZone-equivalent mode |
+| Smart I/O | Programmable interconnect between pins and the digital fabric — runtime reconfigurable |
+
+The CM0+ in PSoC 6 acts as a poor-man's TrustZone — it runs the privileged security firmware (CySecureTools provides a reference implementation) while the CM4F runs the application. The MPUs on both cores enforce the partitioning. Newer PSoC 64 parts add true ARMv8-M TrustZone on the CM4F, layered on top.
+
+<Callout type="note" title="UDBs versus PIO versus FPGA">
+The UDB fabric on PSoC 4/5LP is closer to a tiny CPLD than to RP2040's PIO. Each UDB has a programmable logic block (8-input function generators), a datapath with an 8-bit ALU, and a small status/control register set. You can implement a UART, a quadrature decoder, a custom counter — at gate level, not as a state-machine program. The PSoC Creator schematic editor lets you wire these up graphically; ModusToolbox 3.x retains UDB support but emphasises fixed-function peripherals.
+</Callout>
+
+## XMC4000 industrial peripherals
+
+The XMC line was designed around **industrial motor control and power conversion**. The headline peripherals:
+
+- **HRPWM** — High-Resolution PWM with 150 picosecond resolution on XMC4400/4700/4800. Critical for digital power supplies running above 500 kHz.
+- **POSIF** — Position Interface module: dedicated hardware for quadrature encoder and Hall sensor decoding, with hardware commutation logic.
+- **MULTICAN** — up to 6 independent CAN-FD nodes with shared message RAM.
+- **EBU** (External Bus Unit) — interface to off-chip SRAM, NOR flash, or memory-mapped peripherals for industrial gateways.
+- **DLR / ERU** (Distributed Logic Router / Event Request Unit) — Infineon's answer to peripheral interconnect; lets a comparator trigger a PWM shutdown without CPU intervention.
+
+The combination of HRPWM + POSIF + comparator-driven safety shutdown makes the XMC4800 a genuine alternative to dedicated digital signal controllers for motor drives. The reference designs Infineon ships (3-phase BLDC, sensorless FOC, 3-level inverter) are some of the best documented in the industry.
+
+## OPTIGA, ModusToolbox, and AURIX-near ARM
+
+**OPTIGA** is Infineon's discrete secure element family — separate ICs that ship with pre-provisioned RSA / ECC keys and authenticate via I²C to a host MCU. OPTIGA Trust M is the volume-friendly variant; Trust Charge is wireless-charging-specific (Qi authentication); OPTIGA TPM 2.0 is a discrete TPM. The integration model is "pair your MCU with an OPTIGA over I²C and the OPTIGA handles key storage" — useful when the MCU itself doesn't have a strong secure element.
+
+**ModusToolbox** is the unifying SDK. Project descriptors are YAML; the build is CMake under the hood; VS Code and Eclipse are both first-class. The library manager pulls dependencies from GitHub. Coverage is broader than Cypress's old PSoC Creator but narrower than ST's CubeMX ecosystem.
+
+For automotive radar (24/77 GHz), Infineon uses Cortex-R52 in the TC4xx alongside the TriCore. The Cortex-R52 cluster runs the radar signal-processing pipeline, while TriCore handles the safety-rated decision logic. The combination is one of the more sophisticated heterogeneous designs in automotive silicon today.
+
+- [Cortex-M0 / M0+](/docs/cortex-m/m0-m0plus/) — PSoC 4 and PSoC 6 secure core.
+- [Cortex-M4](/docs/cortex-m/m4/) — XMC4000, PSoC 6 application core.
+- [Cortex-M7](/docs/cortex-m/m7/) — XMC7000 / Traveo II.
+- [Cortex-R overview](/docs/cortex-r/overview/) — AURIX TC4xx Cortex-R52 cluster.
+- [TrustZone](/docs/architecture/trustzone/) — partitioning model used on PSoC 64.
+- [CMSIS](/docs/programming/cmsis/) — ModusToolbox layers on CMSIS-Core.
+- [MPU on Cortex-M](/docs/cortex-m/mpu/) — used by PSoC 6 dual-core isolation.
+- [STMicro](/docs/vendors/stm/) — STM32G4 versus XMC4000 for motor control.
+- [NXP](/docs/vendors/nxp/) — MCX-W versus PSoC 6 AIROC for combo wireless.
+- [QEMU & Renode](/docs/tools/sim/) — Renode has experimental XMC4 and PSoC 6 platforms.

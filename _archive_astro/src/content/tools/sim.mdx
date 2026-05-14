@@ -1,0 +1,119 @@
+---
+title: QEMU & Renode
+description: Simulating Cortex-M without hardware — when emulation actually works, and when you should just buy the dev board.
+order: 5
+updated: 2026-05-12
+tags: [tools, qemu, renode, simulation]
+---
+
+import Callout from '~/components/Callout.astro';
+
+Simulating an MCU sounds great until you discover the simulator doesn't model the peripherals you care about. Neither **QEMU** nor **Renode** can perfectly model an STM32H7, but both are useful in narrow ways — running CPU-only code, exercising application logic, hosting CI tests for code that doesn't need real-world hardware.
+
+## QEMU for Cortex-M
+
+QEMU's `arm-system-emulation` targets include a few canned Cortex-M boards:
+
+- `mps2-an385` (Cortex-M3)
+- `mps2-an386` (Cortex-M4)
+- `mps2-an500`, `an505`, `an521`, `an524` (Cortex-M7, M33 variants)
+- `lm3s6965evb` (TI Stellaris — old but well-supported)
+- `microbit` (Nordic nRF51)
+
+To run a binary:
+
+```bash
+qemu-system-arm \
+  -machine mps2-an385 \
+  -cpu cortex-m3 \
+  -nographic \
+  -kernel firmware.elf
+```
+
+`-nographic` redirects the emulated UART to your terminal. `-s -S` adds a GDB server at port 1234, halted, so you can attach a debugger.
+
+### What works in QEMU
+
+- The **core**: every Thumb-2 instruction, the NVIC, SysTick, exception entry/exit, MPU, FPU.
+- A **standard UART** model on each board.
+- **Memory layout** matching the modelled board.
+
+### What doesn't
+
+- **Real chip peripherals.** QEMU doesn't model STM32 RCC, GPIO, USB, SPI, I²C — only the generic mps2 peripherals. If your code touches `RCC->AHB1ENR`, it'll read 0 or worse, panic.
+- **Timing.** QEMU's clock is decoupled from real time. A loop that takes 1 ms on hardware takes ~unrelated time in QEMU.
+- **Power modes.** `WFI` returns immediately.
+
+So QEMU is great for **CPU-bound algorithm testing** — unit tests for a CRC routine, a state machine, a parser — where you don't need the hardware peripherals. It's terrible as a soft-replacement for the dev board.
+
+## Renode — the more ambitious simulator
+
+[Renode](https://renode.io/) is an open-source simulator from Antmicro that tries harder than QEMU to model real peripherals. It has board files for STM32F4, F7, H7, nRF52, MIMXRT, LPC, SAMD, and many others.
+
+```bash
+renode
+(monitor) machine LoadPlatformDescription @platforms/boards/stm32f4_discovery.repl
+(monitor) sysbus LoadELF @firmware.elf
+(monitor) start
+```
+
+Renode can also:
+
+- **Co-simulate** with Verilator (for FPGA designs).
+- **Model networks** — multiple Renode instances connected over emulated Ethernet/BLE/CAN, useful for testing multi-node systems.
+- **Run robot framework tests** — high-level scripted scenarios with assertions about peripheral state, GPIO levels, register values.
+
+### What works in Renode
+
+- Many of the **peripherals you'd expect on supported boards** — basic GPIO, UART, SPI, I²C, sometimes DMA, sometimes USB.
+- **Multi-MCU and network scenarios** — Renode's strongest feature.
+- **CI integration** — supports running headless from scripts.
+
+### What doesn't
+
+- **Vendor-specific peripheral quirks.** Renode models the documented behaviour, not the silicon errata.
+- **Bit-perfect timing.** Like QEMU, simulated time is decoupled.
+- **Newer chips.** Each chip model is hand-written; coverage trails the market.
+
+For **integration testing** of code that runs on a supported chip family, Renode is genuinely useful. For chip bring-up or peripheral-specific work, the dev board is faster.
+
+## When simulation is the right call
+
+**Yes**:
+- CI tests for pure-logic code (parsers, state machines, math).
+- Reproducing a crash in a portable, captureable environment.
+- Teaching/training without buying dev kits.
+- Pre-silicon software development (when the silicon doesn't exist yet, Renode is sometimes the *only* option).
+
+**No**:
+- Real-time-sensitive code (sub-millisecond timing).
+- Driver development for peripherals not yet modelled.
+- Performance work that depends on cache, pipeline, branch prediction.
+
+## Running unit tests on the host instead
+
+A different approach: don't simulate the chip at all. Compile your business logic for the host (x86_64 Linux/Mac) and run it under native unit tests. Stub out the hardware-touching layer.
+
+```c
+// In production
+#ifdef PRODUCTION
+  #include "stm32f4xx.h"
+  #define LED_ON()  GPIOA->BSRR = (1 << 5)
+#else
+  #include "test_stubs.h"
+  #define LED_ON()  test_record("LED_ON")
+#endif
+```
+
+The pure-logic code (CRC, parser, state machine) builds natively and runs under `pytest`, `Catch2`, `gtest`, whatever. You get fast iteration, full coverage analysis, sanitizers — *and* you sidestep the simulation question.
+
+This is the pattern most production firmware shops use. Simulation is reserved for the cases where the hardware genuinely matters.
+
+<Callout type="tip" title="Test pure logic on the host; test hardware integration on real hardware">
+Don't try to test everything via simulation. The 80% that's pure logic — run it natively, get all the testing tools your host platform offers. The 20% that touches hardware — run it on the dev board, with a HIL fixture if your team is mature enough.
+</Callout>
+
+## See also
+
+- [Build systems](/docs/tools/build/) — running CI tests in CMake/Make.
+- [Toolchains](/docs/tools/toolchains/) — cross-compiling for the test target.

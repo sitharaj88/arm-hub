@@ -1,0 +1,148 @@
+---
+title: Cortex-M0
+description: The smallest, lowest-power Cortex — ARMv6-M, 3-stage von Neumann pipeline, Thumb-only ISA, no MPU, no cache. The minimum-viable 32-bit MCU.
+order: 1
+updated: 2026-05-13
+tags: [cortex-m, cortex-m0, armv6-m, low-power, microcontroller]
+---
+
+The Cortex-M0 is ARM's smallest licensable 32-bit core. It exists to replace the 8- and 16-bit MCU market: same gate count as a beefed-up 8051, but with a 32-bit datapath, a sane interrupt controller, and the same toolchain you use on bigger Cortex-M parts. Every line of code written for an M3 or M4 will recompile against an M0 — minus a handful of instructions the M0 doesn't implement — and run on a die that's somewhere around 12,000 gates and costs the silicon vendor a few cents.
+
+The trade is straightforward. The M0 gives up the rich ARMv7-M feature set (no MPU, no bit-banding, a heavily reduced Thumb-2 subset, no hardware divide, no DSP) in exchange for area and power. If you don't need those features — and a startling number of products don't — the M0 is the right answer. If you do, the [M0+](/docs/cortex-m/m0plus) or [M3](/docs/cortex-m/m3) are a small step up.
+
+<SpecSheet
+  title="Cortex-M0 at a glance"
+  specs={[
+    { label: 'Architecture', value: 'ARMv6-M' },
+    { label: 'Pipeline', value: '3-stage (fetch, decode, execute)' },
+    { label: 'Bus interface', value: 'Single AHB-Lite, von Neumann (one bus for I+D)' },
+    { label: 'ISA', value: 'Thumb + a 56-instruction subset of Thumb-2 (BL, MRS/MSR, DMB/DSB/ISB, NOP variants)' },
+    { label: 'Registers', value: 'r0..r15 plus xPSR. No FPU. No DSP. No Helium.' },
+    { label: 'Multiply', value: '32×32 → 32-bit single-cycle (fast) or 32-cycle (small). Vendor picks at synthesis.' },
+    { label: 'Divide', value: 'None — software via __aeabi_idiv (libgcc) or vendor implementation' },
+    { label: 'Interrupts', value: 'Up to 32 external IRQs in NVIC, 2 priority bits (4 levels)' },
+    { label: 'MPU', value: 'Not available on M0' },
+    { label: 'Sleep modes', value: 'WFI / WFE, SLEEPDEEP via SCB.SCR' },
+    { label: 'DMIPS/MHz', value: '0.84 (Dhrystone 2.1)' },
+    { label: 'CoreMark/MHz', value: '~2.33' },
+    { label: 'Typical clock', value: '24–50 MHz silicon, headroom to 100 MHz in modern process nodes' },
+    { label: 'Typical parts', value: 'NXP LPC11xx, STM32F0, Nordic nRF51, Atmel/Microchip SAMD20' },
+  ]}
+/>
+
+## Architecture overview
+
+The M0 implements **ARMv6-M**, the smallest ARM architecture profile. ARMv6-M is a strict subset of ARMv7-M (the M3/M4 architecture): every M0 binary runs unmodified on an M3, but not vice versa. The cut-down comes from three places — ISA, system control, and the bus interface.
+
+### Three-stage pipeline
+
+Fetch, decode, execute. No branch prediction, no speculative execution, no out-of-order. A taken branch flushes one instruction (the one already in decode), giving a 2-cycle taken-branch penalty; an untaken branch is single-cycle. This determinism is the M0's killer feature for hard real-time work — every instruction's cycle count is in the TRM and never varies.
+
+```
+Cycle  0 : F1 ─ D0 ─ E (-1)
+Cycle  1 : F2 ─ D1 ─ E (0)    ← instr 0 retires
+Cycle  2 : F3 ─ D2 ─ E (1)
+```
+
+A branch at E-stage forces F and D to refill from the new PC; the bubble is one decode slot. Load-use stalls are one cycle (the loaded value is forwarded to E but not visible to D in time).
+
+<PipelineDiagram
+  title="Cortex-M0 3-stage von Neumann pipeline"
+  stages={['F', 'D', 'EX']}
+  instructions={[
+    { name: 'MOV r0, #1', stages: ['F', 'D', 'EX'] },
+    { name: 'LDR r1, [r2]', stages: ['', 'F', 'D', 'EX'] },
+    { name: 'ADD r3, r1, r0', stages: ['', '', 'F', '', 'D', 'EX'] },
+    { name: 'BX  lr (taken)', stages: ['', '', '', 'F', 'D', 'EX'] },
+    { name: 'STR r3, [r4]', stages: ['', '', '', '', '', 'F', 'D', 'EX'] },
+  ]}
+  caption="A single AHB-Lite master means an instruction fetch and a data load can't share a cycle — note the empty F slot when LDR drives the bus, and the branch bubble that refills F/D after BX lr."
+/>
+
+### Von Neumann bus
+
+The M0 has a **single AHB-Lite master port**. Code fetches and data accesses share the same bus, which means an instruction fetch and a load to RAM cannot happen in the same cycle — one stalls the other. On the M3/M4, separate I- and D-buses (Harvard-style) eliminate this contention. On the M0 it shows up as occasional one-cycle stalls when tight loops read tables from RAM while fetching the loop body. For most code the effect is in the single-digit percent range.
+
+The single bus also simplifies bring-up: the linker maps flash and RAM into one address space, and there's no separate ICode/DCode/SBus to balance. Vendors typically wire flash, RAM, and the peripheral region behind a small AHB bus matrix with single-cycle access for code, single- or two-cycle for RAM, and the usual deeper wait states for peripherals.
+
+### Thumb-only ISA
+
+The M0 executes a **subset of Thumb-2** — strictly Thumb, mostly 16-bit instructions with a handful of 32-bit ones thrown in. ARM published the list as the ARMv6-M instruction set; everything else (UDIV, SDIV, MLA, all the DSP saturating ops, IT blocks, conditional ldr/str other than the bare branches) is out.
+
+| Instruction class | M0 (ARMv6-M) | M3+ (ARMv7-M) |
+|---|---|---|
+| ALU on r0–r7 | yes (16-bit) | yes |
+| ALU on r8–r15 | limited (high-register MOV, ADD, BX) | full |
+| Hardware divide (UDIV/SDIV) | no | yes (M3+) |
+| Saturating arithmetic (QADD, QSUB) | no | yes (M4+) |
+| Bit-field (BFI, UBFX) | no | yes |
+| LDR/STR with shifted register offset | no | yes |
+| IT (if-then) block | no | yes |
+| CLZ | no | yes |
+
+This isn't a problem — GCC and Clang both emit pure ARMv6-M code with `-mcpu=cortex-m0` and `-mthumb`. You just need to know that `__builtin_clz` will compile to a function call, and signed division on hot paths will cost you 30–40 cycles per call instead of 2.
+
+<Callout type="note" title="No interworking, no ARM state">
+The M0 is **Thumb-only**. There is no ARM (32-bit instruction) state to switch to — the bit-0 of every code address must be 1 (Thumb bit), and `BX` targets with bit 0 cleared raise a UsageFault on bigger cores and a HardFault on M0. Toolchains handle this transparently with `.thumb_func` directives.
+</Callout>
+
+## NVIC on the M0
+
+The M0's NVIC supports up to **32 external interrupts** plus the architectural exceptions (Reset, NMI, HardFault, SVCall, PendSV, SysTick). Priority is **2 bits**, giving four levels (0..3, 0 most urgent). There is no `BASEPRI`, no `FAULTMASK`, and the only mask is `PRIMASK` — set/clear with `CPSID i` / `CPSIE i`.
+
+Tail-chaining is supported (the same ~6-cycle saving as the M3), and late-arrival is supported. The whole exception entry/exit path is byte-for-byte identical to the M3 from an architectural standpoint — what changes is just the per-cycle accounting, which is slightly worse on the M0 because of the von Neumann bus.
+
+Interrupt latency: typically **16 cycles** from IRQ assertion to first instruction of the handler, assuming zero-wait-state memory. With flash wait states this grows to 20+ cycles. The [interrupt latency calculator](/tools/interrupt-latency) has the exact breakdown.
+
+## Memory map
+
+Cortex-M0 inherits the standard Cortex-M memory map — flat 4 GB, with regions for code (0x0000_0000), SRAM (0x2000_0000), peripherals (0x4000_0000), and the PPB (0xE000_0000) for the NVIC and SCB. **No bit-banding** — that's a Cortex-M3 feature that requires aliased decode logic and wasn't worth the gates on M0. If your driver code uses `BIT_BAND_ADDR(...)` it won't work on M0; do read-modify-write manually.
+
+Unaligned accesses fault. Always. `SCB->CCR.UNALIGN_TRP` is fixed to 1 on M0 — there's no option to allow unaligned. The compiler avoids them naturally for `int` and pointer types but you can still hit one with `memcpy` of a packed struct or a `*(uint32_t*)bytes_ptr` cast. Use `__packed` and `memcpy`, or compile with `-mno-unaligned-access`.
+
+## Power
+
+The Cortex-M0 is what you reach for when µA matters. The core itself draws ~16 µW/MHz at typical conditions on a 90 nm process and considerably less on 40 nm or smaller. In sleep (WFI clock-gated), the core current goes to leakage only. The real win is **shorter run-time** — at the same workload, an M0 finishes the work in roughly the same wall time as an M3 (DMIPS-per-MHz is close-ish) but burns less per cycle, so the integrated charge is smaller. Vendors pair the M0 with aggressive clock gating and multiple sleep modes; an STM32L011 (M0+ but representative) hits ~480 nA in standby.
+
+The deepest sleep mode (vendor-named "standby", "shutdown", or similar) typically powers down the core entirely. Wake-up is via a reset; the core boots from scratch. State is preserved only in a small "backup" SRAM region kept alive by the RTC supply. See the [low-power](/docs/cortex-m/low-power) page for the full sleep-mode taxonomy.
+
+<Callout type="tip" title="When to use M0 vs M0+">
+The M0+ is almost always the better choice for new designs — it's the same gate-count budget with a 2-stage pipeline (one cycle off taken branches), an optional MPU, and single-cycle GPIO on some vendors. The M0 lingers because of older parts still in active product lines; STMicroelectronics, NXP, Nordic and others all moved their cheapest tier to M0+ years ago. Pick M0 only if you're constrained to a specific part.
+</Callout>
+
+## Programming model differences vs M3/M4
+
+If you've written for the M3 and are moving down to M0, here's the migration checklist:
+
+- **No CBZ/CBNZ** — compare-and-branch must be two instructions (CMP then BEQ/BNE).
+- **No IT blocks** — conditional execution requires explicit branches. Code density suffers slightly.
+- **No UDIV/SDIV** — every division costs a libgcc call. Hot loops should multiply by reciprocals or shift.
+- **No CLZ** — `__builtin_clz` becomes a small software helper.
+- **No LDREX/STREX** — atomics rely on disabling interrupts (`CPSID i` / `CPSIE i`) instead of exclusive monitors. Single-core M0 still has reliable atomics this way, but you cannot port lock-free algorithms designed around LL/SC.
+- **No `IT`-based conditional MOV** — write explicit `B`s.
+- **Limited high-register access** — `MOV r8, r0` works, but `ADD r8, r9, r10` doesn't (only `MOV`, `ADD`, `CMP`, `BX` reach high registers).
+
+These all compile silently — GCC will emit slower but functionally equivalent sequences. The performance hit is rarely more than 10–15% for typical control code.
+
+## Representative parts
+
+| Part | Vendor | Flash | RAM | Peripherals | Note |
+|---|---|---|---|---|---|
+| LPC1114 | NXP | 32 KB | 8 KB | UART, SPI, I2C, ADC, GPIO | First mass-market M0, ~$1 in volume |
+| STM32F030 | STMicro | 16–256 KB | 4–32 KB | USART, SPI, I2C, 12-bit ADC | "Value line" — extremely cheap, no USB |
+| nRF51822 | Nordic | 128–256 KB | 16–32 KB | 2.4 GHz radio (BLE), SoftDevice stack | Legacy BLE chip, replaced by nRF52 (M4) |
+| SAMD20 | Microchip | 16–256 KB | 2–32 KB | SERCOM (configurable UART/SPI/I2C) | M0+ successor (SAMD21) ships in higher volume |
+| Kinetis KL0x | NXP | 8–32 KB | 1–4 KB | Low-cost, no USB | Ultra-low-power tier |
+
+## When to choose Cortex-M0
+
+Choose M0 when **cost and silicon area dominate** and you don't need: floating-point, hardware divide, DSP, MPU, or more than four interrupt priorities. Typical fits are sensor front-ends, simple HMIs, BLDC commutation (where determinism matters more than DMIPS), battery-powered sensor nodes, and legacy 8-bit replacements. If your application uses any flavor of cryptography that touches public-key math, a hardware divider would help — consider M0+ or M3.
+
+## Cross-references
+
+- [Cortex-M0+](/docs/cortex-m/m0plus) — the slightly better M0 you should usually pick instead
+- [Architecture comparison](/docs/cortex-m/architecture-compare) — side-by-side of every Cortex-M
+- [ARMv7-M vs ARMv8-M](/docs/architecture/memory-model) — what the bigger architecture profiles add
+- [NVIC overview](/docs/cortex-m/nvic) — the interrupt controller in detail
+- [Startup code](/docs/programming/startup) — bringing up an M0 from reset
+- ARMv6-M Architecture Reference Manual (DDI 0419) — the authoritative spec

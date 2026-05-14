@@ -1,0 +1,19 @@
+---
+import BaseLayout from '~/layouts/BaseLayout.astro';
+import Terminal from '~/components/Terminal.astro';
+---
+<BaseLayout title="404 — page not mapped" description="That path isn't in our address space." noIndex>
+  <section class="container-page grid min-h-[60vh] place-items-center py-16">
+    <div class="max-w-xl">
+      <div class="font-mono text-xs uppercase tracking-wider text-ink-faint">/ 0x0000_0404</div>
+      <h1 class="mt-2 font-display text-5xl font-semibold tracking-tight">HardFault</h1>
+      <p class="mt-4 text-ink-muted">That address isn't mapped. The page you're looking for either doesn't exist, has been moved, or was unmapped in a recent refactor.</p>
+      <Terminal title="armhub ~ trap">
+        <div><span class="text-err">!!</span> exception 3 · HardFault</div>
+        <div><span class="text-ink-faint">  PC </span> <span class="font-mono">0xFFFF_FFF1</span> <span class="text-ink-faint">(invalid)</span></div>
+        <div><span class="text-ink-faint">  LR </span> <span class="font-mono">{Astro.url.pathname}</span></div>
+        <div class="mt-2 text-ink-muted">tip · jump back to <a href="/" class="text-brand">/</a> or search with <kbd class="kbd">⌘</kbd><kbd class="kbd">K</kbd></div>
+      </Terminal>
+    </div>
+  </section>
+</BaseLayout>

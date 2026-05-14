@@ -1,0 +1,110 @@
+---
+title: STM32 (STMicroelectronics)
+description: The most prolific Cortex-M family — F0 through U5, plus the H7 / H5 high-end. Strengths, ecosystem, and the right line for the job.
+order: 1
+updated: 2026-05-12
+tags: [vendors, stm32, st]
+---
+
+import Callout from '~/components/Callout.astro';
+
+If you've used a Cortex-M, statistically you've used an STM32. STMicroelectronics ships >2 billion STM32 units a year across a dozen families, from ultra-low-cost C0 to the 480 MHz dual-core H7. The ecosystem (HAL, CubeMX, CubeIDE, Discovery/Nucleo boards, documentation) is rough around the edges but **vast** — for almost any problem there's a HAL example, an AN-XXXX application note, or a community post.
+
+## The families
+
+| Family    | Core                | Clock           | Position              |
+|-----------|---------------------|-----------------|-----------------------|
+| **STM32C0** | Cortex-M0+        | 48 MHz          | Lowest cost, 8-bit replacement |
+| **STM32F0** | Cortex-M0          | 48 MHz          | Mainstream entry, legacy        |
+| **STM32G0** | Cortex-M0+         | 64 MHz          | Modern mainstream entry, C0's bigger sibling |
+| **STM32L0** | Cortex-M0+         | 32 MHz          | Low-power M0+                 |
+| **STM32F1** | Cortex-M3          | 72 MHz          | Legacy classic, still shipping |
+| **STM32F2** | Cortex-M3          | 120 MHz         | Connectivity (Ethernet)        |
+| **STM32F3** | Cortex-M4          | 72 MHz          | Mixed-signal + analog peripherals |
+| **STM32F4** | Cortex-M4          | 84–180 MHz      | The workhorse — most popular M4 in the world |
+| **STM32F7** | Cortex-M7          | 216 MHz         | High-end M7 + L1 cache         |
+| **STM32G4** | Cortex-M4          | 170 MHz         | Motor control + digital power  |
+| **STM32H7** | Cortex-M7 (+M4)    | 480 MHz         | Top-end perf, single or dual-core |
+| **STM32H5** | Cortex-M33         | 250 MHz         | M33 successor to F4/F7         |
+| **STM32L4** | Cortex-M4          | 80 MHz          | Mainstream low-power           |
+| **STM32L5** | Cortex-M33         | 110 MHz         | Low-power + TrustZone          |
+| **STM32U5** | Cortex-M33         | 160 MHz         | Modern mainstream, TrustZone-first |
+| **STM32WB** | Cortex-M4 + M0+    | 64 MHz          | Wireless (BLE) + app core      |
+| **STM32WL** | Cortex-M4 (+M0+)   | 48 MHz          | LoRa / sub-GHz                 |
+| **STM32MP** | Cortex-A7 + M4     | 800 MHz / 209 MHz | Linux + RT companion         |
+
+## How to pick a line
+
+- **"I want cheapest possible 32-bit"** → STM32C0 ($0.30–$1.00).
+- **"I want a general-purpose modern entry MCU"** → STM32G0.
+- **"I want maximum ecosystem for an M4 mid-range design"** → STM32F4 (specifically F411 or F446).
+- **"I want maximum performance"** → STM32H7 (single-core 480 MHz) or H7 dual-core (M7 + M4 helper).
+- **"I want low-power for a battery-powered IoT device"** → STM32L4 (older) or STM32U5 (newer, recommended).
+- **"I want TrustZone for secure boot / PSA"** → STM32U5 or L5.
+- **"I want motor control or power"** → STM32G4.
+- **"I want Bluetooth Low Energy on chip"** → STM32WB.
+- **"I want LoRa on chip"** → STM32WL.
+- **"I need Linux + real-time"** → STM32MP (Cortex-A7 + Cortex-M4 on one die).
+
+## The ecosystem
+
+### CubeMX
+
+GUI configurator. You pick a chip, click through pin assignments and peripheral configurations, and it generates a project (Makefile, CMake, IDE-specific) with the HAL code initialised. Pretty good for bring-up; opinionated about HAL usage. Many production teams generate CubeMX code once for the init scaffolding and then write their own peripheral drivers on top.
+
+### HAL vs LL
+
+**HAL** — the "Hardware Abstraction Layer". Higher level, callback-based, portable across STM32 families. `HAL_UART_Init`, `HAL_UART_Transmit_DMA`. Reasonable performance, plenty of code overhead.
+
+**LL** — "Low-Layer". Inline functions directly mapping to register writes. Same as writing the registers yourself but with named macros. Faster, smaller, less portable.
+
+Use HAL for fast development. Drop to LL (or raw registers via CMSIS) for hot paths.
+
+### CubeIDE
+
+Eclipse-based IDE bundled by ST. Free. Works fine but slower than CLion/VS Code for the same projects. Most production teams use CubeIDE for the integrated CubeMX experience and then VS Code with CMake for daily work.
+
+### Documentation
+
+Every chip has:
+- **Datasheet** — pinout, electrical characteristics, package info.
+- **Reference Manual (RM)** — register-level details. Often 1500+ pages.
+- **Programming Manual (PM)** — Cortex-M ISA reference (mostly redundant with ARM's docs).
+- **Application Notes (AN)** — per-topic deep dives. The hidden gold; there are excellent ANs on motor control, USB, secure boot, RTC.
+- **Errata sheet** — bugs in the silicon. Always check.
+
+The RM is your daily reference once you're past bring-up. Bookmark it.
+
+## STM32-specific things to know
+
+### Two PLLs and a clock tree to study
+
+The clock tree on STM32H7 has three PLLs feeding multiple bus and peripheral domains. Getting clocks right is the first hard problem on any STM32 project. CubeMX has a graphical clock-tree configurator — use it.
+
+### `BSRR` is your friend
+
+The Bit Set/Reset Register on every STM32 GPIO is **atomic** — setting and clearing pins doesn't need read-modify-write. Use it instead of `ODR |= ...`. See [GPIO](/docs/peripherals/gpio/).
+
+### Boot pins
+
+`BOOT0` (and on some chips `BOOT1`) select the boot mode: from flash, from system memory (ROM bootloader), or from SRAM. The ROM bootloader supports flashing over UART, USB DFU, SPI, I²C, CAN. Saves you from a brick if SWD ever fails.
+
+### Option bytes and RDP
+
+Each STM32 has **option bytes** controlling watchdog config, brown-out, write protection, and **Read Out Protection (RDP)**:
+- **RDP Level 0** — fully open.
+- **RDP Level 1** — flash read disabled via SWD, but you can revert to Level 0 (mass-erasing the chip).
+- **RDP Level 2** — permanently locked. SWD disabled forever. **Cannot be undone.**
+
+Set Level 2 only on production binaries — and only on chips you've already qualified. Test extensively in Level 1 first.
+
+<Callout type="warn" title="RDP Level 2 is irreversible. Once set, you can't recover via SWD.">
+Many an engineer has bricked dev boards by accidentally setting RDP 2 on the wrong chip. Use script gates and double-confirmation in your factory programming flow.
+</Callout>
+
+## See also
+
+- [Cortex-M4](/docs/cortex-m/m4/) — what the F4 family is built on.
+- [Cortex-M7](/docs/cortex-m/m7/) — H7 details.
+- [Cortex-M33](/docs/cortex-m/m33-m23/) — U5/L5/H5 details.
+- [STM32 reference manuals](https://www.st.com/en/microcontrollers-microprocessors.html) (external).

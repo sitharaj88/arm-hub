@@ -1,0 +1,55 @@
+---
+interface Heading { depth: number; slug: string; text: string }
+interface Props { headings: Heading[] }
+const { headings = [] } = Astro.props;
+const items = headings.filter((h) => h.depth === 2 || h.depth === 3);
+---
+{items.length > 0 && (
+  <aside class="hidden xl:block">
+    <div class="sticky top-16 max-h-[calc(100vh-4rem)] overflow-y-auto scrollbar-thin py-6 pl-6 text-sm">
+      <div class="mb-3 font-mono text-[0.7rem] uppercase tracking-wider text-ink-faint">On this page</div>
+      <ul class="space-y-1 border-l border-line/70 text-ink-muted">
+        {items.map((h) => (
+          <li>
+            <a
+              href={`#${h.slug}`}
+              data-toc-slug={h.slug}
+              class:list={[
+                'block border-l-2 -ml-px pl-3 py-0.5 transition hover:text-ink',
+                h.depth === 3 ? 'pl-6 text-[0.85em]' : '',
+                'border-transparent hover:border-brand/40',
+              ]}
+            >
+              {h.text}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  </aside>
+)}
+
+<script>
+  const links = document.querySelectorAll<HTMLAnchorElement>('[data-toc-slug]');
+  if (links.length) {
+    const map = new Map<string, HTMLAnchorElement>();
+    links.forEach((a) => map.set(a.dataset.tocSlug!, a));
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          const link = map.get(entry.target.id);
+          if (!link) return;
+          if (entry.isIntersecting) {
+            links.forEach((l) => l.classList.remove('text-brand', 'border-brand/60', '!border-brand/60'));
+            link.classList.add('text-brand', '!border-brand/60');
+          }
+        });
+      },
+      { rootMargin: '-80px 0px -75% 0px', threshold: 0.1 }
+    );
+    map.forEach((_l, slug) => {
+      const el = document.getElementById(slug);
+      if (el) observer.observe(el);
+    });
+  }
+</script>

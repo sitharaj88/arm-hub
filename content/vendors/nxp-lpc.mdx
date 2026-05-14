@@ -1,0 +1,136 @@
+---
+title: NXP LPC family
+description: NXP's LPC microcontrollers — LPC54xxx M4+M0+ dual core, LPC55Sxx M33 with TrustZone and PUF, LPC845 low-cost M0+. State-Configurable Timer, MCUXpresso ecosystem, and how LPC differs from i.MX RT.
+order: 14
+updated: 2026-05-13
+tags: [vendors, nxp, lpc, lpc55s, cortex-m33, puf, sctimer]
+---
+
+NXP's LPC line is the longest-running Cortex-M family from any vendor — the original LPC1700 series shipped in 2008, before STM32 existed in its modern form. Over five generations LPC evolved from pure Cortex-M3 into a multi-core M4+M0+ portfolio (LPC54xxx) and then a TrustZone-enabled M33 family (LPC55Sxx) with hardware security features that beat most competitors: a PUF (Physically Unclonable Function) for hardware-bound key derivation, a CASPER cryptographic coprocessor, secure boot ROM with rollback protection, and DICE attestation.
+
+Alongside LPC sits NXP's i.MX RT "crossover" line (Cortex-M7 at 600 MHz to 1 GHz, separate page) and the Kinetis line (now mostly merged into LPC's branding). This page focuses on the LPC family proper — what makes the architecture distinct and where it lives in real designs.
+
+<SpecSheet
+  title="NXP LPC at a glance"
+  specs={[
+    { label: 'LPC845 / LPC8xx', value: 'Cortex-M0+ @ 30 MHz, 64 KB Flash, 16 KB RAM; cost-optimised, Switch Matrix for any-pin-anywhere routing' },
+    { label: 'LPC11xx / LPC15xx', value: 'Older M0/M3 lines, still in production' },
+    { label: 'LPC54xxx', value: 'Cortex-M4F @ 220 MHz + optional Cortex-M0+ @ 100 MHz (LPC54114/40); HS USB, Ethernet, SD/MMC, FlexComm' },
+    { label: 'LPC55S6x / S2x / S1x', value: 'Cortex-M33 @ 150 MHz with TrustZone; PUF, CASPER PKC accelerator, secure boot ROM' },
+    { label: 'LPC55S69 (flagship)', value: 'Dual M33 @ 150 MHz (one secure-only, one non-secure), 640 KB Flash, 320 KB RAM' },
+    { label: 'Process node', value: 'LPC54xxx: 40 nm; LPC55Sxx: 40 nm ULP' },
+    { label: 'SCTimer/PWM', value: 'State-Configurable Timer — programmable state machine on top of a 32-bit counter; replaces complex hand-coded PWM' },
+    { label: 'Ecosystem', value: 'MCUXpresso IDE (Eclipse), MCUXpresso SDK (BSD source), MCUXpresso Config Tools, SDK Builder web' },
+    { label: 'OS', value: 'FreeRTOS (bundled), Zephyr (NXP is a Tier-1 contributor), MCUXpresso RTOS' },
+  ]}
+/>
+
+## LPC845 — the small one done right
+
+LPC845 (and the broader LPC8xx series) is NXP's response to the question "how small can a useful Cortex-M0+ be?". 30 MHz, 64 KB Flash, 16 KB RAM, in a TSSOP-20 or QFN-33. Where it differentiates is in two features:
+
+**Switch Matrix.** Most MCUs map peripherals to fixed pins, with limited "alternate functions" per pin. LPC845's Switch Matrix decouples the two — any movable function (UART TX/RX/CTS, SPI MISO/MOSI/SCK, I2C SDA/SCL, PWM, comparator output, etc.) can be routed to any GPIO. The Switch Matrix is configured at runtime via a register interface; in practice you set it up once in `main` and forget. The benefit is PCB freedom — you route to whichever pin minimises crossings, and the firmware adapts.
+
+**FlexComm.** A unified serial peripheral block that can be UART, SPI, I2C, or I2S, switchable in software. The same physical channel runs as a UART for boot-time debug and an SPI for sensor reads in normal operation. This sounds like a gimmick until you're trying to fit nine serial interfaces onto a 33-pin chip — FlexComm is what makes it work.
+
+LPC845 lands in remotes, smart switches, sensor edge nodes, and motor-control IO expansion. The MCUXpresso SDK package is small enough to build start-to-Hello-World in 30 seconds.
+
+## LPC54xxx — the M4+M0+ dual core
+
+LPC54114 was the first NXP "asymmetric dual core" — an M4F doing application work alongside an M0+ doing IO. LPC5400 series scaled this up: M4F at 220 MHz, optional M0+ at 100 MHz, up to 512 KB Flash, 200 KB RAM, plus the heavyweights — Hi-Speed USB with on-chip PHY, 10/100 Ethernet, SD/MMC controller, two-channel high-resolution audio I2S, and the SCTimer.
+
+The dual-core split here is different from STM32H7's M7+M4: on LPC54xxx the M0+ is a small auxiliary helper, not a peer. Typical use is offloading a fast-poll IO task — bit-banging a custom protocol, doing tight-timing UART handshakes, running a state machine on a GPIO — leaving the M4F free for the application proper. The cores share SRAM and Flash; an IPC mailbox via a 32-bit register pair gives them a way to talk.
+
+| Variant | M4 Flash | M4 RAM | M0+ | Notes |
+|---------|----------|--------|-----|-------|
+| LPC54101 | 256 KB | 104 KB | Yes | Cheapest M4+M0+ |
+| LPC54114 | 256 KB | 104 KB | Yes | Adds USB FS |
+| LPC54608 | 512 KB | 200 KB | No | HS USB, Ethernet, SD, audio |
+| LPC54618 | 512 KB | 200 KB | No | + LCD controller |
+| LPC54628 | 512 KB | 200 KB | No | + SDRAM controller, larger pin counts |
+
+LPC546xx is the natural home for "industrial gateway + display + Ethernet" designs where the user wants something more capable than STM32F4 but cheaper than i.MX RT.
+
+## LPC55Sxx — TrustZone, PUF, and secure boot
+
+LPC55Sxx is NXP's flagship secure-MCU line. Cortex-M33 with TrustZone, single core (LPC55S1x/S2x/S6x) or dual M33 (LPC55S69 — both cores M33 with TrustZone, one running secure-only, the other available for non-secure app), and a stack of security features:
+
+**PUF (Physically Unclonable Function).** A hardware block that derives a unique 256-bit key from manufacturing variability in the silicon — the same chip always produces the same key, but no two chips do, and the key never appears in any register. You use the PUF to wrap (encrypt) application-level keys before storing them in Flash; on boot, the PUF unwraps them. The wrapped key is useless if extracted from Flash because no other chip can unwrap it. This defeats whole categories of physical attacks.
+
+**CASPER.** A public-key crypto accelerator — 256-bit and 384-bit ECC, RSA-2048, RSA-4096. Speeds up TLS handshakes, signature verification, and secure boot.
+
+**Secure boot ROM (RTRT, "ROM-based Trust Root").** The boot ROM verifies the application image against a signed manifest before jumping into it. Rollback protection: a monotonic counter prevents downgrading to an older (potentially vulnerable) image. DICE attestation generates a measurement of the image and a derived key, letting upstream software prove what image is running.
+
+**ELU (Encryption-Less Unique).** Hardware fixed unique 128-bit chip ID for serial-number purposes.
+
+**On-chip random number generation.** True random (TRNG) backed by ring oscillators, NIST SP 800-90B compliant.
+
+| Feature | LPC55S69 | STM32U5 (comparison) |
+|---------|----------|----------------------|
+| Core | 2× M33 @ 150 MHz | M33 @ 160 MHz |
+| TrustZone | Yes | Yes |
+| Secure boot | ROM-based, rollback-protected | RSS + SBSFU |
+| PUF | Yes (SRAM PUF + key wrap) | No (chip UID only) |
+| AES | 128/256 + GCM | 128/256 + GCM |
+| ECC | 256, 384, 521 (CASPER) | 256, 384 (PKA) |
+| TRNG | NIST SP 800-90B | NIST SP 800-90B |
+| Common Criteria readiness | EAL5+ artifact | EAL4+ |
+
+For products that need to pass formal security certification — payment terminals, smart-card readers, automotive secure gateways, government communication devices — LPC55Sxx is the differentiator. The PUF in particular is hard to match: NXP, Renesas, and Microchip have it; STMicro and TI's MCU lines do not.
+
+<Callout type="warn">
+PUF use is one-shot at enrollment. The first time you generate a key, the PUF reads "Activation Code" from a write-once region. Lose the activation code and the key cannot be regenerated. Production flow: enroll at factory test, archive the activation code in a secure manufacturing database, recover from the database if the chip needs reflash. Do not throw away activation codes.
+</Callout>
+
+## SCTimer/PWM — the differentiator
+
+The State-Configurable Timer is NXP's most distinctive peripheral. Rather than a fixed-function PWM with capture and compare, it's a programmable state machine on top of a 32-bit counter:
+
+- 8 (or 16) states, with transitions on counter match or external event.
+- Each state controls up to 16 outputs (set, clear, toggle, none).
+- Up to 8 events (timer match, input edge, software trigger) drive state transitions.
+
+This lets one peripheral implement protocols that would otherwise take CPU intervention or multiple peripherals chained with DMA:
+
+- Stepper-motor microstepping sequences with non-linear timing.
+- Bidirectional DSHOT (digital ESC protocol with telemetry response within the bit time).
+- High-resolution PWM with dead-time inserts for half-bridge drives.
+- Custom serial protocols (LIN, J1939 segments, proprietary).
+- Software-defined SPI variants with non-standard idle states.
+
+The downside: programming the SCTimer is harder than a vanilla PWM. NXP's MCUXpresso Config Tools have an SCTimer designer with a graphical state-machine view, which significantly lowers the bar.
+
+## MCUXpresso ecosystem
+
+NXP's tooling stack has consolidated under the **MCUXpresso** brand:
+
+- **MCUXpresso IDE** — Eclipse-based, includes GCC, OpenOCD/LinkServer/SEGGER probes, FreeRTOS-aware debug, peripheral views. Free.
+- **MCUXpresso SDK** — driver and middleware bundle. BSD-licensed source. Includes FreeRTOS, FatFS, lwIP, USB stack, BLE host (for LPC55S/RT600 with KW radio), audio framework. Downloaded from the SDK Builder web portal — you pick the chip and the optional middleware, and get a tailored zip.
+- **MCUXpresso Config Tools** — graphical configurator for pinmux, peripheral init, clock tree, and the SCTimer. Generates source.
+- **MCUXpresso Insight** — runtime profiler / variable graphing over SWO.
+- **MCUXpresso Secure Provisioning** — production tooling for PUF enrollment, secure boot key injection, and certificate generation.
+
+For most LPC parts the SDK is also exposed as a Zephyr "module" — NXP contributes the Zephyr drivers and you can choose Zephyr instead of MCUXpresso SDK if you prefer. The choice is mostly about scope (Zephyr for cross-vendor portability, MCUXpresso SDK for tightest integration).
+
+<Callout type="tip">
+LPC's `ROM-based bootloader` is a feature often missed in evaluation. Every LPC55Sxx has a UART/SPI/I2C/USB ISP bootloader in masked ROM that can flash the chip without any external programming hardware — useful for production line bring-up, field recovery, and prototyping. Drive the ISP pin low at reset and you get a `blhost`-compatible interface.
+</Callout>
+
+## Where LPC fits
+
+NXP positions LPC as the "secure mainstream" play — more security than STM32 mainstream, less compute than i.MX RT. Real product fits:
+
+- **LPC845** — wireless remotes, button panels, IO expanders, simple sensors.
+- **LPC54xxx** — industrial controllers needing Ethernet + USB-HS + display, audio capture systems, small HMI panels.
+- **LPC55Sxx** — payment terminals, secure gateways, electronic locks, automotive secure storage, IoT-as-a-service modules, smart-meter SE (secure element). Anywhere "the chip must protect a key" is the requirement.
+
+For pure CPU performance with Linux capability, NXP wants you on i.MX 8 or i.MX 93 (covered under the [Sitara](/docs/vendors/ti-sitara) competitor page). For pure cost on a M0+, LPC845 fights with STM32G0 and Microchip SAML10.
+
+## Cross-references
+
+- [Nordic nRF53](/docs/vendors/nordic-nrf53) — alternative dual-M33 with integrated radio.
+- [STM32 low-power L, U](/docs/vendors/stm32-lowpower) — TrustZone competitor.
+- [Cortex-M33](/docs/cortex-m/m33) — the core in LPC55Sxx.
+- [TrustZone-M](/docs/security/trustzone-m) — secure / non-secure partitioning.
+- NXP UM11126 (LPC55Sxx reference manual), UM10912 (LPC54xxx), UM11029 (LPC8xx).
+- NXP AN12283 — "PUF in LPC55S69" application note.

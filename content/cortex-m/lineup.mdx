@@ -1,0 +1,141 @@
+---
+title: The Cortex-M lineup
+description: Every Cortex-M core from M0 to M85 — what changed, what it costs, when to pick it.
+order: 1
+updated: 2026-05-12
+tags: [cortex-m, cores, selection]
+---
+
+
+The Cortex-M family spans almost two orders of magnitude in performance, from ~12k-gate M0 cores fit for power-budget-constrained sensors all the way to the superscalar M85 running edge ML inference. The trick is matching a core to the product.
+
+<SpecSheet
+  title="Cortex-M lineup — quick reference"
+  specs={[
+    { label: 'Lineage span', value: '2009 (Cortex-M0) through 2022 (Cortex-M85); ARMv6-M to ARMv8.1-M' },
+    { label: 'Smallest', value: 'Cortex-M0 — ~12k gates, ARMv6-M, 0.84 DMIPS/MHz, no MPU on most implementations' },
+    { label: 'Largest', value: 'Cortex-M85 — dual-issue, branch-predicted, Helium-equipped, 4.75 CoreMark/MHz, PACBTI' },
+    { label: 'TrustZone tier', value: 'Cortex-M23 (Baseline) and M33/M35P/M52/M55/M85 (Mainline) — v8-M cores' },
+    { label: 'Vector tier (Helium / MVE)', value: 'Cortex-M52, M55, M85 — v8.1-M only' },
+    { label: 'FPU tier', value: 'M4F (single-prec), M7 (single or double, synthesis-time), M33 (single, optional), M55/M85 (Helium-FP variant)' },
+    { label: 'Cache tier', value: 'M7 only (L1 I+D, 4-64 KB each); no other Cortex-M ships caches' },
+    { label: 'FPGA-only', value: 'Cortex-M1 (ARMv6-M soft core for Xilinx / Altera fabrics)' },
+    { label: 'Discontinued / very rare', value: 'Cortex-M35P (M33 with physical countermeasures, niche)' },
+  ]}
+/>
+
+<CoreCompare />
+
+## Quick selector
+
+- **Battery-powered sensor, microamp budget** → Cortex-M0+ or M23
+- **General-purpose firmware, plenty of headroom** → Cortex-M4 (or M33 if you need TrustZone)
+- **DSP / audio / motor control** → Cortex-M4 (DSP) or Cortex-M7 (more memory + caches)
+- **Networking, USB host, multi-protocol stacks** → Cortex-M7
+- **Edge ML, voice activation, sensor fusion** → Cortex-M55 or M85 (Helium)
+- **Automotive ECU with ASIL-B / ASIL-D** → look at Cortex-R, not Cortex-M
+
+## Generational shifts
+
+### v6-M → v7-M (M0/M0+ → M3)
+
+The jump from Cortex-M0+ to M3 is the *biggest* in the lineup. M3 gains the full Thumb-2 ISA (~150 more instructions), hardware divide, bit-banding, and the full 256-priority NVIC. Performance roughly doubles per MHz. If you're choosing between an M0+ and an M3 at the same clock, the M3 will out-perform it on almost any non-trivial code.
+
+### v7-M → v7E-M (M3 → M4)
+
+Adds DSP (SIMD on packed 8/16-bit lanes in 32-bit registers) and optional single-precision FPU. Same pipeline, same NVIC, same memory model — drop-in for most code. Costs ~30% more silicon area than M3.
+
+### v7E-M scalar → v7E-M superscalar (M4 → M7)
+
+Cortex-M7 widens to a 6-stage dual-issue pipeline, adds L1 I+D caches, ITCM/DTCM tightly coupled memories, and double-precision FPU. ~70% faster per MHz than M4. The trade-off: caches make timing analysis harder and bring coherency questions back into the picture (DMA needs invalidation/cleanup).
+
+### v7E-M → v8-M (M4 → M33)
+
+Same approximate scalar performance, but adds **TrustZone-M**, stack-limit registers, and a refreshed exception model. The big reason to pick M33 over M4 is when you need attestable secure boot and key isolation.
+
+### v8-M → v8.1-M (M33 → M55 / M85)
+
+Adds **Helium / MVE** (vector extension), low-overhead loops, **PACBTI**. M85 also bumps the scalar pipeline to 7-stage dual-issue and ships with branch prediction. For non-vector code, M85 is ~2× M33; for DSP/ML, M55 alone is ~4–5× M4.
+
+## What about Cortex-M1, M7TCM, M35P, M52?
+
+- **Cortex-M1** — an FPGA-optimised Cortex-M (ARMv6-M). Rarely used outside Xilinx soft-core designs.
+- **Cortex-M35P** — a Cortex-M33 with added physical security countermeasures (tamper, anti-side-channel). Niche secure-element use.
+- **Cortex-M52** — a baby sibling of M55 (2023): Helium + TrustZone in a smaller footprint, aimed at high-volume IoT.
+- **Cortex-M7 + double-precision** — note that on M7 you can configure single-only or single+double FPUs; vendors choose at synthesis time.
+
+<Callout type="tip" title="The pragmatic shortcut">
+80% of new general-purpose MCU designs end up on a Cortex-M4 or Cortex-M33. Pick M4 if you want maximum ecosystem maturity; pick M33 if you want TrustZone or are starting a 10-year product where M4 may be EoL'd.
+</Callout>
+
+## Bus and system width
+
+All Cortex-M cores have a 32-bit AHB interface. Higher-end cores (M7, M55, M85) have separate buses for instruction/data/system, allowing simultaneous flash fetch + SRAM data access — critical for sustaining their higher IPC.
+
+## Comprehensive feature matrix
+
+The table below captures every commercially relevant Cortex-M with its key architectural traits and typical clock targets. Use it as the single source of truth when scoping a new chip.
+
+| Core | Year | ISA | Pipeline | FPU | DSP | MVE / Helium | TrustZone | Typical clock | DMIPS/MHz | CoreMark/MHz | Target market |
+|------|------|-----|----------|-----|-----|--------------|-----------|---------------|-----------|--------------|---------------|
+| Cortex-M0 | 2009 | ARMv6-M | 3-stage in-order | no | no | no | no | up to 50 MHz | 0.84 | 2.33 | Sensor, BLE peripheral, cost-down |
+| Cortex-M0+ | 2012 | ARMv6-M | 2-stage in-order | no | no | no | no | up to 80 MHz | 0.95 | 2.46 | Ultra-low-power, secondary core |
+| Cortex-M1 | 2007 | ARMv6-M | 3-stage in-order | no | no | no | no | up to 200 MHz (FPGA) | 0.8 | 1.85 | FPGA soft core (Xilinx, Altera) |
+| Cortex-M3 | 2004 | ARMv7-M | 3-stage in-order, branch spec | no | no | no | no | up to 120 MHz | 1.25 | 3.34 | Mainstream MCU |
+| Cortex-M4 | 2010 | ARMv7E-M | 3-stage in-order, branch spec | optional single | yes | no | no | up to 200 MHz | 1.25 | 3.42 | Mainstream + DSP |
+| Cortex-M7 | 2014 | ARMv7E-M | 6-stage dual-issue, L1 I+D | single or double | yes | no | no | up to 600 MHz (crossover) | 2.14 | 5.04 | High-perf MCU, crossover |
+| Cortex-M23 | 2016 | ARMv8-M Baseline | 2-stage in-order | no | no | no | yes | up to 80 MHz | 0.98 | 2.5 | Low-power + secure |
+| Cortex-M33 | 2016 | ARMv8-M Mainline | 3-stage in-order | optional single | optional | no | yes | up to 200 MHz | 1.50 | 4.02 | Secure mainstream |
+| Cortex-M35P | 2018 | ARMv8-M Mainline | 3-stage in-order | optional single | optional | no | yes | up to 150 MHz | 1.50 | 4.02 | Niche, physical security |
+| Cortex-M52 | 2023 | ARMv8.1-M | 3-stage in-order, LOL | single | yes | yes (MVE-I or -F) | yes | up to 200 MHz | 1.6 | 4.1 | High-volume edge ML / IoT |
+| Cortex-M55 | 2020 | ARMv8.1-M | 4-stage in-order, LOL, MVE | single | yes | yes (MVE-I or -F) | yes | up to 500 MHz | 1.6 | 4.4 | Edge ML, voice, vision |
+| Cortex-M85 | 2022 | ARMv8.1-M | 7-stage dual-issue, LOL, MVE, branch pred | single | yes | yes (MVE-I or -F) | yes | up to 600+ MHz | 3.0 | 6.28 | High-end edge ML, Cortex-A7 replacement |
+
+A few notes the table can't show:
+
+- **CoreMark/MHz** numbers are ARM-reported best cases. Real silicon at production clocks runs roughly 10-20% lower due to flash wait states and memory bandwidth.
+- **Cortex-M52 and M55** ship the same Helium ISA but M52 trades clock speed for area; M52 is the volume part and M55 the performance part.
+- **Cortex-M0 versus M0+**: the M0+ is faster *per cycle* (2-stage pipeline halves branch penalty) and ships with optional MPU and bit-banding (very rare). Most M0+ silicon runs at the same clock as the equivalent M0.
+- **Cortex-M7** is the only core with caches. This makes timing analysis harder (cache misses are stochastic) and brings back coherency concerns (the D-cache is *not* coherent with DMA — you invalidate/clean by hand around every DMA buffer).
+
+## Choosing across vendors at each tier
+
+Because almost every vendor makes parts at multiple Cortex-M tiers, the practical selection question is "which vendor's M4 / M33 / M7 should I use?" The pragmatic guidance:
+
+- **Cortex-M0 / M0+** — STM32C0/G0 for cost, RP2040 for hobby and PIO use, Nordic nRF52810 for BLE peripherals. SAM D21 if you want SERCOM flexibility.
+- **Cortex-M3** — STM32F1 / F2 still dominate volume. Avoid for greenfield; the M3 ecosystem is in maintenance.
+- **Cortex-M4F** — STM32F4 / G4 / L4 are the gold standard. NXP Kinetis K and i.MX RT500-M4 helper variants for industrial. SAM E54 if you need Ethernet + CAN-FD in one part. Tiva TM4C129 if you have legacy.
+- **Cortex-M7** — STM32H7 dominates the mainstream M7 market. NXP i.MX RT for crossover (XIP + cache, no internal flash). SAM E70/V71 for AEC-Q100 automotive M7.
+- **Cortex-M23** — STM32L5/U5 (Baseline-class M33 actually), Nordic nRF54L, SAM L11. Rarely picked solo; usually one half of a dual-core M33+M23.
+- **Cortex-M33** — STM32U5 / U0, Nordic nRF54L / nRF5340, NXP LPC55Sxx / MCX-N, RP2350, EFR32xG24. Most diverse tier in the lineup.
+- **Cortex-M55 / M85** — STM32N6, NXP RT700, Renesas RA8M1, Alif Semiconductor Ensemble. Small but growing.
+
+## Future-proofing — what's likely to change
+
+The Cortex-M roadmap as of 2025-2026 shows three trends:
+
+1. **TrustZone becomes mandatory** for any new design. Pure v7-M parts (M3, M4, M7) are increasingly limited to legacy and ultra-cost-sensitive niches.
+2. **Helium-equipped cores spread downward.** M52 (2023) brought MVE to a mid-range price point; volume MCUs at this tier will be common by 2026-2027.
+3. **NPUs become a peripheral.** Rather than relying on Helium alone, vendors integrate dedicated NPU IP (NXP eIQ Neutron, ST NPU on STM32N6, ARM Ethos-U55/U65). The Cortex-M core's role becomes "secure boot, control plane, NPU dispatch."
+
+For a senior engineer scoping a 10-year product, the safest bet today is Cortex-M33 (or M52 if you want vector headroom). Cortex-M85 is the right pick when you specifically need its dual-issue scalar performance and either Helium or NPU dispatch on the same die.
+
+<Callout type="warn" title="The lineup is wider than the marketing pages suggest">
+ARM publishes a clean three-line story: M0/M0+ for low-power, M3/M4/M7 for mainstream, M23/M33/M55/M85 for secure/ML. Reality is messier — Cortex-M35P exists, Cortex-M1 still ships in FPGA designs, and Cortex-M7 has synthesis-time options that produce noticeably different chips. When evaluating silicon, read the implementation parameters in the chip's reference manual, not just "Cortex-M7 inside."
+</Callout>
+
+## Cross-references
+
+- [Cortex-M3](/docs/cortex-m/m3/) — the original mainstream Cortex-M.
+- [Cortex-M4](/docs/cortex-m/m4/) — the workhorse.
+- [Cortex-M7](/docs/cortex-m/m7/) — caches, TCM, and the bus topology.
+- [Cortex-M0 / M0+](/docs/cortex-m/m0-m0plus/) — the entry tier.
+- [Cortex-M33 / M23](/docs/cortex-m/m33-m23/) — the v8-M cores.
+- [Cortex-M55 / M85](/docs/cortex-m/m55-m85/) — Helium and PACBTI.
+- [ARM ISA family](/docs/architecture/isa-family/) — which ISA each core uses.
+- [ARMv7-M vs ARMv8-M](/docs/architecture/armv7m-armv8m/) — generational deltas.
+- [TrustZone](/docs/architecture/trustzone/) — for the v8-M tier.
+- [NVIC priority](/docs/cortex-m/nvic-priority/), [MPU on Cortex-M](/docs/cortex-m/mpu/), [SysTick & timing](/docs/cortex-m/systick/) — common subsystems.
+- [STMicro](/docs/vendors/stm/), [NXP](/docs/vendors/nxp/), [Nordic](/docs/vendors/nordic/), [Renesas](/docs/vendors/renesas/), [Silicon Labs](/docs/vendors/silabs/), [Infineon](/docs/vendors/infineon/), [Microchip](/docs/vendors/microchip/), [TI](/docs/vendors/ti/), [Raspberry Pi](/docs/vendors/raspberry/) — which vendor for each tier.
+- [QEMU & Renode](/docs/tools/sim/) — simulator coverage per core.
+- [Interrupt latency tool](/tools/interrupt-latency) — compare ISR latency across cores.

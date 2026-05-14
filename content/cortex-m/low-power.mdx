@@ -1,0 +1,218 @@
+---
+title: Low-power & sleep modes
+description: WFI, WFE, sleep / deep-sleep / standby. SCB.SCR.SLEEPDEEP, SLEEPONEXIT, the event registers, wake-up sources, and power consumption tradeoffs.
+order: 24
+updated: 2026-05-13
+tags: [cortex-m, low-power, sleep, wfi, wfe, deep-sleep, standby]
+---
+
+Battery life on a Cortex-M part is rarely about how fast the core can run — it's about how aggressively it can stop. A typical sensor node spends 99.9% of its time asleep and 0.1% of its time waking up, reading sensors, transmitting, and going back to sleep. The choice of sleep mode dominates average current draw by two or three orders of magnitude: running active at 13 mA versus stop mode at 1.2 µA is the difference between a one-day and a one-year battery life.
+
+The Cortex-M architecture defines two sleep mechanisms: **WFI** (Wait For Interrupt) and **WFE** (Wait For Event), and one configuration bit (`SCB->SCR.SLEEPDEEP`) that tells the implementation whether WFI/WFE means "ordinary sleep" or "deep sleep." Beyond that, every vendor layers its own power-mode taxonomy — Run, Sleep, Stop, Standby, Shutdown, names varying by chipset — on top. Understanding the architectural layer first makes the vendor-specific layer easier to navigate.
+
+<SpecSheet
+  title="Low-power at a glance"
+  specs={[
+    { label: 'Architectural sleep modes', value: 'Sleep (WFI/WFE with SLEEPDEEP=0) and Deep Sleep (WFI/WFE with SLEEPDEEP=1)' },
+    { label: 'WFI', value: 'Wait For Interrupt — sleep until an IRQ pends with priority high enough to be taken' },
+    { label: 'WFE', value: 'Wait For Event — sleep until an event is signalled (SEV, interrupt with SEVONPEND, or external event)' },
+    { label: 'SLEEPONEXIT', value: 'SCB->SCR bit — core auto-sleeps when returning to thread mode' },
+    { label: 'WIC', value: 'Wake-up Interrupt Controller — shadow NVIC for deep sleep on M0+/M23/M33/M55/M85' },
+    { label: 'Typical Run current', value: 'STM32L4 at 80 MHz: ~7–13 mA' },
+    { label: 'Typical Sleep current', value: 'STM32L4 sleep: ~1.5 mA (clocks gated, RAM retained)' },
+    { label: 'Typical Stop current', value: 'STM32L4 Stop 2: ~1.2 µA (clocks off except LSI, RAM retained)' },
+    { label: 'Typical Standby current', value: 'STM32L4 Standby: ~120 nA (RAM lost except backup)' },
+  ]}
+/>
+
+## The architectural mechanisms
+
+The Cortex-M architecture defines exactly two instructions for entering sleep:
+
+### WFI — Wait For Interrupt
+
+`WFI` halts the core's instruction pipeline. The core clock can be gated (or fully stopped, in deep sleep). The core stays in this state until an interrupt pends with priority high enough to preempt the current execution priority and is not masked.
+
+```c
+__WFI();   /* CMSIS — emits the WFI instruction */
+```
+
+Three cases trigger wake-up:
+
+1. **An enabled, unmasked interrupt becomes pending.** The core wakes, services the IRQ, and on handler return resumes execution after the `WFI`. This is the normal case.
+2. **An interrupt becomes pending but is masked by PRIMASK.** The core wakes (because the IRQ "would have been taken") but the handler doesn't run yet. Execution continues after `WFI`; the IRQ services later when the mask is lifted. This is a "polled wake" pattern.
+3. **A debugger halt request.** The core wakes for the probe to attach.
+
+In sleep mode (SLEEPDEEP=0), the core clock is gated but the rest of the chip — peripheral clocks, PLL, flash — continues. Wake-up is fast (a handful of cycles). In deep sleep (SLEEPDEEP=1), the implementation can gate more aggressively — PLL off, flash off, sometimes core retention only — and wake-up takes longer.
+
+### WFE — Wait For Event
+
+`WFE` is similar to WFI but waits for an *event* rather than an interrupt. Events include:
+
+- Any of the WFI wake-up triggers (interrupts of high-enough priority).
+- An `SEV` instruction executed by another core (rare on single-core M parts; used heavily on multi-core SMP Cortex-A).
+- An external event signalled to the core via the EVENTI line.
+- An interrupt becoming pending with `SCB->SCR.SEVONPEND = 1` enabled — even if the IRQ is disabled or masked.
+
+The crucial difference from WFI: WFE has a one-bit "event register" inside the core. If the event register is **set** when WFE executes, WFE returns immediately (no sleep) and clears the event register. If it's clear, WFE sleeps until an event arrives, then clears it and resumes.
+
+This makes WFE useful for "may-or-may-not-need-to-wait" patterns:
+
+```c
+while (!data_ready) {
+    __WFE();   /* sleep if no event; spin-check after wake */
+}
+```
+
+If `data_ready` becomes true between the check and `WFE`, the event register was set by the ISR that produced the data (via SEV from the ISR), and WFE returns immediately — no missed wake-up race.
+
+### SLEEPONEXIT — automatic sleep
+
+`SCB->SCR.SLEEPONEXIT` is a bit that says "when returning to thread mode, sleep instead of resuming thread mode." It's for interrupt-driven applications where the thread mode does nothing useful:
+
+```c
+int main(void) {
+    setup_peripherals();
+    SCB->SCR |= SCB_SCR_SLEEPONEXIT_Msk;
+    while (1) { __WFI(); }   /* belt and suspenders */
+}
+```
+
+With SLEEPONEXIT set, every interrupt return puts the core back to sleep automatically. The main loop's `__WFI()` is redundant in steady state but ensures sleep on the first entry to thread mode.
+
+### SEVONPEND — wake on any pending IRQ
+
+`SCB->SCR.SEVONPEND` makes the event signal trigger when *any* IRQ pends, even disabled or low-priority ones. Useful when you want to wake from WFE to check what changed, without committing to running a handler.
+
+<StateDiagram
+  title="Sleep mode transitions (representative STM32-style taxonomy)"
+  width={720}
+  height={300}
+  states={[
+    { id: 'run', label: 'Run', x: 40, y: 120, w: 120, h: 56, tone: 'primary', initial: true },
+    { id: 'sleep', label: 'Sleep', x: 210, y: 120, w: 120, h: 56, tone: 'accent' },
+    { id: 'deep', label: 'Deep Sleep / Stop', x: 370, y: 120, w: 170, h: 56, tone: 'warning' },
+    { id: 'standby', label: 'Standby', x: 580, y: 120, w: 120, h: 56, tone: 'destructive' },
+  ]}
+  transitions={[
+    { from: 'run', to: 'sleep', label: 'WFI / WFE' },
+    { from: 'sleep', to: 'run', label: 'any IRQ', curve: -40 },
+    { from: 'sleep', to: 'deep', label: 'SLEEPDEEP=1 + WFI' },
+    { from: 'deep', to: 'run', label: 'WIC wake', curve: -70 },
+    { from: 'deep', to: 'standby', label: 'PWR.LPMS=Standby' },
+    { from: 'standby', to: 'run', label: 'wake pin / RTC (reset path)', curve: -110 },
+  ]}
+  caption="WFI/WFE enter Sleep; setting SLEEPDEEP plus a vendor LPMS selector pushes the chip into Stop or Standby. Wake from Standby is via dedicated wake pins or the RTC and goes through the reset vector — RAM is lost."
+/>
+
+## Vendor sleep modes — a tour
+
+Architectural sleep is just the trigger; vendors layer their own power-state taxonomy on top. The pattern is the same: a set of progressively deeper sleep modes that gate more clocks, drop more power rails, and lose more state.
+
+### STM32L4 example
+
+| Mode | Core | Flash | RAM | SysClock | Wake source | Wake time | Current |
+|---|---|---|---|---|---|---|---|
+| Run | running | active | active | up to 80 MHz | n/a | n/a | 4–13 mA at 80 MHz |
+| Low-power Run | running | active | active | 2 MHz | n/a | n/a | ~80 µA |
+| Sleep | clock-gated | active | active | active | any IRQ | 1 cycle | ~1.5 mA |
+| Low-power Sleep | clock-gated | active | active | 2 MHz | any IRQ | 1 cycle | ~80 µA |
+| Stop 0 | off | off | retained | LSI/LSE only | EXTI line | ~3.5 µs | ~140 µA |
+| Stop 1 | off | off | retained | LSI/LSE only | EXTI line | ~6 µs | ~6.5 µA |
+| Stop 2 | off | off | retained | LSI/LSE only | EXTI line | ~6 µs | ~1.2 µA |
+| Standby | off | off | lost (backup only) | LSI only | wake pins, RTC | ~14 µs | ~120 nA |
+| Shutdown | off | off | lost | none | wake pins | ~250 µs | ~30 nA |
+
+Each progressively deeper mode trades retention and wake-up speed for current. Stop modes keep RAM but power down everything else; Standby loses RAM but keeps the RTC running; Shutdown loses everything except a tiny "wake pin" circuit.
+
+The architectural mechanism for entering all of these is the same: configure vendor PWR registers for the desired mode, set `SCB->SCR.SLEEPDEEP`, then `WFI`. The PWR config decides what "deep sleep" actually means.
+
+```c
+/* STM32L4 Stop 2 entry */
+PWR->CR1 |= PWR_CR1_LPMS_STOP2;       /* select Stop 2 in PWR_CR1.LPMS field */
+SCB->SCR |= SCB_SCR_SLEEPDEEP_Msk;
+__DSB();
+__WFI();
+```
+
+### nRF52 example (Nordic)
+
+| Mode | Notes |
+|---|---|
+| System ON (idle) | Equivalent to Cortex sleep — clocks gated, RAM retained |
+| System ON (CPU active) | Normal run |
+| System OFF | All clocks off, RAM retained selectively (per "RAM block" enables) |
+
+Nordic's approach is simpler: System ON or System OFF. System OFF is the deepest mode, and wake-up requires a full reset path. The chip can selectively retain RAM blocks across System OFF — useful for BLE persistent state.
+
+### RP2040 example
+
+The dual-M0+ has Sleep (WFI), Dormant (clocks off, wake via GPIO or RTC), and a "low-power sleep" achieved by clocking down to ROSC at low frequency. Simple set of modes; current consumption in Dormant is ~180 µA — higher than STM32L4 but acceptable for the price point.
+
+## The WIC — Wake-up Interrupt Controller
+
+Cortex-M0+, M23, M33, M55, and M85 (and M3/M4 in some implementations) support an **optional Wake-up Interrupt Controller**. The WIC is a shadow NVIC that runs on an always-on clock domain — typically a low-frequency RC oscillator (LSI, around 32 kHz).
+
+The point: in deep sleep, the main clock domain can be **fully powered off** — including the NVIC. Without the WIC, you can't wake up because there's no NVIC to receive the IRQ. With the WIC, the always-on shadow catches the IRQ, restores the main domain (PLL, NVIC, etc.), and the IRQ services normally.
+
+WIC is what makes ~1 µA stop modes possible. Without it, the NVIC's leakage current alone would be 10× higher.
+
+### WIC bring-up
+
+Mostly vendor-driven. The WIC is enabled in vendor power-management registers (e.g., STM32's PWR_CR2.WAKEUP bits), and the architectural side is just setting SLEEPDEEP and executing WFI. Some vendors require selecting which interrupts the WIC will respond to — typically only a handful (EXTI lines for wake-up pins, RTC alarm, watchdog).
+
+## Wake-up sources
+
+What can wake a sleeping Cortex-M? Depends on the depth:
+
+- **Sleep mode**: any IRQ enabled in the NVIC. Identical to running mode.
+- **Stop / deep-sleep**: only IRQs routed through the WIC. Vendor-defined — typically EXTI (GPIO wake-up), RTC alarm, low-power UART receive, USB wake, watchdog.
+- **Standby**: WIC-routable IRQs that are mapped to "wake pins" — physical pins designated as wake-from-standby sources. Often only 4–8 such pins per chip.
+- **Shutdown**: only wake pins (no WIC needed since the chip is essentially off).
+
+The mapping is in the vendor's reference manual. For STM32L4, the wake pins are PA0..PA15 routed through EXTI, plus a dedicated WKUP1..WKUP5 set.
+
+## Code patterns
+
+### Polling loop with sleep
+
+The simplest power-aware idle:
+
+```c
+while (1) {
+    if (work_pending) {
+        do_work();
+    } else {
+        __WFI();   /* sleep until next IRQ */
+    }
+}
+```
+
+The catch is the race between checking `work_pending` and entering WFI: if an ISR sets it between the check and WFI, you sleep through the work. WFE with SEV from the ISR closes the race:
+
+```c
+while (1) {
+    while (!work_pending) {
+        __WFE();
+    }
+    work_pending = false;
+    do_work();
+}
+
+/* In the ISR that produces work: */
+work_pending = true;
+__SEV();
+```
+
+### Tickless RTOS
+
+A tickless RTOS uses sleep modes whenever the scheduler has no work. The kernel calculates how long until the next ready time (next timer expiry, next blocked-task unblock), reconfigures a wake-up timer for that interval, and enters the deepest sleep mode that retains enough state. FreeRTOS exposes this via `vPortSuppressTicksAndSleep` (defined per port); Zephyr does it natively. Average power on a tickless system is 10–100× lower than a system that takes a tick every 1 ms.
+
+## Cross-references
+
+- [SCB](/docs/cortex-m/scb) — SCR.SLEEPDEEP, SLEEPONEXIT, SEVONPEND
+- [NVIC overview](/docs/cortex-m/nvic) — wake-up via pending IRQs
+- [Cortex-M0+](/docs/cortex-m/m0plus) — WIC details
+- [Architecture comparison](/docs/cortex-m/architecture-compare)
+- ARMv7-M ARM section B1.5.16 (low power)
+- Vendor power management reference manuals (STM32 RM, nRF52 PS, etc.)

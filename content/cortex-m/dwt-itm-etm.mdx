@@ -1,0 +1,203 @@
+---
+title: DWT, ITM, and ETM
+description: Debug Watchpoint and Trace, Instrumentation Trace Macrocell, Embedded Trace Macrocell. PC sampling, cycle counting, SWO printf, exception trace, function trace.
+order: 22
+updated: 2026-05-13
+tags: [cortex-m, debug, dwt, itm, etm, trace, swo]
+---
+
+Every Cortex-M3 and up ships with a set of trace blocks that sit alongside the core, watching the bus and the program counter, and emitting events to a debug probe. Three blocks matter in practice:
+
+- **DWT** (Data Watchpoint and Trace) — cycle counter, PC sampler, hardware watchpoints, exception trace.
+- **ITM** (Instrumentation Trace Macrocell) — software-emitted events (SWO printf, timestamped logs).
+- **ETM** (Embedded Trace Macrocell) — full instruction trace; lets you reconstruct every instruction the core executed.
+
+A debug probe (J-Link, ST-Link, Lauterbach) consumes the trace stream over **SWO** (a single pin) or the **TPIU** (Trace Port Interface Unit, 4–8 pins). Software running on the target enables the trace blocks; the probe captures the resulting bitstream and presents it as cycle-stamped events.
+
+This page covers what each block does, how to enable it, and the practical bring-up for the most common use cases: SWO printf, cycle counting for benchmarks, and exception trace for ISR profiling.
+
+<SpecSheet
+  title="DWT / ITM / ETM at a glance"
+  specs={[
+    { label: 'DWT base', value: '0xE000_1000' },
+    { label: 'ITM base', value: '0xE000_0000' },
+    { label: 'ETM base', value: '0xE004_1000 (Cortex-M3); varies on other parts' },
+    { label: 'TPIU base', value: '0xE004_0000' },
+    { label: 'SWO output rate', value: 'Up to ~2 Mbit/s typical (depends on probe + parent clock)' },
+    { label: 'TPIU output rate', value: 'Hundreds of Mbit/s on a parallel port' },
+    { label: 'Cycle counter', value: 'DWT_CYCCNT — 32-bit, increments every core cycle. Wraps every ~21s at 200 MHz.' },
+    { label: 'Hardware watchpoints', value: 'DWT comparators — typically 4 on M3/M4/M7, 8 on M33/M55/M85' },
+    { label: 'Min trace blocks', value: 'M0+ has MTB (Micro Trace Buffer) — branch-only trace into SRAM' },
+  ]}
+/>
+
+## DWT — Data Watchpoint and Trace
+
+DWT is the workhorse. It provides:
+
+- **A cycle counter** (`DWT->CYCCNT`) that runs at the core clock. Essential for benchmarking.
+- **PC sampling** — periodic snapshots of the program counter, used by profilers to build a flame graph.
+- **Exception trace** — emits events on every exception entry, exit, and tail-chain.
+- **Hardware watchpoints** — break or trace on access to a particular address or address range.
+- **Folded-instruction counter, sleep counter, LSU counter** — various microarchitectural stats.
+
+### Enabling the cycle counter
+
+The most common DWT use case. Three steps:
+
+```c
+/* 1. Enable the trace subsystem (CoreDebug DEMCR.TRCENA) */
+CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+
+/* 2. Reset and enable the cycle counter */
+DWT->CYCCNT = 0;
+DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+/* 3. Read it */
+uint32_t start = DWT->CYCCNT;
+do_work();
+uint32_t elapsed = DWT->CYCCNT - start;
+```
+
+The TRCENA bit gates the entire DWT/ITM/ETM block; without it, writes to DWT registers silently fail. CYCCNT is 32-bit and wraps; for measurements longer than ~21 seconds at 200 MHz, you need software wraparound handling.
+
+Cycle counter accuracy is **exact** for cycles executed by the core. There's no skew, no jitter — it's the clock signal itself. The catch: cycles include pipeline stalls, cache misses, and flash wait states. So measuring "cycles for memcpy" gives you the *real* cost including memory hierarchy, not a synthetic best-case number.
+
+### PC sampling
+
+DWT can periodically write the current PC to the trace stream. Configure the sample rate:
+
+```c
+DWT->CTRL = (DWT->CTRL & ~DWT_CTRL_POSTPRESET_Msk)
+          | (DWT_CTRL_POSTPRESET_Msk & (0xF << DWT_CTRL_POSTPRESET_Pos))   /* every 16 cycles */
+          | DWT_CTRL_PCSAMPLENA_Msk;
+```
+
+The probe collects samples over time and a host-side profiler bins them by PC range. Tools like Segger SystemView and Percepio Tracealyzer turn this into flame graphs.
+
+PC sampling is statistical — you miss events that happen between samples. For low-frequency sampling (every 1024 cycles), the overhead is negligible; for high-frequency sampling (every 16 cycles), you can use 5–10% of the SWO bandwidth, but still get useful profile data.
+
+### Exception trace
+
+`DWT_CTRL.EXCTRCENA` enables it. Every exception entry, exit, and tail-chain emits a 16-bit event:
+
+```c
+DWT->CTRL |= DWT_CTRL_EXCTRCENA_Msk;
+```
+
+The probe receives `ENTRY: vector N`, `EXIT: vector N`, `TAIL-CHAIN: vector N` events with cycle timestamps. SystemView turns this into a per-ISR timeline, showing every interrupt entry/exit duration over a recording window. Indispensable for tracking down "why does my system miss the deadline once an hour."
+
+### Hardware watchpoints
+
+DWT comparators can watch for read, write, or read-or-write accesses to specific addresses. Up to 4 on M3/M4/M7, up to 8 on M33+.
+
+```c
+/* Watch for any write to 0x20001234 */
+DWT->COMP0 = 0x20001234;
+DWT->MASK0 = 0;                          /* exact address, no mask */
+DWT->FUNCTION0 = (1 << 0) | (1 << 2);    /* WCH:DATA-W, EMITRANGE */
+```
+
+The exact bit patterns are model-specific — read the TRM. The comparators can be configured to **trigger a breakpoint** (halt the core), **emit a trace event**, or **trigger a DWT data trace** (capture the value being written).
+
+Common uses: tracking down which line of code is corrupting a structure (watch the field, halt on write), profiling reads of a particular variable (watch the address, count).
+
+## ITM — software trace events
+
+ITM is *software-driven* trace. Code writes to ITM stimulus ports (32 of them, addresses `0xE000_0000` to `0xE000_007C`) and the data appears in the trace stream with a cycle timestamp.
+
+The canonical use: **SWO printf**. Stream characters to ITM port 0, the probe reads them, the IDE displays them as a console.
+
+```c
+int _write(int file, char *ptr, int len) {
+    for (int i = 0; i < len; i++) {
+        while (ITM->PORT[0].u32 == 0);   /* wait for FIFO space */
+        ITM->PORT[0].u8 = ptr[i];
+    }
+    return len;
+}
+```
+
+GCC `newlib` calls `_write` for `printf`, so this gives you working `printf` over SWO with no UART required. SWO is a one-wire trace pin (separate from SWDIO/SWCLK), so it doesn't tie up any peripheral.
+
+Enabling ITM:
+
+```c
+CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+
+ITM->LAR = 0xC5ACCE55;                  /* unlock */
+ITM->TCR = ITM_TCR_ITMENA_Msk           /* enable ITM */
+         | ITM_TCR_SYNCENA_Msk          /* periodic sync packets */
+         | (1 << ITM_TCR_TraceBusID_Pos)
+         | ITM_TCR_DWTENA_Msk           /* DWT events go through ITM */
+         | ITM_TCR_SWOENA_Msk;          /* output via SWO */
+
+ITM->TER = 0xFFFFFFFF;                  /* enable all 32 stimulus ports */
+ITM->TPR = 0;                           /* unprivileged-allowed all */
+```
+
+And configure TPIU for SWO output:
+
+```c
+TPI->ACPR = (system_clock / swo_baud) - 1;  /* SWO prescaler */
+TPI->SPPR = 2;                              /* NRZ encoding (UART-style) */
+TPI->FFCR = 0x100;                          /* formatter off, async */
+```
+
+### Stimulus port discipline
+
+The 32 ports let you separate streams. Common conventions:
+
+| Port | Use |
+|---|---|
+| 0 | stdout (printf) |
+| 1 | stderr (errors) |
+| 2 | binary log events (timing, counters) |
+| 31 | "kernel" / RTOS events |
+
+SystemView and Percepio Trace each define their own port assignments.
+
+## ETM — full instruction trace
+
+ETM emits a packet per branch (compressed — most non-branch instructions are inferred). On a 32-bit-bus debug port, you can stream every instruction the core executes in real time. The probe disassembles after the fact and gives you a full execution log.
+
+Use cases:
+
+- **Crash forensics.** "Show me the last 1000 instructions before the HardFault."
+- **Coverage measurement.** Did our test suite execute every instruction in safety-critical code?
+- **WCET analysis.** What's the worst-case path through this function?
+
+ETM is hard to use casually. You need a probe with a TPIU input (J-Trace, Lauterbach POWER DEBUG II, etc.) and a wide trace port (usually 4 pins). Software setup is involved — typically driven by the IDE (Keil µVision, Segger Ozone) rather than hand-rolled. But when you need it, nothing else gives the same fidelity.
+
+### MTB — the ETM-lite for small parts
+
+On Cortex-M0+ (which doesn't have ETM), ARM offers the **Micro Trace Buffer**: a circular buffer in SRAM that records the source and destination of every taken branch. Configure a chunk of SRAM as the MTB region, and the last N branches are always available. Read them out after a fault to reconstruct the path. Far simpler than ETM, far less data, but enough to diagnose most hangs.
+
+## TPIU — Trace Port Interface Unit
+
+TPIU is the formatter that multiplexes DWT, ITM, and ETM streams onto the output pins. Two output modes:
+
+- **SWO (Serial Wire Output)** — single pin, NRZ or Manchester encoded. Up to ~2 Mbit/s. Fine for ITM and DWT exception trace; not enough for ETM.
+- **Parallel trace port** — 4-pin or 8-pin, source-synchronous clock. Hundreds of Mbit/s. Required for ETM.
+
+TPIU configuration is mostly the prescaler (`TPI->ACPR`) for SWO and the encoding mode (`TPI->SPPR`). On STM32 silicon, ST's IDE/probe defaults work; on more exotic vendors, you may need to set the trace clock source in vendor MMIO before TPIU sees a valid clock.
+
+## A practical bring-up checklist
+
+For an STM32F4 with SWD + SWO and a J-Link probe:
+
+1. Connect SWDIO, SWCLK, SWO, GND between probe and target.
+2. In target startup: enable TRCENA (CoreDebug->DEMCR), enable DWT cycle counter, enable ITM, configure TPIU with the right SWO baud.
+3. In target main: `printf("hello\n")` — characters appear in the J-Link RTT viewer or the IDE's SWV console.
+4. Optionally: enable exception trace, hook up SystemView for the full ISR timeline.
+
+Cycle counts for `printf` are ~50 µs per character at 2 Mbit/s SWO — fine for occasional logging, **not** fine in a hot ISR. For high-rate logging, use RTT (Segger's protocol that uses a RAM ring buffer instead of SWO) which has much lower overhead at the cost of probe-side complexity.
+
+## Cross-references
+
+- [Coresight](/docs/cortex-m/coresight) — the broader debug architecture
+- [NVIC priority](/docs/cortex-m/nvic-priority) — exception trace shows preempt and tail-chain behaviour
+- [Tail-chain & late-arrival](/docs/cortex-m/tail-chain) — visible directly in DWT exception trace
+- [GDB](/docs/tools/gdb) — `monitor` commands often expose DWT setup
+- [Interrupt latency tool](/tools/interrupt-latency)
+- ARMv7-M ARM section C1 (Debug)

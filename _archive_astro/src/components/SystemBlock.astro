@@ -1,0 +1,79 @@
+---
+// A simple labeled-block diagram component.
+// Pass `blocks` as a 2D array of rows. Each cell is a Block or null (for a spacer).
+//
+// Use case: showing the chip-level layout of a real device.
+//
+// <SystemBlock title="..." blocks={[
+//   [{ kind: 'core', label: '4× Cortex-A53', detail: '@ 1.4 GHz' }],
+//   [{ kind: 'periph', label: 'Wi-Fi 6 MAC' }, { kind: 'periph', label: '5G modem' }],
+//   ...
+// ]} />
+
+interface Block {
+  label: string;
+  detail?: string;
+  kind?: 'core' | 'memory' | 'radio' | 'periph' | 'power' | 'storage' | 'security' | 'io' | 'accel';
+  span?: number;
+  href?: string;
+}
+
+interface Props {
+  title?: string;
+  blocks: (Block | null)[][];
+  caption?: string;
+}
+
+const { title, blocks, caption } = Astro.props;
+
+const kindStyles: Record<NonNullable<Block['kind']>, string> = {
+  core:     'border-brand/40 bg-brand/8 text-brand',
+  memory:   'border-accent/40 bg-accent/8 text-accent',
+  radio:    'border-violet-500/40 bg-violet-500/8 text-violet-700 dark:text-violet-300',
+  periph:   'border-ok/40 bg-ok/8 text-ok',
+  power:    'border-warn/40 bg-warn/8 text-warn',
+  storage:  'border-sky-500/40 bg-sky-500/8 text-sky-700 dark:text-sky-300',
+  security: 'border-err/40 bg-err/8 text-err',
+  io:       'border-line-strong bg-bg-subtle text-ink',
+  accel:    'border-pink-500/40 bg-pink-500/8 text-pink-700 dark:text-pink-300',
+};
+
+const cols = Math.max(...blocks.map((r) => r.reduce((acc, b) => acc + (b?.span ?? 1), 0)));
+---
+<figure class="not-prose my-8 overflow-hidden rounded-xl border border-line bg-surface/70 shadow-card">
+  {title && (
+    <div class="border-b border-line bg-bg-subtle/70 px-4 py-2.5 font-mono text-xs uppercase tracking-wider text-ink-faint">
+      {title}
+    </div>
+  )}
+  <div class="overflow-x-auto p-3 sm:p-5 scrollbar-thin">
+    <div
+      class="grid gap-1.5 sm:gap-2"
+      style={`grid-template-columns: repeat(${cols}, minmax(6.5rem, 1fr)); min-width: min(100%, ${cols * 6.5}rem);`}
+    >
+      {blocks.flatMap((row) =>
+        row.map((b) => {
+          if (!b) return <div />;
+          const cls = kindStyles[b.kind ?? 'io'];
+          const inner = (
+            <Fragment>
+              <div class="font-mono text-[0.7rem] sm:text-[0.78rem] font-medium leading-tight">{b.label}</div>
+              {b.detail && <div class="mt-1 font-mono text-[0.6rem] sm:text-[0.65rem] text-ink-muted leading-tight">{b.detail}</div>}
+            </Fragment>
+          );
+          return (
+            <div
+              class={`rounded-lg border px-2 py-1.5 sm:px-3 sm:py-2 ${cls}`}
+              style={b.span ? `grid-column: span ${b.span}` : ''}
+            >
+              {b.href ? <a href={b.href} class="block !no-underline">{inner}</a> : inner}
+            </div>
+          );
+        }),
+      )}
+    </div>
+  </div>
+  {caption && (
+    <figcaption class="border-t border-line/70 px-4 py-2 font-mono text-xs text-ink-faint">{caption}</figcaption>
+  )}
+</figure>

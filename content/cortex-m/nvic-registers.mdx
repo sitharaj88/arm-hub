@@ -1,0 +1,206 @@
+---
+title: NVIC register reference
+description: Every NVIC register decoded — ISER, ICER, ISPR, ICPR, IABR, IPR, STIR. Address map, atomic semantics, debug behaviour, and the gotchas of write-1-to-set / write-1-to-clear.
+order: 15
+updated: 2026-05-13
+tags: [cortex-m, nvic, registers, interrupts, reference]
+---
+
+The NVIC presents a deceptively flat MMIO surface — about a kilobyte of registers at `0xE000_E100`, all word-aligned, all atomically writable. Underneath, each register is part of a state machine that the hardware ticks on every cycle, and the *semantics* of writing to each one are surprisingly varied: some are write-1-to-set, some write-1-to-clear, some are normal RW, and at least one is fire-and-forget. Getting this right matters when you're chasing a race condition between an ISR and a pending-bit clear, or trying to deliver a synthetic IRQ from a tight loop.
+
+This page is the bottom-up reference: every register, what it does, the rules for writing it, and the cases where the obvious meaning isn't quite what the hardware does.
+
+<SpecSheet
+  title="NVIC register file at a glance"
+  specs={[
+    { label: 'Base address', value: '0xE000_E100 (always — inside the PPB, no relocation)' },
+    { label: 'Access width', value: 'Word (32-bit). Byte and halfword writes to IPR are also defined.' },
+    { label: 'Atomicity', value: 'Each register is a single MMIO transaction — no torn writes possible.' },
+    { label: 'Register groups', value: 'ISER, ICER, ISPR, ICPR, IABR, IPR, STIR' },
+    { label: 'Banks per group', value: 'Each set/clear group is replicated as Nx 32-bit registers, one bit per IRQ. STM32F4 has 8 → IRQ 0..255.' },
+    { label: 'PRIMASK / BASEPRI', value: 'Not part of NVIC MMIO; accessed via MSR / MRS instructions only.' },
+    { label: 'Privilege', value: 'All NVIC registers are privileged-only by default. SCB->CCR.USERSETMPEND can grant unprivileged access to STIR.' },
+  ]}
+/>
+
+## Address map summary
+
+| Register | Address (per index n) | Width | Function |
+|---|---|---|---|
+| ISER0..ISERn | 0xE000_E100 + 4n | 32 | Interrupt Set-Enable. W1S, RAZ. |
+| ICER0..ICERn | 0xE000_E180 + 4n | 32 | Interrupt Clear-Enable. W1C, reads the enable mask. |
+| ISPR0..ISPRn | 0xE000_E200 + 4n | 32 | Interrupt Set-Pending. W1S, reads pending mask. |
+| ICPR0..ICPRn | 0xE000_E280 + 4n | 32 | Interrupt Clear-Pending. W1C, reads pending mask. |
+| IABR0..IABRn | 0xE000_E300 + 4n | 32 | Interrupt Active Bit. Read-only. |
+| IPR0..IPRn | 0xE000_E400 + 4n | 32 | Interrupt Priority. 4 bytes, one per IRQ. RW. |
+| STIR | 0xE000_EF00 | 32 | Software Trigger Interrupt. Write-only. |
+
+CMSIS gives you these as `NVIC->ISER[n]`, `NVIC->ICER[n]`, etc. Don't mix with the legacy `NVIC_EnableIRQ(IRQn)` form in the same function — the helper just wraps the register, but the register name in the debugger is what shows up in a trace.
+
+## ISER — Interrupt Set-Enable
+
+Each bit corresponds to an IRQ. Writing 1 enables that IRQ in the NVIC; writing 0 has no effect. The register **reads back the current enable mask** — useful for save/restore.
+
+```c
+// Enable USART1_IRQn (= 37 on STM32F4)
+NVIC->ISER[37 / 32] = 1u << (37 % 32);
+// Or via CMSIS:
+NVIC_EnableIRQ(USART1_IRQn);
+```
+
+| Bits | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| 31:0 | SETENA[31:0] | W1S / RO | 0 | Per-bit set-enable for IRQs in this bank. |
+
+The W1S semantics matter when you're enabling several IRQs without disturbing the rest. **Don't use read-modify-write** like `NVIC->ISER[0] |= mask;` — it's redundant (writing 0 to other bits doesn't disable them) and slightly more expensive than a single write.
+
+<Callout type="warn">
+A bit can be set in ISER (enabled) **and** in ISPR (pending) and still **not fire** if its priority is masked by PRIMASK or BASEPRI. Don't confuse "enabled and pending" with "about to run" — three conditions need to align: enabled, pending, priority not masked.
+</Callout>
+
+## ICER — Interrupt Clear-Enable
+
+Mirror of ISER. Writing 1 *disables* (clears the enable for) that IRQ. Reading returns the current enable mask (same as reading ISER).
+
+```c
+NVIC->ICER[37 / 32] = 1u << (37 % 32);   // disable USART1
+NVIC_DisableIRQ(USART1_IRQn);             // same
+```
+
+| Bits | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| 31:0 | CLRENA[31:0] | W1C / RO | 0 | Per-bit clear-enable. Reads back current enable mask. |
+
+Disabling does **not** clear pending state. An IRQ disabled while pending stays pending; if you re-enable it later and the priority allows, it fires. Pair `ICER` with `ICPR` if you want a clean disable.
+
+## ISPR — Interrupt Set-Pending
+
+Writing 1 forces the corresponding IRQ into pending state, just as if the hardware signal had asserted. The NVIC then processes it normally — if enabled and priority allows, the handler runs.
+
+This is useful for:
+
+- **Self-pending in PendSV-style designs** — request a deferred handler from interrupt context by writing to ISPR.
+- **Software-only interrupts** — define a custom IRQ (NVIC supports up to 480 IRQs; vendors use few of them, so unused IRQs make great software-trigger handlers).
+- **Testing handlers** — inject an IRQ to verify your priority configuration.
+
+```c
+NVIC->ISPR[37 / 32] = 1u << (37 % 32);
+NVIC_SetPendingIRQ(USART1_IRQn);
+```
+
+| Bits | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| 31:0 | SETPEND[31:0] | W1S / RO | 0 | Per-bit set-pending. |
+
+## ICPR — Interrupt Clear-Pending
+
+Writing 1 clears the pending state for that IRQ. If the IRQ is *active* (currently executing), clearing pending **does not stop the handler** — the active handler continues; only the pending request is removed. This is the common pattern for clearing a peripheral IRQ at the end of an ISR.
+
+```c
+// At end of UART RX handler, after reading and clearing the peripheral flag:
+NVIC->ICPR[USART1_IRQn / 32] = 1u << (USART1_IRQn % 32);
+```
+
+| Bits | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| 31:0 | CLRPEND[31:0] | W1C / RO | 0 | Per-bit clear-pending. |
+
+**A subtle race**: if the peripheral IRQ source is still asserted when you clear NVIC pending, the NVIC will set pending again immediately and your handler will re-enter (tail-chained). Always clear the **peripheral flag first**, then the NVIC pending bit. The reverse order leaves you in a spinloop.
+
+```c
+void USART1_IRQHandler(void) {
+    // Read and clear peripheral interrupt flag (correct order):
+    if (USART1->SR & USART_SR_RXNE) {
+        char c = USART1->DR;     // reading DR clears RXNE on STM32F4
+        ring_push(c);
+    }
+    // After the handler returns, the NVIC pending bit is cleared automatically
+    // by the exception-return sequence. No need to touch ICPR explicitly here
+    // for the standard case.
+}
+```
+
+The "always write to ICPR in the handler" pattern is a relic. The NVIC clears the pending bit automatically on exception entry; you only need ICPR if you're synthesizing/canceling an IRQ from outside the handler.
+
+## IABR — Interrupt Active Bit (read-only)
+
+Each bit is 1 if the corresponding IRQ is currently active (handler executing, not yet returned). Read-only — you cannot force an IRQ active. Useful for debugger introspection and for diagnostic code that needs to know whether a particular handler is on the call stack.
+
+```c
+if (NVIC->IABR[USART1_IRQn / 32] & (1u << (USART1_IRQn % 32))) {
+    // USART1 handler is currently executing somewhere up the stack
+}
+```
+
+| Bits | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| 31:0 | ACTIVE[31:0] | RO | 0 | Per-bit active-state indicator. |
+
+## IPR — Interrupt Priority
+
+Eight-bit priority per IRQ. The bytes are laid out densely: IPR[0] holds priorities for IRQs 0..3, IPR[1] for 4..7, etc. The 8-bit field stores priority left-justified; only the upper `__NVIC_PRIO_BITS` bits are implemented in silicon.
+
+| Bits (per byte) | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| 7..(8 - N_BITS) | PRIO | RW | 0 | Priority value (lower = more urgent). Unimplemented low bits read as 0. |
+
+```c
+NVIC->IP[USART1_IRQn] = 0x40;   // priority 0x40 (= 4 on a 4-bit part)
+NVIC_SetPriority(USART1_IRQn, 4);   // CMSIS handles the shift
+```
+
+CMSIS exposes `NVIC->IP[]` (byte-addressed) and `NVIC->IPR[]` (word-addressed) — pick one and stick with it. Byte access is easier to reason about; word access is faster if you're setting four priorities together.
+
+Priority changes are visible to the NVIC immediately for **pending-but-not-active** IRQs. For an already-active handler, the active-time priority is locked in. See the [priority page](/docs/cortex-m/nvic-priority) for the full rules.
+
+## STIR — Software Trigger Interrupt
+
+A fire-and-forget shortcut. Writing the IRQ number (0..N) to STIR pends that IRQ — equivalent to setting the corresponding ISPR bit but with a different access path. The main reason for STIR's existence is that it can be made **unprivileged-accessible** via `SCB->CCR.USERSETMPEND = 1`, whereas ISPR is always privileged-only.
+
+```c
+// Pend IRQ 37 (USART1_IRQn)
+NVIC->STIR = 37;
+NVIC_SetPendingIRQ(USART1_IRQn);   // CMSIS equivalent
+```
+
+| Bits | Name | Access | Reset | Description |
+|---|---|---|---|---|
+| 31:9 | - | WO | 0 | Reserved. Write 0. |
+| 8:0 | INTID | WO | 0 | IRQ number to pend (0..N). |
+
+The 9-bit width allows IRQs 0..511, matching the architectural max of 480 in v8-M.
+
+## Atomic-write semantics
+
+Every NVIC MMIO write is a single AHB transaction. There is no torn-write window. Two consequences:
+
+1. **ISR-to-thread races are safe at the register level.** A thread writing `NVIC->ISER[0]` to enable an IRQ cannot be interrupted "mid-write" — either the write completes or the ISR runs first and the write completes after.
+2. **But the state machine spans multiple cycles.** Enabling an IRQ via ISER doesn't make it pending — it just removes the enable mask. If the IRQ source was asserted before the enable, the NVIC re-evaluates pending state on the next cycle and may pend the IRQ immediately. You'll see the IRQ fire "as if" the enable bit's write itself caused it.
+
+A common pattern that hits this:
+
+```c
+// Disable, clear pending, re-enable — clean slate for an IRQ
+NVIC_DisableIRQ(IRQ_X);
+NVIC_ClearPendingIRQ(IRQ_X);
+// Note: peripheral may have set its flag again between the two lines above.
+clear_peripheral_flag(IRQ_X);
+NVIC_EnableIRQ(IRQ_X);
+```
+
+Get the order right: disable in NVIC, clear at the peripheral, clear pending in NVIC, then enable. Anything else and the IRQ re-pends on you.
+
+## Debug visibility
+
+The NVIC registers are all accessible to the debugger via AHB-AP without halting the core. A debugger sampling IABR over time can build a flame graph of which IRQ handlers ran when. ITM (the [ITM page](/docs/cortex-m/dwt-itm-etm)) provides timestamped events with much higher fidelity, but bare IABR polling is a useful low-overhead trick.
+
+The DWT cycle counter (`DWT->CYCCNT`) combined with `DWT_EXCTRC` (exception trace) gives cycle-accurate timing of every IRQ entry and exit, again without halting. See [DWT/ITM/ETM](/docs/cortex-m/dwt-itm-etm) for setup.
+
+## Cross-references
+
+- [NVIC overview](/docs/cortex-m/nvic) — pending/active state machine
+- [NVIC priority & preemption](/docs/cortex-m/nvic-priority) — PRIGROUP, BASEPRI, FAULTMASK
+- [Tail-chain & late-arrival](/docs/cortex-m/tail-chain)
+- [SCB — System Control Block](/docs/cortex-m/scb)
+- [Vector table](/docs/cortex-m/vector-table)
+- ARMv7-M ARM section B3.2; ARMv8-M ARM section D1.2 (NVIC register descriptions)

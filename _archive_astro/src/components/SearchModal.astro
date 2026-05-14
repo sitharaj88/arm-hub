@@ -1,0 +1,122 @@
+---
+// Pagefind-powered command-k search modal.
+// Pagefind UI loads on demand the first time the modal opens.
+---
+<div
+  id="search-modal"
+  class="fixed inset-0 z-50 hidden items-start justify-center bg-bg/70 backdrop-blur-sm p-4 pt-[10vh]"
+  role="dialog"
+  aria-modal="true"
+  aria-label="Search"
+>
+  <div class="surface w-full max-w-2xl overflow-hidden shadow-panel">
+    <div class="terminal-chrome">
+      <span class="terminal-dot bg-err/70"></span>
+      <span class="terminal-dot bg-warn/70"></span>
+      <span class="terminal-dot bg-ok/70"></span>
+      <div class="ml-3 font-mono text-xs text-ink-faint">search › armhub.dev</div>
+      <button id="search-close" class="ml-auto rounded-md px-2 py-1 text-ink-faint hover:bg-surface hover:text-ink" aria-label="Close">esc</button>
+    </div>
+    <div id="search-root" class="p-3 min-h-[20rem]">
+      <div class="p-6 text-center text-sm text-ink-muted">
+        <div class="caret font-mono">loading index</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<style is:global>
+  /* Pagefind UI — themed against our CSS variables so it follows light/dark. */
+  :root {
+    --pagefind-ui-scale: 0.9;
+    --pagefind-ui-primary: hsl(var(--brand));
+    --pagefind-ui-text: hsl(var(--ink));
+    --pagefind-ui-background: hsl(var(--surface));
+    --pagefind-ui-border: hsl(var(--line));
+    --pagefind-ui-tag: hsl(var(--surface-hover));
+    --pagefind-ui-border-width: 1px;
+    --pagefind-ui-border-radius: 10px;
+    --pagefind-ui-image-border-radius: 6px;
+    --pagefind-ui-image-box-ratio: 3 / 2;
+    --pagefind-ui-font: 'Inter', sans-serif;
+  }
+  .pagefind-ui__search-input {
+    background: hsl(var(--bg-subtle)) !important;
+    color: hsl(var(--ink)) !important;
+  }
+  .pagefind-ui__result {
+    border-top: 1px solid hsl(var(--line)) !important;
+  }
+</style>
+
+<script>
+  const modal = document.getElementById('search-modal');
+  const trigger = document.getElementById('search-trigger');
+  const closer = document.getElementById('search-close');
+  const root = document.getElementById('search-root');
+  let loaded = false;
+
+  function ensurePagefind() {
+    if (loaded || !root) return;
+    loaded = true;
+    // Pagefind is generated at build time and lives at /pagefind/ relative to the site.
+    // Inject as a script + stylesheet rather than ES module to avoid Vite trying to resolve at build.
+    const css = document.createElement('link');
+    css.rel = 'stylesheet';
+    css.href = '/pagefind/pagefind-ui.css';
+    document.head.appendChild(css);
+
+    const script = document.createElement('script');
+    script.src = '/pagefind/pagefind-ui.js';
+    script.onload = () => {
+      const W = window as unknown as { PagefindUI?: new (opts: Record<string, unknown>) => unknown };
+      if (W.PagefindUI) {
+        new W.PagefindUI({
+          element: '#search-root',
+          showSubResults: true,
+          excerptLength: 20,
+          resetStyles: false,
+          autofocus: true,
+        });
+      } else if (root) {
+        root.innerHTML = '<div class="p-6 text-center text-sm text-ink-muted font-mono">search index loaded but UI failed to initialise</div>';
+      }
+    };
+    script.onerror = () => {
+      if (!root) return;
+      root.innerHTML = '<div class="p-6 text-center text-sm text-ink-muted font-mono">search index unavailable in dev — try after <code>npm run build</code></div>';
+    };
+    document.head.appendChild(script);
+  }
+
+  function open() {
+    modal?.classList.remove('hidden');
+    modal?.classList.add('flex');
+    document.documentElement.style.overflow = 'hidden';
+    ensurePagefind();
+    setTimeout(() => {
+      const input = modal?.querySelector('input');
+      (input as HTMLInputElement | null)?.focus();
+    }, 50);
+  }
+  function close() {
+    modal?.classList.add('hidden');
+    modal?.classList.remove('flex');
+    document.documentElement.style.overflow = '';
+  }
+
+  trigger?.addEventListener('click', open);
+  closer?.addEventListener('click', close);
+  modal?.addEventListener('click', (e) => { if (e.target === modal) close(); });
+  document.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault();
+      modal?.classList.contains('hidden') ? open() : close();
+    }
+    if (e.key === 'Escape') close();
+    if (e.key === '/' && document.activeElement?.tagName !== 'INPUT' && document.activeElement?.tagName !== 'TEXTAREA') {
+      e.preventDefault();
+      open();
+    }
+  });
+</script>

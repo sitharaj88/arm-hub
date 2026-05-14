@@ -1,0 +1,211 @@
+---
+title: RT-Thread
+description: RT-Thread RTOS — Chinese-developed, dominant in Asia, object-oriented kernel with a package manager, finsh shell, lwIP/FAT integration, SMP support, and optional MMU. Architecture, components, and how it differs from FreeRTOS.
+order: 6
+updated: 2026-05-13
+tags: [rtos, rt-thread, china, kernel, finsh, package-manager]
+---
+
+RT-Thread is the most-deployed RTOS in mainland China and the one Western firmware engineers know least about. Started in 2006 by Bernard Xiong as an open-source project, it now backs a substantial fraction of consumer IoT, industrial controls, and smart-home shipments out of Shenzhen and Shanghai. Tencent, Baidu, GigaDevice, and many smaller Chinese vendors ship products on it. Outside Asia it's relatively obscure — but it's mature, well-engineered, and worth understanding because RT-Thread devices are increasingly common in mixed-supply-chain designs.
+
+This page covers the RT-Thread architecture, what makes it distinctive (object-oriented kernel, integrated package manager, optional MMU support), its component ecosystem, and the practical differences from FreeRTOS that matter when porting between them.
+
+<SpecSheet
+  title="RT-Thread at a glance"
+  specs={[
+    { label: 'Origin', value: 'Bernard Xiong, China, 2006. Apache 2.0 license. Maintained by RT-Thread Foundation + community.' },
+    { label: 'Kernel', value: 'Object-oriented C kernel — every primitive (thread, semaphore, mutex, queue, timer) is an object derived from rt_object_t.' },
+    { label: 'Footprint', value: 'Standard kernel: ~10 KB flash, 1 KB RAM. Nano variant: 3 KB flash, 1 KB RAM. With networking + filesystem: 60+ KB.' },
+    { label: 'Supported architectures', value: 'Cortex-M0/0+/3/4/7/23/33, Cortex-A7/A8/A9/A53, RISC-V (RV32I, RV64GC), x86, MIPS, ARC. Probably the widest arch support of any RTOS.' },
+    { label: 'SMP', value: 'Symmetric multi-processing on Cortex-A and multi-core Cortex-M parts. Up to 8 cores.' },
+    { label: 'MMU support', value: 'Optional. RT-Thread Smart is a posix-like variant with full MMU and process isolation.' },
+    { label: 'Shell', value: 'Finsh / MSH — interactive command-line over UART, supports built-in commands and user-registered ones.' },
+    { label: 'Package manager', value: 'env tool + Studio IDE. Online package center with 400+ verified components.' },
+  ]}
+/>
+
+## Architecture overview
+
+RT-Thread's core is a fixed-priority preemptive scheduler — same shape as FreeRTOS or ThreadX — with 32 to 256 priority levels (configurable), round-robin within priority, and tickless idle support. The distinctive choice is the kernel object model.
+
+Every primitive in RT-Thread inherits from `rt_object_t`:
+
+```c
+struct rt_object {
+    char        name[RT_NAME_MAX];
+    rt_uint8_t  type;
+    rt_uint8_t  flag;
+    rt_list_t   list;
+};
+
+struct rt_thread {
+    struct rt_object  parent;     /* inherit from rt_object */
+    rt_list_t         tlist;
+    void             *sp;
+    void             *entry;
+    void             *parameter;
+    void             *stack_addr;
+    rt_uint32_t       stack_size;
+    rt_uint8_t        current_priority;
+    rt_uint8_t        init_priority;
+    /* ... more fields ... */
+};
+```
+
+This means every thread, semaphore, mutex, timer, message queue, mailbox, and event has a name (up to 8 characters) and is enumerable via the kernel's object container. Run `list_thread` in the shell and you see all threads by name with state, priority, stack usage, and entry point. Run `list_sem`, `list_mutex`, `list_mq` for the corresponding primitives.
+
+The object model costs ~12 bytes per primitive vs FreeRTOS's leaner ~8 bytes, but the runtime introspection and tooling benefit pays for it handsomely on any non-trivial project.
+
+## Kernel primitives
+
+The standard set, with RT-Thread names:
+
+| Primitive | RT-Thread API | FreeRTOS equivalent |
+|-----------|---------------|---------------------|
+| Thread | `rt_thread_create`/`rt_thread_init` | `xTaskCreate`/`xTaskCreateStatic` |
+| Semaphore (counting) | `rt_sem_create`/`rt_sem_take`/`rt_sem_release` | `xSemaphoreCreateCounting` etc. |
+| Mutex (with PI) | `rt_mutex_create`/`rt_mutex_take`/`rt_mutex_release` | `xSemaphoreCreateMutex` |
+| Event | `rt_event_create`/`rt_event_recv`/`rt_event_send` | EventGroup |
+| Mailbox (fixed-size message) | `rt_mb_create`/`rt_mb_send`/`rt_mb_recv` | Queue with size = 4 bytes |
+| Message Queue (variable-size) | `rt_mq_create`/`rt_mq_send`/`rt_mq_recv` | Queue or message buffer |
+| Timer | `rt_timer_create` | `xTimerCreate` |
+| Memory Pool (fixed-block) | `rt_mp_create`/`rt_mp_alloc` | No direct equivalent — use heap_5 |
+| Memory Heap | `rt_malloc`/`rt_free` | `pvPortMalloc`/`vPortFree` |
+
+The mailbox / message queue distinction is unique to RT-Thread: a mailbox carries fixed 4-byte (pointer-sized) messages efficiently, while a message queue carries arbitrary-size blocks at a small overhead. For pointer-passing IPC the mailbox is the right primitive; FreeRTOS would force you into a 4-byte queue.
+
+Priority inheritance is automatic on `rt_mutex`. The implementation is in `src/ipc.c` and follows the standard rules (boost holder to highest waiter's priority, drop back on release).
+
+## Finsh / MSH shell
+
+RT-Thread ships with a built-in interactive shell, accessible over UART (or USB CDC, or telnet via lwIP) once enabled. Two shell variants:
+
+- **Finsh** — original, C-syntax shell. You type C expressions and the shell evaluates them: `list_thread()`, `version()`, etc.
+- **MSH** (Module Shell) — simpler, Linux-like shell. `ls`, `cd`, `cat`, `free`, plus user-registered commands. Default in recent versions.
+
+Adding a custom command is a one-liner:
+
+```c
+static int my_blink(int argc, char **argv) {
+    if (argc < 2) { rt_kprintf("usage: blink <count>\n"); return -1; }
+    int n = atoi(argv[1]);
+    for (int i = 0; i < n; i++) {
+        rt_pin_write(LED_PIN, PIN_HIGH);
+        rt_thread_mdelay(200);
+        rt_pin_write(LED_PIN, PIN_LOW);
+        rt_thread_mdelay(200);
+    }
+    return 0;
+}
+MSH_CMD_EXPORT(my_blink, blink LED n times);
+```
+
+The `MSH_CMD_EXPORT` macro places the function into a special linker section that the shell scans at startup. No registration call, no header — drop the file in, and `blink 5` shows up in `help`.
+
+This is genuinely useful for field debugging. SSH into a device's UART (or USB) and you have an interactive console with introspection commands for every kernel object, plus your own custom ones. FreeRTOS has FreeRTOS+CLI which provides similar functionality but requires more setup; RT-Thread has it built in.
+
+## Component ecosystem
+
+RT-Thread ships with a large set of optional components, each a self-contained module:
+
+| Component | What it provides |
+|-----------|-------------------|
+| lwIP | TCP/IP stack, integrated with the device driver framework |
+| AT Component | AT command parser/sender for cellular and Wi-Fi modules |
+| FATFS / DFS | File system layer with FAT, ROMFS, UFFS, JFFS2 backends |
+| RTGUI / LVGL | Graphics, with LVGL widely supported |
+| USB Stack | Host and device, CDC/HID/MSC/Audio classes |
+| RT-AK | AI Kit — model inference for embedded ML |
+| RT-MQTT | MQTT client |
+| Webclient | HTTP client |
+| TLS / mbedtls | TLS bindings |
+| OTA | Over-the-air firmware update framework |
+
+Each is enabled in `rtconfig.h` via `#define RT_USING_XXX` flags. The build system pulls in the corresponding sources. Most components are also available as **packages** through the env tool — see next section.
+
+## Package manager and env tool
+
+RT-Thread's distinguishing feature in the workflow space is its **online package center**. The `env` tool (Python-based) downloads pre-vetted packages from a registry: 400+ components covering drivers, network protocols, file systems, AI/ML libraries, and complete application examples.
+
+```
+$ pkgs --upgrade
+$ pkgs --list
+$ pkgs --update
+```
+
+After `pkgs --update`, the selected packages are unpacked into `packages/` and their build files merged into the project. The result is roughly equivalent to git submodules + a CMake aggregator, but with curation: every package in the registry has been at least sanity-tested against a recent RT-Thread version.
+
+The package center is one reason RT-Thread is sticky in China — it lowers the bar for assembling a working system. Western embedded engineers are used to wrangling vendor middleware by hand; RT-Thread's curated registry feels closer to Python's pip or Rust's cargo.
+
+## Symmetric multi-processing
+
+RT-Thread supports SMP on Cortex-A (A7/A8/A9/A53) and multi-core Cortex-M (M7 dual-core variants like STM32H745). Per-core run queues, atomic operations for cross-core synchronisation, cache management, and inter-processor interrupt (IPI) handling for scheduler events.
+
+```c
+/* Pin a thread to core 1 */
+rt_thread_control(tid, RT_THREAD_CTRL_BIND_CPU, (void *)1);
+```
+
+SMP support is rare among small-footprint RTOSes — FreeRTOS gained it relatively recently (v11.0, 2024), ThreadX has had it for years. RT-Thread sits in the middle: mature SMP, decent ecosystem for it.
+
+## RT-Thread Smart — MMU and processes
+
+For Cortex-A class parts with an MMU, **RT-Thread Smart** is a separate variant that adds POSIX-style processes with full memory isolation. Each process has its own page table; the kernel runs in kernel mode with the MMU mapped to the kernel space. User processes are loaded from ELF executables on a filesystem and run in user mode with their own address space.
+
+This is closer to a microcontroller-grade Linux than to a classical RTOS. It targets the gap between bare-metal RTOS and full Linux: faster boot, smaller footprint, real-time scheduling, but with process isolation and ELF-based applications.
+
+Adoption is still early — Smart is newer than the classic RT-Thread. But it's the right product for ARM-based gateways and edge devices that need isolation but can't afford the Linux footprint.
+
+## Differences from FreeRTOS that matter
+
+A practical comparison for someone porting between the two:
+
+<CoreCompare
+  rows={[
+    { core: 'Threading model', notes: 'RT-Thread: rt_thread is the unit, named, listable. FreeRTOS: xTask, also listable but less centralised tooling.' },
+    { core: 'Memory allocation', notes: 'RT-Thread: heap_1/2/3/5-equivalent via rt_memheap, plus dedicated rt_mempool for fixed blocks. FreeRTOS: 5 heap implementations, pick one.' },
+    { core: 'Stack overflow detection', notes: 'RT-Thread: pattern-fill stack at create; check on context switch. FreeRTOS: same idea, configurable depth.' },
+    { core: 'IPC variety', notes: 'RT-Thread: thread, sem, mutex, event, mailbox, msgq, signal. FreeRTOS: task, sem, mutex, event group, queue, notification, stream/message buffer. Different vocabularies, equivalent capabilities.' },
+    { core: 'Standard library integration', notes: 'RT-Thread: pulls in newlib/picolibc plus its own kprintf. FreeRTOS: standalone, pairs with whichever libc you choose.' },
+    { core: 'Driver model', notes: 'RT-Thread: device framework — every peripheral is an rt_device with open/read/write/control. FreeRTOS: no built-in driver model; vendor HAL provides it.' },
+    { core: 'Filesystem', notes: 'RT-Thread: DFS layer with FAT/UFFS/JFFS2/ROMFS support. FreeRTOS+FAT is a separate add-on.' },
+    { core: 'Shell', notes: 'RT-Thread: finsh/MSH built-in. FreeRTOS: FreeRTOS+CLI separate, more setup.' },
+  ]}
+/>
+
+The biggest practical difference: RT-Thread has a "batteries included" philosophy. Spin it up and you have an interactive shell, a driver model, a filesystem layer, a package manager, and a network stack. FreeRTOS is the kernel only — everything else you assemble.
+
+## RT-Thread Studio
+
+The official IDE — Eclipse-based, free, Windows-focused but Linux/macOS builds exist. Wraps env, the package manager, the build system, and J-Link/CMSIS-DAP/openocd debugging into one workflow. Comparable to STM32CubeIDE or MCUXpresso — wizard-driven project creation, board support packages for major vendors (ST, NXP, Nordic, GD32, Renesas, Infineon).
+
+For a Chinese-supply-chain project where the parts are GigaDevice GD32 or Nuvoton NUC, Studio is genuinely easier than the original vendor IDE. For ST or NXP parts, the vendor IDE is usually preferred.
+
+## When to pick RT-Thread
+
+Choose RT-Thread when:
+
+- The product targets the Chinese market and benefits from local-ecosystem familiarity
+- You need a built-in shell, package manager, and driver model out of the box
+- You target a part RT-Thread supports natively (GD32, MM32, AIRM2M, many lesser-known Chinese MCUs)
+- You want SMP on a small footprint
+- The team prefers an "object-oriented C" kernel design
+
+Don't choose it when:
+
+- You need SAFERTOS-equivalent certification (RT-Thread has no SIL/ASIL story)
+- Long-term Western support contracts matter
+- The team is already deep in FreeRTOS or Zephyr and the switch cost isn't worth it
+
+<Callout type="note">
+RT-Thread has been around almost as long as FreeRTOS and is feature-complete by any measure. The reason it's less familiar outside Asia is historical — most of the early community and documentation was Chinese-only. English docs (rt-thread.io) have improved substantially since 2020, and the project's GitHub activity is now consistently in the top tier of open-source RTOSes.
+</Callout>
+
+## Further reading
+
+- [RTOS landscape](/docs/rtos/landscape) — where RT-Thread fits in the broader picture
+- [FreeRTOS](/docs/rtos/freertos) — closest comparable RTOS
+- [RTOS scheduling](/docs/rtos/scheduling) — fixed-priority preemptive context
+- [IPC primitives](/docs/rtos/ipc) — mapping between RT-Thread and FreeRTOS vocabulary
+- Project site: rt-thread.io (English) / rt-thread.org (Chinese)
+- GitHub: github.com/RT-Thread/rt-thread

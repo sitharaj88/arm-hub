@@ -1,0 +1,62 @@
+---
+title: Texas Instruments (Tiva, MSP432, Hercules)
+description: TI's ARM portfolio — Tiva (was Stellaris, M4), MSP432 (low-power M4F), Hercules (Cortex-R safety).
+order: 6
+updated: 2026-05-12
+tags: [vendors, ti]
+---
+
+import Callout from '~/components/Callout.astro';
+
+Texas Instruments has a complicated ARM story. They bought Luminary Micro (Stellaris — the original Cortex-M3 family), rebranded as Tiva, then deprioritised it. MSP432 (Cortex-M4F low-power) was a play to extend the MSP430 legacy and was also discontinued. **Hercules** (Cortex-R safety) is alive and well in automotive and industrial.
+
+## Tiva C series (was Stellaris)
+
+The first commercially shipping Cortex-M3 was Luminary Micro's. TI bought them, rebranded to Stellaris, then to Tiva C. The TM4C123 / TM4C129 lines are widely used in academic courses (the "TIVA Launchpad" was the educational board for years) and still in production for industrial designs.
+
+- **TM4C123** — Cortex-M4F, 80 MHz, 256 KB flash, USB 2.0.
+- **TM4C129** — Cortex-M4F, 120 MHz, 1 MB flash, Ethernet MAC+PHY on chip.
+
+TI's marketing focus is now more on SimpleLink (BLE, WiFi) and SitaraLinux processors, but the Tiva parts remain available for legacy designs.
+
+## MSP432 — discontinued
+
+Marketed as the bridge from MSP430 (16-bit) to ARM Cortex-M4F. Was popular in academia. Discontinued for new designs in 2021. If you see it in older codebases, the migration target is typically Tiva C or a different vendor.
+
+## Hercules — automotive Cortex-R
+
+The **TMS570** and **RM48** Hercules lines are Cortex-R4F/R5F in **dual-core lockstep** with extensive BIST, ECC, and ASIL-D certification artefacts. Used in:
+
+- Airbag electronic control units.
+- Antilock braking systems (ABS).
+- Electric power steering (EPS).
+- Industrial robotics.
+
+Hercules ships with HALCoGen (a graphical configurator that generates HAL code) and a full safety certification package (TÜV-SÜD-evaluated, ISO 26262 ASIL D ready). The toolchain is TI's CCS (Code Composer Studio, Eclipse-based with TI's compiler) or commercial Wind River / Green Hills.
+
+For functional-safety work, Hercules + Wind River VxWorks is a textbook combination.
+
+## SimpleLink — TI's wireless line
+
+The **CC13xx** (sub-GHz + 2.4 GHz) and **CC26xx** (2.4 GHz / BLE) families are Cortex-M4 SoCs with integrated radio. Competitive with Nordic nRF52 for some BLE applications, with TI's strength being **sub-GHz** (915 MHz, 868 MHz) support that Nordic only added recently.
+
+- **CC1352** — sub-GHz + 2.4 GHz, BLE + 802.15.4 + proprietary.
+- **CC2640R2F / CC2650** — BLE-only.
+- **CC2652R** — BLE + 802.15.4 (Thread / Zigbee).
+
+The SimpleLink SDK is reasonably good — it's what you'll find in TI's reference designs and academic courses.
+
+## When you'd pick TI ARM
+
+- **Existing automotive program** with Hercules tooling — very strong functional-safety story.
+- **Industrial with strict EMC requirements** — TI's analog and PCB recommendations are top-tier.
+- **Sub-GHz wireless** — CC13xx still has the edge over Nordic in some sub-GHz applications.
+- **You're heavily TI elsewhere** (analog ICs, power, MCUs) — supply chain consolidation is real value.
+
+For greenfield consumer / IoT designs, ST or Nordic typically win on ecosystem.
+
+## See also
+
+- [Cortex-R overview](/docs/cortex-r/overview/) — Hercules core.
+- [Cortex-M4](/docs/cortex-m/m4/) — Tiva, SimpleLink core.
+- [TI MCUs page](https://www.ti.com/microcontrollers-mcus-processors/microcontrollers/overview.html) (external).

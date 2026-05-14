@@ -1,0 +1,206 @@
+---
+title: Battery-powered IoT sensor node
+description: Architecting a battery-powered IoT sensor node — Cortex-M0+/M33 plus Sub-GHz or LTE-M radio, sleep budget in microamps, LoRaWAN / NB-IoT / BLE mesh / Wi-SUN / Zigbee. OTA, secure provisioning, deep-sleep buffers in RTC backup RAM.
+order: 16
+updated: 2026-05-13
+tags: [systems, iot, sensor-node, lora, nb-iot, ble-mesh, zigbee, low-power]
+---
+
+A battery-powered IoT sensor node is a small electronic device that sits in a field, on a wall, on a piece of machinery, or in someone's home, takes occasional measurements, communicates them wirelessly to a gateway or cloud, and stays alive on a primary cell or small Li-Po for years. The class is enormous: water meters, gas meters, soil sensors, asset trackers, building-occupancy detectors, leak sensors, smoke alarms, cattle-tracking ear tags, vibration sensors on industrial pumps, GPS trackers on rented equipment. All share the same architecture skeleton and the same dominant constraint: average current consumption.
+
+This page covers the architectural choices — radio protocol, MCU, sensor interfaces, power management — that turn a circuit into a multi-year battery-powered product, and the firmware patterns that keep the average current under 10 microamps without sacrificing reliability.
+
+<SpecSheet
+  title="IoT sensor node at a glance"
+  specs={[
+    { label: 'MCU class', value: 'Cortex-M0+ (low cost), M33 with TrustZone (secure provisioning); 32–256 KB Flash, 16–64 KB RAM' },
+    { label: 'Radio (LPWAN)', value: 'LoRaWAN (Sub-GHz, ISM bands), NB-IoT / LTE-M (cellular), Wi-SUN, Sigfox' },
+    { label: 'Radio (PAN)', value: 'BLE mesh, Zigbee 3.0, Thread, proprietary 2.4 GHz' },
+    { label: 'Battery', value: 'CR2032 (220 mAh), CR123A (1.5 Ah), 2× AA primary lithium (2.4 Ah), small Li-Po (300-1000 mAh), supercap with energy harvester' },
+    { label: 'Target lifetime', value: '2–15 years; 10 years is the LPWAN standard claim' },
+    { label: 'Average current budget', value: '1–10 µA typical; harder products (door/window sensor with 10-year CR2032) target 1 µA' },
+    { label: 'Sleep current', value: 'STM32U5 Stop 3: 0.3 µA; nRF52 System OFF: 0.4 µA; nRF53 System OFF: 1.4 µA' },
+    { label: 'Wake sources', value: 'RTC timer (periodic), motion (accelerometer interrupt), magnetic switch, light sensor, button' },
+    { label: 'Comm protocol stack', value: 'LoRaWAN, NB-IoT/LwM2M, MQTT-SN, CoAP, Matter (Thread), LoRaWAN+MQTT bridges' },
+  ]}
+/>
+
+## Budgeting from the battery
+
+The defining design step is the energy budget. Start with the battery's usable energy, divide by the target lifetime, and get the average power.
+
+A CR2032 (220 mAh × 3.0 V ≈ 2376 J usable, with ~15% derating for self-discharge and end-of-life voltage) and a 10-year target gives:
+
+```
+energy_usable    = 220 mAh × 3.0 V × 0.85 = 561 mWh ≈ 2020 J
+hours_in_decade  = 87,600
+avg_power_budget = 561 / 87600 = 6.4 µW = 2.1 µA at 3 V
+```
+
+That 2 µA average is the design constraint. The MCU's idle current alone (running a clock and waiting on an interrupt) can blow it. The radio's transmit current is ~30 mA — a single 0.1-second transmit uses 3000 µAs = 24 minutes of budget. Every measurement, every wake, every TX must be carefully planned.
+
+The energy per task gets logged in microamp-seconds (µA·s = µC):
+
+| Task | Current | Duration | Charge |
+|------|---------|----------|--------|
+| Sleep | 1 µA | continuous |  |
+| ADC sample, single channel | 200 µA | 50 µs | 10 nC |
+| BME280 environmental sensor read | 350 µA | 5 ms | 1.75 µC |
+| LoRaWAN TX SF10, +14 dBm | 35 mA | 200 ms | 7 mC |
+| LoRaWAN RX1 + RX2 window | 12 mA | 1 s | 12 mC |
+| Full LoRaWAN cycle (TX + 2 RX) |  |  | ~20 mC |
+
+A daily LoRaWAN message + sleep:
+
+```
+20 mC per day = 230 µA·s / day average
+= 230 / 86400 = 2.7 µA average
+```
+
+Marginal at the 2 µA budget. To make it work: reduce TX power if signal allows (uses less mA × seconds), skip RX windows when not needed (LoRaWAN Class A unconfirmed), or use SF7 (faster TX). A confirmed message at SF12 (worst case) easily exceeds the budget on its own — the spec calls for an SF-adaptive algorithm (ADR) that keeps the average down.
+
+## Radio choice — protocol matrix
+
+The most consequential decision. Each radio protocol targets a niche:
+
+| Protocol | Range | Throughput | Battery friendliness | Network cost |
+|----------|-------|-----------|----------------------|--------------|
+| **LoRaWAN** | 2-15 km outdoor | 0.3-50 kbps | Excellent (sub-µA sleep, ~5 mC/TX) | Network operator monthly fee or DIY gateway |
+| **NB-IoT** | Cellular footprint | 30-60 kbps | Good (~50 µA average for hourly reports) | Cellular SIM, $1-3/month |
+| **LTE-M (Cat-M1)** | Cellular footprint | 0.4-1 Mbps | Good for moderate-rate | Cellular SIM, $1-3/month |
+| **BLE / BLE Mesh** | 30-300 m | 1-2 Mbps | Excellent (low-power advertising) | None — direct to phone or hub |
+| **Zigbee 3.0** | 30-100 m | 250 kbps | Excellent | Zigbee coordinator |
+| **Thread / Matter** | 30-100 m | 250 kbps | Excellent | Thread border router |
+| **Wi-SUN** | 1-5 km mesh | 50-300 kbps | Good | Wi-SUN gateway |
+| **Sigfox** | 10-30 km | &lt;100 bps | Excellent | Sigfox subscription |
+| **Wi-Fi (HaLow / 802.11ah)** | 1 km | Mbps | Moderate | AP needed |
+
+A few patterns:
+
+- **Asset tracker on agriculture** — NB-IoT (cellular, no infrastructure needed).
+- **Smart water meter** — LoRaWAN (utility deploys the gateway).
+- **Smart smoke detector in a home** — Thread (Matter), or BLE mesh.
+- **Industrial pump vibration sensor** — Wi-SUN (mesh, factory-deployed) or LoRaWAN.
+- **Bike GPS tracker** — NB-IoT + GPS combo (nRF9160).
+- **Door/window sensor in a smart home** — BLE or Zigbee (hub-based).
+
+## System architecture pattern
+
+<BlockDiagram
+  title="Generic battery-powered IoT sensor node"
+  width={860}
+  height={420}
+  minWidth={760}
+  nodes={[
+    { id: 'sensors', x: 40,  y: 50,  w: 210, h: 64, kind: 'sensor',   label: 'Application sensors', detail: 'environment · motion · GPIO' },
+    { id: 'wake',    x: 40,  y: 150, w: 210, h: 56, kind: 'sensor',   label: 'Wake sources', detail: 'accelerometer · reed · button' },
+    { id: 'crypto',  x: 40,  y: 244, w: 210, h: 56, kind: 'security', label: 'Crypto / secure element', detail: 'AES · ECC · TRNG · keys' },
+    { id: 'mcu',     x: 325, y: 88,  w: 220, h: 72, kind: 'core',     label: 'Cortex-M0+ / M33', detail: 'deep sleep · DMA · RTC wake' },
+    { id: 'aon',     x: 325, y: 204, w: 220, h: 64, kind: 'periph',   label: 'Always-on island', detail: 'RTC · retained SRAM' },
+    { id: 'flash',   x: 325, y: 310, w: 220, h: 52, kind: 'storage',  label: 'Internal flash', detail: 'app · config · OTA staging' },
+    { id: 'radio',   x: 620, y: 76,  w: 190, h: 72, kind: 'radio',    label: 'Radio modem', detail: 'LoRa · NB-IoT · BLE' },
+    { id: 'ant',     x: 620, y: 178, w: 190, h: 44, kind: 'external', label: 'Matched antenna' },
+    { id: 'pmic',    x: 620, y: 266, w: 190, h: 52, kind: 'power',    label: 'PMIC / regulator', detail: 'load switches · fuel gauge' },
+    { id: 'batt',    x: 620, y: 342, w: 190, h: 44, kind: 'power',    label: 'Battery', detail: 'CR2032 · AA Li · Li-Po' },
+  ]}
+  edges={[
+    { from: 'sensors', to: 'mcu',   label: 'I²C / SPI', tone: 'accent' },
+    { from: 'wake',    to: 'aon',   label: 'IRQ wake', tone: 'warning' },
+    { from: 'crypto',  to: 'mcu',   label: 'I²C / SPI' },
+    { from: 'mcu',     to: 'aon',   label: 'sleep state', arrow: 'both' },
+    { from: 'mcu',     to: 'flash', label: 'OTA image' },
+    { from: 'mcu',     to: 'radio', label: 'SPI / on-die', tone: 'primary', arrow: 'both' },
+    { from: 'radio',   to: 'ant',   tone: 'primary', arrow: 'both' },
+    { from: 'batt',    to: 'pmic',  tone: 'warning' },
+    { from: 'pmic',    to: 'mcu',   tone: 'warning' },
+    { from: 'pmic',    to: 'radio', tone: 'warning' },
+  ]}
+  caption="Each block is sized to its energy contribution. The RTC and a small retained SRAM region stay alive in deep sleep; everything else gates off. Wake comes from RTC (periodic) or accelerometer (event-driven)."
+/>
+
+## Firmware patterns
+
+The application is structured as a state machine driven by wake events:
+
+```c
+typedef enum {
+    STATE_INIT,
+    STATE_PROVISIONING,
+    STATE_IDLE_SLEEPING,
+    STATE_MEASURING,
+    STATE_TRANSMITTING,
+    STATE_RX_WINDOW,
+    STATE_OTA_DOWNLOADING,
+    STATE_OTA_APPLYING,
+} node_state_t;
+
+void main(void) {
+    if (cold_boot()) {
+        load_provisioning();   // from secure backup
+    }
+    enter_low_power();
+
+    while (1) {
+        wait_for_wake_event();
+        switch (wake_source()) {
+        case WAKE_RTC:        handle_periodic_measurement(); break;
+        case WAKE_ACCEL:      handle_motion(); break;
+        case WAKE_DOWNLINK:   handle_command(); break;
+        }
+        enter_low_power();
+    }
+}
+```
+
+Key implementation patterns:
+
+**Retained SRAM for state.** All persistent runtime state — LoRaWAN frame counter, device address, session keys, accumulated counter values — is in retained SRAM. Cold boot reloads from flash; warm wake resumes without re-init. Avoids the multi-millisecond overhead of restoring state from flash.
+
+**Lazy peripheral init.** Peripherals are configured on first use, not in `main`. The few microseconds saved across hundreds of wakes per day are real.
+
+**Bus-clock gating.** Each AHB/APB peripheral has an enable bit. The HAL enables them on driver init; aggressive firmware disables them immediately after use to drop the static leakage.
+
+**LPRUN / LP SLEEP for sub-second work.** When the MCU just needs to do a few hundred microseconds of work, dropping clock to 1 MHz in LPRUN saves more energy than running at full speed and going back to sleep. There's a crossover frequency below which LPRUN wins.
+
+**DMA over CPU for IO.** Even a 50-µs SPI read at 100 µA difference is 5 nA·s. Multiplied by hundreds of reads, this matters.
+
+<Callout type="tip">
+Profile every wake. Wire an oscilloscope across a 1 Ω shunt in the battery line, trigger on the wake event, and verify the current trace matches expectations. Surprises are common: a forgotten `printf` over UART, a peripheral left enabled, a TLS handshake that re-negotiates when it shouldn't.
+</Callout>
+
+## Security and provisioning
+
+A node deployed in the field for ten years is a security target: its keys may be extracted, its firmware may be reverse-engineered, the network it joins may be spoofed. Modern designs treat security as a first-class concern.
+
+**Secure boot.** The MCU boot ROM verifies the application image's signature against a root-of-trust public key before jumping to it. STM32U5, nRF5340, LPC55S69 all support this natively.
+
+**Hardware secure element.** A separate chip (Microchip ATECC608, NXP A71CH, Infineon OPTIGA Trust M) holds long-term keys and signs/decrypts on the MCU's behalf. Required for high-assurance products (medical, automotive aftermarket). Adds ~$0.50 BOM but stops most extraction attacks.
+
+**Provisioning at manufacture.** Each device gets unique credentials (network keys, certificates) injected during production test. The provisioning system (Nordic's nRF Cloud Identity Service, Microchip's secure provisioning, custom HSM) keeps the master keys off the factory floor.
+
+**Encrypted OTA.** Firmware updates are signed and (often) encrypted. The device downloads, verifies signature, decrypts to a staging area, swaps, reboots. MCUboot is the open-source de-facto bootloader.
+
+**Anti-rollback.** A monotonic counter prevents reflashing an older (potentially vulnerable) image.
+
+## OTA — over-the-air firmware update
+
+A device deployed in the field for years will need firmware updates: feature additions, bug fixes, certificate rotations, regulatory adjustments. OTA over the IoT radio is mandatory in any serious product.
+
+Challenges:
+
+- **Bandwidth.** A full firmware image is 50-500 KB; LoRaWAN at SF12 carries ~10 bytes/s usable. Full image transfer over LoRaWAN takes hours and is expensive. Delta updates (only the changed bytes) reduce transfer to 5-10% of full size.
+- **Power.** Receiving 50 KB on LoRaWAN uses tens of mC. Schedule for periods of good signal and adequate battery.
+- **Safety.** A failed update mid-installation must not brick the device. Dual-bank flash (A/B partition) lets the new image install while the old runs; if the new image fails to boot, the bootloader reverts.
+- **Validation.** After updating, run a "validation period" (e.g. 24 hours of normal operation) and only mark the image as the new "stable" after successful validation. Otherwise, automatic revert.
+
+LoRaWAN's "FUOTA" (Firmware Update Over-The-Air) standard (LoRa Alliance Technical Specification) addresses this with multicast image delivery and a defined finite-state machine for the update process.
+
+## Cross-references
+
+- [STM32 low-power L, U](/docs/vendors/stm32-lowpower) — the most common sensor-node MCU family.
+- [STM32 wireless WB / WL](/docs/vendors/stm32-wireless) — integrated radio variants.
+- [Nordic nRF53](/docs/vendors/nordic-nrf53) — BLE / Thread / Matter sibling.
+- [Nordic nRF91](/docs/vendors/nordic-nrf91) — cellular sibling.
+- LoRa Alliance Technical Specifications (LoRaWAN 1.0.4, regional parameters, FUOTA).
+- 3GPP TS 36.300, NB-IoT chapters.
+- Bluetooth SIG Mesh specification.

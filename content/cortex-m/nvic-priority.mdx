@@ -1,0 +1,206 @@
+---
+title: NVIC priority & preemption
+description: How the Cortex-M priority byte gets split into preempt and sub-priority groups, why PRIGROUP matters, how priority changes interact with active interrupts, and the exact rules the hardware uses to decide what runs next.
+order: 14
+updated: 2026-05-13
+tags: [cortex-m, nvic, priority, preemption, prigroup]
+---
+
+Priority on a Cortex-M part looks deceptively simple — every IRQ gets an 8-bit byte in `NVIC_IPR`, lower is more urgent, done. In practice the picture is much richer: only a few of those eight bits are actually implemented in silicon (typically 3 or 4), the implemented bits are split *again* by `PRIGROUP` into preempt and sub-priority fields, and the rules for **when** a priority change takes effect are not what most engineers expect on first reading. Getting this right is the difference between an interrupt scheme that meets its real-time deadlines and one that mysteriously misses them under load.
+
+This page walks through the model end-to-end: how many priority bits you actually have, how the byte is encoded, how `PRIGROUP` splits it, what `BASEPRI` and `PRIMASK` do to that split, and the subtle interaction with active and pending state.
+
+<SpecSheet
+  title="Priority model — quick reference"
+  specs={[
+    { label: '__NVIC_PRIO_BITS', value: 'Implementation-defined: typically 2 (M0/M0+), 3 (STM32G0, nRF52), 4 (STM32F4/H7, most M3/M4/M7)' },
+    { label: 'Priority byte width', value: 'Always 8 bits in the register; unimplemented bits are RAZ and the high bits are used (left-justified)' },
+    { label: 'Preempt vs sub split', value: 'Controlled by AIRCR.PRIGROUP — 3-bit field, 8 possible splits' },
+    { label: 'Range with 4 bits', value: '16 distinct priority levels (0..15), 0 is highest urgency' },
+    { label: 'Range with 3 bits', value: '8 levels (0..7)' },
+    { label: 'Range with 2 bits', value: '4 levels (0..3) — typical Cortex-M0' },
+    { label: 'BASEPRI', value: 'Masks all IRQs whose priority value is ≥ BASEPRI. Setting BASEPRI=0 disables the mask' },
+    { label: 'PRIMASK', value: 'Single-bit "block everything except NMI/HardFault" mask' },
+    { label: 'FAULTMASK', value: 'Like PRIMASK but also blocks HardFault (NMI still goes through)' },
+  ]}
+/>
+
+## How many priority bits do you actually have?
+
+ARM's reference model is `__NVIC_PRIO_BITS`. It's a `#define` in CMSIS that the vendor sets to match silicon. Anywhere from 2 to 8 bits is allowed by the architecture; in practice, you'll see:
+
+| Bits | Levels | Typical parts |
+|------|--------|---------------|
+| 2    | 4      | Cortex-M0 (LPC11xx, nRF51, STM32F0) |
+| 3    | 8      | Cortex-M0+ (STM32G0, RP2040, SAMD21), Cortex-M4 on some Nordic parts |
+| 4    | 16     | Cortex-M3/M4/M7 (STM32F1..H7, NXP i.MX RT, MIMXRT), Cortex-M33 (STM32U5, nRF53) |
+| 8    | 256    | Theoretical max — no commercial part ships all 8 today |
+
+Those bits are stored in the **upper end** of the 8-bit field. If `__NVIC_PRIO_BITS == 4`, then writing `0x10` to a priority byte stores a logical priority of `1`, not `16` — the low four bits are read-as-zero. The CMSIS helper `NVIC_SetPriority(IRQn, prio)` shifts left by `(8 - __NVIC_PRIO_BITS)` so you can pass logical priorities directly.
+
+<Callout type="warn">
+Two consequences flow from this. First, code written for a 4-bit part that passes raw `0x80` will read back as priority `8` on a 4-bit part and priority `2` on a 6-bit part — **never** hardcode raw register values; always use `NVIC_SetPriority`. Second, when you peek at the register in a debugger, what you see is the left-shifted hardware encoding, not the logical priority.
+</Callout>
+
+## PRIGROUP — splitting the priority byte
+
+ARM took the byte and made it more flexible. The `AIRCR.PRIGROUP` field (3 bits, bits 8–10 of `SCB->AIRCR`) splits the implemented priority bits into two groups:
+
+- **Preempt-priority** (the upper field) — a higher (more urgent, numerically lower) preempt-priority can interrupt a lower one.
+- **Sub-priority** (the lower field) — used as a tiebreaker when two IRQs of the same preempt-priority are pending. Sub-priority *cannot* preempt; it just decides ordering at the same level.
+
+`PRIGROUP` is the position of the split. A value of `7` puts the whole byte into sub-priority — preempt-priority is one level, all IRQs behave the same way — and value `0` puts everything into preempt-priority (no sub-priority). The split formula for an 8-bit field is `preempt_bits = 7 - PRIGROUP` clipped to `0..__NVIC_PRIO_BITS`.
+
+<CoreCompare
+  rows={[
+    { core: 'PRIGROUP = 0', notes: '7 preempt bits, 1 sub bit — up to 128 preempt levels' },
+    { core: 'PRIGROUP = 3', notes: '4 preempt bits, 4 sub bits — common default (16 preempt × 16 sub)' },
+    { core: 'PRIGROUP = 4', notes: '3 preempt bits, 5 sub bits — fewer preempt levels, more tiebreaker resolution' },
+    { core: 'PRIGROUP = 5 (4-bit impl)', notes: '2 preempt bits (4 groups), 2 sub bits within each group' },
+    { core: 'PRIGROUP = 6 (4-bit impl)', notes: '1 preempt bit (2 groups), 3 sub bits' },
+    { core: 'PRIGROUP = 7', notes: '0 preempt bits — no nesting, all interrupts run flat. Useful in safety-critical designs' },
+  ]}
+/>
+
+On a 4-bit-of-priority part, only PRIGROUP values 3..7 produce meaningfully different splits. Values 0..3 all collapse to "4 preempt bits, 0 sub bits" because there are no bits left over.
+
+### Worked example
+
+Imagine `__NVIC_PRIO_BITS = 4`, `PRIGROUP = 5`. The 8-bit byte looks like:
+
+<ProtocolFrame
+  title="Priority byte — __NVIC_PRIO_BITS=4, PRIGROUP=5"
+  fields={[
+    { name: 'P', bits: 1, tone: 'primary' },
+    { name: 'P', bits: 1, tone: 'primary' },
+    { name: 'S', bits: 1, tone: 'accent' },
+    { name: 'S', bits: 1, tone: 'accent' },
+    { name: '-', bits: 1, tone: 'muted' },
+    { name: '-', bits: 1, tone: 'muted' },
+    { name: '-', bits: 1, tone: 'muted' },
+    { name: '-', bits: 1, tone: 'muted' },
+  ]}
+  caption="Bit 7..4 are implemented (left-justified); bits 3..0 read as zero. With PRIGROUP=5, the upper two implemented bits are preempt-priority and the lower two are sub-priority."
+/>
+
+<StateDiagram
+  title="NVIC IRQ lifecycle"
+  width={760}
+  height={260}
+  states={[
+    { id: 'inactive', label: 'Inactive', x: 40,  y: 40, w: 150, h: 56, tone: 'muted', initial: true },
+    { id: 'pending',  label: 'Pending',  x: 305, y: 40, w: 150, h: 56, tone: 'warning' },
+    { id: 'active',   label: 'Active',   x: 570, y: 40, w: 150, h: 56, tone: 'primary' },
+    { id: 'apending', label: 'Active + Pending', x: 305, y: 160, w: 180, h: 56, tone: 'destructive' },
+  ]}
+  transitions={[
+    { from: 'inactive', to: 'pending', label: 'IRQ asserted' },
+    { from: 'pending', to: 'active', label: 'dispatched' },
+    { from: 'active', to: 'inactive', label: 'return (IRET)' },
+    { from: 'active', to: 'apending', label: 'IRQ re-asserts', curve: 40 },
+    { from: 'apending', to: 'active', label: 'tail-chain', curve: -40 },
+    { from: 'pending', to: 'inactive', label: 'cleared by ICPR', curve: 40 },
+  ]}
+  caption="Each NVIC IRQ has four observable states. Tail-chain skips the IRET → stack-pop → re-dispatch and goes directly Active+Pending → Active, saving ~6 cycles per back-to-back interrupt."
+/>
+
+`NVIC_SetPriority(USART1_IRQn, 0x5)` writes `0x50` to the priority byte. That's `preempt = 0b01 = 1`, `sub = 0b01 = 1`. If we also do `NVIC_SetPriority(USART2_IRQn, 0x7)` → `0x70` → `preempt = 1, sub = 3`. Both are at preempt-priority 1 — neither can preempt the other. If they pend simultaneously, USART1 runs first (lower sub-priority), then USART2 immediately follows via [tail-chain](/docs/cortex-m/tail-chain).
+
+`NVIC_SetPriority(TIM2_IRQn, 0x3)` → `0x30` → `preempt = 0, sub = 3`. TIM2 *can* preempt either USART because its preempt-priority (0) is lower than theirs (1).
+
+<Callout type="tip">
+CMSIS provides `NVIC_EncodePriority(priority_group, preempt, sub)` and `NVIC_DecodePriority(...)` so you can think in groups instead of mentally splitting the byte every time. Set PRIGROUP **once** at boot, then never touch it again.
+</Callout>
+
+## When a priority change actually takes effect
+
+This is the most-asked, least-documented part. The architectural rules:
+
+1. **Writing to `NVIC_IPRn`** updates the IRQ's stored priority immediately.
+2. **The new priority is only consulted when the NVIC re-evaluates pending state** — which it does on every cycle.
+3. **An IRQ that is already _active_ (currently executing) keeps its execution-time priority** for the purposes of preemption. Changing `IPR` mid-handler does not retroactively raise or lower the handler that's already running.
+4. However, **the handler's stored priority is used the next time it pends**.
+5. **Pending state is not cleared** by a priority change. If the IRQ is pending at priority 5 and you write priority 1, the pending IRQ now competes at priority 1.
+
+A common bug: code raises an IRQ's priority *after* signalling that the IRQ should run, expecting that the new priority takes effect immediately. It does for pending-but-not-active interrupts (good — the elevated IRQ now preempts), but it doesn't change the priority of an active handler that's currently mid-execution.
+
+## BASEPRI, PRIMASK, FAULTMASK — three masks, three semantics
+
+These three special registers all suppress interrupts, but in different ways. They are accessed via `MSR` and `MRS` instructions (or CMSIS `__set_BASEPRI`, `__disable_irq`, etc.).
+
+<RegisterMap
+  name="PRIMASK"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:1', name: '-', access: 'RO', reset: '0', description: 'Reserved, read as zero.' },
+    { bits: '0', name: 'PM', access: 'RW', reset: '0', description: 'When 1, all exceptions of configurable priority are blocked. NMI and HardFault are not blocked. Set by CPSID i / cleared by CPSIE i.' },
+  ]}
+  caption="PRIMASK — global IRQ disable, including SVCall, SysTick, all NVIC IRQs."
+/>
+
+<RegisterMap
+  name="FAULTMASK"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:1', name: '-', access: 'RO', reset: '0', description: 'Reserved.' },
+    { bits: '0', name: 'FM', access: 'RW', reset: '0', description: 'When 1, blocks everything except NMI — including HardFault. Auto-cleared on exception return. Set by CPSID f.' },
+  ]}
+  caption="FAULTMASK — more aggressive than PRIMASK; blocks HardFault too. Used by fault handlers to prevent recursive faults."
+/>
+
+<RegisterMap
+  name="BASEPRI"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:8', name: '-', access: 'RO', reset: '0', description: 'Reserved.' },
+    { bits: '7:0', name: 'BASEPRI', access: 'RW', reset: '0', description: 'Priority threshold (left-justified, same encoding as IPR bytes). All exceptions of priority value ≥ BASEPRI are blocked. Writing 0 disables masking. Available on M3/M4/M7/M33 — not on M0/M0+.' },
+  ]}
+  caption="BASEPRI — selective masking. Lets you suppress 'low-priority' IRQs while still allowing more urgent ones to preempt."
+/>
+
+A frequent FreeRTOS pitfall: the kernel uses BASEPRI to wrap critical sections at `configMAX_SYSCALL_INTERRUPT_PRIORITY`. IRQs *more urgent* than that value (lower numeric priority) keep running and **must not call FreeRTOS APIs** — they bypass the kernel. The number you write to BASEPRI is left-shifted to match the priority byte encoding; `__set_BASEPRI(0x50)` is the typical pattern on a 4-bit part.
+
+## Interaction with the active stack
+
+The NVIC tracks which IRQs are *active* — handlers currently on the call stack but not yet returned. Activation chain stays in `NVIC_IABRn`. When a higher-preempt IRQ fires while another is active, the CPU pushes the active handler's context, runs the higher-priority handler, and on return restores the original handler. This is the classic nested-interrupt pattern.
+
+Key constraints the hardware enforces:
+
+- **You cannot reduce an IRQ's effective priority by writing IPR while it's active.** The active handler runs at its activation-time priority. The new value only affects future activations.
+- **Tail-chain skips the stack pop and re-stack.** If a second IRQ becomes pending while the first is exiting, the hardware tail-chains — saving ~6 cycles versus a full exit + re-entry. The decision uses the latest IPR values.
+- **Late-arriving:** if a *higher*-priority IRQ pends after the lower-priority IRQ started stacking but before the handler begins, the CPU upgrades the stack to be for the higher-priority IRQ and dispatches it instead. The lower IRQ stays pending.
+
+See the [tail-chain & late-arrival](/docs/cortex-m/tail-chain) page for the full timing breakdown.
+
+## Designing a priority scheme
+
+A few patterns that work well in real designs:
+
+**Two preempt levels** — `PRIGROUP = 6` on a 4-bit part gives you 1 preempt bit. Use preempt-priority `0` for hard real-time IRQs (motor commutation, audio buffer, safety watchdog) and preempt-priority `1` for everything else. Within each group, use sub-priority to order tiebreakers. This is the most common scheme — easy to reason about, hard to deadlock.
+
+**RTOS-friendly** — match the FreeRTOS or Zephyr requirement: pick a `configMAX_SYSCALL_INTERRUPT_PRIORITY` somewhere in the middle (say `5` on a 4-bit part). Anything numerically ≥ 5 can use RTOS APIs; anything < 5 is "ultra-fast" and must not call kernel functions. SysTick goes at the lowest urgency (highest number) so it never delays a critical IRQ.
+
+**Flat (no nesting)** — `PRIGROUP = 7`. Every IRQ has the same preempt-priority and they run in pend-order with sub-priority as tiebreaker. Used in safety-critical designs where bounded WCET is more important than responsiveness. Simpler to verify.
+
+**Per-bus latency budget** — if you have an external DAC needing a sample every 22.7 µs (44.1 kHz) and the CPU does ~80 MHz, your audio IRQ deadline is ~1800 cycles. Anything that takes longer than 1800 cycles inside a handler at the same-or-higher preempt-priority will starve the DAC. Set the audio IRQ to the lowest numeric (most urgent) preempt-priority; verify with the [interrupt latency calculator](/tools/interrupt-latency).
+
+<Callout type="danger">
+Lock-free or fully wait-free designs sometimes rely on the assumption that an ISR cannot be preempted by another ISR of the same handler. That's only true if they share preempt-priority. If two ISRs have different preempt-priorities and share a data structure, you need atomicity primitives (ldrex/strex or explicit critical sections via BASEPRI). Same-priority IRQs serialize naturally via tail-chain.
+</Callout>
+
+## Verifying with the priority simulator
+
+Working through priority schemes on paper is error-prone — the [NVIC priority simulator](/tools/nvic-simulator) plots every preempt relationship as a matrix so you can see at a glance which IRQ preempts which. Try a few PRIGROUP values; the visual changes are dramatic and often reveal that what you thought was a 16-level scheme is really a 2-level one.
+
+The simulator also surfaces the "severity bucket" each IRQ falls into, which is a useful sanity check before tape-out. If your "fast audio" IRQ ends up in the "idle" bucket because someone fat-fingered the priority byte, you'll catch it before it's an in-field problem.
+
+## Further reading
+
+- [NVIC overview](/docs/cortex-m/nvic) — the register block and pending/active state machine
+- [NVIC registers](/docs/cortex-m/nvic-registers) — every register decoded
+- [Tail-chain & late-arrival](/docs/cortex-m/tail-chain) — the optimisations the NVIC applies on entry/exit
+- [Vector table](/docs/cortex-m/vector-table) — placement, relocation, and how VTOR affects priority
+- ARMv7-M Architecture Reference Manual, sections B1.5 (Exception model) and B3.2 (NVIC register descriptions)

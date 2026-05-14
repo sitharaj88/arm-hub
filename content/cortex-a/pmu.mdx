@@ -1,0 +1,232 @@
+---
+title: Performance Monitoring Unit (PMU)
+description: How to profile Cortex-A workloads — PMCR control, event counters and architectural events, perf_event_open / perf record workflows, and the Statistical Profiling Extension (SPE) for sub-instruction sampling on ARMv8.2+.
+order: 8
+updated: 2026-05-13
+tags: [cortex-a, pmu, perf, profiling, spe, performance]
+---
+
+A Cortex-A core has dedicated hardware that counts micro-architectural events — cycles, instructions, cache misses, branch mispredictions, TLB events, and dozens more. This is the Performance Monitoring Unit (PMU), and it's the single most useful diagnostic tool for any non-trivial performance work on ARM Linux. Used well, it tells you exactly where your cycles are going; used poorly, it leads you in circles.
+
+This page covers the PMU architecture across ARMv8-A, what events are available, the `perf` user-space workflow, common counting strategies, and the Statistical Profiling Extension (SPE) that addresses PMU's biggest weakness — its inability to tell you *where* a stall happened with cycle-level precision.
+
+<SpecSheet
+  title="PMU at a glance"
+  specs={[
+    { label: 'Architecture spec', value: 'ARMv8 PMUv3 (DDI 0487 chapter D7). Mandatory on application cores; nearly all support 6+ programmable counters' },
+    { label: 'Counter count', value: 'Implementation-defined. Typically 6 (Cortex-A53), 7 (A55/A76/A78), 8+ (Neoverse). Plus 1 dedicated cycle counter (CCNT)' },
+    { label: 'Counter width', value: '32 bits (extendable to 64 via PMCR_EL0.LP on ARMv8.5+)' },
+    { label: 'Event types', value: 'Architectural events (numbered 0x00–0x7F, defined by ARM) and implementation-defined events (0x80+, vendor-specific)' },
+    { label: 'Userspace access', value: 'perf_event_open(2). Direct rdpmc-like access via PMCR_EL0.EN/UEN (privileged setup) and PMUSERENR_EL0' },
+    { label: 'Interrupt-driven sampling', value: 'Counter overflow raises PMU IRQ. Linux uses this for "record at every N events" sampling' },
+    { label: 'SPE (Statistical Profiling)', value: 'ARMv8.2+ optional. Statistical sampling at the IROB — captures instruction PC, latency, address. Cortex-A65/A76+, all Neoverse' },
+    { label: 'Tooling', value: 'perf record/report/stat, perf top, perf c2c, perf script, perf-mem (SPE-based)' },
+  ]}
+/>
+
+## PMU register layout
+
+The PMU exposes a set of system registers accessible at EL1 (always) and optionally EL0 (when `PMUSERENR_EL0.EN = 1`). The core registers:
+
+- **`PMCR_EL0`** — Control register. Enables the PMU, resets counters, sets long-counter mode.
+- **`PMCNTENSET_EL0` / `PMCNTENCLR_EL0`** — Enable / disable individual counters.
+- **`PMSELR_EL0`** — Counter selector for indirect access.
+- **`PMXEVTYPER_EL0`** — Sets the event type of the selected counter.
+- **`PMXEVCNTR_EL0`** — Counter value of the selected counter.
+- **`PMCCNTR_EL0`** — Dedicated cycle counter (separate from the 6+ programmable ones).
+- **`PMOVSCLR_EL0`** — Overflow status (write 1 to clear).
+- **`PMINTENSET_EL1`** — Interrupt enable for counter overflow.
+
+<RegisterMap
+  name="PMCR_EL0"
+  width={32}
+  reset="0x0000_0000"
+  fields={[
+    { bits: '31:24', name: 'IMP', access: 'RO', reset: 'Implementation defined', description: 'Implementer code (e.g. 0x41 for ARM).' },
+    { bits: '23:16', name: 'IDCODE', access: 'RO', reset: 'Implementation defined', description: 'Identification code identifying the specific PMU implementation.' },
+    { bits: '15:11', name: 'N', access: 'RO', reset: 'Implementation defined', description: 'Number of event counters implemented (excluding the cycle counter).' },
+    { bits: '10:7', name: '-', access: 'RO', reset: '0', description: 'Reserved.' },
+    { bits: '6', name: 'LP', access: 'RW', reset: '0', description: 'Long event counter enable (ARMv8.5+) — counters become 64-bit.' },
+    { bits: '5', name: 'LC', access: 'RW', reset: '0', description: 'Long cycle counter — makes PMCCNTR 64-bit (otherwise 32-bit overflow every ~1.4 seconds at 3 GHz).' },
+    { bits: '4', name: 'DP', access: 'RW', reset: '0', description: 'Disable cycle counter when prohibited (e.g. in debug state).' },
+    { bits: '3', name: 'X', access: 'RW', reset: '0', description: 'Export events to external trace (ETM).' },
+    { bits: '2', name: 'C', access: 'WO', reset: '0', description: 'Cycle counter reset (writing 1 zeros PMCCNTR).' },
+    { bits: '1', name: 'P', access: 'WO', reset: '0', description: 'Event counter reset (writing 1 zeros all event counters).' },
+    { bits: '0', name: 'E', access: 'RW', reset: '0', description: 'Enable — when 1, enabled counters count.' },
+  ]}
+  caption="PMCR_EL0 — main PMU control register. Linux sets E=1 once at boot and rarely touches it again."
+/>
+
+## Architectural events
+
+ARMv8 PMUv3 defines a base set of events that every implementation must support, plus optional events that most implementations include. The most commonly used:
+
+| Event | Code | Description |
+|-------|------|-------------|
+| `CPU_CYCLES` | 0x11 | Cycle counter (also accessible via `PMCCNTR_EL0`) |
+| `INST_RETIRED` | 0x08 | Instructions retired (committed, not just dispatched) |
+| `BR_MIS_PRED_RETIRED` | 0x22 | Mispredicted branches retired |
+| `L1D_CACHE_REFILL` | 0x03 | L1 data cache refills (misses that hit L2 or further) |
+| `L1D_CACHE` | 0x04 | L1 data cache accesses |
+| `L2D_CACHE_REFILL` | 0x17 | L2 cache refills (misses that go to L3 or DRAM) |
+| `L2D_CACHE` | 0x16 | L2 cache accesses |
+| `LL_CACHE_MISS_RD` | 0x37 | Last-level cache read misses (effectively DRAM reads) |
+| `DTLB_WALK` | 0x34 | Data TLB walk (L1 DTLB miss that required a page-table walk) |
+| `ITLB_WALK` | 0x35 | Instruction TLB walk |
+| `BUS_ACCESS` | 0x19 | Accesses to the chip-level interconnect |
+| `MEM_ACCESS` | 0x13 | Memory accesses |
+
+Implementation-defined events have codes 0x80 and up. Cortex-A76, for example, exposes events like `STALL_FRONTEND_CACHE` (front-end stalls due to I-cache miss), `STALL_BACKEND_MEM` (back-end stalls due to memory pipeline), and dozens of micro-architectural specifics. These are in the per-core Technical Reference Manual.
+
+## perf — the user-space frontend
+
+Linux's `perf` tool wraps `perf_event_open(2)` and the PMU into a clean CLI. Three primary modes:
+
+**`perf stat`** — counting mode. Run a workload, get totals.
+
+```sh
+$ perf stat -e cycles,instructions,branches,branch-misses,cache-references,cache-misses ./myapp
+Performance counter stats for './myapp':
+   3,245,672,891      cycles
+   4,891,234,567      instructions          # 1.51 insn per cycle
+     482,341,765      branches
+       4,123,456      branch-misses         # 0.86% of all branches
+     123,456,789      cache-references
+      12,345,678      cache-misses          # 10.0% of all cache refs
+       1.234567 seconds time elapsed
+```
+
+The headline metric `IPC = instructions / cycles` is usually the first thing to look at. A modern Cortex-A76 should run at IPC ~2-3 on well-tuned code; IPC &lt;1 indicates major stalls (memory, branch mispredict, dependency chains).
+
+**`perf record`** — sampling mode. Periodically sample the program counter when a counter overflows. Default is "every ~10 ms of CPU time" sampling on cycles.
+
+```sh
+$ perf record -F 999 -g ./myapp     # 999 Hz sampling, capture call stacks
+$ perf report                        # interactive TUI showing hot functions
+```
+
+`perf record -e cache-misses ./myapp` samples on cache-miss overflow instead of cycles. Useful for "show me where my cache misses come from."
+
+**`perf top`** — like `top` but for hot functions across all running processes. Useful for system-level investigations.
+
+## A typical investigation
+
+A real-world performance bug: "the new code is 25% slower than before; figure out why."
+
+```sh
+$ perf stat -e cycles,instructions,branches,branch-misses ./before
+   2,000,000,000   cycles
+   3,000,000,000   instructions   # IPC 1.50
+$ perf stat -e cycles,instructions,branches,branch-misses ./after
+   2,500,000,000   cycles
+   3,000,000,000   instructions   # IPC 1.20 (worse)
+```
+
+Same instruction count, 25% more cycles → it's not algorithm change, it's micro-architectural. Now drill down:
+
+```sh
+$ perf stat -e dtlb_walk,l1d_cache,l1d_cache_refill,l2d_cache,l2d_cache_refill ./after
+       4,500,000  dtlb_walk
+   1,200,000,000  l1d_cache
+      82,000,000  l1d_cache_refill   # 6.8% L1D miss rate (was 4.1%)
+      85,000,000  l2d_cache
+      32,000,000  l2d_cache_refill   # 38% L2 miss rate (was 22%)
+```
+
+L2 miss rate jumped from 22% to 38%. Memory pressure. Now sample to find where:
+
+```sh
+$ perf record -e l2d_cache_refill -c 10000 ./after
+$ perf report
+35%  myfunc /path/to/binary
+24%  hot_inner_loop
+...
+```
+
+The line-level breakdown points at the source line with the L2 misses, and from there it's down to cache layout or access pattern.
+
+<Callout type="tip">
+The `perf list` command shows every event the kernel knows about — both architectural and the implementation-defined ones the kernel has been taught. On a Cortex-A76 system the list runs to several hundred. The `perf list --details` flag prints the description from the PMU JSON, which is invaluable when investigating unfamiliar events.
+</Callout>
+
+## Sampling pitfalls
+
+PMU sampling has well-known limitations:
+
+**Skid.** When a counter overflows, the CPU takes a few cycles to deliver the PMU interrupt — during which the PC advances. The sampled PC is therefore *not* the exact instruction that caused the overflow; it's somewhere in the next 20-30 instructions. For workloads with tight inner loops, skid is usually fine because the whole hot region attracts samples; for cold workloads with isolated hot instructions, skid muddles the picture.
+
+**Multiplexing.** If you ask for more events than the PMU has counters (6-8 typically), the kernel **multiplexes** — runs one set for a slice, swaps to another set for the next slice. Each event's count is scaled up by the multiplex factor; this introduces error, especially for short-running programs. Solution: keep your event set ≤ counter count.
+
+**Inclusive events.** Counts are usually inclusive — `INST_RETIRED` counts all retired instructions, including from kernel code, syscalls, page faults, IRQs. To isolate user-mode counts, use `perf stat -e cycles:u,instructions:u` (the `:u` suffix says user mode only).
+
+## SPE — Statistical Profiling Extension
+
+SPE addresses skid head-on. Instead of "count an event and trap on overflow," SPE samples *instructions in the issue queue* directly — capturing the PC, the operation type, the latency from issue to retire, the memory address (for loads/stores), the cache levels hit, and the translation regime. Every sampled instruction comes with rich metadata.
+
+SPE samples per instruction, configured via `perf record -e arm_spe/period=10240/`. The kernel allocates a buffer; the SPE unit writes records (32 bytes typical) into the buffer; the kernel reads it out periodically.
+
+A `perf-mem` analysis using SPE:
+
+```sh
+$ perf mem record -F 99 ./myapp
+$ perf mem report --sort=mem
+# Samples: 1234 of event 'arm_spe_0/mem_access/'
+# Memory access  Latency (cycles)  Function    Source line
+...
+L3 hit            45               hash_lookup  hash.c:142
+DRAM              312              hash_lookup  hash.c:142
+```
+
+You see the *exact* latency distribution of memory accesses at a given source line — not aggregated, per-sample. For investigating tail latency or detecting cache contention (the same line being pulled in and evicted by another core), `perf c2c` (cache-to-cache analysis) uses SPE data to identify false sharing.
+
+SPE requires:
+- Cortex-A65, A75/A76/A77/A78, all Neoverse (V1/V2/N1/N2), Cortex-X1+
+- Linux kernel ≥ 5.4 with `CONFIG_ARM_SPE_PMU`
+- Buffer memory pinned by the kernel — typically 1-4 MB per CPU
+
+## Per-counter exclude bits
+
+Each counter can be configured to exclude certain modes via PMXEVTYPER bits:
+
+- `U` (Unprivileged exclude) — don't count when running at EL0 (user)
+- `P` (Privileged exclude) — don't count when at EL1/2 (kernel)
+- `NSU` / `NSK` — equivalents for non-secure mode (when secure-world is present)
+- `M` (M-profile, irrelevant on Cortex-A)
+- `HV` (Hypervisor) — don't count at EL2
+
+Linux's `perf` exposes these via event modifiers:
+
+| Modifier | Counts when... |
+|----------|----------------|
+| `:u` | EL0 only |
+| `:k` | EL1+ (kernel + hypervisor) |
+| `:h` | EL2 only |
+| `:G` | Guest only (under KVM) |
+| `:H` | Host only |
+
+For example, to count cycles spent only in user mode of guest VMs running on a KVM host: `cycles:uG`.
+
+## Building intuition — typical event ratios
+
+A few rule-of-thumb metrics for sanity-checking Cortex-A profiles:
+
+| Metric | Healthy | Investigate |
+|--------|---------|-------------|
+| IPC | >2.0 on out-of-order cores | &lt;1.0 |
+| L1D miss rate | &lt;5% | >10% |
+| L2 miss rate (of L2 access) | &lt;20% | >50% |
+| LL cache miss rate | &lt;10% | >25% |
+| Branch mispredict rate | &lt;2% | >5% |
+| DTLB walks per 1000 instructions | &lt;2 | >10 |
+| Frontend stall fraction | &lt;20% | >40% |
+
+These are starting points. A workload doing pointer-chasing through a linked list will look bad on every metric and there's no fixing it without algorithm change.
+
+## Cross-references
+
+- [TLB & address translation](/docs/cortex-a/tlb) — DTLB/ITLB events and walk caches
+- [SMP & cache coherency](/docs/cortex-a/smp) — interpreting cache-coherency events
+- [NEON / SVE](/docs/cortex-a/neon-sve) — vectorization-effectiveness profiling
+- ARM ARM (DDI 0487), chapter D7 — PMUv3 architecture
+- Linux source: `tools/perf/`, `arch/arm64/kernel/perf_event.c`
+- ARM Cortex-A76 Technical Reference Manual — implementation-defined event list

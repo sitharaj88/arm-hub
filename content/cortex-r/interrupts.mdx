@@ -1,0 +1,217 @@
+---
+title: Cortex-R interrupts — VIC, VIM, GIC
+description: How Cortex-R parts handle interrupts — Vectored Interrupt Controller, TI's VIM, GIC on R52, the IRQ vs FIQ distinction, direct vector lookup vs software dispatch, and how it all compares to Cortex-M's NVIC.
+order: 3
+updated: 2026-05-13
+tags: [cortex-r, interrupts, vic, vim, gic, fiq, irq]
+---
+
+Cortex-R interrupt handling sits in an awkward middle ground between the tightly-integrated NVIC of Cortex-M and the much larger GIC of Cortex-A. Different Cortex-R SoCs ship with completely different interrupt controllers — there's no single "Cortex-R interrupt controller" the way the NVIC is the universal Cortex-M one. ARM provides a generic VIC IP, TI ships TMS570 parts with its proprietary VIM, NXP's S32 family uses INTC, and the modern Cortex-R52 standardizes on **GIC v3**.
+
+This page walks through each major pattern, the IRQ-vs-FIQ split that all Cortex-R variants share, how vectored dispatch works in hardware, and what to look out for when porting code from a Cortex-M part to a Cortex-R one.
+
+<SpecSheet
+  title="Cortex-R interrupt controllers"
+  specs={[
+    { label: 'ARM Generic VIC', value: 'PL192 / PL190 — memory-mapped, simple priority, used in early Cortex-R designs and academic boards' },
+    { label: 'TI VIM (Vectored Interrupt Module)', value: 'Used in TMS570 and Hercules family. 128 channels, priority-encoded, optional ECC on vector table' },
+    { label: 'NXP INTC', value: 'Used in S32R series. Similar feature set to VIM; per-channel priority and direct vector dispatch' },
+    { label: 'Xilinx/AMD per-RPU IRQ Controller', value: 'Custom on Zynq Ultrascale+ RPU subsystem. Routes platform interrupts to one or both R5 cores' },
+    { label: 'GIC v2', value: 'On some R8-class designs in cluster configurations' },
+    { label: 'GIC v3', value: 'Standard on Cortex-R52 and R82 — same architecture as Cortex-A' },
+    { label: 'CPU interrupt inputs', value: 'Always two: IRQ (normal interrupt) and FIQ (fast interrupt)' },
+    { label: 'Vector entry points', value: 'IRQ vector at offset 0x18, FIQ vector at offset 0x1C of vector base' },
+  ]}
+/>
+
+## The IRQ/FIQ split
+
+Every ARM core in the A-profile and R-profile (and the ARMv7-A variants of any profile) has *two* interrupt lines: **IRQ** (normal interrupt) and **FIQ** (fast interrupt). This is the architectural inheritance from ARM7TDMI and persists into Cortex-R.
+
+Differences between IRQ and FIQ at the CPU level:
+
+| Property | IRQ | FIQ |
+|----------|-----|-----|
+| Banked registers | r13 (SP), r14 (LR) | r8-r14 (7 registers banked) |
+| Vector offset | 0x18 | 0x1C |
+| Default mask | CPSR.I | CPSR.F |
+| Used for | General-purpose interrupts | Highest-priority, lowest-latency interrupts |
+| Maskable in handler | Yes | Yes |
+| Priority | All IRQs share one level at CPU; controller decides ordering | Higher than IRQ; preempts IRQ handlers |
+
+The FIQ banking is crucial: the CPU has 7 dedicated registers (r8–r14) that only FIQ mode sees. When the FIQ handler runs, those registers are "fresh" — no need to push/pop them to save/restore state. The handler can use them as scratch immediately. This is why FIQ has lower entry/exit latency: ~5 cycles saved compared to IRQ's full register save.
+
+Convention: FIQ is reserved for one critical source (often the highest-priority interrupt — a watchdog, a tight servo loop, an audio buffer underrun handler) and IRQ aggregates everything else through the interrupt controller. Some parts hardwire a specific peripheral to FIQ; others let firmware steer any interrupt to FIQ via the controller's routing.
+
+## ARM Generic VIC (PL192/PL190)
+
+The early Cortex-R-era reference design. The VIC is a memory-mapped block (typically at 0x4000_0000 or similar) with:
+
+- 32 interrupt input lines.
+- One 32-bit "current pending" register.
+- One 32-bit "vector address" register that's *automatically* updated based on which highest-priority interrupt is pending.
+- A "default vector address" for unvectored fallback.
+
+The CPU's IRQ vector at 0x18 of the vector base typically reads the VIC's vector address register and jumps to it:
+
+```asm
+@ IRQ entry at offset 0x18
+irq_vector:
+    ldr   pc, [pc, #-0xff0]    @ load PC from VIC vector address register
+```
+
+The address `[pc, #-0xff0]` is a fixed-offset trick that loads from `VIC base + 0x10` (assuming the vector table is at 0xFFFF0000 and VIC at 0xFFFFF000, a common pseudo-layout). The VIC hardware updates this register every cycle based on pending state, so the load gets the address of the right handler without any software lookup.
+
+## TI VIM — Vectored Interrupt Module
+
+TI's TMS570 Hercules family uses the **VIM**, a 128-channel vectored interrupt controller with several useful safety features:
+
+- **Vector table in dedicated RAM** — VIM has a small SRAM (typically 1 KB) holding 96 32-bit handler addresses. The CPU reads from VIM_IRQVECREG and jumps directly.
+- **Per-channel priority** — 96 channels, each with a programmable priority (0–95). Channel 0 is highest.
+- **Per-channel mask** — VIM_REQMASKCLR0/1/2 and VIM_REQMASKSET0/1/2.
+- **ESM (Error Signaling Module) integration** — uncorrected ECC errors and other safety events route through VIM as priority interrupts.
+- **ECC on the vector table** — VIM RAM has SECDED. A vector RAM corruption raises a critical fault rather than silently jumping to a garbage address.
+
+A typical VIM bring-up:
+
+```c
+void vim_init(void) {
+    // Enable all 96 channels
+    VIM->REQMASKSET0 = 0xFFFFFFFF;
+    VIM->REQMASKSET1 = 0xFFFFFFFF;
+    VIM->REQMASKSET2 = 0xFFFFFFFF;
+
+    // Set handler addresses in VIM vector table
+    VIM->VECTORS[0] = (uint32_t)esm_high_handler;
+    VIM->VECTORS[1] = (uint32_t)reset_handler;
+    VIM->VECTORS[2] = (uint32_t)dma_handler;
+    // ... up to 96 channels
+
+    // Enable VIM IRQ to CPU
+    VIM->IRQVECREG = 0x00000000;   // start at channel 0
+}
+```
+
+The CPU's IRQ vector entry is one instruction:
+
+```asm
+irq_vector:
+    ldr pc, [pc, #-0x44]   @ load handler PC from VIM->IRQVECREG
+```
+
+This gives ~14 cycle IRQ entry latency on a TMS570 — competitive with Cortex-M's NVIC.
+
+<Callout type="tip">
+The VIM's per-channel vector table makes adding a new interrupt trivial: just write the handler address to the right slot. No software dispatcher to update. This is why TI Hercules firmware tends to have very small, fast IRQ handler skeletons compared to NVIC-based systems where the vector table is part of the ELF.
+</Callout>
+
+## Differences from Cortex-M NVIC
+
+The NVIC on Cortex-M is *part of the CPU* — it's tightly integrated and architecturally specified. Interrupt entry is 12 cycles, hardware does the register stacking automatically, and the vector table is fixed in the linker script.
+
+On Cortex-R, the interrupt controller is a *separate IP block* that the CPU just sees as an interrupt source. There's no automatic register stacking — the handler must do it in software (matching AAPCS). Differences:
+
+| Aspect | Cortex-M NVIC | Cortex-R (typical) |
+|--------|---------------|---------------------|
+| Latency (cycles to handler) | 12 (no FPU) – 16 (with FPU) | 15–30, depending on controller |
+| Register stacking | Hardware (r0–r3, r12, lr, pc, xpsr) | Software (in handler prologue) |
+| Vector table | Fixed offset, configurable via VTOR | At VBAR address, in TCM or flash |
+| Tail-chain optimization | Yes | Not directly — handled by controller chaining |
+| Priority | 8-bit byte, NVIC manages | Controller-specific (VIM: 96-level; VIC: 32-level) |
+| FIQ | Not a concept (single IRQ line) | Distinct line with banked registers |
+
+The register-stacking difference is the biggest. Cortex-M handlers can be written as plain C functions because the hardware pushes the AAPCS-clobbered registers. Cortex-R handlers need an explicit prologue:
+
+```asm
+irq_handler:
+    sub    lr, lr, #4               @ adjust LR for IRQ return semantics
+    srsdb  sp!, #0x12               @ store return state on IRQ stack (ARMv7-R+)
+    cpsie  i, #0x13                 @ switch to SVC mode, re-enable IRQs
+    push   {r0-r3, r12, lr}         @ save AAPCS scratch
+    bl     handle_irq               @ C-level handler
+    pop    {r0-r3, r12, lr}         @ restore
+    rfeia  sp!                      @ return from exception
+```
+
+Most BSPs provide a "wrapper" macro that generates this prologue/epilogue, letting application code write plain C handlers.
+
+## GIC v3 on Cortex-R52
+
+The Cortex-R52 ships with a **GIC v3** — the same architectural interrupt controller used on Cortex-A53/A76. Same SGI / PPI / SPI / LPI interrupt classes, same Distributor + Redistributor + CPU Interface partitioning, same affinity routing.
+
+The system-register interface (`ICC_IAR1_EL1`, `ICC_EOIR1_EL1`, etc.) is identical to Cortex-A. This means firmware that runs on an R52 cluster has access to:
+
+- Up to 1020 SPIs (shared peripheral interrupts)
+- 16 SGIs for inter-core communication
+- LPI / ITS for message-signaled interrupts (rare on R52 platforms, but supported)
+- Affinity routing for >8-core configurations
+- Virtual interrupt injection for the EL2 hypervisor
+
+For embedded automotive applications, GIC v3 on R52 is overkill in pure feature count but valuable for the hypervisor support — partitioning real-time loads across vCPUs needs vGIC.
+
+See the [GIC page on Cortex-A](/docs/cortex-a/gic) for the full mechanics; the R52 implementation matches exactly.
+
+## Direct vector lookup vs software dispatch
+
+A core design question for any Cortex-R interrupt controller: should the CPU jump *directly* to the handler, or should it jump to a dispatcher that reads a status register to figure out which handler to call?
+
+**Direct vector lookup** (VIM, ARM VIC):
+- CPU reads a "current vector" register from the controller; the register's value is the handler address.
+- ~5-cycle dispatch — basically one load and one branch.
+- Requires the controller to maintain a software-writable vector table.
+
+**Software dispatch** (most GIC-based and INTC-based designs):
+- CPU jumps to a fixed dispatcher at the IRQ vector.
+- Dispatcher reads `ICC_IAR1_EL1` (GIC) or similar to get the interrupt ID.
+- Dispatcher looks up a handler in a C-level array, jumps to it.
+- ~30-cycle dispatch overhead, but more flexible (handler can be changed without rewriting hardware-visible tables).
+
+Direct vector lookup wins on raw latency but is brittle in safety contexts — corruption of the vector table is catastrophic. Software dispatch trades latency for control: every interrupt entry passes through the same kernel code, which can apply additional checks, log entry/exit, or implement custom priority handling.
+
+<Callout type="warn">
+Mixing direct vector lookup with an RTOS context switch is delicate. The handler that the CPU directly entered is not in RTOS-managed mode; it must not call RTOS APIs (`xSemaphoreGive`, `osThreadFlagsSet`) until it transitions back to a kernel-aware context. RTOSes that support direct-vector mode (Zephyr, ThreadX) provide explicit "from-interrupt" API variants that handle this.
+</Callout>
+
+## IRQ vs FIQ priority
+
+At the CPU level, FIQ is always higher priority than IRQ. The CPU masks IRQ when entering FIQ (CPSR.I implicitly set, plus CPSR.F also set so FIQ doesn't re-enter itself). FIQ cannot be preempted by IRQ from within the handler.
+
+The controller adds its own priority scheme on top:
+
+- **VIM**: 96 priority levels for IRQ channels; channels can also be routed to FIQ via VIM_FIQPROGREG. FIQ channels and IRQ channels are independent.
+- **GIC v3 on R52**: full priority byte (typically 5 implemented bits, 32 levels). FIQ corresponds to "Group 0 interrupts"; IRQ to "Group 1." The grouping is configurable per IRQ via `ICC_IGRPEN1_EL1`.
+
+A common pattern: assign one or two truly-critical handlers to FIQ (CPU-side highest priority, fewer banked registers needed) and put everything else on IRQ with controller-managed priorities. The FIQ handler is often hand-written assembly to extract maximum performance from the banked registers.
+
+## Latency budget walk-through
+
+For a TI TMS570 (Cortex-R5 + VIM) servicing a 4 µs deadline at 200 MHz:
+
+- IRQ assertion to CPU recognition: ~3 cycles
+- CPU pipeline drain: ~5 cycles
+- Mode switch and bank-register select: ~3 cycles
+- Vector load (VIM IRQVECREG → PC): 2 cycles
+- Handler prologue (push scratch regs to stack): ~6 cycles
+- Handler body: variable
+
+Total fixed overhead before handler body: ~19 cycles = 95 ns at 200 MHz. Out of 4000 ns budget, that's 2.4% — plenty of room.
+
+For a Cortex-R52 with GIC v3 at 1 GHz:
+
+- IRQ assertion to CPU recognition: ~3 cycles
+- Pipeline drain (deeper pipeline): ~10 cycles
+- Mode switch: ~3 cycles
+- `ICC_IAR1_EL1` read: ~6 cycles
+- Software dispatch lookup + jump: ~8 cycles
+- Handler prologue: ~6 cycles
+
+Total: ~36 cycles = 36 ns at 1 GHz. Faster in wall-clock time despite more cycles, because of the clock rate.
+
+## Cross-references
+
+- [NVIC priority on Cortex-M](/docs/cortex-m/nvic-priority) — counterpart on the M-profile
+- [GIC on Cortex-A](/docs/cortex-a/gic) — same architecture as R52's GIC
+- [R52 cluster modes](/docs/cortex-r/r52-cluster) — inter-core IRQs in a cluster
+- [Cortex-R MPU and TCM](/docs/cortex-r/mpu-tcm) — vector table placement
+- ARM Cortex-R5 Technical Reference Manual — VIC integration
+- TI TMS570 Hercules Technical Reference Manual — VIM in detail

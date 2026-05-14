@@ -1,0 +1,126 @@
+---
+title: The RTOS landscape
+description: FreeRTOS, Zephyr, ThreadX, RT-Thread, Mbed OS, RIOT — what they are, where they win, and how to choose for a new project.
+order: 1
+updated: 2026-05-12
+tags: [rtos, comparison, selection]
+---
+
+import Callout from '~/components/Callout.astro';
+
+Embedded RTOSes are not really competing on technical features anymore — most do priority-based preemptive scheduling, mutexes, semaphores, message queues, and timers. They're competing on **ecosystem**: drivers, certifications, vendor support, build systems, and the size of the community you can ask questions in.
+
+## The serious contenders
+
+| RTOS         | Origin / steward          | License        | Best at                                    |
+|--------------|---------------------------|----------------|--------------------------------------------|
+| **FreeRTOS** | Amazon (since 2017)       | MIT            | Universal, small, every chip has a port    |
+| **Zephyr**   | Linux Foundation          | Apache 2.0     | Full OS — drivers, networking, BLE         |
+| **ThreadX**  | Microsoft (Azure RTOS)    | MIT (since 2024)| Safety-critical, certified                 |
+| **RT-Thread**| RT-Thread Foundation (CN)  | Apache 2.0     | Chinese ecosystem, large community in APAC |
+| **Mbed OS**  | ARM (deprecated 2026)     | Apache 2.0     | (Sunsetting — don't pick for new projects) |
+| **RIOT**     | FU Berlin                 | LGPLv2.1       | Research, low-power IoT, IPv6              |
+| **NuttX**    | Apache                    | Apache 2.0     | POSIX-compliant, used in PX4 autopilots    |
+
+## How to choose
+
+### "I just need a scheduler"
+
+→ **FreeRTOS**. Smallest learning curve, ports to literally every Cortex-M ever made, MIT-licensed, ~6 KB minimum footprint. The application-level API hasn't changed in 15 years; what you learn today still applies in 2040.
+
+### "I need drivers, networking, BLE, USB out of the box"
+
+→ **Zephyr**. It's an RTOS *and* a complete OS — DTS-described boards, hundreds of in-tree drivers, IPv6 stack, BLE host + controller, USB device/host. Steeper learning curve, but you avoid writing the drivers yourself.
+
+### "I'm in automotive / medical and need certification"
+
+→ **ThreadX** (was Azure RTOS, now Microsoft Eclipse foundation). Pre-certified for IEC 61508 SIL 4, ISO 26262 ASIL D, IEC 62304 Class C, DO-178C. Microsoft moved it to MIT in 2024 — usable in commercial without per-unit royalties.
+
+### "I'm building a power-budget-constrained mesh / IoT node"
+
+→ **RIOT** or **Zephyr**. Both have first-class tickless idle and 6LoWPAN/Thread support.
+
+### "I want to write a flight controller"
+
+→ **NuttX**. PX4 uses it. POSIX-style API means you can prototype on Linux and port — actually useful for testing.
+
+## Schedulers — what they all do
+
+All of these implement essentially the same scheduler:
+
+- **Priority-based** preemptive.
+- Higher priority always preempts lower (no fairness — by design).
+- **FIFO within a priority level** (you control time-slicing if you enable it).
+- **Priority inheritance** on mutexes to prevent unbounded priority inversion.
+- **Tickless idle** — the OS computes the next deadline and sleeps until then.
+
+What changes is the constants:
+
+| RTOS      | Min context-switch cycles (Cortex-M4) | Min ISR overhead | Min RAM | Min flash |
+|-----------|---------------------------------------|------------------|---------|-----------|
+| FreeRTOS  | ~80 cycles                            | ~30 cycles       | 200 B/task | 6 KB    |
+| Zephyr    | ~140 cycles                           | ~50 cycles       | 256 B/task | 25 KB   |
+| ThreadX   | ~100 cycles                           | ~25 cycles       | 200 B/task | 6 KB    |
+
+Zephyr's larger footprint is because it includes more by default (a logging subsystem, a power-management subsystem, a device-tree-driven init). Tune the config and Zephyr can be close to FreeRTOS in raw size, but most projects use it for what it gives you, not in stripped-down mode.
+
+## The mental model differences
+
+**FreeRTOS** is "an RTOS you link with your application". You write `main()`, you initialise the chip, you call `xTaskCreate()`, you call `vTaskStartScheduler()`. You can mix RTOS and bare-metal code freely.
+
+**Zephyr** is "an OS your application lives inside". You provide threads as static config; the OS calls your code via the build system and a top-level `main`. There's a `west` meta-build tool, a device tree, a configuration system (Kconfig like Linux).
+
+**ThreadX** is closer to FreeRTOS in style — link with your code, manual init, manual task creation.
+
+For developers coming from desktop, Zephyr feels more familiar. For developers coming from bare-metal C, FreeRTOS feels more familiar. Both work; the question is which mental model fits your team.
+
+## Concurrency primitives summary
+
+All of them give you:
+
+- **Tasks/threads** with priorities.
+- **Semaphores** — binary and counting.
+- **Mutexes** with priority inheritance.
+- **Message queues**.
+- **Event flags** (or "event groups").
+- **Software timers**.
+- **Wait-on-event-from-ISR** primitives.
+
+Some have:
+- **Notifications** (FreeRTOS) — lighter than semaphores, one per task.
+- **Memory pools** — fixed-size block allocators.
+- **Streams / pipes** — byte-oriented inter-task transports.
+
+## Common pitfalls
+
+### Calling blocking APIs from ISRs
+
+All RTOSes have a separate set of `*_from_ISR` variants of their APIs because the ISR context can't sleep. Calling `xSemaphoreTake()` from an ISR will assert or crash; you want `xSemaphoreTakeFromISR()`.
+
+### Priority inversion
+
+Even with priority inheritance, you can still get inversion if you use binary semaphores for mutual exclusion (semaphores don't have an "owner", so PI can't track it). Use **mutexes** for mutual exclusion, **semaphores** for signalling.
+
+### Stack overflow
+
+Per-task stacks default to small. Print a stack-water-mark periodically:
+
+```c
+UBaseType_t high = uxTaskGetStackHighWaterMark(NULL);
+```
+
+This returns the minimum free stack ever recorded for the calling task. If it dips below ~50 words, increase the stack.
+
+### Non-deterministic priority resolution at compile time
+
+Mixing priorities across teams in a big project produces fights. Centralise a `priorities.h` that all tasks include and assign priorities relative to a few named anchors (`PRIO_SYSTEM`, `PRIO_NETWORK`, `PRIO_UI`).
+
+<Callout type="tip" title="Profile the scheduler">
+Most RTOSes have a tracing facility (FreeRTOS Trace, Zephyr's tracing subsystem, Percepio for ThreadX). Run with tracing enabled and look at the timeline — you'll see priority inversions, missed deadlines, and ISR latencies that you'd never catch otherwise.
+</Callout>
+
+## See also
+
+- [FreeRTOS](/docs/rtos/freertos/) — the most-used in detail.
+- [Zephyr](/docs/rtos/zephyr/) — the most-feature-rich.
+- [ThreadX](/docs/rtos/threadx/) — the certified one.

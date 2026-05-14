@@ -1,0 +1,166 @@
+---
+title: Toolchains (GCC / LLVM / commercial)
+description: arm-none-eabi-gcc, LLVM/clang, IAR, Keil/ARM Compiler — the realistic options for compiling Cortex-M code, with the flags that actually matter.
+order: 1
+updated: 2026-05-12
+tags: [tools, toolchain, gcc, llvm, clang]
+---
+
+
+For most Cortex-M work today, the choice is between two toolchains: **ARM's GCC** (free, open) and **ARM Compiler 6 / Keil** (commercial). LLVM/clang is increasingly viable; **IAR** is still standard in some industries; and **vendor-specific compilers** are mostly relics. Let's go through what each gives you.
+
+## arm-none-eabi-gcc
+
+The default. Free. Maintained by ARM, packaged at [developer.arm.com](https://developer.arm.com/Tools%20and%20Software/GNU%20Toolchain) (or homebrew/apt for most platforms). Releases roughly every 6 months.
+
+```bash
+arm-none-eabi-gcc      # C compiler
+arm-none-eabi-g++      # C++ compiler
+arm-none-eabi-as       # assembler
+arm-none-eabi-ld       # linker (typically called via gcc)
+arm-none-eabi-objcopy  # binary conversions
+arm-none-eabi-objdump  # disassembler
+arm-none-eabi-size     # section sizes
+arm-none-eabi-gdb      # debugger
+```
+
+The compiler proper is GCC with target `arm-none-eabi`. "none" = no OS; "eabi" = the embedded ABI.
+
+### The flags that matter
+
+```
+# CPU and ISA
+-mcpu=cortex-m4               # generates code for this CPU
+-mthumb                       # required for M-profile — always thumb mode
+-mfpu=fpv4-sp-d16             # FPU type (omit for soft-float)
+-mfloat-abi=hard              # pass floats in FPU regs (vs softfp/soft)
+
+# Code size and optimisation
+-Os                           # optimise for size — default for embedded
+-O2                           # optimise for speed
+-O3                           # aggressive — may bloat code
+-Og                           # debug-friendly + some optimisation
+-flto                         # link-time optimisation — typically 5–15% smaller
+
+# Required for dead-code elimination
+-ffunction-sections           # each function in its own section
+-fdata-sections               # each variable in its own section
+-Wl,--gc-sections             # linker discards unused sections
+
+# Linker
+-nostartfiles                 # don't link the C library's _start
+-T linker_script.ld           # custom linker script
+-Wl,-Map=firmware.map         # produce a map file
+
+# C standard
+-std=c11                      # C11 — sane default
+-std=gnu11                    # C11 + GNU extensions
+
+# Warnings
+-Wall -Wextra -Wpedantic
+-Wshadow -Wundef -Wconversion
+-Werror                       # warnings as errors — recommended
+```
+
+The combination of `-ffunction-sections -fdata-sections -Wl,--gc-sections` is non-negotiable — without it, you pay flash for every function you link in. With it, the linker discards anything not reachable from your entry point.
+
+### `-flto` — link-time optimisation
+
+LTO defers compiler optimisations until link time, when the compiler can see the whole program. Typical wins:
+
+- Inlining across translation units.
+- Better dead-code elimination.
+- Cross-module constant propagation.
+
+Costs:
+- Slower link.
+- Slightly less debuggable code (sometimes).
+- Debugger struggles to attribute optimised-out variables.
+
+For release builds: turn it on. For debug builds: usually off.
+
+## LLVM/clang
+
+Same options as GCC for most flags. Same target triples (`arm-none-eabi`). Cross-compiling clang to `arm-none-eabi`:
+
+```bash
+brew install llvm
+clang --target=arm-none-eabi -mcpu=cortex-m4 -mthumb ...
+```
+
+You still need GCC's newlib and linker scripts (clang doesn't ship a libc by default). The typical setup: clang for the compiler, GCC's binutils and newlib.
+
+### Why use clang?
+
+- **Better error messages** — much better. Especially for C++ template errors.
+- **Faster builds** — usually 10–30% faster than GCC for typical Cortex-M code.
+- **clang-tidy, clang-format, clangd** — top-tier tooling. IDE integration is excellent.
+- **Static analyser** — `scan-build`, `-Xanalyzer`, etc.
+
+### Why not use clang?
+
+- **Less battle-tested for ARM embedded** — most issues are caught by GCC's larger user base.
+- **No ARM Compiler 6** semi-supported features — clang has historically been ~6 months behind on supporting new ARM ISA extensions.
+- **Vendor support** — vendor SDKs often only test against GCC.
+
+## ARM Compiler 6 / Keil
+
+ARM Compiler 6 is built on LLVM with ARM's proprietary front-end and tuning. Bundled with Keil µVision. Closed source.
+
+Strengths:
+- Slightly tighter code on highly-tuned benchmarks (typically 1–5% smaller and faster than GCC for the same source).
+- Stronger ARMv8-M and Helium support, historically slightly ahead of GCC.
+- Used by some certification paths (qualified for safety standards).
+
+Weaknesses:
+- Costs money (commercial seat licenses).
+- Tied to Keil µVision IDE or paid command-line tooling.
+- Smaller community than GCC.
+
+For greenfield projects, GCC is typically the default and good enough. ARM Compiler 6 shows up where Keil is already entrenched or where the marginal size savings matter.
+
+## IAR
+
+A long-established commercial toolchain. Strong reputation in automotive, medical, industrial. Has its own front-end (not LLVM-based).
+
+Strengths:
+- Excellent debugger (C-SPY).
+- Strong static analysis built-in.
+- Certified for safety standards (functional-safety editions).
+- Generally produces the tightest code of any compiler for many Cortex-M targets.
+
+Weaknesses:
+- Expensive.
+- Vendor lock-in — the proprietary linker scripts (`.icf`) and project format don't trivially convert.
+- Smaller community.
+
+You'll meet IAR in established product lines where it was chosen years ago and switching costs are high.
+
+## Where the toolchains diverge in practice
+
+- **printf with float** — GCC's newlib needs `-u _printf_float` to pull in floating-point printf. Forgetting this is the #1 reason "my printf doesn't show my temperature" happens. IAR and ARM Compiler include it by default.
+- **C++ exception handling** — sizes differ wildly. Disable exceptions in all of them.
+- **Inline asm** — GCC and clang's extended asm is compatible. IAR's is different syntax (closer to ARM's UAL).
+- **`__weak`** — GCC: `__attribute__((weak))`. IAR: `#pragma weak`. ARM Compiler 6: both supported via LLVM compatibility.
+
+## The recommended baseline
+
+For a new project today:
+
+1. **arm-none-eabi-gcc**, latest stable release.
+2. **CMake** as the build system.
+3. **clangd** for IDE integration.
+4. **clang-format** for style.
+5. **probe-rs** or **OpenOCD + GDB** for flashing and debugging.
+
+Free, open, portable across Linux/macOS/Windows, ~zero vendor lock-in. Switch to LLVM/clang for the build if you want the better diagnostics; stay on GCC's linker and libc.
+
+<Callout type="tip" title="Pin your toolchain version">
+A new GCC release will occasionally change code generation in ways that bump your binary size by a few percent. CI catches it, but if you don't pin the version, you can ship a release where the binary suddenly grew past your flash budget. Use a Dockerfile or a pinned tarball.
+</Callout>
+
+## See also
+
+- [GDB & on-chip debug](/docs/tools/gdb/) — debugging across toolchains.
+- [Build systems](/docs/tools/build/) — CMake, Make, west, scons.
+- [Linker scripts](/docs/programming/linker-scripts/) — the linker side of the toolchain.

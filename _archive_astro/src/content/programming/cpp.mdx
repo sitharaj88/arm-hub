@@ -1,0 +1,196 @@
+---
+title: C++ on Cortex-M
+description: Modern C++ in firmware — constexpr, std::array, templates, and the language features to embrace or avoid on embedded.
+order: 5
+updated: 2026-05-12
+tags: [programming, cpp]
+---
+
+import Callout from '~/components/Callout.astro';
+
+C++ on Cortex-M is *not* the bloated, runtime-heavy language people remember from 2003. Modern C++ (≥ C++17) gives you compile-time computation, type safety, and zero-overhead abstractions — *if* you stay inside the subset of the language that respects the embedded constraints. The wrong C++ adds code bloat, hidden allocations, and runtime exception machinery. The right C++ produces tighter binaries than equivalent C.
+
+## What to use
+
+### `constexpr` everywhere
+
+```cpp
+constexpr uint32_t baud_to_brr(uint32_t pclk, uint32_t baud) {
+    return pclk / baud;
+}
+
+static constexpr uint32_t BRR = baud_to_brr(84'000'000, 115200);
+```
+
+Compile-time computation. The result is a literal in the binary, no runtime arithmetic. Use it for any value computable from constants — register addresses, timing values, lookup tables.
+
+### `std::array` instead of C arrays
+
+```cpp
+constexpr std::array<uint8_t, 4> firmware_version{1, 4, 2, 0};
+```
+
+Same memory footprint as a C array (the compiler optimises away the object wrapper), but with `.size()`, range-based `for`, bounds-checking via `at()` (off by default with optimisations on), and easy passing without decay-to-pointer.
+
+### Strong typedefs
+
+```cpp
+struct GpioPin { uint8_t value; };
+struct Microseconds { uint32_t value; };
+
+void delay(Microseconds us);         // can't accidentally pass a GpioPin
+
+constexpr Microseconds operator""_us(unsigned long long v) {
+    return Microseconds{static_cast<uint32_t>(v)};
+}
+
+delay(500_us);
+```
+
+Different units that compile-time refuse to interconvert. The whole "the Mars Climate Orbiter crashed because of unit mismatch" class of bugs becomes a compile error.
+
+### Templates for register access
+
+```cpp
+template <uintptr_t Addr>
+class Reg32 {
+public:
+    static uint32_t read()              { return *reinterpret_cast<volatile uint32_t *>(Addr); }
+    static void   write(uint32_t value) { *reinterpret_cast<volatile uint32_t *>(Addr) = value; }
+    static void   set_bit(int bit)      { write(read() | (1u << bit)); }
+    static void   clr_bit(int bit)      { write(read() & ~(1u << bit)); }
+};
+
+using GPIOA_MODER = Reg32<0x40020000>;
+
+GPIOA_MODER::set_bit(5);
+```
+
+Zero overhead — every method compiles to the same instructions as raw register access — but you get autocomplete, type safety, and impossible-to-confuse parameter ordering.
+
+The Kvasir, MMIO, and ARM's own MRA libraries take this much further with strongly-typed bit fields.
+
+### `enum class` for state machines
+
+```cpp
+enum class State : uint8_t { Idle, Connecting, Connected, Error };
+State state = State::Idle;
+
+// Compile error — won't implicitly convert to int
+// int x = state;
+// Compile error — won't accept the wrong enum
+// state = SomeOtherEnum::Foo;
+```
+
+Use it for every state machine. The strict typing pays for itself the first time a refactor leaves a stale comparison around.
+
+## What to use carefully
+
+### `std::function` — has a heap allocation hidden inside
+
+For arbitrary callable storage, `std::function<void()>` typically allocates on the heap if the callable doesn't fit in its small-buffer optimisation. Use [function2](https://github.com/Naios/function2) or roll a `static_function<void(), 16>` with a fixed-size buffer.
+
+### Virtual functions — fine, but think about the vtable
+
+Each class with a virtual function pays for a vtable pointer per instance and a vtable per class (in flash). For one-instance-per-class designs, prefer CRTP or template-based polymorphism. For genuinely runtime-dynamic types (think drivers behind a generic interface), virtual functions are fine.
+
+### Exceptions — usually disable
+
+`-fno-exceptions` is the default for most Cortex-M projects. Exceptions bring in unwinding tables (hundreds of KB on a complex project) and runtime overhead at every potential throw point. Use `std::optional` and `std::expected` (C++23) for fallible operations instead.
+
+```cpp
+std::optional<uint32_t> read_temperature() {
+    if (!sensor_ready()) return std::nullopt;
+    return raw_to_celsius(read_raw());
+}
+```
+
+### RTTI — disable too
+
+`-fno-rtti`. `typeid()` and `dynamic_cast` need runtime type information which costs flash. Rarely needed in firmware.
+
+## What to avoid
+
+### `iostream`
+
+`std::cout << x` drags in hundreds of KB of formatting machinery. Use `printf`-style functions or a lightweight format library ([fmt](https://github.com/fmtlib/fmt) has an embedded-friendly mode; [emio](https://github.com/Eyenseo/emio) targets embedded directly).
+
+### `std::shared_ptr` / `std::unique_ptr` with `make_shared` / `new`
+
+These imply heap allocation. If you want unique ownership of a fixed-size resource, use a static storage region and a custom deleter:
+
+```cpp
+static MyDevice device_storage;
+std::unique_ptr<MyDevice, void(*)(MyDevice*)> dev(
+    &device_storage,
+    [](MyDevice *) { /* no-op deleter */ }
+);
+```
+
+Or use Boost's `intrusive_ptr` patterns or a pool allocator.
+
+### `std::map`, `std::vector`, `std::string`
+
+All allocate. For small collections with known max size, use `etl::vector`, `etl::map`, `etl::string` from the [Embedded Template Library](https://www.etlcpp.com/) — same API, fixed-capacity allocation.
+
+```cpp
+etl::vector<float, 16> samples;   // capacity 16, no heap
+samples.push_back(1.5f);
+```
+
+## Build flags
+
+```
+-std=c++17                            # or c++20 / c++23 with modern toolchains
+-fno-exceptions                       # disable C++ exceptions
+-fno-rtti                             # disable RTTI
+-fno-threadsafe-statics               # disable C++11 static-init thread safety (saves locking)
+-fno-use-cxa-atexit                   # don't register __dso_handle / static dtor chain
+-ffunction-sections -fdata-sections   # so --gc-sections can drop unused
+-Wl,--gc-sections
+```
+
+`-fno-use-cxa-atexit` is the one most people miss. By default, every C++ static destructor is registered for "run at program exit" via `__cxa_atexit` — but your firmware never exits, so it's wasted code and a `__dso_handle` symbol you have to provide.
+
+<Callout type="tip" title="Look at the .map file">
+After enabling C++, check `firmware.map` for symbols starting with `__cxa_`, `_Z`, `vtable for`. They tell you what runtime machinery the toolchain pulled in. The smaller this list, the more "zero-overhead" your C++ is.
+</Callout>
+
+## A complete pattern
+
+```cpp
+template <uintptr_t Base>
+class Usart {
+public:
+    static void init(uint32_t baud, uint32_t pclk) {
+        reg<0x0C>() = pclk / baud;          // BRR
+        reg<0x00>() = (1 << 13) | (1 << 3) | (1 << 2);  // UE | TE | RE
+    }
+
+    static void putc(char c) {
+        while (!(reg<0x1C>() & (1 << 7))) {}     // wait TXE
+        reg<0x28>() = static_cast<uint32_t>(c);  // TDR
+    }
+
+private:
+    template <uintptr_t Offset>
+    static volatile uint32_t & reg() {
+        return *reinterpret_cast<volatile uint32_t *>(Base + Offset);
+    }
+};
+
+using Usart2 = Usart<0x40004400>;
+
+int main() {
+    Usart2::init(115200, 84'000'000);
+    Usart2::putc('H');
+}
+```
+
+Compiles to exactly the same instructions as the equivalent C — but with type-safe templated APIs and per-USART specialisation.
+
+## See also
+
+- [Embedded C patterns](/docs/programming/embedded-c/) — the C foundation under the C++.
+- [Linker scripts](/docs/programming/linker-scripts/) — `.init_array` and friends.
+- [ETL — Embedded Template Library](https://www.etlcpp.com/) (external).

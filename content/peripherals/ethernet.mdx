@@ -1,0 +1,227 @@
+---
+title: Ethernet MAC & PHY
+description: The Ethernet peripheral on Cortex-M parts — MAC vs PHY split, MII/RMII/RGMII interfaces, descriptor rings, PTP hardware timestamping, hardware checksum and VLAN offload, and the MDIO bus that configures the PHY.
+order: 18
+updated: 2026-05-13
+tags: [peripherals, ethernet, mac, phy, ptp, rmii]
+---
+
+Ethernet on a Cortex-M part is one of the most complex peripherals on the chip — easily 1500 lines of init code in any production firmware and a thick layer of vendor middleware on top of that. But the underlying architecture is consistent across vendors: a **MAC** (Media Access Controller) inside the SoC, an **external PHY** (Physical-layer transceiver) on the board, a digital data interface between them (MII, RMII, or RGMII), a separate **MDIO** management bus, and a pair of DMA descriptor rings that move frames between the MAC FIFOs and main RAM.
+
+This page covers the MAC/PHY split, the variant interfaces, descriptor-ring design, and the optional features that production designs almost always end up needing: PTP timestamping, checksum offload, jumbo frames, and VLAN tagging.
+
+<SpecSheet
+  title="Ethernet at a glance"
+  specs={[
+    { label: 'Standard', value: 'IEEE 802.3 (Ethernet) — 10/100/1000 Mbit/s on copper or fiber' },
+    { label: 'STM32 MAC peripherals', value: 'F7/H7/U5 ETH — 10/100 Mbit/s; H7 ETH gigabit-capable via external RGMII PHY' },
+    { label: 'NXP', value: 'i.MX RT ENET — 10/100/1000 with RGMII; LPC54xxx LPC_ENET 10/100' },
+    { label: 'MAC/PHY data interface', value: 'MII (16 pins, 100 Mbit/s), RMII (7 pins, 100 Mbit/s), RGMII (12 pins, up to 1 Gbit/s)' },
+    { label: 'MDIO management', value: 'Separate 2-pin (MDC + MDIO) async serial bus to configure the PHY — 16-bit registers, up to 32 PHYs per bus' },
+    { label: 'Descriptor rings', value: 'Tx and Rx, each a circular array in RAM. Typical sizes 4–32 descriptors per ring' },
+    { label: 'PTP', value: 'IEEE 1588v2 hardware timestamping — sub-microsecond precision via a free-running counter clocked by the MAC' },
+    { label: 'Offloads', value: 'IP/TCP/UDP checksum, VLAN tag insert/remove, IPv4 header replacement (some MACs)' },
+  ]}
+/>
+
+## MAC and PHY — what each does
+
+The **MAC** is the digital protocol engine. It handles:
+
+- Frame formatting (DA, SA, EtherType, payload, FCS).
+- CRC-32 generation and check.
+- Collision detection (in half-duplex 10/100; gigabit is always full-duplex).
+- Flow control (PAUSE frames).
+- VLAN tag handling.
+- Address filtering (own MAC, broadcast, multicast hash, promiscuous).
+- DMA to/from descriptor rings.
+
+The **PHY** is the analog transceiver. It handles:
+
+- 4B/5B line coding (100Base-TX) or 8B/10B (1000Base-T scrambling).
+- Manchester encoding (10Base-T).
+- Analog driver/receiver for the twisted pair.
+- Auto-negotiation of speed and duplex.
+- Cable diagnostics (TDR, link-up event reporting).
+
+The MAC lives in silicon on the MCU. The PHY is always an external chip: Microchip LAN8742 (10/100, RMII), TI DP83848 (10/100, MII/RMII), Realtek RTL8211F (gigabit, RGMII), Marvell 88E1512 (gigabit, RGMII, automotive-grade).
+
+<ProtocolFrame
+  title="Ethernet II frame as seen on the wire"
+  fields={[
+    { name: 'Preamble', bits: 56, tone: 'muted' },
+    { name: 'SFD', bits: 8, tone: 'warning' },
+    { name: 'DST', bits: 48, tone: 'primary' },
+    { name: 'SRC', bits: 48, tone: 'primary' },
+    { name: 'Type', bits: 16, tone: 'accent' },
+    { name: 'Payload', bits: 368, tone: 'highlight', flexible: true },
+    { name: 'FCS', bits: 32, tone: 'success' },
+  ]}
+  caption="Preamble plus SFD (0xAB closing nibble) clock-syncs the receiver; DST and SRC are 6-byte MAC addresses; Type ≥ 0x0600 distinguishes Ethernet II from 802.3 length; payload is 46-1500 bytes for classic frames; FCS is the CRC-32 the MAC verifies on RX and inserts on TX."
+/>
+
+The MAC connects to the PHY through the chosen MII variant; both also share the MDIO management bus.
+
+## MII / RMII / RGMII
+
+### MII (Media Independent Interface)
+
+The original 802.3 spec. 16 pins between MAC and PHY:
+
+| Direction | Signals | Purpose |
+|-----------|---------|---------|
+| PHY → MAC | RX_CLK, RX_DV, RX_ER, RXD[3:0] | 25 MHz receive clock, data valid, error, 4-bit data |
+| MAC → PHY | TX_CLK, TX_EN, TX_ER, TXD[3:0] | 25 MHz transmit clock, enable, error, 4-bit data |
+| Bidirectional | CRS, COL | Carrier sense, collision detect (half-duplex only) |
+
+Two separate clocks (RX_CLK from PHY, TX_CLK from PHY too) running at 2.5 MHz (10 Mbit/s) or 25 MHz (100 Mbit/s). 4-bit nibbles at 25 MHz × 4 bits = 100 Mbit/s.
+
+### RMII (Reduced MII)
+
+Same throughput, half the pins. Single 50 MHz reference clock shared by MAC and PHY:
+
+| Direction | Signals | Purpose |
+|-----------|---------|---------|
+| PHY → MAC | CRS_DV, RXD[1:0] | Carrier-sense/data-valid combined, 2-bit data |
+| MAC → PHY | TX_EN, TXD[1:0] | Transmit enable, 2-bit data |
+| Shared | REF_CLK | 50 MHz reference, either MCU-driven (HSE) or PHY-driven |
+
+7 pins versus MII's 16. Standard choice for cost-sensitive boards. The 50 MHz clock can come from the MCU (e.g. STM32 with `RCC_CFGR.MCO = HSE/PLL`) or the PHY's own crystal — typically the MCU drives the clock since it already has high-precision oscillator hardware.
+
+### RGMII (Reduced Gigabit MII)
+
+For 1 Gbit/s. 12 pins, source-synchronous DDR clocking:
+
+| Direction | Signals | Purpose |
+|-----------|---------|---------|
+| PHY → MAC | RX_CLK, RX_CTL, RXD[3:0] | 125 MHz DDR clock, control, 4-bit DDR data (= 8 bits/cycle) |
+| MAC → PHY | TX_CLK, TX_CTL, TXD[3:0] | 125 MHz DDR clock, control, 4-bit DDR data |
+
+DDR at 125 MHz × 4 bits × 2 edges = 1 Gbit/s. The TX_CLK delay (the alignment between TX_CLK edges and TXD transitions) is the main source of bring-up pain — RGMII requires either a deliberately-skewed clock (TX_CLK delayed ~2 ns relative to TXD) or an in-band-skew configuration via the PHY's MDIO registers.
+
+<Callout type="warn">
+RGMII timing skew problems are responsible for an enormous fraction of "Ethernet works at room temperature but fails over -40 to +85 °C" field issues. Either use an RGMII PHY with internal skew programmable via MDIO (the modern way) or pay close attention to PCB trace lengths and external delay-line components. Test corners with iperf3 and large packet sizes — if PHYs only barely meet timing, you'll see slow degradation as cables warm up, not catastrophic failure.
+</Callout>
+
+## MDIO — PHY management
+
+A separate 2-pin async serial bus (MDC clock, MDIO bidirectional data) used to read and write 16-bit PHY registers. The MDC clock runs at up to 2.5 MHz; an MDIO transaction takes ~64 cycles. Each PHY has a 5-bit address (0–31, set by hardware strapping on the PHY's RXD pins at reset).
+
+The standard PHY register set (defined by IEEE 802.3 Clause 22) starts with:
+
+| Reg | Name | Function |
+|-----|------|----------|
+| 0 | Control | Reset, speed, duplex, autoneg enable, restart autoneg |
+| 1 | Status | Link up, autoneg complete, jabber, remote fault |
+| 2-3 | PHY ID 1/2 | OUI + model — used for driver-software detection |
+| 4 | Autoneg advertisement | Speeds and duplex this PHY can do |
+| 5 | Autoneg link partner ability | What the other end advertised |
+| 6 | Autoneg expansion | Status of the autoneg process |
+
+Vendor PHYs add chip-specific registers above 16 (e.g. LAN8742 register 17 is "Special Control/Status" with link-up interrupt enable). The PHY-specific driver in your stack knows these.
+
+```c
+// Read PHY register via STM32 ETH MAC
+ETH->MACMDIOAR = (phy_addr << 21)
+              | (reg << 16)
+              | (3 << 2)            // read operation (RGMII MII)
+              | (1 << 0);           // start
+while (ETH->MACMDIOAR & 1) { }
+uint16_t value = ETH->MACMDIODR;
+```
+
+## Descriptor rings
+
+Frames don't go directly through CPU. The MAC has a DMA engine that walks a ring of **descriptors** in main memory. Each descriptor describes one frame buffer:
+
+| Field | Tx descriptor | Rx descriptor |
+|-------|---------------|---------------|
+| Buffer address 1 | Pointer to TX data | Pointer to RX buffer |
+| Buffer address 2 (or next descriptor) | Optional split TX or chain ptr | Optional split RX or chain ptr |
+| Length | Bytes to transmit | (filled by HW) bytes received |
+| Status / control | Own bit, FCS insert, checksum offload, interrupt-on-completion | Own bit, frame status, error flags |
+| (PTP) Timestamp | (filled by HW on TX with PTP enabled) | (filled by HW on RX with PTP enabled) |
+
+The "OWN" bit decides who controls each descriptor. Software sets OWN=1 to hand the descriptor to the MAC; the MAC clears OWN to 0 when it's done. Software can't touch a descriptor that's OWN=1 (the MAC might be writing to it).
+
+The Tx ring typically has 4–8 descriptors; the Rx ring 8–32. Larger rings reduce interrupt frequency (frames can come in faster than ISR can handle one-by-one) but use more RAM.
+
+Frame reception flow:
+
+1. MAC receives a frame on the wire.
+2. MAC examines the head Rx descriptor's OWN bit. If clear (software owns it), drop the frame (overrun). If set, DMA the frame into the buffer pointed to by the descriptor.
+3. MAC writes the frame length and status into the descriptor, then clears OWN.
+4. MAC optionally raises an interrupt.
+5. ISR / NAPI / lwIP polling routine sees the cleared OWN bit, processes the frame, marks the descriptor OWN=1, ready for re-use.
+6. MAC advances to the next descriptor.
+
+Multi-buffer frames (jumbo or split DMA) chain across descriptors via the "next descriptor" pointer or the second-buffer pointer.
+
+## PTP — hardware timestamping
+
+IEEE 1588v2 (Precision Time Protocol) needs sub-microsecond timestamping on selected packets to compute clock offset between master and slave. The MAC has a free-running PTP counter clocked off a stable reference (typically a 50 MHz local source) plus hardware that captures the counter value into the descriptor on:
+
+- Every received frame (or only PTP-classified frames, depending on config).
+- Every transmitted frame (or only those marked PTP).
+
+Captured timestamps are 64-bit (32-bit seconds + 32-bit fractional seconds). The PTP slave software adjusts the counter via the **addend register** (a fine-grained frequency adjustment) and the **adjust register** (coarse one-shot offset) to keep local time aligned with master time.
+
+Achievable precision on an unloaded LAN: ~100 ns peer-to-peer with sane PCB layout, ~1 µs with no special care. For industrial control (TSN, EtherCAT, PROFINET-IRT), this is the foundation.
+
+<Callout type="tip">
+PTP works at the MAC layer, not the PHY. The timestamp is captured by the MAC just after the FCS check on RX and just before the FCS insert on TX. PHY delay variation is therefore part of the measurement error — high-quality PHYs (Marvell 88E1512) spec PHY delay to within 1 ns over temperature, and the more permissive PHYs (LAN8742) vary by 10 ns or more.
+</Callout>
+
+## Checksum offload, VLAN, jumbo
+
+These are the features that turn "Ethernet works" into "Ethernet works fast."
+
+- **Checksum offload** — the MAC computes IPv4/TCP/UDP checksums on transmit (insert into outgoing packet) and verifies on receive (set a flag in the descriptor). Saves ~5% CPU per gigabit of throughput.
+- **VLAN tagging** — the MAC can insert or remove an 802.1Q VLAN tag automatically. The driver passes only the inner payload; the MAC adds/removes the 4-byte VLAN header.
+- **Jumbo frames** — frames larger than 1518 bytes. Common sizes: 4 KB, 9 KB. The MAC's frame-size filter must be set to allow them, and every descriptor's buffer must be ≥ jumbo size (or chained across multiple buffers).
+- **Multicast filtering** — a 64-bit hash table in the MAC accepts/rejects multicast addresses without CPU. Software hashes the multicast address and sets the corresponding bit; the MAC compares incoming multicast addresses to the table.
+
+## STM32 ETH peripheral
+
+The STM32 ETH peripheral (on F4/F7/H7/U5) is a Synopsys DesignWare EMAC core, programmable through register groups:
+
+- **MAC** registers — frame filter, flow control, MAC address.
+- **MMC** (MAC Management Counters) — frame counters, error counters.
+- **PTP** registers — timestamp control, addend, second/nanosecond counters.
+- **DMA** registers — descriptor ring pointers, status, operation mode.
+- **MDIO** registers — PHY management bus.
+
+Init sequence (abbreviated):
+
+1. Enable ETH clocks (MAC, TX, RX, PTP) in RCC.
+2. Configure RMII pins to AF11 (or RGMII for H7 with external PHY).
+3. Soft-reset the MAC (`DMAMR.SWR = 1`; wait until clear).
+4. Configure DMA bus mode, descriptor formats.
+5. Initialize descriptor rings in RAM.
+6. Configure MAC: frame filter, MAC address, flow control.
+7. Enable PHY via MDIO, wait for autoneg complete.
+8. Read PHY status to learn speed/duplex; program MAC to match.
+9. Enable MAC TX and RX, start DMA.
+
+Total ~150–400 lines of register code, or one CubeMX-generated `MX_ETH_Init` call.
+
+## Network stack choice
+
+The MAC alone gives you frames in/out. A full TCP/IP stack provides ARP, IP, ICMP, TCP, UDP, DHCP, DNS:
+
+- **lwIP** — the universal choice for embedded TCP/IP. BSD-licensed, ~30 KB code, supports raw API and BSD-sockets API. Used everywhere.
+- **uIP / Contiki-NG** — even smaller, used in 8-bit and very small 32-bit systems.
+- **FreeRTOS+TCP** — Amazon-maintained stack tightly integrated with FreeRTOS.
+- **NetX Duo** — Express Logic / Microsoft, used in safety-certified contexts.
+- **Zephyr networking stack** — for Zephyr-based systems.
+
+Vendor demos always ship with lwIP; this is the path of least resistance.
+
+## Cross-references
+
+- [Advanced DMA](/docs/peripherals/dma-advanced) — descriptor-ring DMA is a heavy user
+- [GPIO alternate functions](/docs/peripherals/gpio-af) — pin mux for MII/RMII/RGMII at very-high speed
+- [Memory model](/docs/architecture/memory-model) — placement of descriptor rings in non-cacheable memory
+- [Cortex-M7](/docs/cortex-m/m7) — cache management for Ethernet buffers
+- IEEE 802.3 — Ethernet standard
+- IEEE 1588-2008 — PTP standard

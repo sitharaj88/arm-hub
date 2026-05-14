@@ -1,0 +1,173 @@
+---
+title: Firmware profiling
+description: Measuring where time goes on Cortex-M — DWT PC sampling, SystemView, Tracealyzer, ETM streaming with J-Trace, and embedded gcov for coverage. When statistical wins, when full trace wins, and how to wire each up.
+order: 18
+updated: 2026-05-13
+tags: [tools, profiling, dwt, etm, systemview, tracealyzer, coverage]
+---
+
+Profiling firmware is fundamentally about answering "where is the CPU spending its time?" and "is the firmware doing what I think it is?". On a desktop, `perf record` answers both in a few keystrokes. On a Cortex-M with 128 KB of RAM, no operating system to instrument, and 200 nanoseconds of slack per loop iteration, the answer is more involved — but the hardware gives you enough hooks that you can do it without recompiling, without slowing the firmware, and without missing real-time deadlines.
+
+This page covers the four working approaches: statistical profiling via DWT PC sampling, RTOS-aware event tracing (SystemView, Tracealyzer), full instruction trace via ETM, and code-coverage instrumentation. Each has a different overhead / fidelity tradeoff, and most real engineering teams use two or three of them at different points in a project.
+
+<SpecSheet
+  title="Profiling techniques at a glance"
+  specs={[
+    { label: 'DWT PC sampling', value: 'Statistical, hardware-driven, <0.1% overhead, requires ITM/SWO; samples every 64..16384 cycles' },
+    { label: 'SystemView (SEGGER)', value: 'RTOS event trace; instrumented OS, RTT or SWO transport; ~1-3% overhead' },
+    { label: 'Tracealyzer (Percepio)', value: 'RTOS + custom event trace; supports FreeRTOS/Zephyr/ThreadX; stream or snapshot' },
+    { label: 'ETM streaming', value: 'Full instruction trace, 0% CPU overhead, requires J-Trace/ULINKpro and dedicated trace port (TRACECLK + 4-bit TRACEDATA)' },
+    { label: 'OpenOCD profiler', value: '"profile" command, polls PC over SWD at low rate, useful for parts with no ITM' },
+    { label: 'Coverage (gcov)', value: '`-fprofile-arcs -ftest-coverage`, writes counters to RAM; pull .gcda via semihosting at exit' },
+    { label: 'Best for hot-spot finding', value: 'DWT PC sampling' },
+    { label: 'Best for timing analysis', value: 'SystemView / Tracealyzer (RTOS) or ETM (bare-metal)' },
+    { label: 'Best for verification', value: 'Coverage + ETM (full path proof)' },
+  ]}
+/>
+
+## Statistical profiling with DWT PC sampling
+
+The Cortex-M3/M4/M7/M33 DWT has a built-in PC sampler. Set `DWT->CTRL.PCSAMPLENA = 1` and pick a period via `POSTPRESET`. Every N cycles, the DWT snapshots the current `PC` and emits an ITM trace packet of type "PC sample". Stream this over [SWO](/docs/tools/swo) to the host, accumulate a histogram, and you have a statistical profile.
+
+```c
+// Configure 1-in-4096-cycle PC sampling — at 120 MHz that's ~30 kHz sample rate
+DWT->CTRL = (DWT->CTRL & ~DWT_CTRL_POSTPRESET_Msk)
+          | (0xF << DWT_CTRL_POSTPRESET_Pos)   // POSTINIT = 15, divider 4096
+          | DWT_CTRL_PCSAMPLENA_Msk
+          | DWT_CTRL_CYCCNTENA_Msk;
+ITM->TCR |= ITM_TCR_DWTENA_Msk;                 // forward DWT packets through ITM
+```
+
+Host side, `orbuculum` and `orbtop` (from the open-source orbcode suite) decode the stream and display a live `top`-style breakdown:
+
+```
+$ orbuculum -p /dev/ttyACM0 -s 2000000 -t 1
+$ orbtop -e firmware.elf -r 5
+ 39.4%   control_loop
+ 17.2%   ekf_predict
+  9.8%   spi_isr
+  6.4%   xQueueGenericReceive
+  4.2%   __aeabi_fdiv
+  ...
+```
+
+A few thousand samples (a fraction of a second on a 30 kHz rate) is enough to identify the hot 5–10 functions. The longer you run, the better the resolution on cold functions and the tail.
+
+<TimingDiagram title="PC sampling vs ETM full trace density" signals={[
+  { name: 'CPU clk',      wave: '01010101010101', tone: 'muted' },
+  { name: 'DWT PC sample', wave: '00001000000010', tone: 'primary' },
+  { name: 'ETM trace',    wave: '11111111111111', tone: 'accent' },
+]} markers={[
+  { x: 4, label: 'sample N' },
+  { x: 12, label: 'sample N+1' },
+]} caption="PC sampling only snapshots the PC every N cycles, so it misses short bursts but adds essentially zero overhead; ETM emits a packet for every executed branch, giving full path coverage at the cost of a wide trace port and a J-Trace probe." />
+
+PC sampling **does not see function call depth** — it sees the leaf function only. To get an inverted "where am I called from" view you need either compile-time `-fno-omit-frame-pointer` plus a stack walker on the host, or an ETM trace.
+
+<Callout type="tip">
+The sample rate trades resolution against SWO bandwidth. At 30 kHz over 2 Mbit/s SWO, PC sample packets consume ~10% of available bandwidth — plenty of room for ITM `printf` traffic alongside. Going to 100 kHz starts crowding the link, and saturated SWO drops packets silently (you'll see gaps in cycle counts).
+</Callout>
+
+## RTOS-aware event tracing — SystemView and Tracealyzer
+
+Statistical profiling answers "where". Event tracing answers "in what order, when, and why". Both SystemView (SEGGER, free) and Tracealyzer (Percepio, commercial) instrument the RTOS so every task switch, ISR entry, queue post, mutex take, and timer event is timestamped and shipped to the host.
+
+The transport is typically SEGGER RTT — a ring buffer in RAM that a J-Link reads asynchronously over SWD at up to 1 MByte/s. RTT outperforms SWO for high-rate event streams because it doesn't have a single-wire bottleneck; the probe just drains the buffer as fast as USB allows.
+
+Configuration is RTOS-specific. For FreeRTOS + SystemView:
+
+```c
+// FreeRTOSConfig.h
+#define configUSE_TRACE_FACILITY            1
+#define configRECORD_STACK_HIGH_ADDRESS     1
+#define INCLUDE_xTaskGetIdleTaskHandle      1
+#include "SEGGER_SYSVIEW_FreeRTOS.h"        // trace hooks
+
+// main.c
+SEGGER_SYSVIEW_Conf();
+SEGGER_SYSVIEW_Start();
+```
+
+The host viewer renders a Gantt-style timeline: each task is a row, each ISR is a row, and you can scroll to any moment and see what was running, what woke up next, and what the priority inversions look like. This is the indispensable view for diagnosing missed deadlines, busy waits, and lock contention.
+
+| Aspect | SystemView | Tracealyzer |
+|--------|------------|-------------|
+| Vendor | SEGGER | Percepio |
+| Price | Free | Commercial (~$1500 seat) |
+| RTOS support | FreeRTOS, embOS, µC/OS, Zephyr, ThreadX | FreeRTOS, Zephyr, ThreadX, SafeRTOS, µC/OS, Linux |
+| Transport | RTT primarily | RTT, USB-CDC, file snapshot |
+| Live view | Yes | Yes |
+| Trace duration | Bounded by RTT buffer / host disk | Bounded by host disk |
+| Strengths | Free, fast bring-up, integrates with Ozone | Deeper analytics, scheduling stats, custom intervals |
+
+Custom user events let you tag arbitrary firmware milestones — "frame 1872 decoded", "battery cell 3 over-temperature" — and view them on the same timeline. This is where event tracing earns its keep on systems with complex inter-task choreography.
+
+## ETM streaming — full instruction trace
+
+The Embedded Trace Macrocell (ETM) is a dedicated hardware block on M7/M85 (and optional on M3/M4/M33) that streams **every instruction executed** to the trace port. With a J-Trace or ULINKpro probe and the wider trace port (4-bit TRACEDATA + TRACECLK), bandwidth reaches 500+ Mbit/s — enough for an unfiltered trace on a 200 MHz Cortex-M7.
+
+ETM trace is reconstructed offline against the firmware ELF: the probe captures the compressed packet stream, the host decoder follows branch packets and exception entries to rebuild the exact instruction sequence. You can:
+
+- Reverse-execute through a fault — back-step through every instruction up to the crash.
+- Measure exact cycle counts for any code region.
+- Verify that an interrupt did or did not preempt a critical section.
+- Generate code coverage from execution traces (no instrumentation needed).
+
+ETM is the heaviest tool — it requires a dedicated probe (J-Trace PRO is $2k+), a trace-port-equipped board (rare on production hardware), and significant decode time. But for bring-up of safety-critical firmware, or for debugging a once-in-a-million race, nothing else gives you the same visibility.
+
+<Callout type="warn">
+Most production boards do not route the trace port pins. If you want ETM access, design the early prototype boards with the 20-pin Cortex-Debug+ETM header connected, and verify trace works before tape-out. Adding it later requires bodge wires onto exposed pads that may not be present.
+</Callout>
+
+## OpenOCD's polled profiler
+
+For parts without ITM (Cortex-M0/M0+) or when you don't have an SWO pin wired, OpenOCD's `profile` command provides a fallback. It halts the CPU at low frequency (a few hundred Hz), reads PC, resumes, and accumulates samples on the host.
+
+```
+> profile 10 firmware.gmon
+```
+
+This collects samples for 10 seconds and writes a gmon.out-format file that you can process with `gprof firmware.elf firmware.gmon`. Sample rate is much lower than DWT — typically 1–5 kHz, and each sample halts the CPU for a few hundred microseconds, so it perturbs the system. For hot-spot identification this is good enough; for hard real-time profiling it isn't.
+
+## Coverage on embedded targets
+
+Code coverage on a host with gcov is mature: compile with `-fprofile-arcs -ftest-coverage`, run, the program writes `.gcda` files on exit, lcov produces an HTML report. On a Cortex-M target the same flags work, but the runtime has to be told where to put the counters and how to flush them.
+
+The counters are placed in RAM by the linker as part of `.bss` (or a dedicated section). The runtime hook `__gcov_flush` writes them out when called. With semihosting fileio enabled, `__gcov_flush` opens `.gcda` files directly on the host filesystem; without semihosting you dump the `__gcov_*` regions over UART or SWO and reconstruct files offline.
+
+```c
+// At end of test run:
+extern void __gcov_dump(void);   // GCC 11+ replaces __gcov_flush
+__gcov_dump();
+// then halt — let host pull .gcda via semihosting
+```
+
+For test campaigns: each test case calls `__gcov_dump` at end, the harness aggregates `.gcda` files, `lcov` and `genhtml` produce a coverage report. Branch coverage is usually 70-80% for production firmware; getting to 95% requires fault-injection tests for error paths.
+
+A complementary approach uses ETM trace and offline analysis to derive coverage **without source instrumentation** — the trace is matched against the disassembly and every executed instruction is marked covered. This is the approach favoured for IEC 61508 / ISO 26262 evidence because there is no compiler transformation between the source and what the safety case covers.
+
+## A typical workflow
+
+A realistic profiling campaign on a 100 kHz motor control loop:
+
+1. **Coarse hot-spot pass** — turn on DWT PC sampling for 30 seconds during a representative workload. Identify the top 5 functions. Total host effort: 5 minutes.
+2. **Targeted timing** — instrument the suspect function with DWT cycle counter reads (`DWT->CYCCNT`) at entry/exit. Log min/max/avg over 10000 iterations via SWO ITM. Pinpoints which path in the function is slow.
+3. **RTOS interaction** — SystemView snapshot during a 100 ms window that contains the slow event. Check whether the slow path coincides with task preemption, queue wait, or ISR storm.
+4. **Worst-case proof** — for safety-critical confirmation, ETM trace through the full hot path with worst-case operands. Decode and measure cycle counts. Build the WCET budget table.
+5. **Coverage gate** — after fixing, run the test suite under gcov and confirm the relevant branches are exercised.
+
+Each step uses a different tool. Trying to do all of it with one tool either misses subtleties (PC sampling alone won't show preemption causing the slowdown) or is too expensive (ETM-only is overkill for hot-spot identification).
+
+<Callout type="note">
+The CPU's MAX cycle count is rarely a problem; the *jitter* is. A function that takes 100 ± 5 cycles is fine for a 1 µs budget; the same function at 100 ± 500 cycles is not — even though the mean is identical. Always log max and min, not just average.
+</Callout>
+
+## Cross-references
+
+- [SWO and ITM](/docs/tools/swo) — the transport for DWT trace.
+- [Semihosting](/docs/tools/semihosting) — how `__gcov_dump` writes files to host.
+- [OpenOCD](/docs/tools/openocd) — `profile` command, ITM configuration.
+- [GDB](/docs/tools/gdb) — `monitor profile` and ETM viewer integrations.
+- [NVIC priority](/docs/cortex-m/nvic-priority) — interpreting exception traces.
+- "Cortex-M7 Technical Reference Manual" — ETM register set.
+- Percepio Tracealyzer manual; SEGGER SystemView manual.

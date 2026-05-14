@@ -1,0 +1,173 @@
+---
+title: Drone Electronic Speed Controller
+description: Drone ESC firmware — BLDC commutation (back-EMF zero-cross vs sensored), six-step trapezoidal vs FOC sinusoidal, PWM 16–32 kHz, DShot300/600/1200 digital throttle protocol, bidirectional DShot for RPM telemetry, BLHeli_32 / AM32 / BetaFlight ESC.
+order: 12
+updated: 2026-05-13
+tags: [systems, drone, esc, bldc, foc, dshot, blheli, am32]
+---
+
+An ESC — Electronic Speed Controller — is the small board between a drone's flight controller and one of its motors. The flight controller sends a throttle command; the ESC translates that into the high-frequency switching pattern that drives the brushless DC motor. On a typical quadcopter there are four ESCs (one per motor); on a hexacopter or octocopter there are six or eight. Each is a Cortex-M0+ or M4 microcontroller plus three half-bridge MOSFET gate drivers, running firmware that solves a surprisingly hard real-time problem: drive a three-phase motor without a rotor position sensor at up to 50,000 RPM, respond to throttle changes within microseconds, and report telemetry back to the flight controller within the same communication frame.
+
+This page covers the BLDC commutation algorithms, the trapezoidal vs FOC tradeoff, the DShot family of digital throttle protocols that replaced analog PWM, and the dominant open-source ESC firmware projects.
+
+<SpecSheet
+  title="Drone ESC at a glance"
+  specs={[
+    { label: 'MCU', value: 'STM32F051 / STM32F031 (BLHeli_S legacy), STM32G071 / STM32F411 (BLHeli_32, AM32), AT32F421 (clones)' },
+    { label: 'Gate drivers', value: 'EG2104S / FD6288Q / 2-in-1 driver-MOSFET ICs; ~25-50 A continuous, ~120 A burst per phase' },
+    { label: 'PWM switching frequency', value: '16-48 kHz; 24 or 32 kHz typical to minimise audible noise' },
+    { label: 'Throttle protocol', value: 'DShot150 / DShot300 / DShot600 / DShot1200 / DShot2400; older PWM and Multishot mostly retired' },
+    { label: 'Throttle latency', value: 'DShot600 frame ~26 µs; commit-to-PWM ~5 µs; total response ~50 µs' },
+    { label: 'Telemetry', value: 'Bidirectional DShot (BBDShot) — ESC replies with RPM, voltage, current, temperature within the throttle frame slot' },
+    { label: 'Open-source firmware', value: 'BLHeli_32 (proprietary closed since 2023), AM32 (open replacement), BlueJay, Bluebird (BetaFlight ESC)' },
+    { label: 'Commutation', value: 'Six-step trapezoidal sensorless (cheap, simple), increasingly FOC sinusoidal (efficient, quiet)' },
+    { label: 'Rotor position', value: 'Back-EMF zero-crossing detection on idle phase (sensorless), or Hall / encoder (sensored, rare on drones)' },
+  ]}
+/>
+
+## Six-step trapezoidal commutation
+
+The classic and still-dominant BLDC commutation scheme. The motor has three phases; the controller energises two at a time, leaving the third idle. By cycling through the six possible energisation patterns in order, the controller produces a rotating magnetic field that the rotor's permanent magnets follow.
+
+```
+Step  Phase A  Phase B  Phase C
+1     +V       -V       (idle)
+2     +V       (idle)   -V
+3     (idle)   +V       -V
+4     -V       +V       (idle)
+5     -V       (idle)   +V
+6     (idle)   -V       +V
+```
+
+The trick is knowing *when* to step from one pattern to the next — too early and the rotor lags, too late and you lose torque or stall. With Hall sensors mounted in the motor, this is direct: read the Hall, look up the next pattern. Drone motors usually don't have Hall sensors (cost, weight, reliability), so the ESC infers rotor position from the back-EMF voltage on the idle phase.
+
+**Back-EMF zero-crossing.** When the rotor moves, the magnetic field induces a voltage in the idle phase winding — a sinusoid offset by the motor's electrical angle. The zero-crossing of that sinusoid is a precisely-timed indicator of rotor position. The ESC reads the idle-phase voltage on its ADC (or via a comparator), detects the zero-crossing, waits 30° of electrical phase, then commutates.
+
+Limitations:
+
+- **No back-EMF at zero speed.** Spinning a stopped motor requires either an external prime (impractical) or a "blind" open-loop start-up sequence where the ESC commutates at a guessed rate, hoping the rotor catches the field. Some sub-percent of starts fail and have to be retried. This is the cause of "ESC arming failure" on a cold drone.
+- **Limited efficiency.** The 30° electrical step is not aligned with the back-EMF sinusoid peak, so torque ripple is high (~15% peak-to-peak), efficiency 5–10% below FOC.
+- **Audible noise.** The step-wise commutation generates harmonics, producing the characteristic high-pitched motor whine of trapezoidal ESCs.
+
+For racing drones, none of these matter; trapezoidal still dominates because it's simple, robust, and the noise is acceptable. For long-flight-time photography drones, the inefficiency matters and FOC is increasingly common.
+
+## FOC — sinusoidal field-oriented control
+
+Same hardware, very different firmware. Instead of stepping through six discrete energisation patterns, FOC continuously modulates all three phases with sinusoidal voltages, computed to produce a rotating magnetic field exactly aligned with the rotor at all times.
+
+The algorithm:
+
+1. Sample phase currents (two of three, the third is implicit).
+2. Clarke transform: `(a, b, c) → (α, β)` — convert three-phase to two-phase orthogonal frame.
+3. Park transform: `(α, β) → (d, q)` using the estimated rotor angle. d-axis is aligned with the rotor flux; q-axis is perpendicular (torque-producing).
+4. PI control: `Id_setpoint = 0` (no field-weakening), `Iq_setpoint = torque_command`. PI controllers in d and q frame produce `Vd, Vq`.
+5. Inverse Park: `(Vd, Vq) → (Vα, Vβ)`.
+6. SVPWM (Space Vector PWM): generate the three-phase PWM duty cycles that produce the desired `(Vα, Vβ)`.
+7. Update timer PWM registers; DMA pushes them at the next cycle.
+
+This runs at 10–20 kHz. The rotor angle estimator is either a back-EMF observer (most common on drones — a Luenberger or sliding-mode observer that estimates the rotor angle from the measured phase currents and voltages) or, on high-end ESCs, an encoder.
+
+| Aspect | Trapezoidal | FOC |
+|--------|-------------|-----|
+| Compute per cycle | ~50 cycles | ~1500 cycles |
+| MCU class | M0+ at 48 MHz suffices | M4F at 100+ MHz |
+| Efficiency | 82-88% typical | 88-94% typical |
+| Audible noise | High (whine) | Very low (smooth) |
+| Throttle response | ~50 µs | ~30 µs |
+| Cold start reliability | 99% | 99.5% (better initial-angle estimator) |
+| Low-speed control | Poor | Excellent |
+| Cost (firmware complexity) | Low | High |
+
+Modern AM32 and BlueJay support FOC; older BLHeli_S is trapezoidal-only. The trend is clearly toward FOC as Cortex-M4 ESCs become standard.
+
+## DShot — digital throttle
+
+For two decades the throttle command from FC to ESC was an analog PWM pulse — 1.0 ms = idle, 2.0 ms = full throttle. The resolution depended on the FC timer (typically 1 µs = 1000-step resolution) and the latency was up to one PWM frame (10–20 ms at 50–125 Hz refresh).
+
+DShot is a digital protocol — a 16-bit throttle word with checksum, sent over the same single signal wire at a defined bit rate.
+
+| Variant | Bit rate | Frame time | Throttle resolution |
+|---------|----------|------------|---------------------|
+| DShot150 | 150 kbit/s | 107 µs | 11-bit |
+| DShot300 | 300 kbit/s | 53 µs | 11-bit |
+| DShot600 | 600 kbit/s | 27 µs | 11-bit |
+| DShot1200 | 1200 kbit/s | 13 µs | 11-bit |
+| DShot2400 | 2400 kbit/s | 7 µs | 11-bit |
+
+The frame layout:
+
+```
+| 11 bits throttle value | 1 bit telemetry request | 4 bits CRC |
+```
+
+Bit encoding: each bit is a pulse, where the duty cycle determines 0 or 1 (different from UART). A "0" bit is 37.5% high; a "1" bit is 75% high; both take 1.67 µs at DShot600. The ESC samples the duty cycle, reconstructs the bit pattern, validates the CRC, and accepts the throttle command.
+
+<TimingDiagram
+  title="DShot bit-cell — three sub-windows per bit at the PWM rate"
+  signals={[
+    { name: 'DShot line', wave: '01100110', tone: 'primary' },
+    { name: 'Sub-window', wave: '01010101', tone: 'muted' },
+    { name: 'Decoded',    wave: '00110011', tone: 'accent' },
+  ]}
+  markers={[{ x: 0, label: 'bit "0" (37.5%)' }, { x: 2, label: 'bit "1" (75%)' }]}
+  caption="Each DShot bit-cell spans three PWM sub-windows. A short high-pulse covers one window and decodes as 0; a wider high-pulse covers two windows and decodes as 1. Sixteen bit-cells (11 throttle + 1 telemetry-request + 4 CRC) make one frame."
+/>
+
+DShot600 is the most common variant on modern flight controllers. DShot1200 and DShot2400 are used on extreme-end racing setups; the limiting factor is signal integrity on long ESC wires.
+
+## Bidirectional DShot (BBDShot)
+
+The original DShot is one-way: FC tells ESC the throttle. BBDShot adds a reply slot — immediately after the FC's throttle frame, the ESC inverts the signal direction and sends back a 21-bit telemetry word containing the motor's electrical RPM. The FC samples the reply, decodes, and feeds RPM into the [harmonic notch filter](/docs/systems/drone-imu) for vibration suppression.
+
+The timing is tight. At DShot600, the FC's throttle frame is 27 µs; the ESC has ~30 µs of dead time then sends a 21-bit reply at the same rate (~35 µs). The whole exchange completes in under 90 µs — easily within the 125 µs of an 8 kHz attitude loop slot.
+
+Telemetry payload:
+
+- Electrical RPM (eRPM) — divide by motor pole-pair count for mechanical RPM.
+- Voltage and current (some variants).
+- Temperature (some variants).
+- Cumulative energy consumed.
+
+The harmonic notch in the FC is the primary reason BBDShot exists. Without it, the FC has to guess motor RPM from throttle command (inaccurate) or skip the harmonic notch altogether (less effective vibration rejection).
+
+<Callout type="warn">
+BBDShot's signal-direction inversion is sensitive to PCB layout. The ESC's signal pin acts as input then output within ~10 µs — series resistors that filter the input also slow down the output. Reference designs from AM32 specify exact resistor values and trace impedance; deviation causes telemetry CRC failures, which the FC sees as missing RPM data, which causes the notch to fall back to estimated RPM, which is exactly what BBDShot was supposed to fix.
+</Callout>
+
+## ESC firmware — BLHeli_32, AM32, and the open-source story
+
+For a decade BLHeli_S (8051 microcontroller, six-step trapezoidal) was the dominant open-source ESC firmware. In 2018 BLHeli_32 launched as a paid commercial product on Cortex-M ESCs, adding higher PWM rates, BBDShot, and various tuning features. Initially distributed as a free-as-in-beer binary; in 2023 BLHeli_32 was acquired and the source closed entirely — no new development on the open side.
+
+This drove the rise of open-source replacements:
+
+**AM32** — full-stack open source. Cortex-M0+/M4 firmware, trapezoidal and FOC variants, BBDShot, runs on all the popular ESC silicon (STM32F051, STM32G071, AT32F421). Configurator app for Windows/Mac/Linux. Most new ESC hardware ships with AM32 from the factory or includes AM32-flashed variant.
+
+**BlueJay** — fork of BLHeli_S source, kept on the older 8051 hardware. Active development for legacy ESCs.
+
+**Bluebird (BetaFlight ESC)** — newer effort to embed ESC firmware directly into the FC, with the ESC reduced to a "smart MOSFET bank". Reduces parts count; raises FC complexity. Limited adoption so far.
+
+| Firmware | Hardware | Algorithm | Status |
+|----------|----------|-----------|--------|
+| BLHeli_S | 8051 (Silicon Labs EFM8) | Trapezoidal | Open, frozen |
+| BlueJay | 8051 | Trapezoidal, refined | Open, active |
+| BLHeli_32 | Cortex-M0+ (STM32F051 etc.) | Trapezoidal + tuning | Closed since 2023 |
+| AM32 | Cortex-M (multiple) | Trapezoidal or FOC | Open, active, leading |
+| Bluebird (BetaFlight ESC) | Cortex-M on FC | Trapezoidal | Experimental |
+
+## Hardware safety considerations
+
+A drone ESC is a power-electronic device. Failure modes include:
+
+- **Shoot-through** — both high-side and low-side MOSFETs in a half-bridge briefly conducting simultaneously, shorting the battery through the MOSFET pair. Causes immediate MOSFET destruction, often a fire. Dead-time (a few hundred nanoseconds gap between high turning off and low turning on) prevents it; the firmware must always inject dead-time even at 100% duty cycle.
+- **Over-current.** Stalled motor under high throttle pulls 100+ A through one phase. Current-sensing shunt + comparator triggers an emergency-shutoff interrupt; firmware should respond within microseconds.
+- **Battery polarity reversal.** Capacitors explode dramatically. Most drone ESCs lack reverse-polarity protection (cost); the rule is "check before plugging in".
+- **Wire-break / loss of signal.** ESC must default to motor-stop on DShot signal loss. Firmware monitors DShot frame timing; >100 ms with no valid frame triggers shutoff.
+
+## Cross-references
+
+- [Drone flight controller](/docs/systems/drone-flight-controller) — sender of DShot.
+- [Drone IMU](/docs/systems/drone-imu) — consumer of BBDShot RPM for harmonic notch.
+- [Motor FOC](/docs/systems/motor-foc) — the algorithm AM32 FOC mode runs.
+- [STM32 mainstream](/docs/vendors/stm32-mainstream) — the F051 and G071 chips that host ESC firmware.
+- AM32 GitHub repository; BlueJay project documentation.
+- "BLHeli_S manual" — for the legacy parameter set.

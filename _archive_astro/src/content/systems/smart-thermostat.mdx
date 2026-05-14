@@ -1,0 +1,150 @@
+---
+title: Smart thermostat
+description: Inside a Nest / ecobee class thermostat — Cortex-M33 + Wi-Fi/Thread radio, capacitive touch, e-paper or LCD, HVAC relays, Matter, and how to run on 24 VAC stolen-power.
+order: 5
+updated: 2026-05-12
+tags: [systems, thermostat, cortex-m33, matter, thread, hvac]
+---
+
+import SpecSheet from '~/components/SpecSheet.astro';
+import SystemBlock from '~/components/SystemBlock.astro';
+import Callout from '~/components/Callout.astro';
+
+A smart thermostat is at the easy end of the embedded difficulty spectrum from a CPU standpoint — but at the hard end from a *power-budget* and *power-stealing* perspective. The chip is a comfortably-fast Cortex-M33; the system constraint is "run forever from 24 V AC drawn through an HVAC relay coil without tripping the HVAC controller's brown-out detection."
+
+## At a glance
+
+<SpecSheet specs={[
+  { label: 'Product class', value: 'Connected residential thermostat (Wi-Fi + Matter/Thread)' },
+  { label: 'Typical SoC', value: 'Silicon Labs EFR32MG24 (Cortex-M33 + Thread/Matter)' },
+  { label: 'Alt SoC', value: 'Nordic nRF5340 + nRF7002 Wi-Fi coprocessor' },
+  { label: 'Core', value: 'Cortex-M33F @ 78 MHz · TrustZone · FPU', link: '/docs/cortex-m/m33-m23/' },
+  { label: 'RAM', value: '256 KB' },
+  { label: 'Flash', value: '1.5 MB' },
+  { label: 'Wireless', value: 'Wi-Fi 6 (via coprocessor), Thread 1.3, BLE 5.3, Matter 1.3' },
+  { label: 'Display', value: 'Color LCD 240×240 or e-paper 200×200' },
+  { label: 'Input', value: 'Capacitive touch (FT6336 / vendor IP), rotary encoder, IR proximity' },
+  { label: 'Sensors', value: 'Temperature ±0.5 °C, humidity, ambient light, occupancy (PIR / radar)' },
+  { label: 'HVAC outputs', value: '4–8 isolated relays (W, Y, G, RC, RH, O/B, AUX)' },
+  { label: 'Power', value: '24 VAC from C-wire (~5 W) or stolen from W/Y wires' },
+  { label: 'OS', value: 'Zephyr (Matter SDK is Zephyr-native)', link: '/docs/rtos/zephyr/' },
+  { label: 'Certifications', value: 'FCC, CE, Matter Alliance certified, ENERGY STAR' },
+]} />
+
+## The C-wire problem
+
+Older US homes don't have a "common" (C) wire at the thermostat — only R, W, Y, G. The original mercury / bimetallic thermostats didn't need power. Smart thermostats *do* need 5–8 W continuously, and the C-wire is the only legit way to get it.
+
+So vendors built **power-stealing** circuits: trickle a few mA through the W or Y wire when the HVAC isn't calling for heat/cool. The HVAC controller's relay coil draws ~150 mA when energized; if you sneak &lt;10 mA through it while it's *off*, the relay doesn't pick up and you've got phantom power.
+
+This places **a hard constraint on average system power**: ~0.5–2 W maximum stolen, plus brief bursts from a supercap for Wi-Fi TX. Hence the obsession with Cortex-M33 (low power) over Cortex-M7 (faster but ~3× the active power) for this market.
+
+<Callout type="warn" title="Power stealing is fragile">
+Some modern variable-speed HVAC controllers (Carrier Infinity, Trane XL series) reject power-stealing because their solid-state inputs detect the trickle. Smart thermostats that don't have a "no C-wire" mode (or that require an external Power Extender Kit) won't work with these. Always ship a C-wire adapter.
+</Callout>
+
+## Block diagram
+
+<SystemBlock
+  title="Matter-capable smart thermostat"
+  blocks={[
+    [
+      { kind: 'core', label: 'Cortex-M33F @ 78 MHz', detail: 'EFR32MG24 / nRF5340 app core' },
+      { kind: 'core', label: 'BLE/Thread radio core', detail: 'separate M33; 802.15.4 + BLE 5.3' },
+    ],
+    [
+      { kind: 'radio', label: 'Wi-Fi 6 coprocessor', detail: 'nRF7002 / ESP32-C6 (over SPI/SDIO)', span: 2 },
+    ],
+    [
+      { kind: 'memory', label: 'Flash 1.5 MB', detail: 'app + OTA slot + filesystem' },
+      { kind: 'memory', label: 'External QSPI 16 MB', detail: 'UI assets, fonts, icons' },
+    ],
+    [
+      { kind: 'periph', label: 'TFT LCD controller', detail: 'parallel RGB or SPI' },
+      { kind: 'periph', label: 'Capacitive touch (I²C)', detail: 'FT6336 / GT911' },
+    ],
+    [
+      { kind: 'periph', label: 'Temp/humidity sensor', detail: 'SHT45 / HDC2080 (I²C)' },
+      { kind: 'periph', label: 'PIR / mmWave radar', detail: 'occupancy' },
+    ],
+    [
+      { kind: 'periph', label: 'Relay driver array', detail: 'MAX3209 / ULN2003' },
+      { kind: 'periph', label: 'Power stealing AFE', detail: 'analog' },
+    ],
+    [
+      { kind: 'security', label: 'TrustZone + secure element', detail: 'Matter DAC/PAI cert storage', span: 2 },
+    ],
+  ]}
+  caption="Wireless complexity dominates. The Wi-Fi coprocessor exists because integrated Wi-Fi+Thread radios that play nicely with Matter are recent."
+/>
+
+## Matter — what it actually is
+
+**Matter** is an application-layer protocol that runs over IP. The transports it supports are **Wi-Fi**, **Thread** (mesh over 802.15.4), and **Ethernet**. For thermostats, the two common combos:
+
+- **Wi-Fi only** — directly on home Wi-Fi. Higher power (Wi-Fi radio is hungry).
+- **Thread (via a border router)** — much lower power; needs a Thread Border Router on the network (Apple TV, Google Home Hub, Amazon eero work). Most C-wire-free thermostats pick this.
+
+Matter device commissioning uses BLE for setup (you scan the QR code with your phone), then transitions to Wi-Fi or Thread for operation. The thermostat exposes Matter clusters:
+
+- **Cluster 0x0201** — Thermostat (setpoint, mode, current temp)
+- **Cluster 0x0405** — Relative Humidity Measurement
+- **Cluster 0x0406** — Occupancy Sensing
+- **Cluster 0x0202** — Fan Control (auto/manual, speed)
+
+Any Matter controller (Apple Home, Google Home, Alexa, SmartThings, Home Assistant) can read and set these without vendor app dependency. That's the headline feature: **no more vendor lock-in for HVAC control**.
+
+## Software stack
+
+```
+Boot ROM → MCUboot → app image (Matter SDK + Zephyr base)
+                          │
+                          ▼
+              ┌──────────────────────────┐
+              │ Zephyr kernel             │ tickless, 32 kHz RTC tick
+              │ Matter stack (Cluster impl)│
+              │ Thread / Wi-Fi netstack    │
+              │ LVGL (UI framework)        │
+              │ Display thread             │ 30 fps refresh
+              │ Touch thread               │ interrupt-driven
+              │ Thermostat control thread  │ 1 Hz (HVAC is slow)
+              │ Telemetry thread           │ aggregates + sends every ~60 s
+              └──────────────────────────┘
+```
+
+**LVGL** is the standard for embedded GUI on color displays — it has a draw model, widget library, theming, and runs comfortably on a 78 MHz M33 if your scenes are simple. Most thermostat UIs are 4–6 screens (home, schedule, settings, away mode) so this is well within budget.
+
+The **control loop** is slow because HVAC is slow: relay state changes every few minutes, not milliseconds. A hysteresis algorithm with 0.5–1 °F deadband is typical; more sophisticated firmware does PID + outdoor-temp-compensated learning (the original Nest claim to fame).
+
+## The auxiliary-heat smart bit
+
+In heat-pump systems, the firmware decides when to engage auxiliary (resistive or gas) heat. Naive thermostats just kick in aux when the room is 2 °F below setpoint. Smart ones consider:
+
+- **Outdoor temperature** (over the internet) — heat pumps are inefficient below ~25 °F.
+- **Indoor temperature trajectory** — if temperature is rising at 1 °F/hour, no need for aux even if delta is large.
+- **Electricity rate schedule** — if you're on time-of-use, delay aux until off-peak.
+- **Comfort tolerance** — user preference.
+
+This is where firmware companies differentiate. Same hardware, much smarter algorithms = lower utility bills.
+
+## Real products
+
+| Product | SoC | Wireless | Notes |
+|---|---|---|---|
+| **Google Nest Learning Thermostat (4th gen)** | Vendor M-class + ESP32 | Wi-Fi + Thread (Matter) | The category-creator; Nest's algorithms are proprietary |
+| **ecobee SmartThermostat Premium** | Cortex-M class + ESP32 | Wi-Fi + Thread | Has air-quality sensor, voice (Alexa) built-in |
+| **Honeywell T9 / T10 Pro** | Cortex-M class | Wi-Fi only | Pro install, multi-zone capable |
+| **Amazon Smart Thermostat** | nRF52 + Wi-Fi coprocessor | Wi-Fi | Cheap ($60), no display polish |
+| **Mysa for Electric Baseboards** | Cortex-M class | Wi-Fi | Specialized — controls 240V baseboard heat |
+| **Sinopé TH1124WF / Stelpro KI** | Cortex-M0+ class | Wi-Fi or Zigbee | Canadian-market high-voltage thermostats |
+
+DIY: **Home Assistant + ESP32 + relay board** lets you build your own. Less polished UI, full local control.
+
+## See also
+
+- [Cortex-M33 / M23](/docs/cortex-m/m33-m23/) — the SoC class.
+- [Silicon Labs (EFR32)](/docs/vendors/silabs/) — the dominant SoC vendor for Matter thermostats.
+- [Nordic Semiconductor](/docs/vendors/nordic/) — the alternative SoC vendor.
+- [TrustZone](/docs/architecture/trustzone/) — used for Matter cert storage.
+- [Zephyr](/docs/rtos/zephyr/) — the Matter SDK's reference RTOS.
+- [Connectivity Standards Alliance: Matter](https://csa-iot.org/all-solutions/matter/) (external).

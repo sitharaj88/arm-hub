@@ -1,0 +1,25 @@
+---
+interface Props {
+  type?: 'note' | 'tip' | 'warn' | 'danger' | 'spec';
+  title?: string;
+}
+const { type = 'note', title } = Astro.props;
+
+const styles: Record<string, { ring: string; bg: string; icon: string; label: string }> = {
+  note:   { ring: 'border-brand/30',  bg: 'bg-brand/5',  icon: 'ℹ', label: 'note' },
+  tip:    { ring: 'border-ok/30',     bg: 'bg-ok/5',     icon: '✓', label: 'tip' },
+  warn:   { ring: 'border-warn/40',   bg: 'bg-warn/5',   icon: '!', label: 'warning' },
+  danger: { ring: 'border-err/40',    bg: 'bg-err/5',    icon: '✕', label: 'danger' },
+  spec:   { ring: 'border-accent/30', bg: 'bg-accent/5', icon: '§', label: 'spec' },
+};
+const s = styles[type] ?? styles.note;
+---
+<aside class={`not-prose my-6 rounded-xl border ${s.ring} ${s.bg} p-4`}>
+  <div class="flex items-start gap-3">
+    <span class="grid h-6 w-6 shrink-0 place-items-center rounded-md border border-line/70 bg-surface/80 font-mono text-xs">{s.icon}</span>
+    <div class="min-w-0 flex-1">
+      <div class="mb-1 font-mono text-[0.7rem] uppercase tracking-wider text-ink-faint">{title ?? s.label}</div>
+      <div class="text-sm leading-relaxed text-ink"><slot /></div>
+    </div>
+  </div>
+</aside>

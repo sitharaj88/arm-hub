@@ -1,0 +1,204 @@
+---
+title: Safety-certified RTOSes
+description: Safety-certified real-time operating systems. SAFERTOS, Azure RTOS ThreadX certifications, PikeOS, QNX, INTEGRITY, VxWorks Cert. IEC 61508, ISO 26262, DO-178C, IEC 62304, and the artifacts required.
+order: 7
+updated: 2026-05-13
+tags: [rtos, safety, certification, iec-61508, iso-26262, do-178, qnx, pikeos]
+---
+
+Most embedded projects can pick an RTOS based on price, footprint, and developer familiarity. Some projects can't — a brake controller, an infusion pump, a flight management computer, a railway interlocking, a nuclear plant I/O scanner. Those projects need an RTOS whose vendor has produced not just code but a **certification package**: requirements traceability, code coverage evidence, FMEA, dynamic-analysis reports, configuration management — the artifacts that satisfy IEC 61508, ISO 26262, DO-178C, IEC 62304, or EN 50128.
+
+The certified RTOS market is small (maybe a dozen serious players), expensive (license fees that make Linux-distro-level pricing look like a rounding error), and slow-moving (certifications are tied to specific kernel versions). But for safety-critical work it's the only sensible path — building your own kernel from scratch and certifying it is a multi-year, multi-million-dollar endeavour that few teams attempt today.
+
+This page covers the major certified RTOSes, what standards they target, what artifacts ship with them, and the practical implications of choosing one.
+
+<SpecSheet
+  title="Safety RTOS landscape"
+  specs={[
+    { label: 'IEC 61508', value: 'Industrial functional safety. SIL 1-4. Generic standard; most domain-specific standards derive from it.' },
+    { label: 'ISO 26262', value: 'Automotive functional safety. ASIL A-D (D highest). Adapted from IEC 61508 for road vehicles.' },
+    { label: 'DO-178C', value: 'Avionics software. Levels A (catastrophic) to E (no effect). Requires MC/DC coverage for Level A.' },
+    { label: 'IEC 62304', value: 'Medical device software. Classes A, B, C. Less prescriptive than DO-178C; more risk-based.' },
+    { label: 'EN 50128', value: 'Railway software. SIL 0-4. The European rail standard.' },
+    { label: 'Common Criteria', value: 'Security evaluation. EAL 1-7 (7 most rigorous). Often combined with safety standards for defense.' },
+  ]}
+/>
+
+## What "certified" actually means
+
+A certification is the output of an independent assessor who reviews evidence that the software meets a standard's process and quality requirements. The assessor examines:
+
+- **Requirements documentation** — every line of code traces to a written requirement; every requirement traces to test cases.
+- **Architecture documentation** — module decomposition, interfaces, data flow.
+- **Source code** — coding standards (MISRA-C, CERT-C), static analysis reports.
+- **Test results** — unit tests, integration tests, hardware-in-the-loop tests. For DO-178C Level A, **MC/DC coverage** (Modified Condition / Decision Coverage) — every boolean condition exercised in every possible way.
+- **Hazard analysis** — FMEA (Failure Mode and Effects Analysis), FTA (Fault Tree Analysis), HARA (Hazard Analysis and Risk Assessment).
+- **Configuration management** — change control, version traceability.
+- **Verification and validation** — independent of development.
+
+A certified RTOS doesn't *automatically* make your application certified. It satisfies the requirements *for the RTOS portion of your system*. Your application code, your hardware drivers, your integration choices still need their own evidence. What the certified RTOS gives you is a **pre-certified building block** plus, crucially, the documentation that lets the certifier accept your dependency on it without re-certifying the kernel from scratch.
+
+## The major players
+
+### SAFERTOS — Wittenstein high integrity systems
+
+The safety-certified sister of FreeRTOS. Same heritage, fork of the FreeRTOS source around 2005, then maintained as a separate hardened product by Wittenstein (acquired by HCC Embedded; now part of Renesas).
+
+- **IEC 61508 SIL 3** — full third-party assessment.
+- **ISO 26262 ASIL D** — automotive, the highest level.
+- **IEC 62304 Class C** — medical.
+- **DO-178C Level A** — avionics, the highest level.
+
+The API is intentionally similar to FreeRTOS so engineers can move between the two, but SAFERTOS removes dangerous or hard-to-certify features (dynamic allocation by default, some optional API variants) and adds runtime invariant checks. Source code ships with the certification artifacts; you build it into your firmware like any other library.
+
+License cost: tens to hundreds of thousands of dollars per project, depending on volume and target. The artifacts are the expensive part — the kernel itself is small (~10 KB flash).
+
+Used in: medical infusion pumps, automotive EPS (electric power steering), aerospace flight control auxiliaries.
+
+### Azure RTOS ThreadX
+
+Microsoft's ThreadX (formerly Express Logic before the 2019 acquisition) is widely deployed and certified across multiple standards:
+
+- **IEC 61508 SIL 4** — the highest industrial level.
+- **ISO 26262 ASIL D**.
+- **IEC 62304 Class C**.
+- **EN 50128 SIL 4**.
+- **DO-178C Level A** (with the SafeRTOS-equivalent variant, distinct certification scope).
+
+ThreadX is the most-deployed RTOS measured by units shipped (Microsoft's claim: 10 billion devices). The certified variants cover the safety markets; the standard ThreadX is what ships in most non-safety embedded products that use it.
+
+Open-source under MIT since 2024 — but the certifications are tied to specific commercial-supported releases, not the open-source HEAD. To claim certification you need a specific licensed kernel version.
+
+### PikeOS — SYSGO
+
+A **separation kernel** with hypervisor capabilities. PikeOS partitions the system into time-and-space-isolated containers; each container can run a different guest OS (Linux, RTEMS, bare-metal, another instance of PikeOS) or directly host applications.
+
+- **DO-178C Level A** (avionics — used in Airbus A350).
+- **EN 50128 SIL 4** (railway — used in ETCS train control).
+- **IEC 61508 SIL 4**.
+- **ISO 26262 ASIL D**.
+- **Common Criteria EAL 5+** — security evaluation, the highest in routine use.
+
+The separation kernel architecture is fundamentally different from a traditional RTOS. PikeOS provides time and resource budgets per partition; a misbehaving partition cannot affect another. The kernel is tiny (~15 KB on Cortex-A) because most "OS services" run inside partitions, not in the kernel.
+
+Used in: A350, Boeing 787 (some subsystems), ETCS rail signalling, defense systems.
+
+### QNX — BlackBerry
+
+A microkernel POSIX-like real-time OS, originally for industrial embedded, now ubiquitous in automotive infotainment, ADAS, and medical devices.
+
+- **ISO 26262 ASIL D**.
+- **IEC 61508 SIL 3**.
+- **IEC 62304 Class C**.
+- **Common Criteria EAL 4+**.
+- **FDA 510(k)** clearance for medical use.
+
+QNX runs on Cortex-A (and x86, MIPS) rather than Cortex-M — its memory model assumes an MMU. The microkernel architecture (drivers run in user space as separate processes) gives strong fault isolation: a buggy driver doesn't crash the kernel.
+
+Massive adoption in automotive: GM, Ford, Volkswagen, BMW, Toyota all ship QNX in some infotainment or ADAS module. Roughly 215 million vehicles run QNX as of 2024.
+
+### INTEGRITY — Green Hills Software
+
+A separation kernel competitor to PikeOS, focused on defense and aerospace.
+
+- **DO-178C Level A**.
+- **NSA Type 1** certification (cryptographic high assurance).
+- **Common Criteria EAL 6+** — the highest EAL routinely awarded to commercial software.
+- **ARINC 653** compliance (avionics partitioning standard).
+
+INTEGRITY runs on Cortex-A and PowerPC mainly. The toolchain (MULTI IDE, Green Hills compiler) is bundled. License costs are aerospace-typical: hundreds of thousands per project.
+
+Used in: F-35 (mission systems), B-2 stealth bomber, Boeing 787 (some subsystems), Lockheed F-22 avionics.
+
+### VxWorks — Wind River
+
+The historical leader in aerospace and defense RTOSes, in market since 1987.
+
+- **DO-178C Level A** (Cert Edition variant).
+- **DO-254** (hardware-software integration).
+- **IEC 61508 SIL 3**.
+- **ISO 26262 ASIL D**.
+
+VxWorks runs on Cortex-A, Cortex-R (the safety-focused R-Profile cores like R52), PowerPC, x86, and others. The standard VxWorks edition is the workhorse; the Cert Edition is the locked-down certified variant.
+
+Famous deployments: Mars rovers (Spirit, Opportunity, Curiosity, Perseverance — all run VxWorks), Boeing 787, James Webb Space Telescope, BMW E60 series electronics, F-35 (some subsystems alongside INTEGRITY).
+
+## Certification artifacts in detail
+
+What you actually receive when you license a certified RTOS:
+
+| Artifact | What it is |
+|----------|------------|
+| **Requirements document** | Numbered statements of what the kernel must do, traceable to standards clauses |
+| **Architecture document** | Module decomposition, dependencies, data flow, threat model |
+| **Detailed design** | Per-function design notes, invariants, pre/post-conditions |
+| **Source code** | The kernel source under configuration management |
+| **Coding standard compliance** | MISRA-C report — every deviation justified |
+| **Static analysis** | Polyspace / LDRA / Coverity output showing no defects in scope |
+| **Unit test suite** | Per-function tests with coverage report |
+| **Integration test suite** | Multi-component scenarios |
+| **MC/DC coverage report** | Boolean coverage proof (for DO-178C Level A) |
+| **FMEA / FTA** | Failure modes and effects analysis |
+| **Configuration management plan** | Version control, change control evidence |
+| **Verification plan** | How V&V was conducted, by whom, with what tools |
+| **Validation report** | Results of running all the above |
+| **Assessment report** | Independent assessor's confirmation |
+
+For ASIL D or DO-178C Level A, the artifact package can run to thousands of pages and tens of thousands of test cases. The reason a certified RTOS is expensive: the artifacts cost vastly more than the code to produce, and the vendor amortises them across customers.
+
+## What changes in your application code
+
+Beyond the kernel choice, certification places constraints on **your** application:
+
+**MISRA-C compliance.** Every line of your application code, not just the kernel. Common rules: no goto, no unbounded recursion, no dynamic memory after init, no `malloc` from interrupts, strict type rules, no implicit type conversions. Tools like Polyspace, LDRA, Helix QAC enforce.
+
+**Bounded execution.** Worst-case execution time (WCET) for every task. No unbounded loops. Static analysis (aiT, Bound-T) provides upper bounds.
+
+**Determinism.** No nondeterminism in scheduling or data flow. Tickless idle may be disallowed (introduces wakeup-source variance). Some certifications forbid caches; others require flushed caches at task boundaries.
+
+**Coverage targets.** For DO-178C Level A: 100% statement, decision, and MC/DC coverage of *your* code, in addition to the kernel's certified coverage.
+
+**Tool qualification.** Compiler, linker, debugger, static analyzer — each must be qualified for the safety level. GCC qualified for DO-178C is not stock GCC; it's a specific maintained branch with its own certification artifacts.
+
+<Callout type="warn">
+A common misconception is that picking a certified RTOS makes the project "safety-certified." It does not. The certified RTOS is a building block; the application, drivers, integration, and process around them must all meet the standard. Pick the RTOS early and budget for the full process — staffing, tooling, time, and audit fees usually run 3-10× the kernel license cost.
+</Callout>
+
+## The decision matrix
+
+For a new safety-critical project:
+
+| Domain | Standard | Reasonable choices |
+|--------|----------|--------------------|
+| Aerospace flight-critical | DO-178C Level A | INTEGRITY, VxWorks Cert, PikeOS |
+| Avionics non-critical (display, comms) | DO-178C Level B/C | VxWorks, INTEGRITY, RTEMS |
+| Automotive ASIL D (brakes, steering) | ISO 26262 ASIL D | SAFERTOS, ThreadX-cert, QNX, VxWorks, AUTOSAR Classic stacks |
+| Automotive ASIL B (body control) | ISO 26262 ASIL B | SAFERTOS, ThreadX, QNX, FreeRTOS with extensive qualification |
+| Medical Class C (life-supporting) | IEC 62304 Class C | SAFERTOS, ThreadX-cert, QNX |
+| Medical Class B | IEC 62304 Class B | Same as above; FreeRTOS sometimes accepted with strong process |
+| Industrial SIL 3 (process safety) | IEC 61508 SIL 3 | SAFERTOS, ThreadX, INTEGRITY, PikeOS |
+| Railway SIL 4 (signalling) | EN 50128 SIL 4 | PikeOS, INTEGRITY, VxWorks Cert |
+| Defense security-critical | Common Criteria EAL 5+ | INTEGRITY, PikeOS |
+
+The choice is rarely about features — most certified RTOSes can run the same tasks. The decision is dominated by: which artifacts your assessor recognises, which vendor your contracts demand, which toolchain the team knows, and the license-and-support relationship over the 15-30 year lifetime of the product.
+
+## Open-source RTOSes in safety contexts
+
+The frontier question: can you use FreeRTOS, Zephyr, or RT-Thread in a certified system? Sometimes, with substantial extra work:
+
+- **FreeRTOS for ASIL B** — has been achieved by some integrators with extensive in-house qualification (full test suite, FMEA, MISRA scrub). Not a recommended path.
+- **Zephyr Long-Term Support releases** have begun pursuing IEC 61508 SIL 3 certification (the Zephyr Safety Working Group). As of 2026, partial certification is in progress.
+- **NuttX** has been used in aerospace projects (notably some BAE Systems work) but no end-to-end certification.
+
+For a regulated product, the "use open-source and certify it ourselves" path is usually a false economy. The certification effort dominates total cost, and a vendor who has already done it (with maintained artifacts, audit support, and indemnification) is almost always cheaper in the end.
+
+## Further reading
+
+- [RTOS landscape](/docs/rtos/landscape) — broader RTOS context
+- [FreeRTOS](/docs/rtos/freertos) — the SAFERTOS parent kernel
+- [ThreadX](/docs/rtos/threadx) — the Azure RTOS certified base
+- [RTOS scheduling](/docs/rtos/scheduling) — why deterministic scheduling matters for certification
+- IEC 61508-3 (software portion of functional safety)
+- ISO 26262-6 (software development for automotive)
+- DO-178C / ED-12C — RTCA software considerations in airborne systems
+- "Safety-Critical Systems" — Storey, Pearson 1996 — the classical textbook

@@ -1,0 +1,200 @@
+---
+title: Debug architecture
+description: How ARM debug works under the hood — DAP, AHB-AP, JTAG vs SWD, the FPB breakpoint unit, DWT watchpoints, vector catch, CoreSight, ROM tables, and the difference between halting and sampling debug.
+order: 16
+updated: 2026-05-13
+tags: [architecture, debug, jtag, swd, coresight, fpb, dwt, dap]
+---
+
+ARM debug is one of those subsystems you ignore until it breaks, at which point you discover it's a small operating system in its own right. The debugger on your bench — J-Link, ST-Link, DAPLink, Black Magic Probe, NXP CMSIS-DAP — speaks a low-level protocol (JTAG or SWD) to a piece of silicon called the **Debug Access Port** (DAP), which is itself a bus master onto the chip's internal **APB** and **AHB** buses. From there it programs a handful of debug-only IP blocks: the **FPB** (Flash Patch and Breakpoint), the **DWT** (Data Watchpoint and Trace), the **ITM** (Instrumentation Trace Macrocell), and on bigger chips the **CoreSight** ecosystem (ETM, TPIU, funnel, replicator, ATB).
+
+This page is about the architecture, not any one vendor's GUI. Understanding the layers lets you diagnose "the J-Link can't see my CPU" failures (almost always at the DAP layer), "my breakpoints are silently ignored" (FPB exhaustion), and "the chip locks up the instant I run" (a stale vector-catch bit). It also explains how a tool like SEGGER SystemView gets non-intrusive trace data out without halting the CPU — sample-mode debug via ITM and DWT.
+
+<SpecSheet
+  title="ARM debug at a glance"
+  specs={[
+    { label: 'Wire protocols', value: 'JTAG (IEEE 1149.1, 4–5 wires: TCK/TMS/TDI/TDO + optional TRST) or SWD (ARM, 2 wires: SWCLK/SWDIO)' },
+    { label: 'Top-level component', value: 'DAP — Debug Access Port. Translates wire protocol to AP/DP register accesses' },
+    { label: 'Access Ports', value: 'AHB-AP (most common — bus master onto AHB), APB-AP (debug peripherals), JTAG-AP (legacy)' },
+    { label: 'Modes', value: 'Halting debug (CPU stopped, full state visible) and Sample-mode (CPU running, sample-only)' },
+    { label: 'Breakpoint mechanism', value: 'FPB (Flash Patch and Breakpoint) — 6–8 hardware breakpoints in Cortex-M; BKPT instruction (always-on, single-byte)' },
+    { label: 'Watchpoint mechanism', value: 'DWT comparators — 4 on Cortex-M3/M4, 4 on M7, often 4 on M33/M55' },
+    { label: 'Vector catch', value: 'DEMCR.VC_* — auto-halt on Reset, HardFault, NMI, MemManage, BusFault, UsageFault, etc.' },
+    { label: 'ROM table', value: 'Component description table at a fixed address (0xE00FF000 on Cortex-M); debugger walks it to discover IP blocks' },
+    { label: 'Trace', value: 'ITM (instrumentation), DWT (event/data trace), ETM (program flow) — all routed through TPIU or ETB' },
+  ]}
+/>
+
+## JTAG vs SWD
+
+JTAG is the older protocol, originally for boundary scan (1990s production test) and later repurposed for CPU debug. It uses 4 mandatory wires (TCK, TMS, TDI, TDO) plus optional TRST and is daisy-chainable — multiple TAPs (Test Access Ports) on the same chain.
+
+SWD is ARM's purpose-built debug protocol. Two wires only: **SWCLK** (clock) and **SWDIO** (bidirectional data). It's not daisy-chainable in the same sense; instead, multiple SWD targets are addressed via a unique "SWD multidrop" ID, programmed at boot. Most modern ARM chips support both — they share the same physical pads (TCK = SWCLK, TMS = SWDIO) and you select the protocol via a wire sequence at probe attach time.
+
+For ARM development, SWD is the default. The 2-wire footprint is friendlier on dense boards and the throughput is roughly equivalent. JTAG remains useful when:
+
+- You need to also test a non-ARM device on the same chain (FPGAs, CPLDs, SerDes ICs)
+- You need boundary scan (production test of solder joints)
+- You need higher throughput trace via TRACECLK + TRACEDATA[0..3] (SWO is single-wire on SWD)
+
+The handshake to switch a chip from JTAG to SWD is a magic 16-bit sequence (`0xE79E`) clocked out on TMS while TCK toggles; from SWD to JTAG is `0xE73C`. Probe firmware handles this; you don't write it manually.
+
+## The DAP — Debug Access Port
+
+The DAP is the gateway between the wire protocol and the chip's internal buses. It comprises:
+
+- **DP** (Debug Port) — interacts with the wire protocol. Holds CTRL/STAT, SELECT, RDBUFF, IDCODE registers. There's exactly one DP per chip.
+- **APs** (Access Ports) — bus masters onto various internal buses. Up to 256 per DP (addressable by AP number).
+
+The most important AP is the **AHB-AP** (also called MEM-AP). It's a bus master onto the chip's AHB, which means via the AHB-AP the debugger can read or write *any* memory or memory-mapped peripheral on the chip — the same address space the CPU sees. This is how the debugger reads registers (writes to the SCB/NVIC), reads RAM, programs flash (via the flash controller's MMIO), and even single-steps the CPU (writes to DCRSR/DCRDR for register access while halted).
+
+Other APs you'll encounter:
+
+- **APB-AP** — for chips where debug peripherals live on a private APB (Cortex-A typically).
+- **JTAG-AP** — bridges JTAG to a downstream JTAG chain. Used in big SoCs to hang JTAG-only peripherals off the main DAP.
+- **AXI-AP** — newer, for AXI-based interconnects (Cortex-A, Cortex-R82).
+
+The DAP's CSW (Control/Status Word) register configures the access size (byte/halfword/word) and auto-increment behavior for the AHB-AP. Setting CSW correctly is the difference between "single-word reads" (slow but always works) and "auto-incrementing burst reads" (fast, for dumping RAM). Most probes auto-tune this.
+
+<BlockDiagram title="Probe to core debug interface" width={780} height={220} nodes={[
+  { id: 'probe', x: 20,  y: 80, w: 140, h: 60, kind: 'external', label: 'Probe', detail: 'J-Link / DAPLink' },
+  { id: 'swj',   x: 180, y: 80, w: 120, h: 60, kind: 'io',       label: 'SWJ-DP', detail: 'SWD/JTAG mux' },
+  { id: 'dap',   x: 320, y: 80, w: 120, h: 60, kind: 'security', label: 'DAP / DP', detail: 'CTRL/STAT, SELECT' },
+  { id: 'ahb',   x: 460, y: 30, w: 130, h: 60, kind: 'security', label: 'AHB-AP', detail: 'memory access' },
+  { id: 'apb',   x: 460, y: 130, w: 130, h: 60, kind: 'security', label: 'APB-AP', detail: 'debug peripherals' },
+  { id: 'core',  x: 620, y: 30, w: 140, h: 60, kind: 'core',     label: 'Core debug', detail: 'DHCSR, DCRSR' },
+  { id: 'fpb',   x: 620, y: 130, w: 140, h: 60, kind: 'periph',  label: 'FPB / DWT / ITM', detail: 'breakpoints, trace' },
+]} edges={[
+  { from: 'probe', to: 'swj', label: 'SWD/JTAG', tone: 'primary' },
+  { from: 'swj', to: 'dap', tone: 'primary' },
+  { from: 'dap', to: 'ahb', tone: 'accent' },
+  { from: 'dap', to: 'apb', tone: 'accent' },
+  { from: 'ahb', to: 'core', label: 'halt/step', tone: 'success' },
+  { from: 'apb', to: 'fpb', label: 'config', tone: 'warning' },
+]} caption="The DAP fans out to two access ports: AHB-AP exposes the chip's main memory map (including core registers via DHCSR/DCRSR), while APB-AP configures the FPB, DWT, and ITM debug IP blocks." />
+
+## The ROM table
+
+When a debugger attaches, it has no idea what IP is on the chip. The discovery mechanism is the **ROM table** — a tiny read-only table at a fixed address (`0xE00FF000` on Cortex-M, `0x80000000` on Cortex-A) containing pointers to every debug-visible component, plus each component's identity (an architectural ID). The debugger walks the table, identifies each component (FPB, DWT, ITM, NVIC, SCB, CTI, ETM...), and builds an internal map.
+
+Each pointed-to component starts with a **PIDR** (Peripheral ID Register) and **CIDR** (Component ID Register) block at offset 0xFD0..0xFFC. The four CIDR words have a magic signature (`0x0D, 0xE0, 0x05, 0xB1`) confirming "this is a CoreSight component." The PIDR encodes the JEDEC manufacturer, part number, and revision. The debugger uses these to load the right XML description and present the user with named registers in its UI.
+
+```
+Cortex-M ROM table at 0xE00FF000:
+
+Offset    Value                Pointer to
+0x000     0xFFF0F003           SCS (System Control Space) at 0xE000E000
+0x004     0xFFF02002           DWT at 0xE0001000
+0x008     0xFFF03002           FPB at 0xE0002000
+0x00C     0xFFF01002           ITM at 0xE0000000
+0x010     0xFFF41002           TPIU at 0xE0040000
+0x014     0xFFF42002           ETM at 0xE0041000 (optional)
+0x018     0x00000000           End of table
+```
+
+You can read this table over SWD with any debugger; J-Link's "RTT Viewer" and OpenOCD's `scan_chain` command do exactly this on attach.
+
+## FPB — Flash Patch and Breakpoint
+
+Hardware breakpoints are implemented by the **FPB** (Flash Patch and Breakpoint) unit. It has 6 to 8 instruction comparators that match PC against programmed addresses. When the CPU is about to execute an instruction at a programmed address, the FPB either:
+
+- **Halts the CPU** (debug mode) and notifies the debugger, OR
+- **Substitutes a different instruction** (flash patch mode — the "flash patch" half of the name)
+
+The flash patch use is for in-field firmware bug fixes: you can program the FPB to substitute, say, a `bx lr` for the buggy instruction, effectively patching read-only flash from RAM. It's rarely used today (OTA firmware update displaced it).
+
+The breakpoint count is the architectural ceiling. STM32F4 has 6, STM32H7 has 8, nRF52 has 6, RP2040 has 4. If your debugger reports "out of hardware breakpoints," the FPB comparators are exhausted; remove a breakpoint or use software breakpoints (which replace the instruction in RAM/flash with `BKPT` — only works for code in RAM, or for flash if the toolchain inserts BKPT at compile time).
+
+The `BKPT` instruction itself is always available — a 16-bit Thumb instruction that unconditionally halts. The debugger's `assert(0)` typically resolves to a `BKPT #0` so you stop at the assertion with the debugger attached.
+
+## DWT — Data Watchpoint and Trace
+
+The **DWT** is the data-side counterpart to FPB. Where FPB matches instruction addresses, DWT matches data addresses and provides watchpoints, plus a cycle counter, plus event-trace generation.
+
+Each DWT comparator can be programmed for:
+- **Watchpoint** — halt on read, write, or read+write to a specific address (with optional mask for range matching)
+- **PC sampling** — periodically emit the current PC over trace
+- **CPI counter** — count cycles per instruction (lightweight profiling)
+- **Exception trace** — emit a packet on every exception entry/exit
+
+Watchpoint use is the headline feature. You set a comparator to "halt on write to `&buggy_var`" and the debugger stops at the very instruction that corrupted the variable. This is dramatically better than printf-debugging memory corruption, especially when the corruption happens deep inside a library or DMA path.
+
+```
+DWT->COMP0 = (uint32_t)&buggy_var;       // address to watch
+DWT->MASK0 = 0;                          // exact match (no range)
+DWT->FUNCTION0 = (DWT_FUNCTION_FUNCTION_Pos << 0)  // 6 = halt on R+W
+              | DWT_FUNCTION_ENABLE_Msk;
+```
+
+The CMSIS macros and J-Link's "Set Data Breakpoint" UI hide these register pokes; the result is the same.
+
+The **DWT cycle counter** (`DWT->CYCCNT`) is a 32-bit free-running counter at CPU clock. Enable via `DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk` and `CoreDebug->DEMCR |= DEMCR_TRCENA_Msk`. It's the easiest source of microsecond-resolution timestamps on Cortex-M — sample at start and end of a region, subtract, divide by `SystemCoreClock / 1_000_000`.
+
+## DEMCR and vector catch
+
+The **Debug Exception and Monitor Control Register** (DEMCR, at `0xE000EDFC`) controls debug-related behaviors:
+
+| Bit | Name | Purpose |
+|-----|------|---------|
+| 0   | VC_CORERESET | Halt on reset |
+| 4   | VC_MMERR | Halt on MemManage fault |
+| 5   | VC_NOCPERR | Halt on no-coprocessor UsageFault |
+| 6   | VC_CHKERR | Halt on integrity-check fail |
+| 7   | VC_STATERR | Halt on state-error UsageFault |
+| 8   | VC_BUSERR | Halt on BusFault |
+| 9   | VC_INTERR | Halt on interrupt-related UsageFault |
+| 10  | VC_HARDERR | Halt on HardFault |
+| 16  | MON_EN | Enable DebugMonitor exception (non-halting debug) |
+| 24  | TRCENA | Enable trace and DWT — must be 1 for cycle counter, ITM, etc. |
+
+`VC_CORERESET = 1` is the standard "stop at main" trick: the debugger sets it, issues a reset, and the CPU halts on the first instruction at the reset vector. The debugger walks the startup code, breakpoints `main`, and clears VC_CORERESET so subsequent code runs unimpeded.
+
+`VC_HARDERR = 1` halts immediately on HardFault, with the stack frame intact and the fault-status registers still showing the fault details. This is invaluable for diagnosing crashes — without it, the HardFault handler runs (often into another fault) and clobbers the evidence.
+
+<Callout type="tip">
+Always set `VC_HARDERR = 1` and `VC_BUSERR = 1` when bringing up new hardware. The default is 0 (faults run their handlers), which is wrong for development. OpenOCD's `cortex_m vector_catch` command and J-Link's `Edit.Breakpoint Vector Catch` UI both set these.
+</Callout>
+
+## Halting vs sample-mode debug
+
+There are two fundamentally different debug modalities on Cortex-M:
+
+**Halting debug** — the classic mode. The debugger writes 1 to `DHCSR.C_HALT`, the CPU stops, and the debugger reads/writes registers via DCRSR/DCRDR and memory via the AHB-AP. CPU state is fully visible but execution is paused. This is what you use for "step over this line" and "inspect this struct."
+
+**Sample-mode debug** — the CPU keeps running; the debugger samples PC, captures DWT events, and reads ITM trace packets without halting. This is how non-intrusive profilers work (SEGGER SystemView, Percepio Tracealyzer, μC/Probe). The CPU runs at full speed; the debugger gets a statistical view of behavior plus exact event timestamps for ITM packets the firmware writes.
+
+The trade-off: halting debug shows you everything but stops time. Sample-mode debug doesn't stop time but only shows you what you've instrumented (ITM writes from firmware) and what the DWT is configured to capture. For real-time systems where halting the CPU breaks the system (motor control, network protocols), sample-mode is the only option.
+
+## CoreSight on bigger chips
+
+Cortex-M3/M4 systems usually have just FPB, DWT, ITM, and TPIU. Bigger ARM systems (Cortex-A, Cortex-R, multi-core SoCs) layer on the full **CoreSight** ecosystem:
+
+- **ETM / ETMv4** — Embedded Trace Macrocell. Per-core program-flow trace.
+- **HTM** — Bus trace (AXI traffic).
+- **STM** — System Trace Macrocell. Multi-source trace aggregator.
+- **CTI** — Cross-Trigger Interface. Lets one core's halt trigger another core's halt.
+- **Trace funnel** — merges multiple ATB (AMBA Trace Bus) streams.
+- **TPIU** — Trace Port Interface Unit. Pumps trace out a pin (parallel or SWO single-wire).
+- **ETB** — Embedded Trace Buffer. On-chip RAM trace destination (no pin needed).
+
+On a Cortex-M, the trace data path is typically `DWT → ITM → TPIU → SWO pin`. The SWO is a single asynchronous serial output at up to ~50 Mbit/s. On a Cortex-A, you might have `ETM → funnel → ETF (Embedded Trace FIFO) → ETB` and the trace stays entirely on-chip.
+
+## Common debug failures
+
+**"Cannot connect to target."** Usually the DAP itself. Causes: SWCLK frequency too high for the wire length, target in reset (RESET pulled low), target sleep mode (clock to debug logic gated), or wrong protocol selected. The probe should fall back to lower SWCLK rates automatically; if not, force it manually.
+
+**"Connection lost during programming."** The target ran code that disabled the SWD pins (e.g., reconfigured SWCLK/SWDIO as GPIO). Recovery: hold the BOOT0/RESET pin during attach to force the chip into ROM bootloader mode, which always has SWD enabled. Vendor "connect under reset" is the modern mechanism.
+
+**"Breakpoint at 0x... is set but the CPU runs through it."** FPB is full or wasn't enabled. Check `FP_CTRL.ENABLE = 1`. Or you set a breakpoint in flash without the FPB programmed — common when the debugger thinks it's in software-breakpoint mode but the address is in read-only flash.
+
+**"Halt request times out."** The CPU may be in WFI/WFE with `SCB->SCR.SLEEPDEEP = 1` and clocks gated. Use the probe's "halt under reset" or pulse RESET to wake it.
+
+## Cross-references
+
+- [ITM and SWO](/docs/cortex-m/itm-swo) — instrumentation trace output
+- [DWT cycle counter](/docs/cortex-m/dwt-cyccnt) — practical use of the cycle counter
+- [PMU](/docs/architecture/pmu) — performance counters (Cortex-A) vs DWT (Cortex-M)
+- [Fault decoder](/tools/fault-decoder) — decode HardFault when VC_HARDERR has halted you
+- ARMv7-M Architecture Reference Manual, section C1 (Debug architecture)
+- ARM CoreSight Architecture Specification (ARM IHI 0029)
+- ARM Debug Interface v5 / v6 (DAP specification, ARM IHI 0031)

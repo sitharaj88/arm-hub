@@ -1,0 +1,191 @@
+---
+title: MPU & TCM on Cortex-R
+description: Memory protection regions and tightly-coupled memories on Cortex-R — how the MPU differs from Cortex-M, the ATCM/BTCM at fixed addresses, ECC-enabled bring-up, and vector remap mechanics for fault tolerance.
+order: 2
+updated: 2026-05-13
+tags: [cortex-r, mpu, tcm, atcm, btcm, ecc, memory-protection]
+---
+
+Cortex-R parts get their deterministic timing from two architectural mechanisms layered on the same core: a Memory Protection Unit (MPU) that enforces region-based access control without page tables, and Tightly Coupled Memories (TCMs) that bypass the cache hierarchy entirely with single-cycle access from fixed physical addresses. Together they let firmware engineers reason about exact cycle counts in a way that Cortex-A's MMU-and-caches model makes impossible.
+
+This page covers both — how the Cortex-R MPU differs from Cortex-M, what's special about the ATCM and BTCM, the bring-up sequence for ECC-protected TCMs, and the vector-remap dance that production safety-critical firmware uses.
+
+<SpecSheet
+  title="Cortex-R MPU and TCM at a glance"
+  specs={[
+    { label: 'MPU regions (R4/R5)', value: '8 or 12 regions, vendor-configured at integration' },
+    { label: 'MPU regions (R52)', value: '16 or more — v8-style flexible base/limit, MAIR attribute indirection' },
+    { label: 'Region constraints (R4/R5/R7)', value: 'Power-of-two size ≥32 B, naturally aligned. 8 sub-regions per region for non-power-of-two effective sizes' },
+    { label: 'Region constraints (R52)', value: 'Any 32-byte aligned base, any 32-byte aligned limit. No power-of-two restriction' },
+    { label: 'ATCM (Instruction TCM)', value: 'Mapped at 0x00000000 by default. 32-128 KB typical. Single-cycle access from CPU, parallel-port from external master' },
+    { label: 'BTCM (Data TCM)', value: 'Mapped at 0x00800000 by default. Similar size to ATCM. Some parts split into BTCM0 / BTCM1' },
+    { label: 'TCM ECC', value: 'SECDED Hamming (single-error correct, double-error detect) per 32-bit or 64-bit word' },
+    { label: 'Cache (when present)', value: 'L1 I/D 32 KB typical, also with ECC or parity. Configured per-region as cacheable/non-cacheable via MPU attrs' },
+    { label: 'Default memory map', value: 'After reset, MPU is OFF. Memory is accessible per the architectural default map: 0x00000000–0x7FFFFFFF normal, 0x80000000+ device' },
+  ]}
+/>
+
+## Cortex-R MPU vs Cortex-M MPU
+
+Both Cortex-M and Cortex-R have an MPU, but the design tradeoffs are different.
+
+On Cortex-M, the MPU primarily serves RTOS task isolation — 8–16 regions are usually enough because you reprogram them on context switch. The Cortex-M MPU is small and cheap.
+
+On Cortex-R, the MPU often holds a more elaborate *static* map covering ATCM, BTCM, peripheral regions, shared memory blocks, and DMA-accessible regions, plus dynamic regions for task isolation. 12–16 regions is a more typical baseline because the system map alone consumes 6–10 regions before any task-specific use.
+
+Other Cortex-R MPU differences:
+
+- **More region attributes.** Cortex-R MPU regions support more memory types (strongly ordered, device, normal cacheable, normal non-cacheable) with finer cacheability and shareability bits.
+- **No execute-never-by-default for unprivileged.** Cortex-R unprivileged code can execute from any region unless explicitly XN'd — Cortex-M's default-deny-on-uncovered does not apply the same way.
+- **Cache-coherency interactions.** When the Cortex-R has a D-cache, each region's `C`, `B`, and `TEX` bits control cacheability and write-allocate behavior. Wrong attributes corrupt DMA buffers.
+
+The MPU registers are accessed through coprocessor 15 (CP15) on ARMv7-R:
+
+```asm
+@ Select region N
+MCR p15, 0, r0, c6, c2, 0      @ MPU_RGNR = r0
+
+@ Write region base + size + attributes
+MCR p15, 0, r1, c6, c1, 0      @ MPU_DRBAR (data region base)
+MCR p15, 0, r2, c6, c1, 2      @ MPU_DRSR (size + enable)
+MCR p15, 0, r3, c6, c1, 4      @ MPU_DRACR (access control)
+```
+
+There are *separate* instruction-side and data-side MPU configurations on some Cortex-R variants — IRBAR/IRSR/IRACR for instruction-side. This lets you mark a region cacheable for D-side but not for I-side, or change permissions independently. Newer R52 collapses these to one unified MPU, simplifying configuration.
+
+## TCM — what and why
+
+Tightly-Coupled Memory is a chunk of SRAM that sits *inside* the CPU's load/store and instruction fetch units — bypassing the cache hierarchy and the AXI interface. Access latency is one cycle for both reads and writes; there's no cache miss to worry about because there's no cache in the path.
+
+Two TCMs are standard on Cortex-R:
+
+- **ATCM (A-bank TCM, "Instruction TCM")** — typically mapped at physical address `0x00000000` to coincide with the reset vector. Holds critical interrupt vectors, the first-stage bootloader, and time-critical handlers.
+- **BTCM (B-bank TCM, "Data TCM")** — typically mapped at `0x00800000`. Holds critical data structures, RTOS task control blocks, time-critical stack(s).
+
+The naming convention is historical and not strictly enforced — code can run from BTCM and data can live in ATCM. But the convention helps because it keeps instruction fetches on the I-side bus and data accesses on the D-side bus, which improves throughput.
+
+Sizes:
+
+| Part family | ATCM | BTCM |
+|-------------|------|------|
+| Cortex-R5 (TI TMS570) | 128 KB | 128 KB |
+| Cortex-R5 (Xilinx Zynq Ultrascale+ RPU) | 64 KB | 128 KB |
+| Cortex-R52 (NXP S32G) | 64–128 KB | 128 KB |
+| Cortex-R52+ | up to 256 KB ATCM | up to 256 KB BTCM |
+
+Some parts expose TCMs as **dual-ported**: the CPU accesses one port, an AXI slave port on the cluster boundary lets external masters (DMA, debugger, other cores in the cluster) access the TCM. This is how RPU firmware on a Zynq UltraScale+ shares data with the APU (Cortex-A53) — the RPU pins data in its BTCM and the APU's master gets to it via the cluster's slave port.
+
+## TCM bring-up sequence
+
+After reset, the TCMs are *not necessarily enabled* — some parts boot with TCMs disabled, requiring the startup code to enable them. The bring-up steps:
+
+1. **Enable the TCM banks** in `ACTLR` (Auxiliary Control Register) or, on some parts, in `IMP_SLPCR` / vendor-specific registers.
+2. **Initialize the ECC syndrome.** If the TCM has ECC, the syndrome bits start uninitialized. Reading uninitialized bytes triggers ECC errors. The startup code must write every word of TCM (typically with zeros) to populate the syndrome before any read.
+3. **Enable ECC checking.** A control bit (often in CP15 ACTLR or vendor-specific) enables the ECC compare logic on every TCM access.
+4. **Optionally remap the vector base.** The ARM CPU starts execution from address 0 (low vectors) or 0xFFFF0000 (high vectors). The vector table needs to be in TCM (or aliased to TCM) for deterministic fetch.
+
+```c
+// Typical R5 TCM bring-up
+void tcm_init(void) {
+    // 1. Enable TCM access in ACTLR
+    asm volatile("mrc p15, 0, r0, c1, c0, 1\n\t"   // ACTLR
+                 "orr r0, r0, #0x0C\n\t"             // ATCM and BTCM enable
+                 "mcr p15, 0, r0, c1, c0, 1\n\t"
+                 ::: "r0");
+
+    // 2. Initialize ECC syndrome by writing every word
+    volatile uint32_t *atcm = (uint32_t *)0x00000000;
+    for (int i = 0; i < (128*1024)/4; i++) atcm[i] = 0;
+    volatile uint32_t *btcm = (uint32_t *)0x00800000;
+    for (int i = 0; i < (128*1024)/4; i++) btcm[i] = 0;
+
+    // 3. Enable ECC checking (vendor-specific bit)
+    asm volatile("mrc p15, 0, r0, c1, c0, 1\n\t"
+                 "orr r0, r0, #(1 << 25)\n\t"        // ECC enable bit (vendor)
+                 "mcr p15, 0, r0, c1, c0, 1\n\t"
+                 ::: "r0");
+
+    asm volatile("dsb sy\n\t" "isb sy\n\t");
+}
+```
+
+The exact register layout and bit positions vary by part — consult the technical reference manual for your specific Cortex-R variant. TI TMS570 has its own L2RAMW (level-2 RAM wrap) bring-up flow; Xilinx Zynq UltraScale+ uses a different sequence again.
+
+<Callout type="warn">
+Forgetting to initialize the ECC syndrome is the most common Cortex-R bring-up bug. Symptoms: code runs fine for some milliseconds, then a spurious "uncorrectable data abort" fault on a memory access that should have been clean. Cause: the ECC syndrome of an uninitialized word is implementation-defined and may signal an uncorrectable error on read. Always do a full-zero (or known-pattern) write of every TCM word before the first read.
+</Callout>
+
+## Region attributes — pre-fetchable vs strongly ordered
+
+Cortex-R MPU regions carry memory-type attributes that drive cache and prefetch behavior:
+
+| Memory type | TEX/C/B (v7-R) | Pre-fetchable | Reorderable | Use |
+|-------------|-----------------|----------------|--------------|-----|
+| Strongly Ordered | 000/0/0 | No | No | System control registers; ensures observable order |
+| Device | 000/0/1 | No (architecturally) | No | Peripheral registers |
+| Normal Non-Cacheable | 001/0/0 | Possible | Yes | DMA buffers, shared memory |
+| Normal Write-Through | 000/1/0 | Yes | Yes | Read-mostly data |
+| Normal Write-Back, no Write-Allocate | 000/1/1 | Yes | Yes | General data, no write streaming |
+| Normal Write-Back, Write-Allocate | 001/1/1 | Yes | Yes | General data with streaming writes |
+
+The pre-fetchable property matters because Cortex-R cores have a prefetcher that speculatively fetches cache lines ahead of demand. For peripheral registers, the prefetcher could trigger side-effects (e.g., reading a FIFO drains an entry) that you didn't ask for. Marking peripheral regions as `Device` disables the prefetcher.
+
+Strongly Ordered is even stricter: no prefetch, no reorder, and the access must complete before the next instruction proceeds. Use for cross-CPU synchronization registers and any memory where ordering matters more than throughput.
+
+## TCM and the vector table
+
+The reset vector is at `0x00000000` (or `0xFFFF0000` for high vectors). On a part with ATCM mapped at 0x00000000, the reset vector physically lives in ATCM — fetch is single-cycle, deterministic.
+
+But ATCM is typically uninitialized after reset (ECC syndrome problem above). The startup code must run from *somewhere* before TCM is usable. Two strategies:
+
+**Strategy 1: ROM/flash boot.** The CPU boots from external flash at 0x00000000 (with ATCM disabled or unmapped initially). Startup code runs from flash, initializes the TCMs, copies a stage-2 image into ATCM, and re-vectors. Common in deeply embedded automotive parts.
+
+**Strategy 2: Vector remap.** The CPU boots from ATCM with a power-on default content (a "boot ROM" baked into the silicon). After early initialization, software writes the runtime vector table to ATCM and the system continues. Common in cores with mask ROM.
+
+Some parts have a "vector remap" feature that lets the runtime move the vector base to a different region post-boot. On the Cortex-R5, `VBAR` (Vector Base Address Register) holds the base address — setting `VBAR = 0x00100000` re-routes all subsequent exception vectors to that address. Use this once TCM is set up to relocate vectors out of the boot ROM into runtime-controlled memory.
+
+## Cache and MPU interaction
+
+When the Cortex-R has L1 caches (32 KB I + 32 KB D typical), the MPU's region attributes drive whether each region is cached:
+
+- **Cacheable** regions can be allocated into the L1 cache; misses fetch from external memory; lines are evicted on capacity pressure.
+- **Non-cacheable** regions go straight to memory on every access.
+- **Write-back** vs **write-through** controls when dirty data hits external memory.
+- **Write-allocate** vs **no-write-allocate** controls whether stores fill the cache line on a write miss.
+
+For DMA buffers, the typical setting is **non-cacheable** — the CPU and the DMA see the same memory state without explicit cache maintenance. The alternative (cacheable + explicit invalidate/clean on each transfer) works but is error-prone.
+
+For code and read-only data, write-back cacheable is the high-performance default. For stacks, write-back write-allocate is usually optimal — most stack writes are followed by reads (function locals).
+
+<Callout type="tip">
+Mark DMA buffer regions as Non-Cacheable Non-Bufferable. Buffered writes from the CPU might not have drained to memory yet when the DMA starts reading. Strongly Ordered is even safer but slower for bulk transfers. Most production code uses Normal Non-Cacheable with explicit DSB before kicking the DMA.
+</Callout>
+
+## R52 MPU — the v8-style upgrade
+
+The Cortex-R52 MPU follows the ARMv8 model (similar to v8-M MPU described in the [Cortex-M MPU page](/docs/cortex-m/mpu)):
+
+- Region base and limit are independently 32-byte aligned — no power-of-two restriction.
+- Memory attributes come from a MAIR (Memory Attribute Indirection Register) — up to 8 attribute types defined globally, each region picks one by index.
+- Two MAIR registers: MAIR0_EL1 covers attribute indices 0–3, MAIR1_EL1 covers 4–7.
+- Per-region XN (execute-never) bit is in the base register.
+
+The region count is implementation-defined; R52 implementations ship with 16 or more regions per core. Each core in the cluster has its own MPU (no sharing).
+
+## ECC on caches
+
+When the Cortex-R has L1 caches, those caches typically have ECC or parity:
+
+- **L1 I-cache**: parity on each cache line. A parity error invalidates the line, forcing a refetch. Single-bit errors in instruction code are silently retried.
+- **L1 D-cache**: SECDED ECC on each line. Single-bit errors are corrected on read; double-bit errors trigger a data abort exception.
+
+The CFLR (Cache Fault Location Register) or vendor equivalent records the address of the failing access. Production firmware logs these to non-volatile memory for field diagnostics.
+
+## Cross-references
+
+- [Cortex-R interrupts (VIC/VIM/GIC)](/docs/cortex-r/interrupts) — how vectors map to TCM
+- [ECC and parity on Cortex-R](/docs/cortex-r/ecc) — fault detection mechanics
+- [Cortex-M MPU](/docs/cortex-m/mpu) — for comparison, similar concept simpler scope
+- [R52 cluster modes](/docs/cortex-r/r52-cluster) — per-core MPU in a cluster
+- ARM Cortex-R5 Technical Reference Manual
+- ARM Cortex-R52 Technical Reference Manual

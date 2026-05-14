@@ -1,0 +1,159 @@
+---
+title: OpenOCD & probes
+description: ST-Link, J-Link, CMSIS-DAP, Black Magic — the debug probes you'll meet, what OpenOCD does, and the alternatives (pyOCD, probe-rs).
+order: 3
+updated: 2026-05-12
+tags: [tools, openocd, swd, probe]
+---
+
+
+A debug probe is a USB-to-SWD/JTAG bridge that lets your host computer talk to the chip's Debug Access Port. **OpenOCD** is the open-source server that drives the probe. There are several probes worth knowing and a few alternatives to OpenOCD.
+
+## The probes
+
+| Probe                  | Cost      | Strengths                                | Caveats                       |
+|------------------------|-----------|------------------------------------------|-------------------------------|
+| **ST-Link V2/V3**      | $5–$25    | Bundled on every ST dev board, fast      | ST chips only (in OpenOCD)    |
+| **J-Link EDU**         | $60       | Best-in-class speed, RTT, flash drivers  | Educational-only license      |
+| **J-Link Base/Plus/Pro**| $400–$1500| Commercial, full speed, all features     | Expensive                     |
+| **CMSIS-DAP** (DAPLink)| $5–$30    | ARM-blessed, USB MSC drag-drop flash     | Slower than J-Link            |
+| **Black Magic Probe**  | $70       | Built-in GDB server, no OpenOCD needed   | Slower for big flashes        |
+| **PicoProbe**          | $5        | Raspberry Pi Pico programmed as a probe  | Works for most Cortex-M       |
+| **Tag-Connect probes** | varies    | Spring-loaded contact for no-header debug| Awkward without a stand       |
+
+For new development, the practical defaults are:
+
+- **ST-Link V3** if you're on STM32 (bundled with Nucleo/Discovery, $25 standalone).
+- **CMSIS-DAP** for everything else, especially if your team needs cross-platform support.
+- **J-Link Base** when you need its speed (high-rate RTT logging, large flashes).
+
+## OpenOCD architecture
+
+```
+    GDB ───┬─── gdb-server :3333    ┬
+    Telnet ┴─── command port :4444 ─┤   openocd
+                                    │
+                                    ├── probe driver (hla, jlink, cmsis-dap, ...)
+                                    │
+                                    └── target driver (cortex_m, stm32f4x, ...)
+```
+
+OpenOCD's two big knobs:
+
+1. **Interface config** — which probe. `-f interface/stlink.cfg`, `-f interface/cmsis-dap.cfg`, `-f interface/jlink.cfg`.
+2. **Target config** — which chip. `-f target/stm32f4x.cfg`, `-f target/nrf52.cfg`, `-f target/rp2040.cfg`.
+
+Combined:
+
+```bash
+openocd -f interface/stlink.cfg -f target/stm32f4x.cfg
+```
+
+The two files configure the SWD pins/protocol and the chip's flash size, RAM size, debug ports respectively. OpenOCD ships hundreds of board-specific configs in `share/openocd/scripts/` — `board/st_nucleo_f4.cfg`, `board/raspberrypi-pico.cfg`, etc.
+
+<BlockDiagram title="Probe to target memory bus path" width={780} height={200} nodes={[
+  { id: 'host', x: 20,  y: 70, w: 130, h: 60, kind: 'cloud',    label: 'Host', detail: 'GDB / OpenOCD' },
+  { id: 'probe', x: 170, y: 70, w: 130, h: 60, kind: 'external', label: 'Probe', detail: 'ST-Link / J-Link / DAPLink' },
+  { id: 'swj',   x: 320, y: 70, w: 110, h: 60, kind: 'io',       label: 'SWJ-DP', detail: 'SWD or JTAG entry' },
+  { id: 'dap',   x: 450, y: 70, w: 110, h: 60, kind: 'security', label: 'DAP', detail: 'Debug Access Port' },
+  { id: 'ap',    x: 580, y: 70, w: 110, h: 60, kind: 'security', label: 'AHB-AP', detail: 'Memory access port' },
+  { id: 'tgt',   x: 710, y: 30, w: 60,  h: 60, kind: 'memory',   label: 'Bus', detail: 'AHB' },
+  { id: 'core',  x: 710, y: 110, w: 60, h: 60, kind: 'core',     label: 'Core', detail: 'Cortex-M' },
+]} edges={[
+  { from: 'host', to: 'probe', label: 'USB', tone: 'primary' },
+  { from: 'probe', to: 'swj', label: 'SWD/JTAG', tone: 'primary' },
+  { from: 'swj', to: 'dap', tone: 'accent' },
+  { from: 'dap', to: 'ap', tone: 'accent' },
+  { from: 'ap', to: 'tgt', label: 'mem r/w', tone: 'success' },
+  { from: 'ap', to: 'core', label: 'halt / step', tone: 'warning' },
+]} caption="OpenOCD never touches the core directly — every memory read, breakpoint write, and halt request travels host to probe to SWD to DAP to AP and only then onto the target's AHB bus." />
+
+## OpenOCD telnet console
+
+While OpenOCD is running, connect to its command port:
+
+```bash
+telnet localhost 4444
+> reset halt
+> mdw 0x40023830 4        # memory display word — 4 words at RCC->AHB1ENR
+> mww 0x40023830 0x1      # memory write word
+> flash write_image erase firmware.bin 0x08000000
+> flash verify_image firmware.bin 0x08000000
+> reset run
+```
+
+Same commands work from GDB via `monitor <command>`. The telnet console is handy for one-off poking without firing up GDB.
+
+## OpenOCD adapter speed
+
+```
+> adapter speed 4000      # 4 MHz SWD clock
+```
+
+Higher speed = faster flashing and faster step. Most modern probes do 4–8 MHz cleanly; some chips are sensitive to long traces or 1.8 V signalling and need to back off. Start at 1 MHz, scale up until it gets unreliable, then back off 20%.
+
+## J-Link's standalone GDB server
+
+J-Link comes with `JLinkGDBServer`, which serves the same GDB RSP as OpenOCD but is implemented by SEGGER, often faster, with built-in support for all chips J-Link knows about.
+
+```bash
+JLinkGDBServer -device STM32F407VG -if SWD -speed 4000 -port 2331
+arm-none-eabi-gdb -ex "target extended-remote :2331" firmware.elf
+```
+
+J-Link's "Unlimited Breakpoints" feature can install software breakpoints in *flash* by intercepting flash reads — useful when you've exhausted the FPB's 6–8 hardware slots.
+
+## pyOCD
+
+Python-implemented debug server, particularly strong for CMSIS-DAP probes. Bundled with the [PyOCD project](https://github.com/pyocd/pyOCD). Used by ARM's mbed and increasingly elsewhere.
+
+```bash
+pyocd gdbserver --target=stm32f407vg
+pyocd flash --target=stm32f407vg firmware.bin
+pyocd erase --target=stm32f407vg --chip
+```
+
+For Cortex-M development on macOS or in Python-friendly environments, pyOCD is a smooth alternative to OpenOCD.
+
+## probe-rs — the Rust ecosystem's tool
+
+[probe-rs](https://probe.rs/) is a one-tool replacement for OpenOCD + GDB + RTT in a single Rust binary. Despite the Rust origin, it works for C/C++ projects too.
+
+```bash
+probe-rs run --chip STM32F407VGTx firmware.elf    # flash and run
+probe-rs gdb --chip STM32F407VGTx                  # GDB server
+probe-rs attach --chip STM32F407VGTx --rtt-port 1  # RTT viewer
+```
+
+It supports ST-Link, J-Link, CMSIS-DAP, FTDI-based probes, and a growing list of native USB protocols. For modern projects (especially Rust embedded) it's often the smoothest experience.
+
+## Black Magic Probe — the no-GDB-server option
+
+Black Magic Probe runs its own GDB server *on the probe itself*. You connect GDB directly to the probe over USB-serial:
+
+```bash
+arm-none-eabi-gdb firmware.elf
+(gdb) target extended-remote /dev/cu.usbmodem*1
+(gdb) monitor swdp_scan
+(gdb) attach 1
+(gdb) load
+(gdb) run
+```
+
+No OpenOCD or other server process. Less moving parts, very nice for portable setups (BMP fits in your pocket).
+
+## Common probe problems
+
+- **"Error: connect failed"** — wrong target voltage, missing SWCLK/SWDIO connection, NRST stuck low.
+- **"Error: failed to read DSCSR"** — debug port locked (RDP level 2 on STM32, or fuse-locked on others). Sometimes recoverable with `monitor reset_config srst_only srst_pulls_trst`, sometimes the chip is bricked.
+- **Random disconnects on long flashes** — USB hub or cable issue. Try a direct port and a short cable.
+- **Probe shows up but target doesn't** — target reset issue. Try `reset_config srst_only` or `reset_config srst_push_pull`.
+
+<Callout type="tip" title="VTREF is the most-skipped wire">
+On a 10-pin Cortex-M debug header, VTREF tells the probe what the target's logic voltage is. If you don't connect it, the probe may use 3.3V signalling on a 1.8V target (destroying the target pins over time) or vice versa (intermittent failures). **Always wire VTREF**.
+</Callout>
+
+## See also
+
+- [GDB & on-chip debug](/docs/tools/gdb/) — using GDB once you have a server.
+- [Toolchains](/docs/tools/toolchains/) — getting the ELF that the probe flashes.

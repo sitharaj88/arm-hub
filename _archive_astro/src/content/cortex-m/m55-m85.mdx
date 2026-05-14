@@ -1,0 +1,144 @@
+---
+title: Cortex-M55 / M85
+description: ARMv8.1-M, Helium / MVE vector extension, PACBTI pointer authentication — the cores enabling on-device ML and high-DSP workloads.
+order: 7
+updated: 2026-05-12
+tags: [cortex-m, m55, m85, armv8.1-m, helium, mve, ml]
+badge: Helium
+---
+
+import Callout from '~/components/Callout.astro';
+
+The Cortex-M55 (2020) and Cortex-M85 (2022) are the first cores to implement **ARMv8.1-M** — adding **Helium / MVE** (M-profile Vector Extension), **PACBTI** (pointer auth + branch target identification), and low-overhead loop instructions. They're the cores you reach for when "Cortex-M5×" needs to do edge ML inference or industrial-grade DSP.
+
+## At a glance
+
+| Feature           | Cortex-M55              | Cortex-M85                |
+|-------------------|-------------------------|---------------------------|
+| ISA               | ARMv8.1-M Mainline      | ARMv8.1-M Mainline        |
+| Pipeline          | 4-stage in-order        | 7-stage dual-issue        |
+| Performance       | 1.6 DMIPS/MHz · 4.5 CoreMark/MHz | 3.0 DMIPS/MHz · 6.3 CoreMark/MHz |
+| Helium / MVE      | yes (Int + FP option)   | yes (Int + FP option)     |
+| FPU               | optional SP / SP+DP     | optional SP / SP+DP       |
+| Caches            | optional L1 I+D         | L1 I+D standard           |
+| TrustZone         | yes                     | yes                       |
+| PACBTI            | yes                     | yes                       |
+| Branch prediction | yes                     | yes (improved)            |
+
+The M85 is the **highest-performing Cortex-M ever**. It's the first Cortex-M to ship with branch prediction and dual-issue. On scalar workloads it's ~2× the M33. On vector workloads with Helium, both M55 and M85 hit 4–5× the M4.
+
+## Helium / MVE — what it actually is
+
+Helium reuses the **FPU register file** (32 × 32-bit registers) as **8 × 128-bit vectors**: Q0..Q7. The instruction set covers:
+
+- Integer SIMD on 8, 16, 32-bit lanes (signed and unsigned).
+- Single-precision FP SIMD (when FPU has SP support).
+- Half-precision FP (FP16) SIMD.
+- Predicated execution — every vector instruction can be masked.
+
+What makes it special on M-profile is **tail predication**:
+
+```c
+// Standard scalar loop tail handling
+for (int i = 0; i < n; i++) acc += a[i] * b[i];
+// Scalar version: ~4n cycles
+// MVE version with tail predication: ~n/4 + 6 cycles
+```
+
+The MVE version processes 4 lanes per cycle and lets you keep the same loop count `n` even if it's not a multiple of 4 — the last iteration auto-predicates the unused lanes. Compare to A-profile NEON, where you have to write a tail-handling scalar loop yourself.
+
+```c
+#include <arm_mve.h>
+
+void vec_mul_q15(const int16_t *a, const int16_t *b, int16_t *out, uint32_t n) {
+    while (n > 0) {
+        mve_pred16_t p = vctp16q(n);                    // predicate for this iteration
+        int16x8_t va = vldrhq_z_s16(a, p);              // masked load
+        int16x8_t vb = vldrhq_z_s16(b, p);
+        int16x8_t vo = vmulq_x_s16(va, vb, p);          // masked multiply
+        vstrhq_p_s16(out, vo, p);                       // masked store
+        a += 8; b += 8; out += 8; n -= 8;
+    }
+}
+```
+
+This is the canonical Helium loop shape. Eight 16-bit lanes per cycle. **CMSIS-DSP** and **CMSIS-NN** ship hand-tuned Helium kernels that you can drop into existing code — no rewrite needed.
+
+## Low-overhead loops
+
+ARMv8.1-M adds three instructions that eliminate loop overhead entirely:
+
+- **`WLS`** — While Loop Start. Tests the loop count once before entering.
+- **`DLS`** — Do Loop Start. Unconditional loop entry.
+- **`LE`** — Loop End. Branches back to start, decrementing the counter.
+
+The processor caches the loop in a special "loop end" buffer and skips the decode for every iteration after the first. Result: a single-instruction loop body costs exactly 1 cycle per iteration, no branch overhead.
+
+```
+DLS lr, r0       ; counter = r0 iterations
+loop:
+    LDRH r1, [r2], #2     ; 1 cycle
+    STRH r1, [r3], #2     ; 1 cycle
+    LE lr, loop           ; 0 cycle (folded)
+```
+
+The compiler generates these automatically with `-O2` on `-mcpu=cortex-m55` or higher.
+
+## PACBTI — pointer auth and branch target ID
+
+**PAC** (Pointer Authentication Code): when you push the return address (`LR`) to the stack, you sign it with a key. When you pop it, you verify the signature. If an attacker overwrote the saved LR (classic ROP), the verification fails and you get a fault.
+
+```
+PUSH {r4, lr}     →   PACBTI emits:   AUT lr, r4, sp    ; sign LR before push
+                                       PUSH {r4, lr}
+
+POP {r4, pc}      →   PACBTI emits:   POP {r4, lr}
+                                       AUT lr, r4, sp    ; verify or fault
+                                       BX lr
+```
+
+**BTI** (Branch Target Identification): every legal indirect-branch target must be a `BTI` instruction. If you JOP into the middle of a function, the next instruction won't be a `BTI` and the core faults.
+
+Cost: a handful of extra instructions per function. Most compilers gate it behind `-mbranch-protection=standard`.
+
+## Coprocessor interface (M55) and Custom Datapath Extension (M85)
+
+The M55 keeps the M33's coprocessor interface; the M85 adds the **Custom Datapath Extension (CDE)** — *encodings reserved in the ISA* for vendor-specific datapath instructions. A vendor can define `CX1`/`CX2`/`CX3` instructions for their accelerator, and the compiler can emit them through ACLE intrinsics. ARM-blessed extensibility without breaking the standard ISA.
+
+## Where they ship
+
+### Cortex-M55
+
+- **Alif Ensemble** — first M55 silicon, paired with Ethos-U55 NPU for ML.
+- **Renesas RA8E1** — Helium-class IoT MCU.
+
+### Cortex-M85
+
+- **NXP i.MX RT700** — M85 + M33 hybrid for AI-at-the-edge.
+- **Renesas RA8M1 / RA8D1** — high-performance M85 for industrial and HMI.
+
+<Callout type="tip" title="When to skip Cortex-A and stay on M85">
+If your workload is real-time + has bursts of DSP/ML inference, an M85 can be a better fit than a Cortex-A7 Linux box. You get the same throughput, deterministic timing, instant boot, lower power, and you stay inside the much simpler M-profile toolchain.
+</Callout>
+
+## Build flags
+
+```
+# Cortex-M85 with Helium (int+FP), single+double FPU, branch protection
+-mcpu=cortex-m85
+-mthumb
+-mfpu=fpv5-d16
+-mfloat-abi=hard
+-march=armv8.1-m.main+mve.fp+fp.dp
+-mbranch-protection=standard
+
+# Cortex-M55 (integer-only Helium)
+-mcpu=cortex-m55+nofp+mve
+-mthumb
+```
+
+## See also
+
+- [ARMv8-M overview](/docs/architecture/armv7m-armv8m/) — what v8 → v8.1 added.
+- [Cortex-M33](/docs/cortex-m/m33-m23/) — the previous tier.
+- [TrustZone](/docs/architecture/trustzone/) — same as M33.

@@ -1,0 +1,198 @@
+---
+title: Tail-chain & late-arrival
+description: "The two NVIC optimizations that hide exception-entry latency. Cycle-by-cycle: standard entry, tail-chain savings, late-arrival upgrade path."
+order: 16
+updated: 2026-05-13
+tags: [cortex-m, nvic, latency, tail-chain, late-arrival]
+---
+
+The Cortex-M's exception entry takes 12 cycles on a typical ARMv7-M part (16 on M0). That's the cost of stacking 8 words of context, fetching the vector, loading PC and PSR, and starting the handler. For back-to-back interrupts, paying that cost twice would push tail-IRQ latency above 24 cycles — bad for any system with closely-spaced events.
+
+The NVIC has two hardware optimizations to avoid the double cost:
+
+1. **Tail-chaining** — if a second IRQ is pending when the first handler returns, skip the unstack-then-restack and dispatch the second handler directly. Saves ~6 cycles.
+2. **Late-arrival** — if a higher-priority IRQ pends after a lower-priority IRQ has started entry but before its handler begins, "upgrade" the in-progress entry to the higher-priority handler. The lower IRQ stays pending.
+
+Both are automatic, transparent to software, and worth understanding because they shape the latency budget of any tight-real-time design.
+
+<SpecSheet
+  title="At a glance"
+  specs={[
+    { label: 'Standard exception entry', value: '12 cycles on M3/M4 (zero-wait memory), 16 on M0' },
+    { label: 'Tail-chain entry', value: '6 cycles on M3/M4 — half the standard cost' },
+    { label: 'Late-arrival', value: 'Upgrade path during entry — no extra cycle cost' },
+    { label: 'When tail-chain triggers', value: 'A second IRQ is enabled, pending, and not masked when the first handler returns' },
+    { label: 'When late-arrival triggers', value: 'A higher-priority IRQ pends during the entry sequence (after vector fetch, before handler starts)' },
+    { label: 'Visibility', value: 'No software-visible difference. Tail-chain shows as a single ENTRY/EXIT pair in DWT exception trace, not two.' },
+    { label: 'Memory impact', value: 'Context stays on the stack between tail-chained handlers — one stack frame, two handlers' },
+  ]}
+/>
+
+## Standard exception entry — the baseline
+
+Before talking about the optimisations, here's what a single, uncontested IRQ does:
+
+```
+Cycle  0: IRQ asserted at the NVIC input.
+Cycle  1: NVIC pends, compares priorities, sees the IRQ wins. Signals the core.
+Cycle  2: Core begins entry. Stacks r0..r3, r12, lr, pc, xPSR (8 words, ~6 cycles
+          on 32-bit-bus 0-wait memory).
+Cycle  8: Vector fetch — read the handler PC from the vector table.
+Cycle  9: Load PSR, set IPSR to exception number, clear bits per the entry rules.
+Cycle 10: Load PC from vector entry.
+Cycle 11: Pipeline refill — fetch first instruction of the handler.
+Cycle 12: First instruction of the handler executes.
+```
+
+That's 12 cycles to the first instruction, all overlapped where possible. Different cores have slightly different counts (M7 is faster because of dual-issue, M0 is slower because of the von Neumann bus), but 12 is the canonical M3/M4 number with zero-wait flash.
+
+On exit:
+
+```
+Cycle  N+0: Handler executes BX LR (EXC_RETURN) — 8 cycles of unstacking begin.
+Cycle  N+6: Unstacking completes, PC restored, pipeline refills.
+Cycle  N+8: Pre-exception instruction stream resumes.
+```
+
+So a one-IRQ trip costs 12 + handler + 8 = handler + 20 cycles of fixed overhead.
+
+## Tail-chaining
+
+Now imagine a second IRQ pends *while the first handler is executing*. When the first handler returns, the NVIC sees the second pending and the priorities allow it to run. Without tail-chain, the core would:
+
+1. Unstack (8 cycles) the saved context — restoring registers that the second handler is about to push back.
+2. Resume the interrupted code for zero cycles.
+3. Re-enter (12 cycles) for the second IRQ.
+
+Total overhead between the two handlers: 8 + 12 = 20 cycles, plus the redundant push/pop work.
+
+Tail-chaining recognises that the saved context is *already* on the stack and the second handler is going to push the same context anyway. So the NVIC:
+
+1. Does NOT unstack. The first handler returns its stack frame intact.
+2. Updates IPSR with the new exception number.
+3. Fetches the second handler's vector.
+4. Branches directly to the second handler.
+
+```
+Cycle  N+0: Handler 1 executes BX LR.
+Cycle  N+1: NVIC sees handler 2 pending. Cancels unstack.
+Cycle  N+2: Update IPSR.
+Cycle  N+3: Vector fetch for handler 2.
+Cycle  N+4: Load PC.
+Cycle  N+5: Pipeline refill.
+Cycle  N+6: First instruction of handler 2.
+```
+
+About 6 cycles total — half the cost of a fresh entry. The saved context stays on the stack until handler 2 returns; when *it* returns (and no third IRQ is pending), the single unstack restores everything back to the pre-handler-1 state.
+
+### The cycle accounting
+
+```
+Without tail-chain:
+  IRQ1 entry (12) + handler1 + exit (8) + IRQ2 entry (12) + handler2 + exit (8)
+  = handler1 + handler2 + 40 cycles overhead
+
+With tail-chain:
+  IRQ1 entry (12) + handler1 + tail-chain (6) + handler2 + exit (8)
+  = handler1 + handler2 + 26 cycles overhead
+
+Savings: 14 cycles per back-to-back pair.
+```
+
+For UART receive interrupts at high baud rates, where one byte's handler can finish just as the next byte's IRQ pends, tail-chaining is the difference between keeping up and falling behind.
+
+<PipelineDiagram
+  title="Standard back-to-back entry vs tail-chain"
+  stages={['stack', 'vec', 'PC', 'fill', 'H1', 'unstk', 'stack', 'vec', 'PC', 'fill', 'H2', 'unstk']}
+  instructions={[
+    { name: 'Standard: IRQ1 then IRQ2', stages: ['stack', 'vec', 'PC', 'fill', 'H1', 'unstk', 'stack', 'vec', 'PC', 'fill', 'H2', 'unstk'] },
+    { name: 'Tail-chain: IRQ1 then IRQ2', stages: ['stack', 'vec', 'PC', 'fill', 'H1', 'vec', 'PC', 'fill', 'H2', 'unstk'] },
+    { name: 'Savings', stages: ['', '', '', '', '', '✓', '✓', '✓', ''] },
+  ]}
+  caption="Standard entry pays unstack(8) + stack(6) between handlers — about 14 wasted cycles. Tail-chain leaves the saved context on the stack and re-vectors directly into handler 2, cutting the gap to roughly 6 cycles."
+/>
+
+<Callout type="tip" title="DWT EXCTRC sees tail-chain explicitly">
+Enable DWT exception trace (`DWT_CTRL.EXCTRCENA = 1`) and the ITM port reports the chain — `EXCEPTION ENTERED 23, EXCEPTION ENTERED 24, EXCEPTION RETURNED 24, EXCEPTION RETURNED 23`. The second ENTRY shows up with the same stack pointer as the first — that's your tail-chain signature.
+</Callout>
+
+### When tail-chain fails to apply
+
+Three cases where the second IRQ doesn't tail-chain even though it's pending:
+
+1. **Different stack** — if the first handler used MSP and the second would use PSP (or vice versa), tail-chain still works because both handlers run on MSP. The stack is determined by CONTROL.SPSEL at entry; tail-chaining preserves the entry-time SPSEL.
+2. **PRIMASK or BASEPRI gates it** — if the kernel disabled IRQs at the end of handler 1 and the second IRQ is blocked, the NVIC unstacks and returns to thread mode (which then re-enables IRQs and the second pends again, with a full entry). This is the FreeRTOS critical-section pattern.
+3. **FPU lazy-stacking interaction** — if the first handler used the FPU and the lazy-stack space hasn't been written yet, the NVIC delays tail-chain by a couple of cycles to settle the FP state.
+
+In practice tail-chain "just works" — software writes look the same whether or not it kicks in. The benefit is the cycle count.
+
+## Late-arrival
+
+The other optimization. Imagine IRQ 1 (priority 5) pends and the core starts entry — stacking, vector fetch. Mid-entry, IRQ 2 (priority 2 — more urgent) pends. The standard behavior would be to:
+
+1. Finish entry for IRQ 1.
+2. Execute IRQ 1's handler.
+3. Eventually the handler returns; meanwhile IRQ 2 has been pending all along.
+4. Tail-chain to IRQ 2.
+
+But that's wrong — IRQ 2 is more urgent, and the core *hasn't actually started* the first handler yet, only stacked context. Late-arrival fixes this: during the entry sequence, the NVIC monitors pending state. If a higher-priority IRQ becomes pending and could preempt, the NVIC "upgrades" the in-progress entry — finishes the stacking that's common to all IRQs, then fetches the higher-priority IRQ's vector instead of the original IRQ's.
+
+```
+Cycle  0:  IRQ 1 pends (priority 5).
+Cycle  1:  Core decides IRQ 1 wins, begins entry.
+Cycle  2:  Stacking begins...
+Cycle  4:  IRQ 2 pends (priority 2 — higher than IRQ 1).
+Cycle  5:  NVIC notices, decides to upgrade.
+Cycle  6:  Stacking continues (the context is the same regardless of which IRQ).
+Cycle  8:  Stacking finishes.
+Cycle  9:  Vector fetch — for IRQ 2's handler (not IRQ 1's).
+Cycle 11:  Handler 2 starts.
+```
+
+The lower-priority IRQ 1 stays in pending state. When handler 2 returns, IRQ 1 tail-chains in.
+
+### What late-arrival doesn't do
+
+Late-arrival is a within-entry optimisation. It does **not** preempt an already-running handler — that's the normal preemption mechanism, where a higher-priority IRQ stacks the current handler's context and runs. The two mechanisms compose: if IRQ 1 is mid-entry, IRQ 2 (higher) upgrades it; if IRQ 1's handler is mid-execution, IRQ 2 preempts normally.
+
+Late-arrival is also not visible to software — there's no flag or counter that says "this entry was a late-arrival upgrade." From the handler's perspective, the IRQ just pended and ran.
+
+## Composed timing — the worst case
+
+Combining standard entry, late-arrival, tail-chain, and preemption:
+
+```
+t=0:   IRQ A (prio 5) pends.
+t=2:   Core begins entry for A.
+t=5:   IRQ B (prio 2) pends. Late-arrival kicks in.
+t=11:  Handler B begins (12-cycle entry, no savings vs IRQ-A-only entry).
+t=20:  IRQ C (prio 0) pends — preempts B.
+t=26:  B's context stacks, handler C entry begins.
+t=32:  Handler C executes.
+t=...: C completes. Tail-chain check — B is still pending (it was preempted, not finished).
+t=:    Tail-chain to B. Handler B resumes execution where preempted.
+t=:    B completes. Tail-chain check — A is pending.
+t=:    Tail-chain to A. Handler A runs.
+t=:    A completes. Standard exit, return to thread mode.
+```
+
+Three IRQs, three handlers, all properly nested by priority. The hardware handles the ordering automatically. The software cost is just writing the three handlers correctly.
+
+## When tail-chain matters in practice
+
+**Back-to-back UART/SPI/I2C transfers.** Each byte raises an IRQ. With 14 cycles saved per pair, a 1 Mbaud UART (87 µs/byte) finds those cycles useful — handler code can be more readable, less hand-coded for speed.
+
+**Multi-source DMA completion.** When several DMA channels finish at roughly the same time, each raises its own IRQ. Tail-chain coalesces the handlers.
+
+**Sensor sampling at high rates.** A timer + ADC + filter pipeline often fires multiple IRQs per sample period. Tail-chain reduces total overhead.
+
+**RTOS tick processing.** SysTick fires, queues a context switch via PendSV, SysTick returns, PendSV tail-chains. The two-handler sequence is a deliberate design choice — separating timekeeping from scheduling — and tail-chain makes it cheap.
+
+## Cross-references
+
+- [NVIC priority & preemption](/docs/cortex-m/nvic-priority) — the rules for what preempts what
+- [NVIC registers](/docs/cortex-m/nvic-registers) — register-level state
+- [Exception model](/docs/architecture/exception-model) — stack frame, EXC_RETURN, the entry/exit machinery
+- [Interrupt latency calculator](/tools/interrupt-latency) — model your own timing
+- [DWT/ITM/ETM](/docs/cortex-m/dwt-itm-etm) — observing exception trace in real time
+- ARMv7-M ARM section B1.5.7 (tail-chain) and B1.5.8 (late-arrival)

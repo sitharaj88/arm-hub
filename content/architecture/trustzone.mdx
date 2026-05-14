@@ -1,0 +1,141 @@
+---
+title: TrustZone
+description: How TrustZone partitions ARM systems into secure and non-secure worlds — on Cortex-M (per-access SAU/IDAU) and on Cortex-A (per-CPU NS bit).
+order: 5
+updated: 2026-05-12
+tags: [architecture, security, trustzone]
+badge: security
+---
+
+
+TrustZone is ARM's hardware mechanism for partitioning a system into two worlds — **Secure** and **Non-secure** — that can't see each other's memory or registers. The two profiles (M and A) implement it very differently; this page covers both.
+
+## Cortex-M TrustZone (TrustZone-M)
+
+On ARMv8-M, the security state is checked on **every memory access**, by the **SAU** (Secure Attribution Unit) inside the core and the **IDAU** (Implementation-Defined Attribution Unit) on the vendor's silicon.
+
+```
+              NS code ──load──▶  ┌─────────┐
+                                 │  SAU   │
+                                 │ + IDAU │ ──▶ allow / fault
+              S code ──load──▶  │ check  │
+                                 └─────────┘
+```
+
+Each address has one of three attributes:
+
+- **Secure (S)** — accessible only when the core is in Secure state.
+- **Non-secure (NS)** — accessible from either state.
+- **Non-secure Callable (NSC)** — only NSC pages can hold the `SG` instructions that Non-secure code calls into Secure code through.
+
+### The SG instruction
+
+The only legal entry into Secure code is via a **secure gateway veneer**:
+
+```c
+// In a Secure module, exposed to Non-secure callers:
+__attribute__((cmse_nonsecure_entry))
+int secure_add(int a, int b) {
+    return a + b;
+}
+```
+
+The compiler emits a tiny veneer like:
+
+```
+secure_add:
+    SG                  ; secure gateway — only valid in NSC region
+    PUSH  {lr}
+    BL    _secure_add_impl
+    POP   {lr}
+    BXNS  lr            ; return to Non-secure
+```
+
+Any other instruction in NSC space faults. Any branch from NS into S that doesn't start at an `SG` faults. This makes the attack surface a finite, auditable list of entry points.
+
+### Calling NS from S
+
+The reverse — Secure code calling out to a Non-secure callback — uses **BLXNS**, and the compiler decorates the function pointer type:
+
+```c
+typedef void (*ns_callback_t)(void) __attribute__((cmse_nonsecure_call));
+
+void register_callback(ns_callback_t cb) {
+    cb();   // compiler emits BLXNS — registers cleared before transition
+}
+```
+
+Before the BLXNS, the compiler **clears all caller-saved registers** so that S code never leaks state into NS — this is the `cmse_nonsecure_call` ABI.
+
+<Callout type="warn" title="Don't trust NS pointers blindly">
+A Non-secure caller can pass a pointer that points *into Secure memory* hoping the Secure function will dereference it. Use the `TT` instruction (via `cmse_check_address_range()` intrinsics) to validate NS-supplied pointers before touching them.
+</Callout>
+
+### Configuring the SAU
+
+A typical SAU setup, done early in Reset_Handler before C runtime init:
+
+```c
+// 4 regions, each up to 32 bytes aligned
+SAU->RNR  = 0;
+SAU->RBAR = 0x0010_0000;   // base
+SAU->RLAR = 0x001F_FFE0 | SAU_RLAR_ENABLE_Msk;  // limit + enable
+// NSC bit (bit 1 of RLAR) marks a region as Non-secure Callable
+
+SAU->CTRL = SAU_CTRL_ENABLE_Msk;
+__DSB(); __ISB();
+```
+
+### Build flags
+
+The toolchain needs to know which "world" your code targets:
+
+```bash
+# Building Secure firmware (knows about NS too)
+arm-none-eabi-gcc -mcpu=cortex-m33 -mcmse  secure.c -o secure.o
+
+# Building Non-secure firmware (only sees public veneers)
+arm-none-eabi-gcc -mcpu=cortex-m33 nonsecure.c -o nonsecure.o
+```
+
+Secure builds emit a **veneer object** (`--out-implib=secure_veneers.o`) that the Non-secure side links against, so the linker knows the addresses of the SG veneers.
+
+## Cortex-A TrustZone (TrustZone-A)
+
+A-profile TrustZone is older and works differently. There's a single **NS bit** in the Secure Configuration Register (`SCR_EL3`) that says whether the *whole CPU* is currently Non-secure. The bit is propagated on the AXI bus as `AxPROT[1]`, and the system memory controller decides per-region what's accessible.
+
+The mode hierarchy gets a fourth level:
+
+```
+EL0  user                  ┐ Non-secure world (Linux/Android)
+EL1  kernel                │
+EL2  hypervisor            │
+─────────────────────────  ─ Secure Monitor (EL3)
+EL3  secure monitor         ─ trusted firmware (TF-A)
+                            │
+EL1  trusted OS (OP-TEE)    │ Secure world
+EL0  trusted applets        ┘
+```
+
+Switching between worlds is done with `SMC` (Secure Monitor Call). Linux issues `SMC` to ask the Secure world for a service (e.g. *"please decrypt this block"*) and OP-TEE in EL1-S services it.
+
+### Where you meet it
+
+- **Trusted Firmware-A (TF-A)** — the reference EL3 implementation on ARMv8-A.
+- **OP-TEE** — the open-source Trusted Execution Environment running in EL1-S.
+- **DRM, key storage, fingerprint sensors** — secure-world clients in shipping Android phones.
+
+## Comparing the two
+
+| Aspect             | TrustZone-M (Cortex-M)        | TrustZone-A (Cortex-A)         |
+|--------------------|--------------------------------|---------------------------------|
+| Check granularity  | per memory access (SAU/IDAU)   | per CPU mode (NS bit on bus)    |
+| Transition cost    | a few cycles (SG / BXNS)       | hundreds (SMC + monitor)        |
+| State              | added to CPU; M+S = 4 modes    | added EL3 + SCR_EL3.NS          |
+| Typical use        | secure boot, key isolation, certified bootloaders | trusted OS, DRM, root of trust |
+
+## See also
+
+- [ARMv8-M overview](/docs/architecture/armv7m-armv8m/) — the rest of the v8-M additions.
+- [Cortex-M33 / M23](/docs/cortex-m/m33-m23/) — first cores to ship TrustZone-M.
+- [Boot flow & EL levels](/docs/cortex-a/boot-and-exception-levels/) — TF-A bring-up on Cortex-A.

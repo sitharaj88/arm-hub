@@ -1,0 +1,233 @@
+---
+title: Linker scripts
+description: GNU ld linker scripts for Cortex-M — memory regions, section placement, AT-load addresses, alignment, and the directives you actually need.
+order: 3
+updated: 2026-05-12
+tags: [programming, linker, ld]
+---
+
+
+The linker script is what tells the linker where your code, data, and stack live in the physical memory of the chip. Most vendor SDKs ship a default one and you never look at it. The moment you need to place a DMA buffer at a specific SRAM bank, run a function from ITCM, or implement A/B firmware update, you're in the linker script.
+
+## The two minimum-viable sections
+
+For a Cortex-M binary, you almost always need:
+
+- **`.text`** in flash — your code and read-only data.
+- **`.data`** in RAM (but *loaded from* flash) — initialised globals. The linker emits both a flash image and a RAM destination, plus markers so the startup code can copy.
+- **`.bss`** in RAM — zero-initialised globals. The startup code clears it.
+- **A stack** in RAM — usually placed at the top of SRAM, growing down.
+
+A minimal STM32F4 linker script:
+
+```ld
+ENTRY(Reset_Handler)
+
+MEMORY
+{
+  FLASH (rx) : ORIGIN = 0x08000000, LENGTH = 1024K
+  SRAM  (rwx): ORIGIN = 0x20000000, LENGTH = 128K
+}
+
+_estack = ORIGIN(SRAM) + LENGTH(SRAM);
+
+SECTIONS
+{
+  .isr_vector :
+  {
+    KEEP(*(.isr_vector))
+  } > FLASH
+
+  .text :
+  {
+    *(.text*)
+    *(.rodata*)
+    . = ALIGN(4);
+    _etext = .;
+  } > FLASH
+
+  .data :
+  {
+    _sdata = .;
+    *(.data*)
+    . = ALIGN(4);
+    _edata = .;
+  } > SRAM AT > FLASH      /* placed in SRAM, loaded from FLASH */
+
+  _sidata = LOADADDR(.data);
+
+  .bss :
+  {
+    _sbss = .;
+    *(.bss*)
+    *(COMMON)
+    . = ALIGN(4);
+    _ebss = .;
+  } > SRAM
+}
+```
+
+That's 95% of what most projects need. Let's unpack the key bits.
+
+<BlockDiagram title="Cortex-M7 memory layout with AT-load .data" width={760} height={340} nodes={[
+  { id: 'flash', x: 30, y: 30, w: 200, h: 260, kind: 'storage', label: 'FLASH', detail: '0x0800_0000  2 MB  .text + .rodata + .data (load)' },
+  { id: 'itcm',  x: 280, y: 30, w: 200, h: 80, kind: 'memory', label: 'ITCM', detail: '0x0000_0000  16 KB  single-cycle code' },
+  { id: 'dtcm',  x: 280, y: 130, w: 200, h: 80, kind: 'memory', label: 'DTCM', detail: '0x2000_0000  128 KB  stack + hot data' },
+  { id: 'sram',  x: 280, y: 230, w: 200, h: 80, kind: 'memory', label: 'SRAM (AXI)', detail: '0x2400_0000  512 KB  .data + .bss + heap' },
+  { id: 'd2',    x: 530, y: 30, w: 200, h: 80, kind: 'memory', label: 'SRAM_D2', detail: '0x3000_0000  288 KB  DMA buffers' },
+]} edges={[
+  { from: 'flash', to: 'sram', label: 'AT > FLASH  .data copy', tone: 'primary' },
+  { from: 'flash', to: 'itcm', label: 'AT > FLASH  ITCM copy', tone: 'accent' },
+]} caption="The AT-load trick: .data has its run-time address in SRAM but its bytes are stored in FLASH; the startup code copies flash to SRAM before main runs. ITCM follows the same pattern for hot ISR code." />
+
+## `MEMORY` blocks
+
+Each memory region has:
+- **Name** — used in `> REGION` clauses below.
+- **Attributes** in parentheses — `r` (readable), `w` (writable), `x` (executable). Affects nothing semantically but generates warnings if a section's attributes don't match.
+- **ORIGIN** and **LENGTH** — the actual address range.
+
+You can have as many regions as you want — CCM RAM, ITCM, DTCM, separate flash banks. Most Cortex-M7 STM32 chips need 4+ regions.
+
+## `SECTIONS` and the AT-load trick
+
+```ld
+.data : { ... } > SRAM AT > FLASH
+```
+
+The `> SRAM` says "give this section virtual addresses in SRAM". The `AT > FLASH` says "but its actual bytes go in the FLASH region of the final image". The linker stores the load-time address in the ELF program header.
+
+The result: your binary contains the `.data` initialisation values in flash, but your symbols (`int counter = 5;`) have addresses in SRAM. The startup code is responsible for copying flash → SRAM at boot:
+
+```c
+extern uint32_t _sdata, _edata, _sidata;
+
+void Reset_Handler(void) {
+    // Copy .data: flash → SRAM
+    uint32_t *src = &_sidata, *dst = &_sdata;
+    while (dst < &_edata) *dst++ = *src++;
+
+    // Clear .bss
+    dst = &_sbss;
+    while (dst < &_ebss) *dst++ = 0;
+
+    // Hand to C runtime
+    SystemInit();
+    __libc_init_array();   // run C++ static constructors
+    main();
+}
+```
+
+## Placing code in ITCM
+
+On Cortex-M7, you want hot ISRs in ITCM. Add a region and a section:
+
+```ld
+MEMORY
+{
+  ITCM   (rx)  : ORIGIN = 0x00000000, LENGTH = 16K
+  FLASH  (rx)  : ORIGIN = 0x08000000, LENGTH = 2048K
+  DTCM   (rwx) : ORIGIN = 0x20000000, LENGTH = 128K
+  RAM    (rwx) : ORIGIN = 0x24000000, LENGTH = 512K
+}
+
+SECTIONS
+{
+  .itcm_text :
+  {
+    *(.itcm.text*)
+  } > ITCM AT > FLASH
+
+  _sitcm = LOADADDR(.itcm_text);
+  _eitcm_load = _sitcm + SIZEOF(.itcm_text);
+  _sitcm_dst = ADDR(.itcm_text);
+  /* ... */
+}
+```
+
+Then in C:
+
+```c
+__attribute__((section(".itcm.text")))
+void TIM2_IRQHandler(void) { /* runs from single-cycle ITCM */ }
+```
+
+And the startup code copies the ITCM section from flash to ITCM at boot, the same way it handles `.data`.
+
+## Stack and heap placement
+
+```ld
+PROVIDE(_estack = ORIGIN(SRAM) + LENGTH(SRAM));   /* top-of-stack */
+PROVIDE(_min_stack = 4K);
+PROVIDE(_min_heap = 8K);
+
+.stack (NOLOAD) :
+{
+  . = ALIGN(8);
+  _sstack = .;
+  . = . + _min_stack;
+  _estack_check = .;
+} > SRAM
+
+ASSERT(_estack_check < _estack, "Stack overflows SRAM")
+```
+
+`(NOLOAD)` means "reserve this space but don't put anything in the binary for it" — useful for stack and uninitialised buffers. The `ASSERT` is checked at link time and fails the build if the layout is wrong.
+
+`_estack` is what goes into vector table slot 0 — the initial main stack pointer. Most CMSIS startup files reference it as `&_estack`.
+
+## Putting a buffer at a specific address
+
+```c
+__attribute__((section(".dma_buffer")))
+static uint8_t rx_buf[1024];
+```
+
+```ld
+MEMORY
+{
+  /* ... */
+  RAM_D2 (rwx) : ORIGIN = 0x30000000, LENGTH = 288K   /* AHB SRAM2 on H7 */
+}
+
+SECTIONS
+{
+  /* ... */
+  .dma_buffer (NOLOAD) :
+  {
+    KEEP(*(.dma_buffer))
+  } > RAM_D2
+}
+```
+
+The `KEEP` prevents `--gc-sections` from discarding the buffer if there are no direct references at link time (some DMA buffers are only referenced through their address — the linker can't tell they're "used").
+
+## `PROVIDE` vs assignment
+
+```ld
+_estack = ...;       /* always defines _estack */
+PROVIDE(_estack = ...); /* defines only if not already defined elsewhere */
+```
+
+Use `PROVIDE` for symbols the user code might want to override.
+
+## A real-world stm32 linker script size
+
+Vendor linker scripts grow. STMicro's STM32H7 default linker is ~250 lines because of:
+- Multiple flash banks (dual-bank A/B for safe updates).
+- Multiple SRAM regions (D1, D2, D3 with different cacheability).
+- ITCM, DTCM.
+- DMA buffer regions in each SRAM bank.
+- Optional "no-init" RAM (preserved across resets).
+
+Don't write your own from scratch for a complex chip — start from the vendor's template and modify.
+
+<Callout type="tip" title="Use -Wl,-Map=output.map to debug section placement">
+Add `-Wl,-Map=firmware.map` to your link command. The .map file shows every symbol's address, every section's size, and every region's fill percentage. When you're 12 bytes over budget on flash, the map tells you which translation unit to crash-diet first.
+</Callout>
+
+## See also
+
+- [Startup & vector table](/docs/programming/startup/) — writing the code that runs before `main`.
+- [Cortex-M7](/docs/cortex-m/m7/) — ITCM/DTCM details.
+- [Memory model](/docs/architecture/memory-model/) — placing cacheable vs non-cacheable buffers.

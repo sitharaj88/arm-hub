@@ -1,0 +1,58 @@
+---
+title: Infineon (XMC, PSoC, AURIX)
+description: Infineon's Cortex-M lines — XMC (industrial), PSoC (programmable analog + digital), and the TriCore-based AURIX for automotive.
+order: 9
+updated: 2026-05-12
+tags: [vendors, infineon, psoc, xmc]
+---
+
+Infineon (formerly Siemens Semiconductor) is a German power and automotive specialist. After acquiring **Cypress in 2020**, their MCU portfolio doubled in size and breadth. The ARM-relevant lines are **XMC** (their own Cortex-M industrial chips) and **PSoC** (Cypress's programmable analog/digital line, now Infineon).
+
+## XMC — industrial Cortex-M
+
+| Series | Core               | Position                                |
+|--------|--------------------|-----------------------------------------|
+| XMC1000| Cortex-M0          | Cost-optimised entry                    |
+| XMC4000| Cortex-M4F         | Industrial mainstream — motor control, power, communication |
+| XMC7000| Cortex-M7 (dual)   | High-perf industrial (was Cypress Traveo) |
+
+Infineon's XMC line targets **industrial motor control, power conversion, and field-bus communication** (PROFINET, EtherCAT, CANopen). Strong analog peripherals (high-resolution PWM, fast ADCs).
+
+## PSoC — programmable analog + digital
+
+The PSoC story is unique. Cypress (acquired by Infineon) built MCUs with **programmable digital and analog blocks** — like an FPGA fabric and a tiny mixed-signal IC alongside the CPU.
+
+| Series           | Core               | What's special                         |
+|------------------|--------------------|----------------------------------------|
+| PSoC 4           | Cortex-M0 / M0+    | Programmable analog blocks + UDBs (Universal Digital Blocks) |
+| PSoC 4 BLE       | Cortex-M0 + radio  | BLE + programmable analog              |
+| PSoC 5LP         | Cortex-M3          | Most analog blocks; 12+ programmable blocks |
+| PSoC 6           | Cortex-M4F + M0+   | Dual-core, TrustZone-class isolation   |
+| PSoC 6 BLE       | M4F + M0+ + BLE    | Dual-core wireless                     |
+
+In PSoC, you can describe an analog filter graphically in the IDE (PSoC Creator or ModusToolbox) and the tool wires up real analog blocks — opamps, switched-cap filters, ADCs — to implement it. Then the CPU just reads the result. It's between an MCU and a programmable analog/digital IC.
+
+This makes PSoC a *very* productive platform for mixed-signal prototypes and small-volume specialty products, but the productivity tax is that the parts are pricier than equivalent fixed-function MCUs.
+
+## ModusToolbox
+
+Infineon's modern SDK, now used across PSoC and XMC. CMake-based, supports VS Code and Eclipse, comes with BSPs for many dev boards. Reasonable but smaller community than ST or Nordic.
+
+## AURIX — TriCore, not ARM
+
+Infineon's flagship automotive MCU line, the **AURIX TC3xx / TC4xx**, runs on TriCore — Infineon's proprietary architecture, not ARM. Mentioned only to clear up potential confusion: if someone says "Infineon automotive MCU", they probably mean AURIX/TriCore, not XMC/ARM.
+
+For automotive **near** AURIX — radar, ADAS — Infineon does use ARM cores: the **TC4xx** series adds a Cortex-R52 alongside the TriCore. The **PSoC 4 Auto** is ARM Cortex-M0+ for automotive body electronics.
+
+## When you'd pick Infineon
+
+- **Industrial motor control / power conversion** — XMC4000 is genuinely strong here.
+- **Mixed-signal prototyping** — PSoC's programmable analog is uniquely productive.
+- **Automotive radar / ADAS** — Infineon's RF and DSP IP is best-in-class.
+- **You're already an Infineon power IC customer** — supply chain coherence.
+
+## See also
+
+- [Cortex-M0 / M0+](/docs/cortex-m/m0-m0plus/) — PSoC 4 core.
+- [Cortex-M4](/docs/cortex-m/m4/) — XMC4000, PSoC 6 application core.
+- [Infineon ModusToolbox](https://www.infineon.com/cms/en/design-support/tools/sdk/modustoolbox-software/) (external).

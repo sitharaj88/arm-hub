@@ -1,0 +1,111 @@
+---
+title: ADC / DAC
+description: Analog-to-digital and digital-to-analog converters — sampling, resolution, references, oversampling, and the signal-chain tradeoffs you make without realising it.
+order: 8
+updated: 2026-05-12
+tags: [peripherals, adc, dac]
+---
+
+import Callout from '~/components/Callout.astro';
+
+ADCs and DACs are where firmware meets the physical world. The peripheral is rarely the hardest part — most measurement problems are in the analog front end before the ADC pin or the filter after the DAC. But the digital side has its own subtleties: sampling time, reference accuracy, alignment of triggered conversions with PWM edges.
+
+## ADC fundamentals
+
+A SAR (Successive Approximation Register) ADC — the type in essentially every Cortex-M — works in two phases:
+
+1. **Sample**: an internal capacitor charges to the input voltage. The longer the sample time, the lower the source impedance the ADC can tolerate.
+2. **Convert**: the SAR algorithm bisects: "Is the voltage > 1/2 VREF? Is it > 1/4 or 3/4? ..." It takes one cycle per bit of resolution.
+
+So a 12-bit ADC takes 12 cycles to convert + N cycles to sample. STM32's typical numbers: 12-bit ADC, 1.5 to 480 cycles sample time, 12.5 cycles conversion → total 14 to 492 cycles. At 36 MHz ADC clock, that's 0.4 to 13 µs per sample.
+
+## Sample time and source impedance
+
+Each input pin and the trace and the source resistor form an RC network. The ADC's input capacitor has to charge through this network. **Higher source impedance → longer sample time needed**.
+
+| Source impedance | Min sample time @ 12-bit |
+|------------------|---------------------------|
+| 100 Ω            | 3 cycles                  |
+| 1 kΩ             | 15 cycles                 |
+| 10 kΩ            | 80 cycles                 |
+| 100 kΩ           | 480 cycles                |
+
+If your sample time is too short, the ADC measures a voltage between the source and the previous channel's residual — and you get crosstalk between channels. Symptoms: "my temperature reading changes when I touch the unrelated channel".
+
+<Callout type="tip" title="Always buffer high-impedance sources with an op-amp">
+Putting a unity-gain op-amp (an "ADC driver") between your sensor and the ADC pin gives the ADC a stiff source. You can then use minimum sample time and get clean cross-channel switching. The op-amp typically costs ~10¢.
+</Callout>
+
+## Voltage reference
+
+The ADC measures relative to VREF+. If VREF+ is your VDD (typical on low-end designs), then a VDD that varies from 3.2 V to 3.4 V (battery droop, regulator tolerance) translates directly into ~3% measurement error.
+
+Three strategies:
+
+1. **External precision reference** — REF02, REF195, MAX6126 type chips. ±0.05% reference, gives you the full 12 bits.
+2. **Internal reference** with VREF+ tied to VDD, then *measure* the internal reference channel and ratiometrically correct. STM32's internal `VREFINT` is at ~1.21 V with ±10 mV factory calibration values stored in system memory.
+3. **Ratiometric sensors** — use the same VDD to power the sensor and as VREF+. Sensor output scales with VDD, ADC measures relative to VDD, errors cancel. Works beautifully for resistive bridges.
+
+## Oversampling — getting more bits
+
+If your signal is slow and you're prepared to spend time, you can oversample and decimate to recover effective resolution:
+
+```
+ENOB_gain ≈ log4(N)
+```
+
+So 16× oversampling gives ~2 extra bits (12 → 14 ENOB). 256× gives 4 extra bits (12 → 16 ENOB). The newer STM32 H7 and G4 ADCs have *hardware* oversampling — you set a register, and the ADC averages internally before raising the data-ready flag.
+
+The catch: oversampling only helps if there's **noise** in the signal big enough to dither the LSB. A perfectly clean DC signal won't gain anything from oversampling (you'll just average the same value).
+
+## Triggered conversions
+
+A timer can trigger an ADC conversion. This lets you sample at *exactly* the right time relative to other events — typically the centre of the PWM period in motor control, when the current ripple is at its minimum:
+
+```c
+ADC1->CR2 |= ADC_CR2_EXTEN_0;                     // trigger on rising edge
+ADC1->CR2 |= (TIM1_TRGO_event << ADC_CR2_EXTSEL_Pos);
+```
+
+Combined with DMA writing the conversion result to memory, the entire ADC pipeline runs with zero CPU intervention. Your code just reads the most recent sample whenever it needs to.
+
+## Differential vs single-ended
+
+Most modern Cortex-M ADCs support **differential** input mode — one pin minus another, doubling the dynamic range and rejecting common-mode noise. Use this for sensors that produce a differential output (load cells, current-sense amplifiers, RTD bridges).
+
+Single-ended mode measures the pin relative to ground. Common-mode noise (ground bounce, switching transients) is rejected only by your filtering, not by the ADC itself.
+
+## DAC
+
+Less interesting than ADC. The two common Cortex-M DAC architectures:
+
+- **Resistor-string DAC** — for low-speed, e.g. STM32 DAC1 at up to ~1 MSPS. 12-bit, easy to drive, monotonic by construction.
+- **Sigma-delta DAC** — for audio applications, high resolution at the cost of bandwidth.
+
+Driving a DAC from DMA gives you a waveform generator:
+
+```c
+DAC1->CR = DAC_CR_TEN1 | (4 << DAC_CR_TSEL1_Pos)  // trigger on TIM2_TRGO
+         | DAC_CR_DMAEN1 | DAC_CR_EN1;
+
+// DMA writes a sine table into DAC1->DHR12R1 on each TIM2 trigger
+// → continuous sinusoidal output, no CPU
+```
+
+For audio-quality analog output, external DACs (CS43L22, PCM5102) over I²S give you much better SNR than the on-chip DAC.
+
+## Special channels
+
+Most STM32 ADCs include:
+
+- **Internal temperature sensor** — calibrated, ~25°C accuracy ±5°C.
+- **VREFINT** — internal 1.21 V reference, used for ratiometric correction.
+- **VBAT** — through a divider, useful for battery monitoring.
+
+The calibration values for the temperature sensor and VREFINT are factory-burned into specific addresses (e.g. `0x1FFF7A2A` for STM32F4) — read them, don't assume the typicals.
+
+## See also
+
+- [Timers & PWM](/docs/peripherals/timers/) — triggering ADCs from PWM events.
+- [DMA](/docs/peripherals/dma/) — auto-streaming samples to memory.
+- [GPIO](/docs/peripherals/gpio/) — analog input pin configuration.

@@ -1,0 +1,109 @@
+---
+title: Lockstep & ASIL
+description: How dual-core lockstep delivers ASIL-D readiness on Cortex-R — and where the software still has to do work.
+order: 2
+updated: 2026-05-12
+tags: [cortex-r, lockstep, asil, safety]
+---
+
+import Callout from '~/components/Callout.astro';
+
+A Cortex-R chip running in lockstep is fundamentally a single logical CPU that happens to have two physical cores doing the same work. The redundancy is the safety story — but lockstep alone is not enough to claim ASIL-D. There's a lot of software engineering required to compose the certification.
+
+## What lockstep catches
+
+Lockstep is designed to detect **random hardware faults** — single-event upsets from cosmic rays, marginal silicon, transient voltage glitches. When such a fault hits one core, the two cores diverge for one instruction, the comparator fires, and the chip enters a safe state.
+
+What lockstep **doesn't** catch:
+
+- **Systematic faults** — bugs in your code, design errors, requirements gaps. (Mitigated by process, not silicon.)
+- **Common-mode failures** — a clock glitch hitting both cores simultaneously. (Mitigated by clock domain crossing, voltage monitors, and BIST.)
+- **Memory corruption** — both cores read the same bad RAM and "agree". (Mitigated by ECC on RAM and TCMs.)
+
+That's why a Cortex-R safety chip *also* ships with:
+
+- **ECC SECDED** on all RAM, TCMs, flash, caches, and bus interfaces.
+- **Voltage and clock monitors** that trip on out-of-spec conditions.
+- **Built-in self-test** (BIST) hardware that exercises the cores on boot and (optionally) periodically.
+- **Watchdog timers**, often with windowed designs that catch both "stuck" and "running ahead" conditions.
+
+The combination is what's evaluated for the SIL/ASIL claim.
+
+## ASIL levels in one paragraph
+
+ISO 26262 defines four Automotive Safety Integrity Levels:
+
+| ASIL | Failure rate (per hour)  | Examples                              |
+|------|--------------------------|---------------------------------------|
+| QM   | unclassified             | infotainment, comfort                 |
+| A    | 10⁻⁶                     | rear lights                           |
+| B    | 10⁻⁷                     | airbag electronics                    |
+| C    | 10⁻⁸                     | cruise control                        |
+| D    | 10⁻⁸ + extra-strong process | braking, steering, accelerator       |
+
+ASIL-D is the hardest. It requires:
+
+- Random-fault detection (lockstep + ECC + BIST + monitors).
+- Systematic-fault prevention (Misra C, formal methods, certified toolchain, traceability).
+- Process compliance (V-model, hazard analysis, FMEDA documenting every failure mode and its mitigation).
+
+The chip is necessary; not sufficient.
+
+## The two SPFM, LFM, and PMHF numbers
+
+When a chip vendor says "Cortex-R52 ready for ASIL-D" they usually publish three numbers from the FMEDA:
+
+- **SPFM** — Single-Point Fault Metric. Fraction of single-point faults that are detected. ASIL-D requires ≥ 99%.
+- **LFM** — Latent Fault Metric. Fraction of latent (multi-point) faults detected before they become single-point. ASIL-D: ≥ 90%.
+- **PMHF** — Probabilistic Metric for Hardware Failures. Average failure rate. ASIL-D: < 10 FIT (failures per billion device-hours).
+
+Lockstep, ECC, and BIST are what make these numbers achievable. Software fault-handling (you must respond to a detected fault by entering the safe state within a deadline — the **fault tolerant time interval**, FTTI) is what closes the loop.
+
+## What firmware actually does
+
+A typical Cortex-R safety firmware structure:
+
+```
+        ┌──────────────────────────────┐
+        │  Safety hypervisor (EL2)     │   Schedules QM and ASIL partitions.
+        └──────────────┬───────────────┘
+                       │
+          ┌────────────┴────────────┐
+          ▼                         ▼
+  ┌────────────────┐         ┌────────────────┐
+  │ ASIL-D part.  │         │  QM partition   │
+  │ Brake control  │         │  Bluetooth      │
+  │ AUTOSAR Classic│         │  AUTOSAR Adapt. │
+  └────────────────┘         └────────────────┘
+```
+
+The hypervisor (often a vendor-provided one — ETAS RTA-VRTE, Vector MICROSAR, Wind River Helix) uses Cortex-R52's MPUs to isolate the partitions. A fault in the QM partition can't corrupt the ASIL one. The hardware lockstep covers random faults; the partition isolation covers systematic faults from less-rigorous code.
+
+## Common architectural patterns
+
+### 1. Hot-standby
+
+Two complete Cortex-R chips, primary and standby, both fed the same inputs. Outputs from the primary go to the actuator; the standby is checking against the primary. If they disagree, the system enters a degraded mode (e.g. "limp home" for an engine controller).
+
+### 2. Dual-redundancy with diverse implementations
+
+Same as hot-standby but the two chips run *different software* implementing the same spec — sometimes even *different compilers* or *different cores*. Defends against systematic faults that lockstep can't catch. Common in aviation (DO-254).
+
+### 3. Voter on three lanes
+
+Three identical Cortex-R systems, output goes to a voter that takes the majority. Tolerates a single failure. Used in flight control computers.
+
+## Toolchain implications
+
+For ASIL/SIL certification you typically need a **certified compiler** — TI Code Composer with QualNet, IAR with the Functional Safety Edition, Green Hills MULTI, etc. The vendor provides documentation showing the compiler was developed under ISO 26262-compliant processes and has known-bug lists you can audit.
+
+GCC/LLVM can be used (and increasingly are, under TÜV-SÜD-certified packaging from vendors like CodeSonar/AdaCore), but you'll need an extra evidence package.
+
+<Callout type="warn" title="Lockstep ≠ '2x throughput'">
+A common misconception: "if I have two cores in lockstep, can I disable lockstep and use them as a 2-core SMP?" Usually **no**. The cores share fetch/decode logic with the comparator; "unlock-step" mode (if it exists at all on your chip) is a vendor-specific feature with reduced safety coverage.
+</Callout>
+
+## See also
+
+- [Cortex-R overview](/docs/cortex-r/overview/) — the family.
+- [TrustZone](/docs/architecture/trustzone/) — partitioning on other ARM profiles for comparison.

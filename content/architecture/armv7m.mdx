@@ -1,0 +1,178 @@
+---
+title: ARMv7-M architecture
+description: The mainstream M-profile ISA — full Thumb-2, IT blocks, LDREX/STREX, optional MPU and FPU, DSP extensions, bit-banding. The architecture behind Cortex-M3, M4, and M7.
+order: 11
+updated: 2026-05-13
+tags: [architecture, armv7m, cortex-m3, cortex-m4, cortex-m7, isa]
+---
+
+ARMv7-M is the architecture you target when you need real performance from an M-profile microcontroller. It is full-featured Thumb-2, with the conditional-execution machinery (IT blocks), exclusive-monitor atomics (LDREX/STREX), a hardware divider, optional saturating-DSP extensions, optional single-precision and double-precision FPUs, and an architecturally well-defined MPU. ARMv7-M is what Cortex-M3, M4, and M7 implement; everything from a 48 MHz LPC1768 to a 600 MHz NXP i.MX RT1170 lives inside this ISA envelope.
+
+The microarchitecture varies dramatically across the family — Cortex-M3 is in-order 3-stage, Cortex-M4 adds DSP/FPU, Cortex-M7 is dual-issue 6-stage with branch prediction and caches — but they all share the same ARMv7-M instruction set, the same exception model, the same NVIC layout, and the same debug architecture.
+
+<SpecSheet
+  title="ARMv7-M at a glance"
+  specs={[
+    { label: 'Cores using it', value: 'Cortex-M3 (base), Cortex-M4 (+DSP, +SP-FPU optional), Cortex-M7 (+DP-FPU optional, caches, dual-issue)' },
+    { label: 'Instruction set', value: 'Full Thumb-2 — 16-bit and 32-bit encodings mixed in the same stream' },
+    { label: 'Pipeline', value: '3-stage (M3, M4), 6-stage dual-issue (M7)' },
+    { label: 'Priority bits', value: '3 to 8 bits — typically 3 (some Nordic, some STM32G/L) or 4 (most STM32, NXP RT, MIMXRT)' },
+    { label: 'Mask registers', value: 'PRIMASK, FAULTMASK, BASEPRI (selective threshold mask)' },
+    { label: 'Hardware divider', value: 'UDIV / SDIV — 2–12 cycles' },
+    { label: 'Atomic primitives', value: 'LDREX / STREX / CLREX — full exclusive monitor' },
+    { label: 'MPU', value: 'Optional, 8 or 16 regions, power-of-two-and-aligned' },
+    { label: 'FPU', value: 'M3 — none. M4 — optional single-precision (FPv4-SP). M7 — optional FPv5 (SP) or FPv5-D16 (DP)' },
+    { label: 'DSP extensions', value: 'M3 — no. M4/M7 — yes (SIMD, MAC, saturating math, packed-byte ops)' },
+    { label: 'Bit-banding', value: 'M3/M4 only (optional; STM32 keeps it, many vendors drop it). Not on M7' },
+  ]}
+/>
+
+## What Thumb-2 gives you
+
+The single biggest leap from ARMv6-M to ARMv7-M is the *full Thumb-2* instruction stream — a mix of 16-bit and 32-bit Thumb encodings that the decoder picks between transparently. The architecture matches each opcode against a 16-bit pattern first; if it doesn't fit, the leading half-word marks the start of a 32-bit instruction. The result is code that's almost as dense as pure Thumb but with the full reach of 32-bit ARM mode.
+
+Key 32-bit instructions you couldn't have on v6-M:
+
+- **`MOVW Rd, #imm16` / `MOVT Rd, #imm16`** — load any 32-bit constant in two cycles (low half + high half) with no literal pool.
+- **`UDIV` / `SDIV`** — hardware divide, 2 to 12 cycles (early-exit on small quotients).
+- **`LDREX` / `STREX` / `CLREX`** — exclusive monitor for atomic read-modify-write.
+- **`LDRD` / `STRD`** — 64-bit load/store pairs, useful for double-precision and 64-bit ints.
+- **`IT` (If-Then) block** — predicate the next 1–4 instructions on a flag condition.
+- **`UMULL`, `SMULL`, `UMLAL`, `SMLAL`** — 32×32 → 64 multiplies and multiply-accumulates.
+- **`RBIT`, `REV`, `REV16`, `REVSH`** — bit-reversal and byte-swap, both single-cycle.
+- **Bitfield operations** — `BFI`, `BFC`, `UBFX`, `SBFX` for clean register-bitfield manipulation.
+
+A function written in C with `if (cond) x++; else x--;` will compile to a 3-instruction IT block on v7-M (`CMP`, `IT NE`, `ADDNE`/`SUBEQ` ...). On v6-M it requires explicit branches. The savings compound in tight inner loops; a typical FIR filter inner loop is 40% smaller on v7-M.
+
+### IT blocks — the rule and the gotcha
+
+The IT (If-Then) instruction enables conditional execution for the **next 1 to 4** Thumb instructions. The encoding is `IT{x{y{z}}} cond`:
+
+```asm
+    cmp     r0, #0
+    ittee   ne          @ IT-then-then-else-else, on NE condition
+    addne   r1, #1      @ executed if NE
+    movne   r2, r1      @ executed if NE
+    subeq   r1, #1      @ executed if EQ (the "else")
+    moveq   r2, r1      @ executed if EQ
+```
+
+Each `T` or `E` after the `IT` describes one of the next 4 instructions: T means "execute if condition is true", E means "execute if condition is false". The decoder enforces that *exactly* the number of T/E modifiers matches the instructions inside.
+
+<ProtocolFrame title="Thumb-2 IT instruction encoding (16-bit)" fields={[
+  { name: '1011', bits: 4, tone: 'muted' },
+  { name: '1111', bits: 4, tone: 'muted' },
+  { name: 'firstcond', bits: 4, tone: 'primary' },
+  { name: 'mask', bits: 4, tone: 'highlight' },
+]} caption="The firstcond field carries the IT block condition; the mask encodes the T/E pattern for up to four predicated instructions that follow. Mask = 1000 means a single IT; mask trailing zeros count the predicated slots." />
+
+<Callout type="warn">
+Two IT-block gotchas. First, only the **last** instruction in an IT block may be a branch — taking a branch from anywhere else aborts the block and produces unpredictable behavior. Second, an interrupt taken *inside* an IT block re-enters via the standard exception frame, runs the handler, and resumes by re-executing the IT itself (the `EPSR.IT` field captures the pending conditional state and is saved in the stacked xPSR). This is handled by hardware — but if you single-step inside an IT block in a debugger, the IT state can confuse the user.
+</Callout>
+
+## The DSP extensions (M4/M7 only)
+
+ARMv7-M's DSP extensions add ~70 instructions for fixed-point, saturating, and packed-SIMD arithmetic. They appear on Cortex-M4 and Cortex-M7 but **not** on Cortex-M3. The headline categories:
+
+| Category | Example instructions | Use |
+|----------|----------------------|-----|
+| Saturating math | `QADD`, `QSUB`, `QDADD`, `QDSUB` | Audio mixers, control-loop integrators that must clamp |
+| Packed-byte SIMD | `SADD8`, `UQSUB8`, `SEL` | Image kernels, byte-wise pixel ops |
+| Packed-halfword SIMD | `SADD16`, `SSUB16`, `SXTAB16` | DSP filters, FFT butterflies |
+| Multiply-accumulate | `SMLAL`, `SMLALD`, `SMLAD`, `SMUAD` | FIR/IIR filter inner loops |
+| Bit count / select | `CLZ`, `RBIT` | Priority-encoder, bit-stream codecs |
+
+These let a Cortex-M4 implement a basic FFT or FIR filter at 4–8× the throughput of the equivalent Cortex-M3 code. The CMSIS-DSP library (now CMSIS-DSP v1.16+) hand-rolls assembly that exploits these intrinsics; if you're doing any signal processing on M4/M7, link against CMSIS-DSP rather than rolling your own.
+
+## The FPU — single vs double precision
+
+Cortex-M3 has **no FPU**. All floating-point goes through libgcc. This is fine for slow control loops and config-time math but ruinously slow for any real-time numerical work.
+
+Cortex-M4 optionally includes the **FPv4-SP** unit: 32 single-precision registers (s0..s31, also viewable as 16 double registers d0..d15 — but doubles still use software emulation because there's no DP hardware), single-cycle add/sub/mul/abs, multi-cycle divide and sqrt.
+
+Cortex-M7 optionally includes **FPv5-SP** (single-precision only) or **FPv5-D16** (single + double precision in d0..d15). Double-precision adds significant area; many vendors ship M7 SP-only to save gates.
+
+The FPU adds an extended stack frame on exception entry: 17 more words (s0..s15, FPSCR, plus alignment) on top of the basic frame. The CPU implements **lazy stacking** by default — the extended frame is *reserved* but not *filled* until the handler actually executes an FPU instruction. This keeps interrupt latency low for the (very common) case of an ISR that doesn't touch the FPU.
+
+See [FPU on Cortex-M](/docs/cortex-m/fpu) for the full register description and the lazy-stacking state machine.
+
+## Bit-banding (M3/M4 only)
+
+Bit-banding is the ARMv7-M trick where two 1 MB regions of the memory map (one in SRAM at 0x22000000 and one in peripherals at 0x42000000) act as bit-wise aliases of two 32 KB regions (SRAM at 0x20000000, peripherals at 0x40000000). A single byte at, say, 0x22000004 maps to bit 1 of byte 0 at 0x20000000.
+
+```c
+// Set GPIOA->ODR bit 5 atomically via bit-banding:
+*((volatile uint32_t *)(0x42000000 + ((0x40010C0C - 0x40000000) * 32) + (5 * 4))) = 1;
+```
+
+The win is **atomic single-bit RMW** without `LDREX`/`STREX`: the bus does the read-modify-write transparently to the original word. The bus traffic is identical to a regular load/store — it just lands at a different physical address.
+
+Bit-banding is **optional** in ARMv7-M and **absent** from ARMv7E-M / ARMv8-M. Cortex-M7 dropped it (cache complexity), so even though M7 is ARMv7-M, its bit-band regions read as zero. Cortex-M3 and M4 from ST, NXP, Atmel/Microchip generally keep it; some vendors (Nordic, Silicon Labs) chose to omit it.
+
+<Callout type="tip">
+If you're writing portable Cortex-M code, do not assume bit-banding exists. Use `LDREX`/`STREX` or BASEPRI-bracketed critical sections for portable atomic bit-set. Bit-banding is a nice cycle-saver on M3/M4 STM32 parts but it is not part of the architectural contract you can rely on.
+</Callout>
+
+## Unaligned access and the data path
+
+ARMv7-M permits **unaligned load/store** for word and halfword access by default. A `LDR r0, [r1]` where `r1` is not 4-byte aligned will silently read the unaligned word (taking 2 cycles instead of 1 on Cortex-M3 due to the split bus transaction). This is the opposite of v6-M, which faults.
+
+The `SCB->CCR.UNALIGN_TRP` bit lets you flip this back to "fault on unaligned" — useful for catching bugs where you've cast `uint8_t *` to `uint32_t *` without ensuring alignment. Production code usually leaves it disabled (allow unaligned); safety-critical code typically enables it (trap unaligned, catch the bug).
+
+`LDM`/`STM` and `LDRD`/`STRD` *always* require alignment and fault on misalignment regardless of `UNALIGN_TRP`.
+
+## The exception model on v7-M
+
+Same shape as v6-M but with more knobs:
+
+- **Configurable faults** — UsageFault, BusFault, MemManage are distinct, each with its own vector. Enable in `SCB->SHCSR`. Disabled, they escalate to HardFault as on v6-M.
+- **`SCB->CFSR`** — the Configurable Fault Status Register — decodes which sub-fault fired and why. Vastly easier to debug than v6-M.
+- **`BFAR`, `MMFAR`** — fault address registers for BusFault and MemManage, respectively. The exact memory address that triggered the fault, when meaningful.
+- **`BASEPRI`** — priority threshold register. Block IRQs with priority value ≥ BASEPRI, allow higher-urgency ones to preempt. RTOSes use this for "FromISR" syscall gating.
+- **Vector table relocation** — `VTOR` is mandatory in v7-M. Bootloaders relocate the vector table on application launch.
+
+See [NVIC priority](/docs/cortex-m/nvic-priority) and [exception model](/docs/architecture/exception-model) for the full mechanics.
+
+## Performance comparison across the family
+
+<CoreCompare
+  rows={[
+    { core: 'Cortex-M3 (FPU=N, DSP=N)', notes: '1.25 DMIPS/MHz Dhrystone. 3-stage in-order pipeline. Branch shadow ~1 cycle. Up to ~200 MHz in silicon (LPC4357, STM32F4 has M4 instead).' },
+    { core: 'Cortex-M4 (FPU=SP, DSP=Y)', notes: '1.25 DMIPS/MHz int. Same pipeline as M3 but with FPU + DSP. Up to ~240 MHz (STM32F4 series).' },
+    { core: 'Cortex-M7 (FPU=DP, DSP=Y, caches=Y)', notes: '2.14 DMIPS/MHz. 6-stage dual-issue with branch prediction, 4–64 KB I-cache, 4–64 KB D-cache, optional TCM. Up to 600 MHz (i.MX RT1170, STM32H7).' },
+  ]}
+/>
+
+The Cortex-M7 leap is enormous — it's dual-issue, has branch prediction, and a tightly-coupled memory (TCM) interface for deterministic low-latency code/data. But it's also the most cache-careful: D-cache write-back means DMA buffers must be marked non-cacheable (via the MPU) or invalidated/cleaned around DMA. See [Cortex-M7 cache](/docs/cortex-m/cache) for the management pattern.
+
+## Toolchain flags
+
+For Cortex-M3:
+
+```
+arm-none-eabi-gcc -mcpu=cortex-m3 -mthumb -mfloat-abi=soft -O2 ...
+```
+
+For Cortex-M4 with FPU:
+
+```
+arm-none-eabi-gcc -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -O2 ...
+```
+
+For Cortex-M7 with DP FPU:
+
+```
+arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -mfpu=fpv5-d16 -mfloat-abi=hard -O2 ...
+```
+
+The `-mfpu` flag must match the silicon variant — `fpv5-sp-d16` for SP-only M7 parts, `fpv5-d16` for DP-capable M7 parts. Mismatches show up as bizarre runtime numerical errors (e.g., `double` operations silently truncate) or fault on the first FPU instruction.
+
+## Cross-references
+
+- [ARMv6-M architecture](/docs/architecture/armv6m) — the slimmer cousin
+- [ARMv8-M architecture](/docs/architecture/armv8m) — TrustZone-M and the v8 evolution
+- [Exclusive monitors](/docs/architecture/exclusive-monitors) — LDREX/STREX in detail
+- [FPU on Cortex-M](/docs/cortex-m/fpu) — the floating-point unit and lazy stacking
+- [Cortex-M7 cache](/docs/cortex-m/cache) — cache management and DMA coherency
+- [NVIC priority](/docs/cortex-m/nvic-priority) — BASEPRI and priority grouping
+- ARMv7-M Architecture Reference Manual (ARM DDI 0403) — canonical spec

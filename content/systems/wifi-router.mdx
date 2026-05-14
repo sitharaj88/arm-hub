@@ -1,0 +1,246 @@
+---
+title: Wi-Fi router (Wi-Fi 6 consumer)
+description: How a $150 Wi-Fi 6 router is actually built — quad Cortex-A53, dedicated MAC/PHY, NPU offload, OpenWrt. Plus where ASUS, Linksys, GL.iNet differ.
+order: 1
+updated: 2026-05-12
+tags: [systems, wifi, router, cortex-a, linux]
+---
+
+
+A mid-range consumer Wi-Fi 6 router (AX3000-class, $80–$250 retail) is genuinely one of the most complex pieces of consumer electronics you can hold. It's a small Linux server with multi-radio MIMO transceivers, hardware packet acceleration, and a real-time switching fabric — all behind a plastic case and a web UI that pretends it's just a "router."
+
+## At a glance
+
+<SpecSheet specs={[
+  { label: 'Product class', value: 'Wi-Fi 6 (802.11ax) AX3000/AX5400 home router' },
+  { label: 'Typical SoC', value: 'MediaTek MT7986A / Qualcomm IPQ8074 / Broadcom BCM6750' },
+  { label: 'Application core', value: '4× Cortex-A53 @ 1.4–2.0 GHz' },
+  { label: 'Architecture', value: 'ARMv8-A, AArch64, NEON' },
+  { label: 'L1 / L2 cache', value: '32 KB I/D L1 per core, 1 MB shared L2' },
+  { label: 'RAM', value: '256 MB – 1 GB DDR4 / DDR3L' },
+  { label: 'Storage', value: '128 MB NAND flash + optional 32 MB NOR (boot)' },
+  { label: 'OS', value: 'OpenWrt 23.x or vendor-customized Linux 5.x' },
+  { label: 'Radios', value: '802.11ax 4×4 (5/6 GHz) + 802.11ax 2×2 (2.4 GHz)' },
+  { label: 'Wired ports', value: '1× 2.5 GbE WAN, 4× 1 GbE LAN (typical)' },
+  { label: 'NPU / accelerator', value: 'Vendor packet-processing engine, NAT/QoS offload' },
+  { label: 'Power', value: '8–15 W typical, 24 W peak' },
+  { label: 'Certifications', value: 'FCC Part 15, CE RED, Wi-Fi Alliance (Wi-Fi 6 certified)' },
+]} />
+
+## What's inside the SoC
+
+<BlockDiagram
+  title="MT7986A-class Wi-Fi 6 SoC — architecture"
+  width={860}
+  height={560}
+  minWidth={760}
+  nodes={[
+    { id: 'cpu',    x: 40,  y: 40,  w: 230, h: 72, kind: 'core',     label: '4× Cortex-A53 cluster', detail: 'AArch64 · NEON · L1 I/D' },
+    { id: 'l2',     x: 40,  y: 140, w: 230, h: 48, kind: 'memory',   label: 'L2 cache', detail: '1 MB shared' },
+    { id: 'sboot',  x: 40,  y: 220, w: 230, h: 48, kind: 'security', label: 'Secure boot ROM', detail: 'EL3 reset · image verify' },
+
+    { id: 'fabric', x: 315, y: 142, w: 250, h: 64, kind: 'io',       label: 'AXI / NoC fabric', detail: 'DMA · IRQ · QoS arbitration' },
+    { id: 'ddr',    x: 330, y: 40,  w: 220, h: 72, kind: 'memory',   label: 'DDR4 controller', detail: '32-bit · 1866 MT/s' },
+    { id: 'mem',    x: 640, y: 40,  w: 180, h: 72, kind: 'external', label: 'DDR4 SDRAM', detail: '512 MB – 1 GB' },
+    { id: 'crypto', x: 640, y: 140, w: 180, h: 64, kind: 'security', label: 'Crypto accelerator', detail: 'AES · SHA · RSA · TRNG' },
+    { id: 'iohub',  x: 640, y: 232, w: 180, h: 64, kind: 'periph',   label: 'I/O bridges', detail: 'USB · PCIe · NAND · GPIO' },
+    { id: 'pmu',    x: 40,  y: 300, w: 230, h: 52, kind: 'power',    label: 'PMU + clocks', detail: 'DVFS · resets · watchdog' },
+
+    { id: 'npu',    x: 315, y: 258, w: 250, h: 76, kind: 'accel',    label: 'Packet engine / NPU', detail: 'NAT · QoS · WED · flow table' },
+    { id: 'wifi5',  x: 40,  y: 382, w: 240, h: 72, kind: 'radio',    label: 'Wi-Fi 6 · 5/6 GHz', detail: 'MAC/PHY · 4×4 · 160 MHz' },
+    { id: 'wifi2',  x: 580, y: 382, w: 240, h: 72, kind: 'radio',    label: 'Wi-Fi 6 · 2.4 GHz', detail: 'MAC/PHY · 2×2 · 40 MHz' },
+    { id: 'gmac',   x: 315, y: 468, w: 250, h: 64, kind: 'periph',   label: 'GbE switch + MACs', detail: '2.5G WAN · 4× LAN' },
+  ]}
+  edges={[
+    { from: 'cpu',    to: 'l2',     label: 'private AXI' },
+    { from: 'l2',     to: 'fabric', label: '64-bit AXI' },
+    { from: 'fabric', to: 'ddr',    label: 'memory' },
+    { from: 'ddr',    to: 'mem',    label: 'DRAM' },
+    { from: 'fabric', to: 'crypto' },
+    { from: 'fabric', to: 'iohub',  label: 'APB/AXI' },
+    { from: 'fabric', to: 'npu',    label: 'flow setup', tone: 'primary', arrow: 'both' },
+
+    { from: 'npu',    to: 'wifi5',  label: 'fast path', tone: 'success', arrow: 'both' },
+    { from: 'npu',    to: 'wifi2',  label: 'fast path', tone: 'success', arrow: 'both' },
+    { from: 'npu',    to: 'gmac',   label: 'fast path', tone: 'success', arrow: 'both' },
+  ]}
+  caption="Linux runs on the Cortex-A53 cluster and programs the fabric, drivers, and flow tables. The green fast-path arrows show packets moving between Wi-Fi and Ethernet in hardware after the CPU sets up the flow."
+/>
+
+The Cortex-A cluster runs Linux and the control plane. The **packet-processing engine** is where the magic happens at line rate: every NAT translation, every QoS classification, every wireless-to-Ethernet bridge. Without it, the A53 cluster couldn't sustain 1 Gbps of NAT'd traffic — let alone 2.5 GbE.
+
+<Callout type="note" title="Why Cortex-A and not Cortex-M?">
+A router needs to run **Linux** for its TCP/IP stack, hostapd, configuration daemons, web UI, and IPv6 routing. Linux requires an MMU and rich peripheral abstractions — that's Cortex-A territory. A Cortex-M would have to run a much-thinner network stack and would struggle with the multi-process software architecture vendors actually use.
+</Callout>
+
+## The software stack
+
+```
+   Power on
+       │
+       ▼
+   ┌─────────────────────────────────┐
+   │  Boot ROM (Cortex-A in EL3)     │   verifies BL2 signature
+   └────────────┬────────────────────┘
+                ▼
+   ┌─────────────────────────────────┐
+   │  BL2 (vendor)                   │   sets up DDR, loads BL31
+   └────────────┬────────────────────┘
+                ▼
+   ┌─────────────────────────────────┐
+   │  BL31 / TF-A (EL3 secure mon.)  │   PSCI services
+   └────────────┬────────────────────┘
+                ▼
+   ┌─────────────────────────────────┐
+   │  U-Boot (EL2/EL1)               │   loads kernel from NAND
+   └────────────┬────────────────────┘
+                ▼
+   ┌─────────────────────────────────┐
+   │  Linux kernel 5.x               │   ARM64, multi-core
+   └────────────┬────────────────────┘
+                ▼
+   ┌─────────────────────────────────┐
+   │  OpenWrt / vendor userspace     │   procd, netifd, hostapd, ...
+   └─────────────────────────────────┘
+```
+
+This is the standard ARMv8-A boot chain — see [Boot flow & EL levels](/docs/cortex-a/boot-and-exception-levels/) for the gory details.
+
+### Key userspace components
+
+- **hostapd / wpad** — the Wi-Fi MAC software layer. Handles association, authentication (WPA3-SAE), key management. Talks to the kernel `mac80211` subsystem via nl80211.
+- **netifd** — OpenWrt's network configuration daemon. Brings interfaces up, configures DHCP, applies firewall.
+- **firewall4 (nftables)** — packet filtering. The slow-path filtering happens here when the NPU can't classify a flow.
+- **dnsmasq** — local DNS + DHCP server.
+- **uhttpd + LuCI** — the web UI you actually use to configure the thing.
+- **ubus** — inter-process RPC bus (think D-Bus, simpler).
+
+## Where ARM cores meet the radio
+
+The interesting design choice is how the Cortex-A cluster talks to the Wi-Fi MAC/PHY.
+
+```
+   ┌────────────────────────────────────────┐
+   │  Linux kernel                          │
+   │   ┌────────────────────────────────┐   │
+   │   │  cfg80211 / nl80211 (userspace)│   │
+   │   └─────────────┬──────────────────┘   │
+   │                 ▼                      │
+   │   ┌────────────────────────────────┐   │
+   │   │  mac80211 (soft MAC layer)     │   │
+   │   └─────────────┬──────────────────┘   │
+   │                 ▼                      │
+   │   ┌────────────────────────────────┐   │
+   │   │  Vendor driver (e.g. mt76)     │   │
+   │   └─────────────┬──────────────────┘   │
+   └─────────────────┼──────────────────────┘
+                     │ shared DMA buffers
+                     ▼
+   ┌────────────────────────────────────────┐
+   │  Wi-Fi MAC firmware                    │
+   │  (runs on dedicated MCU inside SoC)    │
+   └─────────────────┬──────────────────────┘
+                     ▼
+   ┌────────────────────────────────────────┐
+   │  PHY / RF (analog + DSP)               │
+   └────────────────────────────────────────┘
+```
+
+The Wi-Fi MAC's low-latency real-time work (responding to ACKs within microseconds, channel switching, beacon scheduling) runs on a **dedicated MCU inside the SoC** — often itself an ARM Cortex-M or a vendor-specific core. The Linux driver hands packets to it via DMA-mapped descriptors and signals via doorbell registers. The MAC firmware is opaque to the kernel and is delivered as a binary blob.
+
+This split — Linux for control plane, dedicated MCU for time-critical MAC — is the same pattern you'll see in [drone flight controllers](/docs/systems/drone-flight-controller/) (control loop on M7, telemetry on host) and [automotive ECUs](/docs/systems/automotive-ecu/) (Cortex-R for safety, M cores for I/O).
+
+## Fast path vs slow path
+
+The single most important number on a router's spec sheet is *NAT throughput*, and the only way to hit gigabit-plus NAT is to NOT route every packet through Linux's IP stack.
+
+```
+   ┌────────────────────────────┐
+   │  Slow path (Linux)         │   first packet of a flow
+   │   - netfilter rules        │   ↓
+   │   - IPsec, complex QoS     │   classified by NPU
+   │   - flow learning          │
+   └─────────────┬──────────────┘
+                 ▼
+   ┌────────────────────────────┐
+   │  NPU flow table (hardware) │   subsequent packets
+   │   - 5-tuple → action       │   matched + forwarded
+   │   - NAT translation        │   in hardware, zero CPU
+   │   - QoS marking            │
+   └────────────────────────────┘
+```
+
+The first packet of a flow goes to Linux, gets classified, and triggers the kernel to push a flow descriptor into the NPU's flow table. Every subsequent packet matches that descriptor and is forwarded *entirely in hardware* — never touching the A53 cores.
+
+This is why a router with a single 1.4 GHz Cortex-A53 can route 2.5 Gbps. The CPU only sees ~1% of packets.
+
+<Callout type="warn" title="Disable hardware offload and your throughput collapses">
+Some advanced features (deep packet inspection, traffic shaping with hundreds of rules) bypass the NPU and force everything through Linux's slow path. On a typical AX3000, this drops NAT throughput from 2.5 Gbps to ~400–600 Mbps. The router didn't get slower; you just stopped using the accelerator.
+</Callout>
+
+## Power and thermals
+
+A Wi-Fi 6 router is **always-on**, but it doesn't run at full tilt all the time:
+
+- **Idle**: ~6 W. CPU at scaling-min frequency (300 MHz), one radio chain awake, NPU mostly idle.
+- **Single client streaming 4K**: ~9 W. One radio chain active, NPU forwarding.
+- **Peak (multi-client AX traffic)**: 12–18 W. All radio chains + amplifiers, NPU + CPU active.
+
+The CPU is rarely the dominant power draw. The **RF power amplifiers** consume most of the budget. A 4×4 5 GHz radio at FCC-max power can draw 5–8 W just for the PAs.
+
+Thermal design is fan-less but uses metal heat spreaders bonded to the SoC and to the PA shields. Routers in plastic-only enclosures (small/cheap ones) thermal-throttle and you'll see Wi-Fi speeds drop after ~10 minutes of sustained load.
+
+## Memory and storage layout
+
+```
+SPI-NOR flash (8–32 MB):
+  0x00000000 - 0x00040000   Boot ROM patches, vendor BL2
+  0x00040000 - 0x00080000   U-Boot
+  0x00080000 - 0x000A0000   U-Boot env + factory MAC/calibration
+  0x000A0000 - end          Recovery firmware (rare; usually on NAND)
+
+NAND flash (128 MB – 1 GB):
+  / (UBI)                   rootfs (SquashFS, read-only)
+  /overlay (UBI)            user changes (OverlayFS)
+  /tmp (tmpfs)              logs, runtime state
+  /reserve                  factory-locked partition (do not touch)
+
+DDR4 RAM (256 MB – 1 GB):
+  Linux kernel + userspace
+  Wi-Fi DMA descriptor rings (carved out, kernel-pinned)
+  NPU flow-table memory (shared with kernel)
+```
+
+The factory MAC/calibration partition is critical and per-device-unique. **Never overwrite it** during firmware flashing — that's how you brick a router permanently. OpenWrt's `sysupgrade` knows to preserve it; manual `dd` doesn't.
+
+## Real products
+
+| Product | SoC | Cortex-A53 cluster | Notes |
+|---|---|---|---|
+| **Xiaomi AX3000 (Redmi AX6S)** | MediaTek MT7621 + MT7905/MT7975 | 2× MIPS 1004Kc | Older MIPS-based; still very popular in flashing community |
+| **GL.iNet Flint 2 (GL-MT6000)** | MediaTek MT7986A | 4× Cortex-A53 @ 2.0 GHz | OpenWrt-first, ships unlocked |
+| **ASUS RT-AX86U / AX88U** | Broadcom BCM4908 | 4× Cortex-A53 @ 1.8 GHz | Strong stock firmware (Asuswrt) |
+| **Linksys WRT3200ACM (legacy)** | Marvell Armada 385 | 2× Cortex-A9 @ 1.8 GHz | Wi-Fi 5 era; archetype of OpenWrt-friendly design |
+| **TP-Link Archer AX6000** | Broadcom BCM4908 | 4× Cortex-A53 @ 1.8 GHz | Mass-market, stock fw only |
+| **Banana Pi BPI-R3** | MediaTek MT7986A | 4× Cortex-A53 @ 2.0 GHz | Bare board for makers/hackers |
+
+For maximum hackability, look for OpenWrt-first vendors (GL.iNet, Banana Pi). For polish + warranty, the big consumer brands (ASUS, TP-Link) deliver but lock down the firmware.
+
+## What makes routers "feel fast"
+
+A router with 5 Gbps theoretical bandwidth that feels sluggish on a web UI has one of these problems:
+
+1. **Crappy stock firmware that runs heavy daemons** (cloud telemetry, mesh management, parental controls all written in Lua) on the A53s. Hits CPU at "I just want to load the admin page" time.
+2. **Bug in NPU driver that drops connections to slow path** under specific traffic mixes. Suddenly the A53s are doing all the routing.
+3. **Insufficient RAM**, causing OOM-kills of hostapd at moments of heavy multicast (mDNS storms from many smart-home devices).
+
+Stock firmware quality varies enormously between vendors. The hardware in $200 routers is mostly fine — the firmware is where the differences live.
+
+## See also
+
+- [Cortex-A overview](/docs/cortex-a/overview/) — what makes it different from Cortex-M.
+- [Boot flow & EL levels](/docs/cortex-a/boot-and-exception-levels/) — the BL1/BL2/BL31/U-Boot chain.
+- [MMU & paging](/docs/cortex-a/mmu/) — required for Linux.
+- [DMA](/docs/peripherals/dma/) — how the Wi-Fi MAC hands packets to the kernel.
+- [TrustZone](/docs/architecture/trustzone/) — used for secure boot.
+- [OpenWrt project](https://openwrt.org/) (external) — the open-source firmware most routers can flash.

@@ -1,0 +1,213 @@
+---
+title: SDMMC & SDIO
+description: The SD/MMC card peripheral on Cortex-M — protocol layers from CMD0/CMD1 initialization through UHS-I speeds, 4-bit data line operation, the SDIO variant for Wi-Fi and other non-card devices, and FATFS integration.
+order: 19
+updated: 2026-05-13
+tags: [peripherals, sdmmc, sdio, sd-card, fatfs]
+---
+
+The SDMMC peripheral connects a Cortex-M to SD cards, microSD cards, eMMC chips, and SDIO devices like Wi-Fi modules. It is hardware-fast where it counts — clocks up to 200 MHz on UHS-II parts, hardware CRC on every block, integrated DMA — but the protocol stack on top is dense, with five different speed classes, two voltage ranges, and a command set inherited from MMC that still bears the marks of its 1997 origin. Most embedded engineers meet SDMMC for the first time when they need to log data to a microSD; what should be "open file, write bytes" turns out to be a 1000-line state machine that has to deal with cards that NAK during init, cards that drop voltage mid-transfer, and cards that quietly take 250 ms to do a single 4 KB write.
+
+This page walks through the SD protocol stack, the practical clock-speed negotiation, the SDIO variant, and the layered FATFS integration that ships with every vendor middleware kit.
+
+<SpecSheet
+  title="SDMMC / SDIO at a glance"
+  specs={[
+    { label: 'Standards', value: 'SD card 7.10 (current); eMMC JESD84-B51 (5.1); SDIO 3.0' },
+    { label: 'Voltage', value: '3.3 V default; 1.8 V signalling for UHS-I and UHS-II (after CMD11 voltage switch)' },
+    { label: 'Bus width', value: '1-bit (boot, fallback) or 4-bit (normal). eMMC adds 8-bit. UHS-II uses 2 differential lanes' },
+    { label: 'Clock speeds', value: '400 kHz initial (mandatory for init), 25 MHz default, 50 MHz high-speed, 104 MHz SDR104, 208 MHz UHS-II' },
+    { label: 'Command frame', value: '48-bit: start + command index (6 bits) + 32-bit argument + 7-bit CRC + end' },
+    { label: 'Data block', value: '512 bytes default; configurable to 4 B–2048 B; CRC-16 per data line' },
+    { label: 'SDIO functions', value: '7 functions per card (function 0 + functions 1-7); each with own register space accessed via CMD52/CMD53' },
+  ]}
+/>
+
+## Pin count and electrical
+
+A four-bit SD card uses:
+
+- CLK (clock from host)
+- CMD (bidirectional command line)
+- DAT0..DAT3 (four data lines)
+- VDD, VSS
+
+Six signal pins plus power. CMD and DAT lines have internal pull-ups inside the card; the host adds external pull-ups (10–50 kΩ) on every line.
+
+eMMC adds DAT4..DAT7 for 8-bit mode (so 11 signal pins). UHS-II is completely different — it uses two differential pairs (TX and RX) at 1.5 Gbit/s, not the legacy parallel interface.
+
+The SDMMC peripheral on STM32 (F7, H7, U5) supports SD-card 4-bit and eMMC 8-bit modes, with a 200 MHz peripheral clock that can drive up to SDR104 (104 MHz card clock).
+
+## The initialization sequence
+
+SD-card init is a multi-step handshake that determines:
+
+- Card type (MMC, SD, SDHC, SDXC)
+- Voltage range
+- Speed class
+- Card RCA (Relative Card Address)
+- Card-Specific Data (CSD) — size, sector layout
+- Card Identification (CID) — manufacturer, serial number
+
+The sequence (simplified — real implementations also handle retries, timeouts, and corner cases):
+
+```
+CMD0 GO_IDLE_STATE          → put card in idle state
+CMD8 SEND_IF_COND           → check SD 2.0 compatibility (voltage 0x1AA echoed back)
+CMD55 + ACMD41 SD_SEND_OP_COND  → loop until card ready (busy bit set)
+CMD2 ALL_SEND_CID           → get card CID
+CMD3 SEND_RELATIVE_ADDR     → card returns its assigned RCA
+CMD9 SEND_CSD               → get card CSD (size, max clock, layout)
+CMD7 SELECT_CARD(rca)       → select this card, transition to transfer state
+ACMD6 SET_BUS_WIDTH(4)      → switch to 4-bit data bus
+CMD6 SWITCH_FUNC(high_speed) → optionally switch to 50 MHz
+```
+
+The card starts at **400 kHz** — slow enough that even worst-case capacitive loads can switch reliably with no clock skew. After CSD is read, the host learns the card's max clock and reprograms its own clock divider. From there:
+
+- **Default speed** (DS) — 25 MHz, 3.3 V, ~12 MB/s.
+- **High speed** (HS) — 50 MHz, 3.3 V, ~25 MB/s. Requires CMD6 to switch.
+- **UHS-I SDR50** — 50 MHz at 1.8 V signalling.
+- **UHS-I SDR104** — 104 MHz at 1.8 V, ~50 MB/s. Requires CMD11 voltage switch and signal tuning.
+- **UHS-I DDR50** — 50 MHz DDR (= 100 MHz effective edge rate).
+
+Voltage switching is one-way — once a card moves to 1.8 V, you can't go back without a power cycle.
+
+<Callout type="warn">
+Card init can fail at any step, and the failure modes are not uniform. Old SD 1.0 cards don't understand CMD8 (return illegal command); SDHC cards require ACMD41 with HCS bit set; UHS cards may NAK CMD11 if the host can't actually deliver 1.8 V. A robust init driver retries with degraded settings (slower clock, 1-bit bus) before giving up. Vendor middleware (ST `BSP_SD`, NXP `fsl_sdmmc`) implements this; rolling your own is a multi-week effort.
+</Callout>
+
+## Data transfer
+
+Once a card is selected and configured, reads and writes use:
+
+| Command | Function |
+|---------|----------|
+| CMD17 READ_SINGLE_BLOCK | Read one 512-byte block |
+| CMD18 READ_MULTIPLE_BLOCK | Read multiple blocks until CMD12 stops |
+| CMD24 WRITE_BLOCK | Write one 512-byte block |
+| CMD25 WRITE_MULTIPLE_BLOCK | Write multiple blocks until CMD12 stops |
+| CMD12 STOP_TRANSMISSION | Halt a multi-block transfer |
+| ACMD23 SET_WR_BLK_ERASE_COUNT | Pre-erase hint for write performance |
+| CMD13 SEND_STATUS | Poll card busy state |
+
+A single-block read on a 4-bit bus at 50 MHz transfers 512 bytes in 256 cycles × 4 bits = 1024 bits = ~20 µs over the wire, but the card adds 2–10 ms of internal latency. Multi-block reads amortize this — sequential 4 MB reads at 25 MB/s sustained is realistic on a class-10 card.
+
+The STM32 SDMMC peripheral handles the wire-level protocol (CRC, timing, framing) in hardware; software just queues commands and consumes/produces data through the FIFO or DMA.
+
+```c
+// Read one 512-byte block at address `blockaddr` into `buf` (DMA mode, abbreviated)
+SDMMC1->DTIMER = 0xFFFFFFFF;
+SDMMC1->DLEN   = 512;
+SDMMC1->DCTRL  = (9 << 4) | (1 << 1) | (1 << 0);  // block size 512, dir read, enable
+SDMMC1->ARG    = blockaddr;
+SDMMC1->CMD    = (17) | SDMMC_CMD_WAITRESP_0 | SDMMC_CMD_CPSMEN;
+// Then wait for DBCKEND or RXOVERR; DMA copies FIFO contents to buf.
+```
+
+## Block size and sector layout
+
+Modern SD cards report 512-byte block size in the CSD regardless of the underlying flash's page size. The host always reads and writes in 512-byte sectors. Internally the card translates 512-byte sectors to its native flash page size (typically 4–16 KB) via a flash translation layer (FTL).
+
+This translation is **not free**. A 4 KB random write requires the card to read a 16 KB page, modify 4 KB, erase the page, and write back — a 4–10 ms operation. Sequential writes are much faster because the FTL can stream into pre-erased pages.
+
+For high-throughput logging, write in **multi-block** sequential mode and use `ACMD23` to pre-erase. Some cards expose a "discard" command (CMD38, similar to ATA TRIM) that hints the FTL to mark erased blocks.
+
+| Pattern | Typical throughput |
+|---------|---------------------|
+| Random 4 KB writes | 100 KB/s – 2 MB/s |
+| Sequential 1 MB writes | 10–25 MB/s |
+| Sequential 1 MB reads | 20–40 MB/s |
+| UHS-I SDR104 sequential | 40–80 MB/s |
+
+## SDIO — non-card devices
+
+SDIO is the SD command set with extensions for non-storage devices. The host treats the device as a 7-function card; each function has its own 128 KB register space accessed via two commands:
+
+- **CMD52** (IO_RW_DIRECT) — single-byte read/write to a function's register space. Used for status polling and configuration.
+- **CMD53** (IO_RW_EXTENDED) — multi-byte/block read/write. Used for bulk data (Wi-Fi packets, Bluetooth audio).
+
+Common SDIO devices in embedded:
+
+- **Broadcom BCM4339, Cypress CYW43439** — Wi-Fi modules used in Raspberry Pi Pico W, many Linux SBCs, BLE combos.
+- **Marvell W8801** — Wi-Fi for industrial designs.
+- **Murata Type1DX** — Wi-Fi + Bluetooth combo.
+
+The Wi-Fi driver communicates with the chip through CMD53 block transfers — typically 256-byte to 2 KB blocks of WLAN MAC frames. The interrupt line is a sideband GPIO (not in the SD card spec) that the device asserts when it has data to send up.
+
+SDIO 3.0 supports the same UHS-I speeds as cards — typical Wi-Fi modules run at 50 MHz, giving ~20 MB/s usable for 802.11n.
+
+<Callout type="tip">
+For SDIO Wi-Fi bring-up, your first test should be a CMD52 read of CCCR (Card Common Control Register) at function 0, offset 0x00. The first byte returns the SDIO revision (typically 0x31 for SDIO 3.0). If you can't read CCCR, the lower-level handshake is broken — no point debugging the Wi-Fi firmware load until SDMMC works.
+</Callout>
+
+## DMA integration
+
+SDMMC peripherals have integrated DMA — the FIFO drains directly into RAM (or fills from RAM) without CPU intervention. On STM32H7 the SDMMC's internal DMA controller (IDMA) is separate from the MDMA/DMA1/2 — it's a master on the bus matrix dedicated to SDMMC traffic.
+
+Linked-list mode on IDMA lets you build a list of descriptors covering scattered RAM buffers — useful for FATFS multi-cluster reads where the destination is split across the FAT cluster chain.
+
+Cache coherency is the usual gotcha on M7 — SD-card buffers must be cache-clean before TX and cache-invalidated after RX, or placed in a non-cacheable region.
+
+## FATFS layering
+
+The block-level SD interface (read sector, write sector) is just the bottom of the file-system stack. On top sits FATFS — the dominant embedded filesystem implementation:
+
+- **FATFS** (Chan's FF) — single-author MIT-licensed, used by ST, NXP, Microchip, Renesas vendor middleware.
+- **LittleFS** — Memfault's wear-leveling FS, designed for raw NOR/NAND flash but works on SD too.
+- **F2FS** (Linux only) — log-structured FS for flash, not typically used on bare-metal.
+
+FATFS exposes a POSIX-like API (`f_open`, `f_read`, `f_write`, `f_close`) and calls into a thin `diskio.c` layer:
+
+```c
+DSTATUS disk_initialize(BYTE pdrv);
+DSTATUS disk_status(BYTE pdrv);
+DRESULT disk_read(BYTE pdrv, BYTE *buff, LBA_t sector, UINT count);
+DRESULT disk_write(BYTE pdrv, const BYTE *buff, LBA_t sector, UINT count);
+DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff);
+```
+
+Your SDMMC driver implements `disk_read` and `disk_write`. FATFS does everything above: directory traversal, FAT chain lookup, free-cluster allocation, long-filename handling, write-back caching of the FAT and directory blocks.
+
+Mounting takes one call:
+
+```c
+FATFS fs;
+f_mount(&fs, "0:", 1);
+FIL file;
+f_open(&file, "0:log.txt", FA_WRITE | FA_CREATE_ALWAYS);
+f_write(&file, "hello\n", 6, NULL);
+f_close(&file);
+f_unmount("0:");
+```
+
+Total flash footprint ~12–20 KB for FATFS plus your SDMMC driver.
+
+## Card durability and wear
+
+SD cards are flash; flash has finite write/erase endurance. A typical consumer microSD has:
+
+- 1000–3000 P/E cycles per cell (TLC) or 10000–100000 (MLC, SLC).
+- Internal wear-leveling spreads writes across cells.
+- Expected lifetime: 10–100 TBW (terabytes written) for consumer; 1+ PBW for industrial-grade.
+
+For data-loggers writing continuously, do the math. 100 MB/s × 1 year = 3 PB — far beyond consumer-card endurance. Industrial-grade pSLC cards (ATP, Swissbit, Cactus) cost 5–10× consumer but last 30–100× longer.
+
+Power-loss protection (PLP) is the other industrial-grade feature: a capacitor in the card lets it finish in-flight writes if power is lost. Consumer cards corrupt the FTL on sudden power loss, sometimes irrecoverably — for any field-deployed system that might lose power unexpectedly, pSLC with PLP is non-negotiable.
+
+## Common pitfalls
+
+- **Insufficient pull-ups** — internal pull-ups in the card alone are not strong enough for fast clock rates. Use 10–22 kΩ externals on every line.
+- **CMD line input shared with DAT0** — some boards route CMD and DAT0 to the same pin via series resistors. Doesn't work on UHS-I; use the SDMMC's dedicated pins.
+- **Forgetting voltage-switch hardware** — UHS-I requires a 1.8 V source on the I/O rail after CMD11. If your board ties the I/O rail to 3.3 V, UHS modes will not work.
+- **Bypassing CRC check** — every command and data block has hardware CRC. Disabling it ("for performance") leaves you with no way to detect bit errors.
+- **Long FATFS calls in ISR** — file operations are slow (10–100 ms). Always do them in a task, never an ISR.
+
+## Cross-references
+
+- [Advanced DMA](/docs/peripherals/dma-advanced) — IDMA model used by SDMMC
+- [GPIO alternate functions](/docs/peripherals/gpio-af) — very-high-speed config for CLK/CMD/DAT pins
+- [Memory model](/docs/architecture/memory-model) — DMA buffer placement on cached MCUs
+- SD Physical Layer Specification 7.10 — the canonical SD reference
+- JESD84-B51 — eMMC standard
+- FatFs documentation — http://elm-chan.org/fsw/ff/

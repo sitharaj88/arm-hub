@@ -1,0 +1,144 @@
+---
+title: Cortex-M0+
+description: The improved M0 — two-stage pipeline, optional MPU, single-cycle GPIO on some vendors, MTB instruction trace. The default low-end Cortex for new designs.
+order: 2
+updated: 2026-05-13
+tags: [cortex-m, cortex-m0plus, armv6-m, low-power, mtb]
+---
+
+The Cortex-M0+ is what the Cortex-M0 should have been from day one. Same ARMv6-M ISA, same gate-count envelope, same low-power target — but ARM shaved a pipeline stage, added an optional MPU, threaded in a tiny Micro Trace Buffer for instruction history, and offered vendors a fast-GPIO "single-cycle I/O" port. If you're choosing a low-end Cortex-M for a new design in 2026, the M0+ is almost always the right answer over the M0.
+
+The improvements look small on paper but compound in practice. The 2-stage pipeline cuts a cycle off every taken branch, which matters a lot for control loops with heavy branching (state machines, bytecode interpreters, CAN/UART byte-level handlers). The single-cycle I/O port reaches GPIO without going through the bus matrix — useful for software-driven bit-banging and ultra-fast pin toggling. The MTB lets you reconstruct instruction history without a full ETM, so you can diagnose hard-to-reproduce crashes on a part that costs under a dollar.
+
+<SpecSheet
+  title="Cortex-M0+ at a glance"
+  specs={[
+    { label: 'Architecture', value: 'ARMv6-M (same ISA as Cortex-M0)' },
+    { label: 'Pipeline', value: '2-stage (fetch + decode/execute merged) — one cycle better than M0 on taken branches' },
+    { label: 'Bus interface', value: 'Single AHB-Lite or optional dual-port (AHB + SIO) for fast-GPIO' },
+    { label: 'Single-cycle I/O port', value: 'Optional dedicated port for GPIO, bypasses AHB matrix' },
+    { label: 'MPU', value: 'Optional, 8 regions (ARMv6-M MPU)' },
+    { label: 'MTB (Micro Trace Buffer)', value: 'Optional — last N instructions logged to a small RAM buffer' },
+    { label: 'NVIC', value: '32 external IRQs, 2 priority bits, otherwise identical to M0' },
+    { label: 'WIC (Wake-up Interrupt Controller)', value: 'Optional — lets the core enter deeper sleep with NVIC powered down' },
+    { label: 'DMIPS/MHz', value: '0.95 (Dhrystone 2.1) — about 13% faster than M0' },
+    { label: 'CoreMark/MHz', value: '~2.46' },
+    { label: 'Typical parts', value: 'STM32G0, STM32L0, RP2040 (dual M0+), Microchip SAMD21, NXP KL2x' },
+  ]}
+/>
+
+## What changed from M0
+
+### Two-stage pipeline
+
+The M0+ collapses decode and execute into a single stage. Fetch is one stage, decode/execute is another. The end result: a taken branch flushes only one cycle of pipeline state (the instruction in fetch), giving a **1-cycle taken-branch penalty** instead of the M0's 2-cycle penalty. Untaken branches remain single-cycle.
+
+```
+M0  (3-stage):   F → D → E
+M0+ (2-stage):   F → DE
+```
+
+The DE merger trades some critical-path slack (each stage is logically bigger, so timing is tighter) for lower branch cost. ARM's synthesis flow accepts the trade because the M0+ targets the same clock frequencies as the M0 on the same process — typically 24–50 MHz in commercial parts, with comfortable headroom into the hundreds of MHz on more aggressive processes.
+
+For straight-line code, M0+ and M0 retire one instruction per cycle and look identical. The win shows up in branchy code: a state-machine inner loop that branches every 4–6 instructions sees 5–10% throughput improvement on M0+ — for free, with no source changes.
+
+### Single-cycle I/O port (IOPORT)
+
+The most under-appreciated feature. ARM exposes an *optional* second master port on the M0+ that hangs directly off the core, parallel to the AHB-Lite bus. Vendors who license this option route the SIO port to a GPIO controller that's accessible in a single cycle — no bus matrix, no AHB handshake, no wait states.
+
+The RP2040 is the poster child. Its M0+ cores have direct access to GPIO via the SIO peripheral at address `0xD000_0000`, and a `str r0, [r1]` writing to a GPIO output register completes in **one cycle** instead of the 2–3 cycles a regular AHB write would take. This makes the RP2040 dramatically better at software-implemented protocols (PIO is the hardware story, but even C-language bit-banging gets noticeably faster). On other vendors (Microchip SAMD21, NXP KL2x), the SIO is wired similarly to their GPIO blocks.
+
+If you're doing soft-SPI, soft-I2C, or any pin-flapping driver, an M0+ with SIO can outperform a higher-clocked M3 that has to go through AHB.
+
+### Optional MPU
+
+The M0+ supports the ARMv6-M MPU — a stripped-down version of the v7-M MPU with **8 regions** (vs typically 8 on M3/M4 too), no sub-regions, and only the basic permission model: `priv-RW/unpriv-RO`, `priv-RW/unpriv-RW`, `priv-RW/unpriv-no-access`, and `no-access`. It's enough to:
+
+- Mark RAM as execute-never (defeats shellcode in buffer overflows)
+- Protect flash from accidental writes (catch runaway pointers)
+- Set up RTOS task isolation with per-task region tables
+- Enforce stack-overflow detection via a guard region
+
+It is **not** enough for full per-process isolation on a multi-user OS — but Cortex-M parts don't run multi-user OSes. See the [MPU page](/docs/cortex-m/mpu) for the register-level details.
+
+<Callout type="warn">
+The ARMv6-M MPU is optional. You'll see vendor parts with "M0+ without MPU" — read the datasheet. STM32L0xx for example has the MPU; STM32C0xx (a newer low-cost line) does not. CMSIS reports availability via `__MPU_PRESENT`.
+</Callout>
+
+### Micro Trace Buffer (MTB)
+
+Optional, but commonly included. The MTB is a tiny in-SRAM circular buffer that records the source and destination addresses of every branch the core executes. Configure a chunk of internal RAM as the MTB region; the core writes 8 bytes per branch (source + destination) until the buffer wraps. When the part hits a fault, the MTB contents are the last N branches — typically 64 to 1024 entries — and a debugger can walk them backwards to show you exactly how the code got to the fault.
+
+The MTB is roughly 1% of the area of a full ETM, which is why it's the trace solution of choice on the cheapest parts. It's not as good as ETM (no cycle counts, no full instruction stream — just branch endpoints), but for diagnosing hard faults it's enormously useful. See the [DWT/ITM/ETM page](/docs/cortex-m/dwt-itm-etm) for how trace fits in the broader Coresight architecture.
+
+### Vector Table Offset Register (VTOR)
+
+On the M0, the vector table is fixed at address 0x0000_0000 — no relocation, no way to swap tables. The M0+ adds the **VTOR** register (`SCB->VTOR`), which lets software relocate the vector table at runtime. This is essential for bootloader designs: the bootloader holds the vector table at 0x0000_0000, then jumps to application code at (say) 0x0000_4000 and writes `SCB->VTOR = 0x4000` so the application's vector table takes over.
+
+```c
+void jump_to_app(uint32_t app_base) {
+    SCB->VTOR = app_base;
+    __DSB();
+    __ISB();
+    // Load app's initial SP from app_base[0]
+    uint32_t app_sp = *(uint32_t*)app_base;
+    __set_MSP(app_sp);
+    // Branch to app's reset handler
+    void (*app_reset)(void) = (void(*)(void))(*(uint32_t*)(app_base + 4));
+    app_reset();
+}
+```
+
+VTOR has alignment constraints: typically the vector table must be aligned to the next power-of-two above its size, with a minimum of 128 bytes. See the [vector table page](/docs/cortex-m/vector-table) for the details.
+
+### Wake-up Interrupt Controller (WIC)
+
+Optional. The WIC is a shadow NVIC that runs from an always-on clock domain. With WIC enabled, the core can enter the deepest sleep mode (the main clock domain fully off, the NVIC powered down) and still wake on an interrupt — the WIC catches the IRQ, restores the clocks, and re-enables the NVIC, which then services the interrupt. Power consumption in this mode can drop below 1 µA. STM32L0xx uses this to hit ~270 nA in Stop mode.
+
+## NVIC and exceptions
+
+Identical to the M0: up to 32 external IRQs, 2 priority bits (4 levels), tail-chaining, late-arrival, PRIMASK as the only mask register. The exception model is unchanged. What's different is the *speed* of entry/exit because of the 2-stage pipeline — the M0+ shaves a cycle off interrupt latency vs M0 (typically 15 cycles instead of 16, plus memory wait states).
+
+## Memory map
+
+Standard Cortex-M layout — code at 0x0000_0000, SRAM at 0x2000_0000, peripherals at 0x4000_0000, PPB at 0xE000_0000. **No bit-banding** (ARMv6-M doesn't have it). Unaligned accesses fault.
+
+With the SIO port, vendors typically map their fast-GPIO region into the system bus region (0x4000_0000–0x5FFF_FFFF) for normal use *and* alias it into a private region (often around 0xD000_0000) for SIO access. The same GPIO state is visible at both addresses; SIO is just faster.
+
+## Representative parts
+
+| Part | Vendor | Notable feature |
+|---|---|---|
+| STM32G0 | STMicro | Best mainstream M0+ — 64 MHz, USB, modern peripheral set, $0.50–$2 |
+| STM32L0 | STMicro | Ultra-low-power — 270 nA in Stop, LCD driver |
+| RP2040 | Raspberry Pi | **Dual M0+ at 133 MHz**, PIO state machines, SIO port, 264 KB RAM |
+| SAMD21 | Microchip | First M0+ to ship in volume, popular in Arduino MKR boards |
+| NXP KL27 | NXP | Crypto accelerator, USB device |
+| nRF52810 | Nordic | M0+ with 2.4 GHz radio (BLE 5) — lower-end of nRF52 family |
+
+The RP2040 is unusual: two M0+ cores, each clocked at 133 MHz (well above ARM's quoted typical), with a dedicated hardware interpolator block, FIFOs between cores, and the PIO state machines for arbitrary protocol generation. It's the M0+ pushed about as far as a 2-stage core can be pushed.
+
+## Picking M0+ over M3/M4
+
+M0+ is the right pick when:
+
+- Cost matters (M0+ is roughly the same die area as M0, well below M3)
+- Power matters more than throughput (deep sleep is where M0+ wins)
+- You don't need: hardware divide, DSP, FPU, more than 4 priority levels, more than 32 IRQs
+- The code is mostly control-plane, not data-plane (M0+ at 48 MHz can drive 115200 baud UART comfortably, but won't keep up with 100 Mbit Ethernet)
+
+Step up to M3 when you need: full Thumb-2 (CBZ/CBNZ, IT blocks, hardware divide, bit-band), more priority levels, more interrupts, or higher single-threaded performance. Step up to M4 when you need DSP or FP.
+
+<Callout type="tip" title="M0+ is the most under-rated Cortex">
+Engineers reach for M4 by reflex. For a lot of products (BLE peripherals, sensor hubs, simple HMIs, USB-CDC dongles, GPIO expanders, motor commutation, e-paper displays) an M0+ does the job at half the cost and a fraction of the active-mode power. The MPU is enough for credible isolation; the MTB is enough to debug field returns. Don't dismiss it.
+</Callout>
+
+## Cross-references
+
+- [Cortex-M0](/docs/cortex-m/m0) — the predecessor, still shipping
+- [Architecture comparison](/docs/cortex-m/architecture-compare) — every Cortex-M side by side
+- [MPU](/docs/cortex-m/mpu) — region setup for stack-overflow detection and task isolation
+- [Vector table & VTOR](/docs/cortex-m/vector-table) — relocating the table for bootloader splits
+- [Low-power modes](/docs/cortex-m/low-power) — WIC, deep sleep, standby
+- [DWT/ITM/ETM/MTB](/docs/cortex-m/dwt-itm-etm) — trace solutions on small parts
+- ARMv6-M Architecture Reference Manual (DDI 0419)

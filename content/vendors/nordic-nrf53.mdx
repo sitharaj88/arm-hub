@@ -1,0 +1,155 @@
+---
+title: Nordic nRF53 series
+description: Nordic Semiconductor's nRF5340 — dual Cortex-M33 with TrustZone, 128 MHz application core, 64 MHz network core running BLE/Thread/Matter. Inter-processor communication, nrfx HAL, Zephyr-based nRF Connect SDK.
+order: 15
+updated: 2026-05-13
+tags: [vendors, nordic, nrf53, nrf5340, cortex-m33, ble, thread, matter, zephyr]
+---
+
+Nordic Semiconductor built its market position on the nRF51 (Cortex-M0) and nRF52 (Cortex-M4F) lines — single-core wireless SoCs that became the default choice for BLE wearables, beacons, and sensor nodes. The nRF53 series is the architectural reset: two Cortex-M33 cores on one die, ARM TrustZone, and a hard split between the application world and the radio world. Where the nRF52 ran the BLE stack alongside the application on a single M4F (with strict priority discipline), the nRF53 puts them on physically separate cores that communicate through hardware mailboxes.
+
+This is the same dual-M33 pattern that NXP LPC55S69 and STM32WBA hint at but never quite committed to — Nordic has gone all-in. The result is a part that can run Matter, Thread border routing, and BLE Mesh simultaneously without ever causing the radio's hard real-time constraints to leak into the application core.
+
+<SpecSheet
+  title="Nordic nRF5340 at a glance"
+  specs={[
+    { label: 'Application core', value: 'Cortex-M33 @ 128 MHz, FPU, DSP ext, TrustZone, 1 MB Flash, 512 KB RAM' },
+    { label: 'Network core', value: 'Cortex-M33 @ 64 MHz, no FPU, 256 KB Flash, 64 KB RAM; runs the radio stack' },
+    { label: 'Radio', value: 'BLE 5.4, Bluetooth Mesh, IEEE 802.15.4 (Thread, Zigbee, Matter), proprietary 2.4 GHz 2 Mbps' },
+    { label: 'TX power', value: 'Up to +3 dBm, 0 dBm typical; FEM (front-end module) support for +20 dBm builds' },
+    { label: 'RX sensitivity', value: '-95 dBm (BLE 1 Mbps), -103 dBm (BLE LR 125 kbps coded PHY)' },
+    { label: 'TrustZone', value: 'Full ARMv8-M; SPU (System Protection Unit) partitions peripherals between secure/non-secure' },
+    { label: 'IPC', value: 'IPC peripheral — 16 channels, 0-cycle posting, separate event lines per channel' },
+    { label: 'Crypto', value: 'CryptoCell-312: AES-128/256, ECC P-256, SHA-256, ChaCha20-Poly1305, TRNG NIST SP 800-90B' },
+    { label: 'Process', value: '22 nm ULP — significantly newer than nRF52 (40 nm)' },
+    { label: 'Power', value: 'System OFF: 1.4 µA; System ON RAM-retained: 2.8 µA; CPU active radio off: ~5 mA @ 128 MHz' },
+  ]}
+/>
+
+## Why two cores
+
+A BLE link layer has microsecond-precision real-time requirements. The radio's "anchor point" — the start of a connection event — is scheduled by hardware, and the link-layer ISR must service that anchor within ~150 µs or the connection drops a packet. On a single-core nRF52, the link-layer ISR runs at the highest priority and the application must yield to it. This works but constrains the application: long interrupt-disabled regions break the link, deep callback chains can blow the stack-budget headroom, and any code path that delays an ISR by more than 150 µs is a bug.
+
+The nRF53 makes this no longer a shared-core problem. The application core runs the application; the network core runs the radio. Each has its own ISR vector, its own scheduling, its own NVIC. They share Flash (partitioned) and a small amount of RAM (for IPC mailboxes), but they execute independently. An application bug that holds the application core in a critical section for 50 ms does not affect the BLE link.
+
+## The two-core split
+
+<BlockDiagram
+  title="nRF5340 — application + network core architecture"
+  width={760}
+  height={420}
+  nodes={[
+    { id: 'mapp', x: 60, y: 40, w: 220, h: 60, kind: 'core', label: 'Cortex-M33 @ 128 MHz', detail: 'application core, TrustZone, FPU' },
+    { id: 'mnet', x: 480, y: 40, w: 220, h: 60, kind: 'core', label: 'Cortex-M33 @ 64 MHz', detail: 'network core, no FPU' },
+    { id: 'appflash', x: 60, y: 130, w: 220, h: 40, kind: 'storage', label: 'App Flash 1 MB' },
+    { id: 'netflash', x: 480, y: 130, w: 220, h: 40, kind: 'storage', label: 'Net Flash 256 KB' },
+    { id: 'appram', x: 60, y: 180, w: 220, h: 40, kind: 'memory', label: 'App RAM 512 KB' },
+    { id: 'netram', x: 480, y: 180, w: 220, h: 40, kind: 'memory', label: 'Net RAM 64 KB' },
+    { id: 'ipc', x: 310, y: 70, w: 140, h: 50, kind: 'periph', label: 'IPC (16 ch)', detail: 'mailbox' },
+    { id: 'shram', x: 310, y: 180, w: 140, h: 40, kind: 'memory', label: 'Shared RAM', detail: 'IPC buffers' },
+    { id: 'crypto', x: 60, y: 240, w: 220, h: 40, kind: 'security', label: 'CryptoCell-312', detail: 'AES, ECC, SHA, TRNG' },
+    { id: 'spu', x: 310, y: 240, w: 140, h: 40, kind: 'security', label: 'SPU', detail: 'sec/non-sec mux' },
+    { id: 'radio', x: 480, y: 240, w: 220, h: 60, kind: 'radio', label: '2.4 GHz radio', detail: 'BLE, 802.15.4, prop. 2 Mbps' },
+    { id: 'periph', x: 60, y: 300, w: 220, h: 60, kind: 'periph', label: 'USB, QSPI, SPI×4, I2C×4, UART×4, PWM×4, SAADC, COMP, QDEC' },
+    { id: 'ant', x: 540, y: 320, w: 100, h: 30, kind: 'external', label: 'Antenna' },
+  ]}
+  edges={[
+    { from: 'mapp', to: 'appflash' },
+    { from: 'mapp', to: 'appram' },
+    { from: 'mnet', to: 'netflash' },
+    { from: 'mnet', to: 'netram' },
+    { from: 'mapp', to: 'ipc', tone: 'accent', arrow: 'both' },
+    { from: 'mnet', to: 'ipc', tone: 'accent', arrow: 'both' },
+    { from: 'mapp', to: 'shram' },
+    { from: 'mnet', to: 'shram' },
+    { from: 'mapp', to: 'crypto' },
+    { from: 'mapp', to: 'spu', label: 'config', arrow: 'both' },
+    { from: 'mnet', to: 'radio' },
+    { from: 'radio', to: 'ant' },
+    { from: 'mapp', to: 'periph' },
+  ]}
+  caption="Application and network cores execute independently — same die, separate Flash, separate RAM, separate NVIC. The IPC peripheral and shared RAM region are the only paths between them. Radio belongs to the network core; the application core cannot reach it directly."
+/>
+
+The application core owns most peripherals: GPIO, SPI, I2C, UART, USB, PWM, ADC, the timers, the crypto block. The network core owns the radio, the radio timers, and a slim set of peripherals it needs to support time-deterministic radio operation. The SPU (System Protection Unit) is the gatekeeper — at boot time the application core programs it to assign each peripheral to either secure or non-secure execution, and the SPU enforces those assignments.
+
+## The IPC mechanism
+
+The IPC peripheral has 16 channels, each with two halves: a sender side and a receiver side. Posting to a channel costs one register write; the receiver wakes via interrupt or polls the channel-active register.
+
+```c
+// Application core — send a message
+shared_buffer.cmd = CMD_START_ADVERTISING;
+shared_buffer.params = &adv_params;
+NRF_IPC->TASKS_SEND[CHANNEL_TX] = 1;          // post to channel
+// Network core's IPC ISR fires immediately
+```
+
+In practice, this raw IPC layer is wrapped by HCI (Host Controller Interface for BLE) — the standard Bluetooth-SIG protocol that lets a host talk to a BLE controller. The application core runs the BLE host (GAP, GATT, security manager); the network core runs the BLE controller (link layer, link manager, PHY). HCI commands flow application → network; HCI events flow back. Same protocol you'd use over UART HCI to a discrete BLE chip, but the transport is the on-chip IPC.
+
+For Thread, Zigbee, and Matter, the split is similar — the network core runs the 802.15.4 MAC and the IPv6 6LoWPAN layer, the application core runs the higher protocol (CoAP for Matter, ZCL for Zigbee).
+
+## TrustZone partitioning
+
+The nRF53's TrustZone is fully implemented. The application core boots into secure state. Application firmware splits into:
+
+- **Secure firmware** — typically TF-M (Trusted Firmware-M), a reference implementation of PSA Functional API services. Manages crypto keys, secure boot, secure storage, attestation.
+- **Non-secure firmware** — the customer's application code. Calls into TF-M for any crypto or secure-storage operation.
+
+The SPU partitions Flash regions (8 KB granularity), RAM regions (also 8 KB), and individual peripheral instances. Once configured, the SPU locks until reset — non-secure code cannot re-allocate itself secure access.
+
+This is the architectural pattern recommended by Arm's PSA Certified scheme. nRF53 was one of the first MCUs to achieve PSA Certified Level 2, and Nordic's Zephyr-based SDK ships TF-M as a build-time option for the secure side.
+
+<Callout type="tip">
+For a first-time nRF53 project, start with the SDK's "ble peripheral hr" sample built with `CONFIG_BUILD_WITH_TFM=y`. This gives you a working secure/non-secure split, TF-M running, BLE heart-rate service on non-secure, all the SPU partitioning correctly configured. From there you replace the non-secure application with your own; the TF-M side rarely needs changes.
+</Callout>
+
+## nRF Connect SDK — Zephyr-based
+
+Nordic's nRF Connect SDK is built on Zephyr. The application core runs Zephyr; the network core runs a Nordic-supplied closed binary (for BLE/Thread/Matter) or, increasingly, an open-source Zephyr image with the OpenThread / Bluetooth controller stacks. The shift to open-source network-core images is recent (2023+) and means you can debug and modify the radio stack source rather than treat it as a black box.
+
+The SDK build flow is multi-image:
+
+```
+$ west build -b nrf5340dk_nrf5340_cpuapp samples/bluetooth/peripheral_hr
+```
+
+This builds the application core image (`build/zephyr/zephyr.hex`) and, automatically, the network core image (`build/hci_ipc/zephyr/zephyr.hex`). Both get flashed; the application core boots into its image, the network core boots into its image, IPC connects them.
+
+Compared to the nRF52 Soft Device model (where the BLE stack is a precompiled binary you flash separately and call via SVC), the nRF53 model is more flexible — different network-core images give you different protocols, and you can mix-and-match at build time.
+
+| Feature | nRF52 (single core) | nRF53 (dual core) |
+|---------|---------------------|-------------------|
+| Cores | 1× M4F @ 64 MHz | M33 @ 128 + M33 @ 64 |
+| Radio stack | "Soft Device" binary | Network-core image |
+| Stack call mechanism | SVC instruction | IPC mailbox |
+| Application can starve radio? | Yes (priority bug) | Architecturally no |
+| TrustZone | No | Yes |
+| FPU | Yes | Yes (app core only) |
+| Process node | 40 nm | 22 nm |
+| Power (CPU active) | ~3 mA @ 64 MHz | ~3.5 mA @ 128 MHz (app), ~2.5 mA radio off |
+| Cost (1k qty) | ~$2.50 | ~$5 |
+
+## nRF91 sibling
+
+The nRF91 series (nRF9160, nRF9151) is similar in spirit — single Cortex-M33 with TrustZone, but pairs it with an integrated LTE-M / NB-IoT / GPS modem instead of a 2.4 GHz radio. Same Zephyr-based SDK, same TF-M secure model. Covered separately under [Nordic nRF91](/docs/vendors/nordic-nrf91).
+
+## Power and certification
+
+The 22 nm process is the unsung win of nRF53. Sleep currents are notably better than nRF52 — System OFF retention at 1.4 µA, plus selectively powered RAM at hundreds of nA per 8 KB block. For coin-cell wearables and sensor tags, this directly translates into months more runtime versus a same-mAh nRF52 design.
+
+Pre-certified hardware modules from Nordic and third parties (Fanstel, Insight SiP, Raytac) wrap the nRF5340 die in an FCC/CE-certified shielded package. Designing with a module shortcuts certification (you inherit the module's intentional-radiator certification and only need unintentional-radiator testing on the rest of the product). For low-volume products this is the right starting point; for high volume you go bare-die and run your own certification.
+
+<Callout type="warn">
+The nRF5340 datasheet's "5 mA @ 128 MHz" CPU current is at minimum-feature operating conditions. Real applications running TLS handshakes plus crypto engagement plus radio events pull substantially more average current. Always budget power from a measured prototype, not from datasheet best-case.
+</Callout>
+
+## Cross-references
+
+- [Nordic nRF91](/docs/vendors/nordic-nrf91) — cellular sibling.
+- [Cortex-M33](/docs/cortex-m/m33) — the core in both cores of nRF53.
+- [TrustZone-M](/docs/security/trustzone-m) — how SPU enforces secure/non-secure.
+- [STM32 wireless WB/WL](/docs/vendors/stm32-wireless) — dual-core wireless competitor.
+- [IoT sensor node](/docs/systems/iot-sensor-node) — system-level design built on nRF53 or competitor.
+- Nordic Product Specification "nRF5340" (latest revision).
+- Nordic InfoCenter, "nRF Connect SDK Fundamentals" course.

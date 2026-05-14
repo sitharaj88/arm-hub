@@ -1,0 +1,195 @@
+---
+title: Industrial edge gateway
+description: Industrial edge gateway architecture — Cortex-A application plus Cortex-R5 or PRU real-time. Fieldbus interfaces (Modbus, EtherCAT, PROFINET, IO-Link), TSN, OPC UA server, MQTT to cloud, Linux + containerised apps.
+order: 18
+updated: 2026-05-13
+tags: [systems, industrial, gateway, edge, opc-ua, modbus, ethercat, profinet, tsn]
+---
+
+An industrial edge gateway sits between two worlds. On one side, the operational technology layer: PLCs, drives, sensors, and HMIs speaking a dozen different fieldbus protocols (Modbus RTU, EtherCAT, PROFINET, IO-Link, EtherNet/IP, CC-Link). On the other side, the IT layer: enterprise systems, MES, cloud SCADA, time-series databases, machine-learning analytics, all speaking OPC UA, MQTT, REST, and HTTPS. The gateway translates between them, applies edge analytics, buffers data over connectivity disruptions, and provides a secure, controlled boundary that keeps the operational network isolated from the corporate network.
+
+The natural silicon platform is a heterogeneous SoC — a Cortex-A class processor running Linux for the IT-side stack, plus one or more Cortex-R5 or Cortex-M cores (or PRUs) for the deterministic fieldbus protocols. TI Sitara AM62x/AM64x, NXP i.MX 8M, Renesas RZ/G, and Xilinx Zynq UltraScale+ all fit this template. This page covers the architecture, the fieldbus side, the IT-side stack, and the real-time / non-real-time split.
+
+<SpecSheet
+  title="Industrial gateway at a glance"
+  specs={[
+    { label: 'Platform', value: 'Heterogeneous Cortex-A + Cortex-R5 / Cortex-M / PRU; TI Sitara AM64x typical' },
+    { label: 'Application core', value: 'Cortex-A53 dual or quad @ 1.0-1.4 GHz running Linux (Yocto, Buildroot, Debian)' },
+    { label: 'Real-time core', value: 'Cortex-R5F lockstep pair @ 800 MHz running FreeRTOS / Zephyr; or PRU at 333 MHz for protocol-PHY work' },
+    { label: 'Fieldbus protocols', value: 'Modbus RTU/TCP, EtherCAT (master or slave), PROFINET RT/IRT, EtherNet/IP, CC-Link IE Field Basic, IO-Link master' },
+    { label: 'Network protocols', value: 'OPC UA Server + Client, MQTT 3.1.1 / 5.0, AMQP, REST/HTTPS, gRPC' },
+    { label: 'Time sync', value: 'IEEE 1588 PTP (PTPv2); TSN (Time-Sensitive Networking, IEEE 802.1Q-2018)' },
+    { label: 'Security', value: 'Secure boot, TPM 2.0 or HSM, TLS 1.3, certificate management, signed firmware updates' },
+    { label: 'Containerisation', value: 'Docker / Podman / balenaEngine, Greengrass, Azure IoT Edge, KubeEdge' },
+    { label: 'Deployment lifetime', value: '10-15 years; multi-decade longevity commitment on silicon and Linux LTS' },
+  ]}
+/>
+
+## The architectural split
+
+<BlockDiagram
+  title="Industrial gateway — heterogeneous compute"
+  width={860}
+  height={460}
+  minWidth={760}
+  nodes={[
+    { id: 'a53',    x: 40,  y: 44,  w: 230, h: 72, kind: 'core',     label: 'Cortex-A53 cluster', detail: 'Linux · containers · TLS' },
+    { id: 'r5',     x: 330, y: 44,  w: 230, h: 72, kind: 'core',     label: 'Cortex-R5F island', detail: 'RTOS · fieldbus timing' },
+    { id: 'pru',    x: 620, y: 44,  w: 180, h: 72, kind: 'accel',    label: 'PRU / ICSS', detail: 'cycle-exact protocol IO' },
+    { id: 'ddr',    x: 40,  y: 154, w: 360, h: 56, kind: 'memory',   label: 'Shared DDR4', detail: 'Linux + reserved R5/RPMsg regions' },
+    { id: 'flash',  x: 440, y: 154, w: 160, h: 56, kind: 'storage',  label: 'eMMC / OSPI', detail: 'boot · rootfs · OTA' },
+    { id: 'tpm',    x: 640, y: 154, w: 160, h: 56, kind: 'security', label: 'TPM 2.0 / HSM', detail: 'secure identity' },
+    { id: 'it',     x: 40,  y: 250, w: 230, h: 64, kind: 'periph',   label: 'IT-side Ethernet', detail: 'OPC UA · MQTT · cloud' },
+    { id: 'tsn',    x: 330, y: 250, w: 230, h: 64, kind: 'periph',   label: 'TSN / industrial Ethernet', detail: '3-port switch · ICSS' },
+    { id: 'field',  x: 620, y: 250, w: 180, h: 64, kind: 'periph',   label: 'Field IO', detail: 'RS-485 · CAN · IO-Link' },
+    { id: 'cloud',  x: 40,  y: 370, w: 230, h: 44, kind: 'cloud',    label: 'Cloud / SCADA' },
+    { id: 'plc',    x: 330, y: 370, w: 230, h: 44, kind: 'external', label: 'PLCs, drives, sensors' },
+    { id: 'dio',    x: 620, y: 370, w: 180, h: 44, kind: 'external', label: 'Digital IO / relays' },
+  ]}
+  edges={[
+    { from: 'a53', to: 'ddr' },
+    { from: 'r5', to: 'ddr' },
+    { from: 'a53', to: 'flash' },
+    { from: 'a53', to: 'tpm' },
+    { from: 'r5', to: 'pru', label: 'shared mem', tone: 'primary', arrow: 'both' },
+    { from: 'a53', to: 'r5', label: 'rpmsg / IPC', tone: 'accent', arrow: 'both' },
+    { from: 'a53', to: 'it' },
+    { from: 'r5', to: 'tsn' },
+    { from: 'pru', to: 'tsn' },
+    { from: 'r5', to: 'field' },
+    { from: 'field', to: 'dio' },
+    { from: 'it', to: 'cloud' },
+    { from: 'tsn', to: 'plc' },
+    { from: 'field', to: 'plc' },
+  ]}
+  caption="Linux on the A-cores handles the IT-side stack — OPC UA, MQTT, cloud, security, containers. R5 plus PRU handles fieldbus and time-deterministic IO. RPMsg IPC moves data between them through DDR-backed shared memory."
+/>
+
+The Cortex-A side runs a full Linux distribution — kernel 6.x with PREEMPT_RT or stock, depending on real-time requirements. Linux services include:
+
+- **OPC UA server** (open62541 or Eclipse Milo) exposing data points to higher-level systems.
+- **MQTT client** (Mosquitto, Paho) for cloud upload.
+- **REST / gRPC** for local management and integration.
+- **Container runtime** (Docker, Podman) for customer-deployed apps and edge analytics.
+- **Linux protocol stacks** (Modbus TCP slave / master, EtherNet/IP via libplctag, OpenPLC).
+- **Security infrastructure** — TLS 1.3, X.509 certificate management, TPM-backed key storage.
+
+The Cortex-R5 side runs a real-time OS (FreeRTOS, SafeRTOS, Zephyr) handling:
+
+- **Industrial Ethernet** (EtherCAT, PROFINET, EtherNet/IP) — protocol stack with hard timing.
+- **IO-Link master** — per-channel state machines, deterministic frame timing.
+- **Modbus RTU master / slave** over RS-485.
+- **CANopen** stack for legacy industrial CAN.
+- **Functional safety** — emergency stop logic, safety relays, ASIL-equivalent monitoring.
+
+The PRU sub-system handles the parts that even an 800 MHz R5 can't do in software — the cycle-by-cycle protocol PHY for EtherCAT slave, PROFINET IRT, or custom serial protocols with sub-microsecond timing.
+
+## Fieldbus protocols — the OT side
+
+A gateway typically supports several:
+
+**Modbus RTU.** Serial (RS-485), 9.6-115 kbaud, master-slave polling. Decades old, ubiquitous in legacy installations. Maximum cycle ~10-50 ms per slave. Easy to implement; the R5 handles dozens of slaves comfortably.
+
+**Modbus TCP.** Ethernet variant. Linux stack handles this without R5 involvement.
+
+**EtherCAT.** The high-performance industrial Ethernet. Master sends a single Ethernet frame containing data for every slave; each slave reads/writes its portion of the frame as it passes through, then forwards. Cycle times down to 31.25 µs achievable; typical industrial use 1-4 ms. Topology is a ring (logical), physically daisy-chained. PRU implements the slave-side ESC (EtherCAT Slave Controller). Master-side runs on Linux or R5.
+
+**PROFINET.** Siemens' industrial Ethernet. Two service classes: RT (millisecond-scale) and IRT (microsecond-scale, isochronous). PROFINET IRT uses TSN-style scheduled traffic. The PRU handles the IRT timing; the R5 runs the stack upper layers.
+
+**EtherNet/IP.** ODVA's industrial Ethernet, based on Common Industrial Protocol (CIP). Used heavily in Rockwell / Allen-Bradley installations. DLR (Device Level Ring) is its redundancy mechanism — PRU territory.
+
+**IO-Link.** Point-to-point serial (UART-like) from master to sensor or actuator. 32 channels per master IC typical; 4.8-230 kbaud per channel. IO-Link master ICs (Maxim MAX22515, Phoenix) handle the line driving; the R5 runs the IO-Link master stack (IODD interpretation, port configuration, parameterisation).
+
+**CC-Link IE Field.** Mitsubishi's industrial Ethernet, popular in Asia. Less common in EU/US installations but a must-have for Japanese OEM equipment.
+
+## TSN — the convergence layer
+
+TSN (Time-Sensitive Networking, IEEE 802.1Q-2018 and friends) is the future-direction layer. It defines extensions to standard Ethernet that allow deterministic time-bounded traffic alongside best-effort traffic on the same wire. The key TSN sub-standards:
+
+- **802.1AS** — Precision Time Protocol (PTP) profile for time synchronisation, sub-microsecond accuracy across the network.
+- **802.1Qbv** — Time-aware shaper: each port has a schedule of which traffic classes can transmit at which time slots, locked to the network's synchronised time.
+- **802.1Qbu / 802.3br** — Frame pre-emption: a high-priority frame can interrupt a lower-priority frame in flight.
+- **802.1CB** — Frame replication and elimination for reliability.
+- **802.1Qcc** — Centralised network management (configure schedules from a single point).
+
+TSN replaces the protocol-specific real-time mechanisms of EtherCAT / PROFINET IRT / EtherNet/IP with a vendor-neutral, IEEE-standard approach. A TSN-capable switch in the gateway lets PLCs from different vendors share a single Ethernet infrastructure with guaranteed time bounds.
+
+Implementing TSN requires hardware: a switch with TSN scheduling, a PHY supporting per-frame timestamping, and an OS / firmware that can drive the schedules. TI Sitara AM64x's CPSW switch supports TSN; NXP i.MX 8M Plus has TSN; Intel Time-Coordinated Computing platforms have it on x86.
+
+## OPC UA — the IT-side standard
+
+OPC UA (Unified Architecture) is the dominant industrial IT-side protocol. A gateway runs an OPC UA server exposing the data it collected from fieldbus devices, plus an OPC UA client subscribing to upstream systems.
+
+Why OPC UA matters:
+
+- **Information model.** Beyond raw data points, OPC UA models objects with types, methods, events. A "temperature sensor" object has properties (location, range, accuracy), methods (calibrate), and events (over-temperature alarm). Clients understand semantics, not just numbers.
+- **Vendor-neutral.** Same protocol from Siemens, Rockwell, B&R, Beckhoff, ABB. Companion specifications (Robotics, Machine Tools, Plastic Machinery) standardise the object model per industry.
+- **Security.** Mutual X.509 certificate authentication, TLS-encrypted transport, role-based access control. Designed for hostile networks (cellular, internet).
+- **Pub/Sub variant.** OPC UA Pub/Sub over UDP / MQTT / AMQP enables the IIoT cloud-uplink pattern at scale.
+
+Implementing OPC UA on the gateway uses open62541 (open-source, BSD), Eclipse Milo (Java, Apache 2.0), or commercial stacks (Unified Automation, ASNeG, Prosys). The 1.05 spec is dense; building a compliant server with companion-spec models is a multi-week engineering effort.
+
+## Containerised edge apps
+
+A modern gateway lets customers deploy their own applications as Docker / Podman containers. Use cases:
+
+- **Edge ML inference** — TensorFlow Lite or ONNX Runtime container processing camera or sensor data; flagging anomalies.
+- **Custom protocols** — vendor-specific or legacy protocol bridges packaged as containers.
+- **Local SCADA** — Grafana + InfluxDB + a UI for plant-level visualisation.
+- **OEM-specific services** — equipment vendors push containers that monitor their own equipment for predictive maintenance.
+
+The container framework integrates with cloud-side device management (Azure IoT Edge, AWS IoT Greengrass, KubeEdge). The cloud pushes new container images and configuration; the gateway pulls, validates signatures, and starts containers.
+
+| Framework | Strengths | Trade-offs |
+|-----------|-----------|------------|
+| **Azure IoT Edge** | Tight integration with Azure cloud, mature module SDK | Azure-only; ~$0.10/device/month |
+| **AWS IoT Greengrass** | Tight AWS integration, supports Lambda functions | AWS-only |
+| **KubeEdge** | Kubernetes-compatible, cloud-agnostic | More complex setup |
+| **balenaCloud** | OS + container + fleet management, hardware-friendly | SaaS lock-in unless self-hosted |
+| **Eclipse ioFog** | Open-source, vendor-neutral | Smaller ecosystem |
+
+## Security
+
+Industrial cybersecurity is a regulated concern. Key standards:
+
+- **IEC 62443** — multi-part industrial automation cybersecurity standard. The gateway should claim IEC 62443-4-1 (product security development lifecycle) and 62443-4-2 (technical security requirements for components).
+- **NERC CIP** — North American electric utility cybersecurity (CIP-002 through CIP-013).
+- **EU NIS2 Directive** — applies to operators of essential services and important entities.
+
+Defensive features expected of a gateway:
+
+- **Secure boot** — bootloader (typically U-Boot with verified boot) signs each stage of the boot chain; first-stage uses HSM/TPM-protected key.
+- **Encrypted filesystem** — at-rest encryption of the eMMC, decryption key bound to TPM/HSM.
+- **TLS 1.3 everywhere** — no plaintext communications across networks.
+- **Certificate management** — provisioned at manufacture, rotated via cloud-based PKI.
+- **Audit logging** — security-relevant events forwarded to SIEM systems.
+- **Firmware integrity** — measurements stored in TPM PCR registers; remote attestation.
+- **Network segmentation** — gateway enforces traffic rules between OT and IT sides; deep packet inspection for protocol anomalies.
+
+## Real-time co-existence with Linux
+
+The defining engineering challenge of these designs is making the real-time R5 and the Linux A-cores share a chip productively:
+
+**DDR partitioning.** The R5 reserves a region of DDR (typically 256 MB to 1 GB) declared in the Linux device tree. Linux's kernel does not allocate from this region. R5 firmware lives there along with its working buffers. Cross-core data exchange uses dedicated shared-memory pages.
+
+**Interrupt routing.** Each interrupt has a configured target — to A-cluster, R5 cluster, or both. Hardware (Sitara's Interrupt Aggregator and Vector Interface Module) routes per the device-tree configuration. Time-critical interrupts go to R5; UI / cloud interrupts go to Linux.
+
+**IPC via RPMessage.** Kernel module `virtio_rpmsg_bus` on the Linux side, TI RPMessage library on the R5 side. Pass a struct, get a struct back. The transport is mailbox-and-shared-memory; throughput easily 50+ MB/s.
+
+**Remote processor lifecycle.** Linux's `remoteproc` framework loads, starts, stops, and restarts the R5 firmware. The R5 image is a separate ELF, signed independently. `/sys/class/remoteproc/remoteproc0/state` reflects the current state.
+
+**Time synchronisation.** The R5 and Linux share a hardware time counter; both can read it. For TSN/PTP, the same hardware that timestamps PROFINET frames timestamps Linux's PTP daemon, so both sides agree on time to nanosecond precision.
+
+<Callout type="warn">
+A common mistake: using PREEMPT_RT Linux for "hard real-time" fieldbus protocols. PREEMPT_RT achieves microsecond-class average latency, but tail-latency (99.999th percentile) can hit milliseconds — caused by I/O sync, NUMA migration, hugepage handling. For "must always be under 50 µs", the R5 is the only safe answer.
+</Callout>
+
+## Cross-references
+
+- [TI Sitara](/docs/vendors/ti-sitara) — AM62x / AM64x / AM243x, the dominant gateway silicon.
+- [AUTOSAR](/docs/systems/autosar) — adjacent but distinct (vehicle ECU rather than gateway).
+- [Cortex-R5](/docs/cortex-r/r5) — the real-time core.
+- IEC 62443 series — industrial cybersecurity.
+- OPC UA Specification Part 1-14 — opcfoundation.org.
+- TSN sub-standards 802.1AS / Qbv / Qbu / CB.
+- Yocto Project documentation; PREEMPT_RT documentation on kernel.org.

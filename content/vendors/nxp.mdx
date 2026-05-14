@@ -1,0 +1,163 @@
+---
+title: NXP (Kinetis, LPC, i.MX RT)
+description: NXP's Cortex-M lines — Kinetis for industrial, LPC for embedded mainstream, i.MX RT for crossover MCUs running at GHz speeds.
+order: 2
+updated: 2026-05-12
+tags: [vendors, nxp]
+---
+
+NXP (formerly Freescale + Philips Semi) has three distinct Cortex-M brands, each born from a different acquisition. Knowing which is which saves a lot of confused datasheet hunting.
+
+<SpecSheet
+  title="NXP ARM portfolio — at a glance"
+  specs={[
+    { label: 'Cortex-M brands', value: 'Kinetis (ex-Freescale), LPC (ex-Philips), i.MX RT (crossover)' },
+    { label: 'Top crossover MCU', value: 'i.MX RT1170 — Cortex-M7 @ 1 GHz + Cortex-M4 helper @ 400 MHz, 2 MB on-chip SRAM, dual gigabit Ethernet' },
+    { label: 'Edge-ML flagship', value: 'i.MX RT700 — Cortex-M33 secure + Cortex-M33 application + HiFi 4 DSP + eIQ Neutron NPU' },
+    { label: 'Crossover MCU twist', value: 'No internal flash on most i.MX RT — code executes XIP from external Octal/Hyper/QSPI through an L1 cache' },
+    { label: 'Automotive line', value: 'S32K (Cortex-M7), S32G (multicore A-class network processor), S32Z/E (R52 lockstep). Not covered in depth here.' },
+    { label: 'SDK', value: 'MCUXpresso SDK — Apache 2.0, CMake-buildable, includes FreeRTOS, mbedTLS, lwIP, USB stack, eIQ ML' },
+    { label: 'Security IP', value: 'EdgeLock 2GO, EdgeLock Secure Enclave (RT1180), PUF-based key wrapping, HAB / RTROM secure boot' },
+    { label: 'DSP / ML accelerators', value: 'LPC55 PowerQuad (FFT/FIR/IIR), RT500/700 Cadence Tensilica HiFi 4, eIQ Neutron NPU on RT700/MCX-N' },
+  ]}
+/>
+
+## The three lines
+
+### Kinetis (was Freescale)
+
+- **Kinetis K** series — Cortex-M4 with strong analog (high-resolution ADCs, DACs, comparators). Industrial control, medical instrumentation.
+- **Kinetis L** series — Cortex-M0+ low-power.
+- **Kinetis V** series — motor control specific.
+- **Kinetis E/EA** — automotive-qualified.
+
+### LPC (was Philips/NXP)
+
+- **LPC8xx** — Cortex-M0+, single-cycle I/O port, "switch matrix" for flexible pin routing.
+- **LPC11xx/13xx** — entry-level M0/M3.
+- **LPC15xx/4xx** — mainstream M3/M4 with SCT (state-configurable timer — a very powerful peripheral).
+- **LPC55xx** — Cortex-M33 with **PowerQuad** DSP coprocessor.
+
+### i.MX RT — the crossover MCUs
+
+The most distinctive product line. **i.MX RT10xx** and **RT11xx** run a Cortex-M7 at **600 MHz to 1 GHz** with code/data backed by external QSPI flash and external SDRAM accessed through a memory-mapped cache. Performance approaches Cortex-A7 at lower power, with deterministic interrupt latency.
+
+- **RT1010 / 1020** — entry-level i.MX RT, M7 @ 500–600 MHz.
+- **RT1050 / 1060** — mainstream, M7 @ 600 MHz, Ethernet, USB HS.
+- **RT1170** — M7 @ 1 GHz + M4 helper, GPU, dual Ethernet, USB.
+- **RT500** — M33 + M33 + Cadence Tensilica HiFi 4 DSP — for AI and audio.
+- **RT700** — M85 + M33, ML accelerator. Newest tier.
+
+If you're considering a Cortex-A7 Linux box for performance but want hard real-time and instant boot, **i.MX RT is the crossover answer**.
+
+## MCUXpresso SDK
+
+NXP's vendor SDK. Apache-licensed, well-organised, CMake-buildable. Includes:
+
+- CMSIS-Core for every NXP MCU.
+- A "fsl_" driver layer (HAL).
+- FreeRTOS, mbedTLS, lwIP, USB, SD-card middleware.
+- Examples for every dev board.
+
+MCUXpresso IDE is the Eclipse-based front-end. Like ST's CubeIDE, it works but isn't loved. Most production teams use VS Code + the MCUXpresso SDK + their own CMake.
+
+## NXP-specific peripherals worth knowing
+
+### LPC SCT — State Configurable Timer
+
+A timer that's effectively a programmable state machine driving 16 outputs. Can generate complex waveforms (motor commutation, communication protocols, lighting) without CPU intervention. Documented in 60+ pages of the LPC reference manuals; once mastered, replaces a small FPGA.
+
+### LPC55 PowerQuad
+
+A coprocessor accessible through the Cortex-M33 coprocessor interface. Implements FFT, FIR, IIR, matrix operations in hardware — fire-and-forget. ~10× faster than CMSIS-DSP on the same core, freeing the CPU for control logic.
+
+### i.MX RT Flexible Communication
+
+The **FlexCAN**, **FlexSPI**, **FlexIO** peripherals — programmable enough to implement almost any serial protocol. FlexIO can be configured as a SDIO controller, a parallel LCD interface, multiple PWM channels — at runtime. Powerful but documentation-heavy.
+
+### Kinetis crossbar switch
+
+Lets you route any signal to any pin without changing the schematic. Reduces design changes during PCB iteration.
+
+## Boot flow on i.MX RT
+
+Different from typical Cortex-M because of the external flash:
+
+1. ROM reads the **IVT** (Image Vector Table) and **boot data** from external flash.
+2. ROM initialises the QSPI / OctoSPI controller to memory-map the flash.
+3. ROM hands off to your firmware running directly from external flash address space.
+
+A **DCD** (Device Configuration Data) block in the image lets ROM run register init scripts (DDR training, etc.) before jumping to your code. This is documented in the i.MX RT reference manual under "Boot ROM".
+
+For secure boot, **HAB** (High Assurance Boot) signs the image with vendor keys fused into the chip. Critical for production.
+
+## i.MX RT memory architecture in depth
+
+The "no internal flash" choice has cascading consequences. Code lives in external Octal-SPI (HyperFlash, JEDEC xSPI Profile 1.0 / 2.0) attached to the **FlexSPI** controller. FlexSPI is memory-mapped: a configurable LUT (lookup table) of SPI command sequences lets the controller translate AHB read transactions into the right SPI command sequence (read/write/erase) for whichever flash family you wired up. The controller then caches the result in a small L1 instruction/data prefetch buffer; longer runs hit the **MMU-less** Cortex-M7 L1 cache (32 KB I + 32 KB D, configurable as TCM via the FlexRAM controller).
+
+Sustained execution from XIP runs at roughly 60–80% of the IPC of TCM-resident code at 600 MHz. The hot path is therefore a multi-stage problem: pre-fetch critical functions into ITCM via a linker script attribute, allocate stacks and frequently-touched globals into DTCM, and keep the cold path on external flash. The MCUXpresso linker scripts ship with `__attribute__((section(".itcm_text")))` and similar markers — use them liberally on ISR handlers, DSP inner loops, and FreeRTOS scheduler hooks.
+
+```c
+/* Place a hot ISR into ITCM for predictable timing */
+__attribute__((section(".itcm_text")))
+void DMA0_IRQHandler(void) {
+    /* No XIP miss penalty here */
+}
+```
+
+The on-chip SRAM is **FlexRAM** — a single physical block of 512 KB to 1 MB that the system controller carves at boot time into ITCM, DTCM, and OCRAM in 32 KB granularity. You configure the split via the `IOMUXC_GPR_GPR17` register before the cache is enabled. This is unusual: most MCUs have fixed SRAM partitioning, and getting the FlexRAM split wrong is one of the most common bring-up bugs on first-time i.MX RT projects.
+
+<Callout type="warn" title="Cache + DMA coherency on i.MX RT">
+The Cortex-M7 D-cache is *not* coherent with DMA. Any buffer touched by a DMA peripheral (ENET, USB, LPSPI, SDHC) must be either placed in **non-cacheable** OCRAM (configured via the MPU) or be invalidated/cleaned around every transfer. Use `SCB_CleanDCache_by_Addr` before a DMA-to-peripheral transfer and `SCB_InvalidateDCache_by_Addr` after a peripheral-to-memory transfer. The MCUXpresso SDK's `SDK_NONCACHEABLE_SECTION` macro is the recommended pattern; misuse here causes "the data on the wire is fine but the CPU sees stale bytes" — classic and infuriating.
+</Callout>
+
+## Security: EdgeLock, PUF, and secure boot lineage
+
+NXP's security story spans three generations:
+
+1. **HAB** (High Assurance Boot) — the original Freescale chain. Vendor signs images with RSA-2048/4096 keys whose hashes are fused into the chip. ROM verifies before jumping. Used on RT10xx and most Kinetis K.
+2. **HAB-lite + RTROM** — the LPC55 family adds a more flexible signed-image format and field-revocable keys.
+3. **EdgeLock Secure Enclave** — on RT1180 and the new MCX-N series, the security IP is its own isolated processor with a separate firmware image, providing a Common Criteria EAL6+ secure element on-die.
+
+The **PUF** (Physically Unclonable Function) is a per-chip entropy source derived from SRAM startup state. Two RT1170 chips off the same wafer produce different PUF responses; the response is stable across reset and aging, so it acts as a device-unique root key without requiring fuse programming. PUF-wrapped keys can live in plain flash because only the originating chip can unwrap them.
+
+## DSP and ML accelerators
+
+| Accelerator | Part | What it does | Speedup vs CMSIS-DSP on M7 |
+|-------------|------|--------------|----------------------------|
+| PowerQuad | LPC55Sxx | FFT, FIR, IIR, matrix, biquad | 8–12x for FFT-512 |
+| HiFi 4 DSP | RT500, RT600, RT700 | Audio codecs, far-field beamforming | 4–6x for Opus / SBC |
+| eIQ Neutron NPU | RT700, MCX-N94x | INT8 / INT4 quantised NN inference | 10–25x for MobileNet-v2 |
+| FlexIO | RT10xx / RT11xx | Programmable I/O state machines | n/a (replaces FPGA glue) |
+
+The PowerQuad on LPC55 is unusual in being accessed through the Cortex-M33 **coprocessor interface** (CP0/CP1) — same hardware path as the FPU. This means dispatch latency is single-digit cycles; you fire off an FFT and poll for completion rather than going through a memory-mapped doorbell.
+
+## MCUXpresso, VS Code, and CI
+
+```bash
+# Headless build of an MCUXpresso SDK example
+west init -m https://github.com/nxp-mcuxpresso/mcux-sdk
+west update
+cmake -B build -G Ninja -DBOARD=evkmimxrt1170 -DCORE_ID=cm7
+cmake --build build
+```
+
+The SDK is delivered both as a downloadable ZIP (the legacy MCUXpresso "Manifest" flow) and as a multi-repo Zephyr `west` workspace (newer). The latter is the recommended path for new projects — versioning is git-based, CI integrates cleanly, and you can pin SDK + driver versions independently. MCUXpresso IDE remains useful for the GUI Pins, Clocks, and Peripheral configurators, which emit `pin_mux.c` / `clock_config.c` you commit to source control.
+
+## Power management
+
+NXP gives you a richer set of power modes than baseline ARM specifies. Kinetis K-series exposes RUN / VLPR / WAIT / VLPW / STOP / VLPS / LLS / VLLS0-3 — each with different peripheral retention rules. RT11xx adds a separate **PMIC** integration option (PCA9420 or PF5020) where the chip negotiates voltage rails with an off-chip power IC over I²C. For battery-powered designs, the SNVS (Secure Non-Volatile Storage) domain stays alive on coin-cell when everything else is off, retaining the RTC, tamper detectors, and a small ZK memory block for secrets.
+
+## Cross-references
+
+- [Cortex-M4](/docs/cortex-m/m4/) — Kinetis K, some LPC.
+- [Cortex-M7](/docs/cortex-m/m7/) — i.MX RT core, caches and TCM topology.
+- [Cortex-M33 / M23](/docs/cortex-m/m33-m23/) — LPC55xx, RT500, MCX-N.
+- [Cortex-M55 / M85](/docs/cortex-m/m55-m85/) — what RT700 uses.
+- [TrustZone](/docs/architecture/trustzone/) — partitioning model used by EdgeLock and TF-M on LPC55/RT.
+- [CMSIS](/docs/programming/cmsis/) — MCUXpresso SDK layers above this.
+- [MPU on Cortex-M](/docs/cortex-m/mpu/) — required to mark OCRAM non-cacheable for DMA buffers.
+- [STMicro](/docs/vendors/stm/) — STM32H7 versus i.MX RT decision.
+- [Renesas](/docs/vendors/renesas/) — RA8 versus RT700 for edge ML.
+- [QEMU & Renode](/docs/tools/sim/) — Renode has stable LPC and partial RT models.
+- [Interrupt latency tool](/tools/interrupt-latency) — explore the cache-miss-versus-TCM trade.

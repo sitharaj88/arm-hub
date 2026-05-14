@@ -1,0 +1,218 @@
+---
+title: Floating-Point Unit (FPU)
+description: FPv4-SP on M4, FPv5-SP/DP on M7/M33/M85, MVE on M55/M85. Register file, FPSCR, lazy stacking, extended stack frame, CPACR enable, denormal handling.
+order: 20
+updated: 2026-05-13
+tags: [cortex-m, fpu, vfp, lazy-stacking, fpscr]
+---
+
+The Cortex-M FPU is a small, fast, IEEE 754 single-precision (sometimes double-precision) coprocessor that sits next to the integer core and shares the pipeline. It's optional on every core that supports it — M4 vendors may ship with or without, M33 the same. When present, it adds 32 single-precision registers (or 16 doubles), single-cycle FP add/sub/mul, multi-cycle FP divide and sqrt, and a small handful of conversion and fused-multiply-add instructions.
+
+Three things consistently trip people up. First, **the FPU has to be explicitly enabled** before use — touch an FP instruction with the FPU disabled and you get a UsageFault. Second, exception entry and exit handle FP state specially via the **lazy stacking** mechanism — the FP registers aren't always pushed, and the extended stack frame is bigger than the basic one. Third, the **floating-point ABI** (-mfloat-abi=hard / soft / softfp) interacts with the linker in non-obvious ways.
+
+This page covers all three, plus the per-core FPU variants and the FPSCR control register.
+
+<SpecSheet
+  title="FPU at a glance"
+  specs={[
+    { label: 'FPv4-SP', value: 'Cortex-M4 — single precision, 32 single regs or 16 double regs (but no double-precision instructions)' },
+    { label: 'FPv5-SP', value: 'Cortex-M7 (option), Cortex-M33 — single precision only' },
+    { label: 'FPv5-DP', value: 'Cortex-M7 (option), Cortex-M55, Cortex-M85 — single + double precision' },
+    { label: 'MVE (Helium)', value: 'Cortex-M55, Cortex-M85 — vector ops on FP registers (Q0–Q7 = pairs of D, or sets of S)' },
+    { label: 'Register file', value: '32 × 32-bit = s0..s31, or 16 × 64-bit = d0..d15 (aliased)' },
+    { label: 'Control register', value: 'FPSCR (rounding mode, exception flags, NaN-handling)' },
+    { label: 'Enable register', value: 'CPACR (SCB->CPACR) — must enable CP10 and CP11 before any FP instruction' },
+    { label: 'Lazy stacking', value: 'Default on. FPCCR.LSPEN = 1 means FP regs are stacked only when needed' },
+    { label: 'Extended stack frame', value: '8 basic words + FPSCR + 17 FP words = 26 words total (104 bytes) with FP state' },
+  ]}
+/>
+
+## Per-core FPU summary
+
+| Core | FPU variants available | Notes |
+|---|---|---|
+| Cortex-M0/M0+/M23/M3 | none | Software FP only (libgcc helpers) |
+| Cortex-M4 | FPv4-SP optional | Single-precision only. Parts named "M4F" have FPU; bare "M4" do not |
+| Cortex-M7 | FPv5-SP or FPv5-DP optional | Vendor picks SP-only or DP at synthesis |
+| Cortex-M33 | FPv5-SP optional | Single only — no DP option exists on M33 |
+| Cortex-M55 | FPv5-SP + FPv5-DP, plus MVE | DP and vector are essentially required by use case |
+| Cortex-M85 | FPv5-SP + FPv5-DP, plus optional MVE | DP standard, MVE optional |
+
+If you need double-precision FP, your options are M7, M55, or M85. The M33's single-precision-only FPU is fine for 90% of embedded code (sensor fusion, control loops, audio) but won't help RSA-2048 modular arithmetic or scientific simulation.
+
+## Register file
+
+The FPU has **32 × 32-bit registers**, named `s0..s31`. They can also be viewed as **16 × 64-bit registers** `d0..d15`, where `d0 = {s1, s0}`, `d1 = {s3, s2}`, and so on (little-endian pair packing). On MVE-equipped cores, the same registers regroup as **8 × 128-bit vectors** `Q0..Q7`, where `Q0 = {d1, d0} = {s3, s2, s1, s0}`.
+
+The single register file shared across SP, DP, and vector views is what makes Helium feasible — no extra storage area is needed for the vector unit.
+
+| View | Count | Width | Aliasing |
+|---|---|---|---|
+| s0..s31 | 32 | 32 bits | Even s reg + next odd s reg = d reg |
+| d0..d15 | 16 | 64 bits | Each d = two consecutive s |
+| Q0..Q7 (MVE) | 8 | 128 bits | Each Q = two consecutive d |
+
+## Enabling the FPU — CPACR
+
+The FPU is reset-disabled. Until you set the Coprocessor Access Control Register, any FP instruction faults with `UsageFault.NOCP`. The standard startup sequence (CMSIS calls this from `SystemInit()` on FPU-capable parts):
+
+```c
+#if (__FPU_USED == 1U)
+    /* Grant full access to CP10 and CP11 (the FPU coprocessor slots) */
+    SCB->CPACR |= (3UL << (10*2)) | (3UL << (11*2));
+    __DSB();
+    __ISB();
+#endif
+```
+
+The CPACR field for each coprocessor is 2 bits: 00 = no access (UsageFault), 01 = privileged only, 11 = full access. CP10 and CP11 together are the FPU.
+
+After this, FP instructions execute normally. The `__DSB`/`__ISB` ensures the pipeline picks up the new state before the next instruction.
+
+<Callout type="warn">
+On TrustZone-M parts, there's also `NSACR` — Non-Secure Access Control Register. The secure side must grant the non-secure side access to CP10/CP11 if non-secure code is to use the FPU. Forgotten NSACR is a common cause of "everything works on the secure side, faults instantly on the non-secure side."
+</Callout>
+
+## FPSCR — Floating-Point Status and Control Register
+
+The single control register for the FPU. Equivalent to ARM's VFP FPSCR but with the M-profile-specific bits.
+
+| Bits | Name | Description |
+|---|---|---|
+| 31 | N | Negative flag (last FP compare) |
+| 30 | Z | Zero flag (last FP compare) |
+| 29 | C | Carry flag (last FP compare) |
+| 28 | V | Overflow flag (last FP compare) |
+| 27 | QC | Saturation flag (MVE / DSP) |
+| 26 | AHP | Alternative half-precision format select (FPv5-DP only) |
+| 25 | DN | Default NaN mode (1 = always produce qNaN with sign bit 0) |
+| 24 | FZ | Flush-to-zero mode (1 = denormals are flushed to zero) |
+| 23:22 | RMODE | Rounding mode: 00 = nearest, 01 = up, 10 = down, 11 = zero |
+| 7 | IDC | Input denormal cumulative |
+| 4 | IXC | Inexact cumulative |
+| 3 | UFC | Underflow cumulative |
+| 2 | OFC | Overflow cumulative |
+| 1 | DZC | Divide-by-zero cumulative |
+| 0 | IOC | Invalid operation cumulative |
+
+The cumulative ("sticky") flags accumulate exceptions across operations until software clears them. You can poll `IOC | DZC | OFC | UFC | IXC | IDC` to detect any IEEE exception since the last reset.
+
+```c
+uint32_t fpscr = __get_FPSCR();
+if (fpscr & 0x1F) {
+    /* Some FP exception occurred — log and clear */
+    __set_FPSCR(fpscr & ~0x1F);
+}
+```
+
+**Flush-to-zero (FZ) and Default-NaN (DN)** are the two performance modes. With FZ = 1, denormals (very small numbers below the normal range) are flushed to zero on input and output — gives 4–20× speedup on workloads that touch denormals, at the cost of losing IEEE conformance in the gradual-underflow region. With DN = 1, all NaN outputs are a canonical qNaN, simplifying NaN handling. Most embedded code wants `FZ = 1, DN = 1`; CMSIS doesn't set them by default, do it yourself in startup.
+
+## Lazy stacking — FPCCR
+
+The FPU is large — 32 × 32 = 128 bytes of register state, plus FPSCR. Pushing that on every exception entry would cost ~30 cycles even from zero-wait memory. Lazy stacking avoids this for handlers that don't use the FPU.
+
+The mechanism, gated by `FPCCR.LSPEN`:
+
+1. On exception entry, the core **reserves** 17 × 32-bit slots on the stack for FPU state but **does not write** them. It records the SP location in `FPCAR` (Floating-Point Context Address Register).
+2. The handler runs. If it doesn't touch the FPU, the reserved slots stay uninitialised — saved cycles.
+3. If the handler *does* execute an FP instruction, the core traps that instruction, lazily pushes the 17 FP-state words to the reserved slots, and then retries the instruction.
+4. On exception return, if the slots were lazy-filled, they're popped normally. If they weren't, the core just advances the SP past them.
+
+```
+Normal stack frame on exception (no FP):
++0x00  r0
++0x04  r1
++0x08  r2
++0x0C  r3
++0x10  r12
++0x14  lr
++0x18  pc
++0x1C  xPSR
+
+Extended stack frame with FP state (lazy-filled):
++0x00..0x1C   same as above (basic 8)
++0x20..0x5C   s0..s15 (16 single-precision regs)
++0x60         FPSCR
++0x64         (reserved)
+```
+
+<ProtocolFrame
+  title="FPU extended exception stack frame (26 words, low → high address)"
+  fields={[
+    { name: 'r0', bits: 32, tone: 'accent' },
+    { name: 'r1', bits: 32, tone: 'accent' },
+    { name: 'r2', bits: 32, tone: 'accent' },
+    { name: 'r3', bits: 32, tone: 'accent' },
+    { name: 'r12', bits: 32, tone: 'accent' },
+    { name: 'LR', bits: 32, tone: 'primary' },
+    { name: 'PC', bits: 32, tone: 'primary' },
+    { name: 'xPSR', bits: 32, tone: 'highlight' },
+    { name: 's0..s15 (16 words)', bits: 512, tone: 'warning' },
+    { name: 'FPSCR', bits: 32, tone: 'highlight' },
+    { name: 'Reserved / align', bits: 32, tone: 'muted' },
+  ]}
+  caption="The basic frame (8 words) is always pushed; the FPU section adds s0..s15, FPSCR and an alignment word — 17 extra words. With lazy stacking, the slots are reserved at entry but only filled when the handler actually executes an FP instruction."
+  flexible
+/>
+
+
+`EXC_RETURN` bits tell the unstacking hardware whether the extended frame is present:
+
+| EXC_RETURN value (M3/M4) | Meaning |
+|---|---|
+| 0xFFFFFFF1 | Handler mode, MSP, basic frame |
+| 0xFFFFFFF9 | Thread mode, MSP, basic frame |
+| 0xFFFFFFFD | Thread mode, PSP, basic frame |
+| 0xFFFFFFE1 | Handler mode, MSP, extended frame |
+| 0xFFFFFFE9 | Thread mode, MSP, extended frame |
+| 0xFFFFFFED | Thread mode, PSP, extended frame |
+
+The "extended frame" flag is bit 4 of EXC_RETURN (0 = extended, 1 = basic). On v8-M parts with TrustZone, additional bits indicate secure/non-secure framing.
+
+### Eager vs lazy stacking
+
+`FPCCR.LSPEN = 1` (default) → lazy. `FPCCR.LSPEN = 0` → eager. With eager, the FP state is pushed on every exception entry whether or not the handler uses it. Lazy is almost always the right default — only force eager if you have a hard deadline that can't tolerate the first-FP-use trap latency.
+
+```c
+/* Enable lazy stacking (default — usually no-op) */
+FPU->FPCCR |= FPU_FPCCR_LSPEN_Msk;
+/* Enable auto-state-save (default — saves S0..S15 + FPSCR on entry to FP-using handlers) */
+FPU->FPCCR |= FPU_FPCCR_ASPEN_Msk;
+```
+
+## The floating-point ABI
+
+GCC has three `-mfloat-abi` modes:
+
+- `soft` — no FPU. Float args in r0..r3 like ints. Calls to libgcc helpers (`__aeabi_fadd` etc.) implement IEEE math in software.
+- `softfp` — FPU present, but float args still in r0..r3 (vmov to s0..s7 inside the callee). Binary-compatible with soft-float code.
+- `hard` — FPU present, float args in s0..s15 / d0..d7. Fastest.
+
+For new Cortex-M4F / M7 / M33 / M55 / M85 designs, **always use hard**. The softfp mode exists for binary compatibility with older soft-float libraries; that's rarely a real constraint today.
+
+The catch: every translation unit that calls FP functions must agree on the ABI. Mixing hard and softfp is a link error (the linker checks the `Tag_ABI_VFP_args` attribute in each object). Get this right in your makefile:
+
+```
+CFLAGS += -mcpu=cortex-m4 -mthumb -mfloat-abi=hard -mfpu=fpv4-sp-d16
+```
+
+For an M33 with FPU, use `-mfpu=fpv5-sp-d16`. For M7 with DP, `-mfpu=fpv5-d16`.
+
+## Divide and sqrt — non-pipelined
+
+Most FP ops are 1- to 3-cycle latency, single-issue. Divide and square root are the exceptions: 14 cycles on M4 for `VDIV.F32`, 28 cycles on M7 for `VDIV.F64`. They block the FP pipeline while running — no other FP instruction can issue. They are not pipelined; back-to-back divides take 14+14 cycles, not 14+1.
+
+The implication: if you have hot code with divisions, consider multiplying by reciprocals. For a constant divisor, `1.0f / d` once outside the loop, then multiply inside. The single reciprocal divide pays off after the third iteration.
+
+## Denormal handling
+
+By default (`FPSCR.FZ = 0`), denormals are handled in hardware on M4F and M7. Older silicon may trap on denormals and emulate in software — check the TRM for your part. Setting `FZ = 1` flushes denormals to zero at the cost of gradual underflow accuracy. For audio DSP and control loops, FZ is almost always the right call.
+
+## Cross-references
+
+- [Cortex-M4](/docs/cortex-m/m4) · [M7](/docs/cortex-m/m7) · [M33](/docs/cortex-m/m33) · [M55](/docs/cortex-m/m55) · [M85](/docs/cortex-m/m85)
+- [AAPCS calling conventions](/docs/architecture/aapcs) — how floats travel in registers across calls
+- [SCB](/docs/cortex-m/scb) — CPACR for FPU enable
+- [Exception model](/docs/architecture/exception-model) — extended stack frame
+- [Stack frame inspector](/tools/stack-frame) — decode basic and extended frames
+- ARMv7-M ARM section A6.7 (VFP) and B3.3 (FPU registers)

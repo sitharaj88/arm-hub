@@ -1,0 +1,196 @@
+---
+title: CAN-FD
+description: CAN with Flexible Data-rate — the second-generation CAN protocol with up to 64-byte payloads and accelerated data-phase bit rates. How the bit timing works, the new frame layout, hardware controllers, and what changes for software.
+order: 10
+updated: 2026-05-13
+tags: [peripherals, can, can-fd, automotive, networking]
+---
+
+CAN-FD is the successor to classic CAN. Same physical layer, same arbitration, same two-wire differential bus — but each frame can carry up to **64 bytes** of payload (versus 8) and the data phase can switch to a faster bit-rate after arbitration. In a modern car or industrial controller, CAN-FD is replacing classic CAN one node at a time, and any chip you spec for a new automotive design after about 2020 should expect to talk CAN-FD by default.
+
+This page walks through what's actually different — the frame layout, the bit timing math, the trick of switching bit-rate mid-frame, the controller hardware on modern Cortex-M parts, and the migration questions that matter when you have a mixed classic/FD bus.
+
+<SpecSheet
+  title="CAN-FD at a glance"
+  specs={[
+    { label: 'Standard', value: 'ISO 11898-1:2015 (CAN with Flexible Data-rate)' },
+    { label: 'Payload', value: 'Up to 64 bytes (DLC values 0..15 — see DLC table below)' },
+    { label: 'Arbitration phase bit-rate', value: 'Up to 1 Mbit/s (same as classic CAN)' },
+    { label: 'Data phase bit-rate', value: 'Typically 2–5 Mbit/s; up to 8 Mbit/s with careful PCB and short bus' },
+    { label: 'CRC', value: '17-bit for ≤16 B payload, 21-bit for >16 B (vs 15-bit classic)' },
+    { label: 'Bit-stuffing', value: 'Fixed stuff bits in the CRC field; otherwise dynamic 5-of-the-same like classic' },
+    { label: 'Frame variants', value: 'Standard ID (11-bit), Extended ID (29-bit), BRS, ESI' },
+    { label: 'Backwards compatibility', value: 'Bus level — yes (uses same physical layer). Frame level — no (classic-only nodes raise errors on FD frames)' },
+  ]}
+/>
+
+## What changed vs classic CAN
+
+Three things, each with knock-on effects.
+
+### 1. Longer payload
+
+Classic CAN carries up to 8 bytes per frame. That made sense in 1986 when CAN was designed for car door modules — most messages were a handful of signals. Modern systems push much more data (point clouds from radar, configuration blobs over CAN-OBD, sensor groups in time-synced packets), and 8 bytes forces fragmentation in software. CAN-FD bumps the limit to 64 bytes per frame.
+
+DLC (Data Length Code) is still 4 bits, but the mapping is no longer linear above 8 bytes:
+
+| DLC | Bytes (classic) | Bytes (CAN-FD) |
+|-----|------------------|----------------|
+| 0..8 | 0..8 | 0..8 |
+| 9    | 8 (truncated) | 12 |
+| 10   | 8 | 16 |
+| 11   | 8 | 20 |
+| 12   | 8 | 24 |
+| 13   | 8 | 32 |
+| 14   | 8 | 48 |
+| 15   | 8 | 64 |
+
+Classic CAN ignores DLC > 8 (truncates to 8); CAN-FD treats those values as real lengths. So 12, 16, 20, 24, 32, 48, 64 are the only payload sizes above 8 — there's no "31-byte" CAN-FD frame.
+
+### 2. Bit-rate switching (BRS)
+
+CAN's arbitration is inherently slow — every node must see and react to every bit during the ID phase to know if it lost arbitration. That caps the arbitration bit-rate at roughly 1 Mbit/s on a 40 m bus. But once one node has won arbitration, it's the sole transmitter for the rest of the frame, so it can crank up the bit-rate during the data and CRC fields.
+
+The BRS (Bit-Rate Switch) flag in the frame tells the receivers: after this point, switch to the configured *data-phase* bit-rate. Receivers re-sync, decode the data and CRC at the higher rate, then switch back to the arbitration rate for the ACK slot.
+
+Typical setup: 500 kbit/s arbitration (compatible with classic CAN bus topologies), 2 Mbit/s data — the data phase runs 4× faster, so a 64-byte payload finishes in roughly the same wire time as an 8-byte classic frame.
+
+<Callout type="warn">
+Bit-rate switching only works if every receiver can sync at both rates. A classic-CAN-only node sharing the bus will misinterpret the BRS transition and raise stuff errors. **CAN-FD requires every node to be CAN-FD-capable** — even nodes that never send FD frames must at least tolerate FD frames on the bus (called "CAN-FD tolerant" or "passive-FD"). Older controllers without this support will spam error frames.
+</Callout>
+
+### 3. New CRC and ESI
+
+Classic CAN uses a 15-bit CRC. With 64-byte payloads and faster data rates, the probability of an undetected error rises — so CAN-FD switches to a 17-bit CRC for payloads ≤16 B and 21-bit CRC for larger payloads. The CRC field also has **fixed stuff bits** inserted at known positions to defeat certain pathological bit-flip patterns (a known weakness of classic CAN's dynamic-only stuffing).
+
+ESI (Error State Indicator) is a single bit that tells receivers whether the transmitter is in "error active" or "error passive" mode — i.e., whether it's contributing to fault confinement or has been demoted. Classic CAN inferred this from error frames; CAN-FD makes it explicit.
+
+## Frame layout
+
+A CAN-FD frame, after arbitration (standard ID):
+
+<ProtocolFrame
+  title="CAN-FD data frame (standard 11-bit ID)"
+  fields={[
+    { name: 'SOF',  bits: 1,  tone: 'muted' },
+    { name: 'ID',   bits: 11, tone: 'primary' },
+    { name: 'RRS',  bits: 1,  tone: 'muted' },
+    { name: 'IDE',  bits: 1,  tone: 'muted' },
+    { name: 'FDF',  bits: 1,  tone: 'highlight' },
+    { name: 'res',  bits: 1,  tone: 'muted' },
+    { name: 'BRS',  bits: 1,  tone: 'warning' },
+    { name: 'ESI',  bits: 1,  tone: 'muted' },
+    { name: 'DLC',  bits: 4,  tone: 'accent' },
+    { name: 'DATA', bits: 512, tone: 'highlight', flexible: true },
+    { name: 'CRC',  bits: 21, tone: 'accent' },
+    { name: 'CRC-DEL', bits: 1, tone: 'muted' },
+    { name: 'ACK',  bits: 1,  tone: 'success' },
+    { name: 'ACK-DEL', bits: 1, tone: 'muted' },
+    { name: 'EOF',  bits: 7,  tone: 'muted' },
+  ]}
+  caption="FDF=1 marks this as an FD frame; BRS=1 triggers the bit-rate switch after the BRS bit. DATA is flexible up to 512 bits (64 bytes). CRC widens from 15 bits (classic) to 17 (≤16 B) or 21 bits (>16 B), with fixed stuff bits inserted at known positions."
+/>
+
+Key bits to know:
+
+- **FDF** — Flexible Data Format flag. 0 = classic CAN frame, 1 = CAN-FD frame. This is the unambiguous marker that lets receivers know which protocol applies for the rest of the frame.
+- **BRS** — Bit-Rate Switch. 1 = switch to data-phase rate after this bit; 0 = stay at arbitration rate.
+- **ESI** — Error State Indicator (transmitter's fault-confinement state).
+
+Extended ID (29-bit) frames use the same layout but with a longer ID field, similar to classic CAN. RTR (Remote Transmission Request) doesn't exist in CAN-FD — FD frames are always data frames; if you need a request-response pattern, encode it in the payload.
+
+## Bit timing — the math
+
+Classic CAN bit timing has four segments per bit: SYNC, PROP, PHASE1, PHASE2. The sample point is between PHASE1 and PHASE2; resynchronization shrinks/grows PHASE1 or PHASE2 to absorb clock drift.
+
+CAN-FD has two completely separate bit-timing configurations: one for the arbitration phase, one for the data phase. Each has its own:
+
+- Time quanta per bit (typically 8–25 tq/bit)
+- Prescaler (clock divider)
+- PROP + PHASE1 length
+- PHASE2 length
+- SJW (Synchronization Jump Width)
+
+A typical STM32 FDCAN register dump for 500 kbit/s arbitration / 2 Mbit/s data, with `fdcan_kernel_clk = 80 MHz`:
+
+| Field | Arbitration (NBTP) | Data (DBTP) |
+|-------|---------------------|-------------|
+| Prescaler | 1 | 1 |
+| Time quanta per bit | 160 (80 MHz / 500 kHz) | 40 (80 MHz / 2 MHz) |
+| PROP + PHASE1 | 127 tq | 31 tq |
+| PHASE2 | 32 tq | 8 tq |
+| Sample point | 80% (128/160) | 80% (32/40) |
+| SJW | 32 tq (= PHASE2) | 8 tq |
+
+The 80% sample point is conservative; tighter PCB layouts can push to 87.5% (the classic CAN default).
+
+<Callout type="tip">
+Modern controllers like Bosch M_CAN (used in STM32 FDCAN, NXP MIMXRT, TI TMS570) accept either tq counts or absolute timing values, but you must compute the prescaler such that the resulting tq/bit is in the allowed range (typically 4–385 for arbitration, 4–65 for data). The vendor HALs include calculators; for a from-scratch design, the canonical Excel sheet ships in the Bosch IP datasheet.
+</Callout>
+
+## Transceiver requirements
+
+Classic CAN transceivers (e.g. TI SN65HVD230, NXP TJA1050) max out at 1 Mbit/s and can't drive the bus crisply at 5 Mbit/s. CAN-FD requires a **CAN-FD-capable transceiver** with sub-microsecond loop delays — examples are TJA1042/1043 (1 Mbit data-phase), TJA1462 (8 Mbit data-phase), MCP2562FD, and Microchip ATA6563.
+
+The transceiver's `tLoop` (transmit-to-receive propagation delay) eats into your bit time. At 5 Mbit/s the bit time is 200 ns; a 200-ns loop delay would consume the entire bit. Modern FD-capable transceivers spec ≤120 ns; for 8 Mbit/s you want ≤80 ns.
+
+Beyond the transceiver, your **bus topology** matters more at higher data rates. A short trunk (≤10 m) with proper 120 Ω termination at each end is fine for 5 Mbit/s; a 40 m bus full of stubs that worked at 500 kbit/s classic will not work at 2 Mbit/s FD. Run the bus through a CAN bus analyzer (Vector CANalyzer, Kvaser, PCAN) when bringing up the first FD link.
+
+## Controller hardware on Cortex-M
+
+The dominant CAN-FD IP in Cortex-M SoCs is **Bosch M_CAN**. It exposes a *message-RAM* model: a chunk of RAM (often 2.6 KB or 10 KB) is reserved for the controller, partitioned into:
+
+- **Rx FIFO 0 / Rx FIFO 1** — circular buffers for received messages.
+- **Dedicated Rx buffers** — addressable receive slots for specific IDs.
+- **Tx event FIFO** — completion notifications.
+- **Tx buffers** — slots the software fills for transmission.
+- **Standard / Extended filter lists** — acceptance filter table.
+
+Vendors wrap M_CAN with their own register naming:
+
+| Vendor | Peripheral name | M_CAN version |
+|--------|------------------|---------------|
+| ST (STM32G4/H7/U5) | FDCAN | 3.0.x (some H7 are 3.1) |
+| NXP (S32K3) | FlexCAN3 (FD support added) | NXP IP, not Bosch — different programming model |
+| NXP (i.MX RT11xx) | MCAN | Bosch M_CAN 3.2 |
+| TI (TMS570, AM62x) | DCAN-FD / MCAN | Bosch M_CAN |
+| Renesas RA6/RX | CAN-FD (different IP) | Renesas IP |
+| Microchip SAM E70/V71 | MCAN | Bosch M_CAN 3.0 |
+
+Programming model differences mostly come down to register names and the message-RAM layout. The acceptance filter is more capable in M_CAN than in classic CAN — filters can mask, range-match, set the destination FIFO or buffer, and even reject messages, all without CPU intervention.
+
+## Software changes
+
+Code that was written for classic CAN (`mcp2515`-style drivers, or first-generation STM32 bxCAN) needs three changes for CAN-FD:
+
+1. **Larger payload buffer.** Anywhere you had `uint8_t payload[8]`, that's now `uint8_t payload[64]`. Static allocations grow ~8×; pool sizes need to be re-checked.
+2. **FDF and BRS flags on every transmit.** The driver API gains an "is this an FD frame?" flag and a "BRS?" flag. Mixed buses commonly send classic frames to legacy nodes and FD frames to modernized ones, in the same driver instance.
+3. **Acceptance filter widening.** Filters now also need to match FDF to separate "legacy data frame at this ID" from "FD data frame at this ID" if the bus carries both.
+
+Higher-level protocols layered over CAN — CANopen, J1939, ISO-TP/UDS — all have CAN-FD-aware revisions:
+
+- **CANopen FD** (CiA 1301) — uses 64-byte payloads for PDOs.
+- **J1939-22** — the FD variant of J1939 with multi-frame burst transport.
+- **ISO-TP** with FD (ISO 15765-2:2016) — much faster diagnostics because a 4 KB UDS message fits in ~80 frames instead of ~520.
+
+<Callout type="warn">
+Mixed-bus designs need careful planning. If you have one classic-only node remaining on a bus you want to upgrade to FD, you have two options: (a) replace that node, or (b) keep the entire bus operating in classic-CAN mode (FDF=0 on every frame), foregoing the data-rate boost. There is no "FD frames only on selected IDs" mode that hides FD frames from a classic receiver.
+</Callout>
+
+## Migration patterns
+
+Real-world migrations from classic to FD usually follow one of three patterns:
+
+**Full upgrade** — every node replaced or firmware-updated to FD support. Cleanest but logistically expensive in a vehicle program. The bus topology may need rework to handle higher data rates.
+
+**Gateway** — a CAN-FD-aware gateway node bridges an FD trunk to one or more classic-CAN branches. Heavy CAN traffic (ADAS, body controller) lives on the FD trunk; legacy ECUs stay on classic branches. Common in automotive today.
+
+**Phased migration** — bus stays classic-CAN-speed temporarily while new nodes are introduced (all FD-tolerant); switched to FD-mode bus-wide after the last classic node is replaced. Requires coordinated rollout but avoids gateway complexity.
+
+## Cross-references
+
+- [CAN (classic)](/docs/peripherals/can) — the predecessor protocol, still in widespread use
+- [Automotive ECU](/docs/systems/automotive-ecu) — system-level context for CAN-FD in vehicles
+- [AUTOSAR stack](/docs/systems/autosar) — software architecture for CAN-FD in production ECUs
+- ISO 11898-1:2015 — the CAN-FD specification
+- Bosch M_CAN User's Manual — the dominant controller IP

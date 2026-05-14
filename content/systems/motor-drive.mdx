@@ -1,0 +1,235 @@
+---
+title: Industrial motor drive (FOC, 3-phase BLDC/PMSM)
+description: Inside a 1–50 kW industrial servo drive — Cortex-M4F or M7, FOC at 20 kHz, current-sense ADC synced to inverter PWM, encoder feedback, CANopen/EtherCAT.
+order: 7
+updated: 2026-05-12
+tags: [systems, motor, foc, cortex-m4, stm32g4, industrial]
+---
+
+
+A modern industrial servo drive — for a robot joint, a CNC spindle, a packaging-machine axis — runs **field-oriented control** (FOC) on a Cortex-M, sampling motor currents at the precise instant the PWM is at midpoint, mixing the αβ-to-dq transforms, running two cascaded PI loops, and updating PWM duty cycles **all within 50 µs every iteration**. The MCU has been built specifically for this since the STM32F3 generation; it's where ARM Cortex-M flexes.
+
+## At a glance
+
+<SpecSheet specs={[
+  { label: 'Product class', value: 'Industrial servo / VFD for 3-phase PMSM or BLDC' },
+  { label: 'Power range', value: '100 W to 50 kW typical' },
+  { label: 'MCU', value: 'STM32G474 (Cortex-M4F @ 170 MHz) — the FOC workhorse' },
+  { label: 'Higher-end', value: 'STM32H723 (M7 @ 550 MHz) for multi-axis or high-res' },
+  { label: 'Architecture', value: 'ARMv7E-M · FPU · DSP', link: '/docs/cortex-m/m4/' },
+  { label: 'Control loop', value: '16–32 kHz current loop, 4 kHz velocity, 1 kHz position' },
+  { label: 'Feedback', value: 'Incremental encoder (A/B/Z), absolute encoder (BiSS/EnDat), resolver' },
+  { label: 'Switching freq', value: '8–32 kHz centre-aligned PWM' },
+  { label: 'Comms', value: 'CANopen, EtherCAT (slave), Modbus RTU/TCP, optional PROFINET' },
+  { label: 'Safety', value: 'STO (Safe Torque Off) IEC 61800-5-2 SIL-3, sometimes SBC/SS1/SS2' },
+  { label: 'RTOS', value: 'Bare-metal or FreeRTOS — ISRs do the heavy lifting' },
+]} />
+
+## Field-Oriented Control in 90 seconds
+
+A PMSM (Permanent Magnet Synchronous Motor) is most efficient when you apply current **90° ahead of the rotor's magnetic axis**. Doing that requires knowing where the rotor *is* and applying a precise current at the right phase.
+
+```
+         3-phase currents iA, iB, iC (measured)
+                       │
+                       ▼
+         ┌─────────────────────────┐
+         │ Clarke transform        │   iA, iB, iC → iα, iβ   (3→2)
+         └─────────────┬───────────┘
+                       ▼
+         ┌─────────────────────────┐
+         │ Park transform          │   iα, iβ, θ → id, iq   (rotating frame)
+         └─────────────┬───────────┘
+                       ▼
+         ┌─────────────────────────┐
+         │ PI controller d-axis    │   id_ref - id  → ud
+         │ PI controller q-axis    │   iq_ref - iq  → uq
+         └─────────────┬───────────┘
+                       ▼
+         ┌─────────────────────────┐
+         │ Inverse Park            │   ud, uq, θ → uα, uβ
+         └─────────────┬───────────┘
+                       ▼
+         ┌─────────────────────────┐
+         │ Space-vector PWM        │   uα, uβ → 3× PWM duties → IGBT/MOSFETs
+         └─────────────────────────┘
+```
+
+Every one of these blocks is ~10–30 multiplies. Total per iteration: ~150 floating-point ops. At 16 kHz iteration rate, that's 2.4 Mflops of motor control — comfortable on a Cortex-M4F at 170 MHz, easy on a Cortex-M7 at 480 MHz.
+
+The cascaded position-velocity-current loop structure:
+
+```
+position_setpoint → [P controller] → velocity_setpoint
+                                        │
+                          velocity ←────┤
+                                        ▼
+                                    [PI controller] → iq_setpoint
+                                                          │
+                                            iq, id ←──────┤
+                                                          ▼
+                                                      FOC inner loop
+                                                          │
+                                                          ▼
+                                                       3× PWM
+```
+
+Outer loops run slower (4 kHz velocity, 1 kHz position) because mechanical dynamics are slower than electrical.
+
+## Block diagram
+
+<BlockDiagram
+  title="Servo drive — FOC control loop and power stage"
+  width={860}
+  height={560}
+  minWidth={760}
+  nodes={[
+    { id: 'host',    x: 40,  y: 50,  w: 220, h: 64, kind: 'cloud',    label: 'PLC / motion controller', detail: 'EtherCAT or CANopen' },
+    { id: 'fieldbus',x: 40,  y: 150, w: 220, h: 64, kind: 'periph',   label: 'Fieldbus interfaces', detail: 'EtherCAT ESC · FDCAN-FD' },
+    { id: 'mcu',     x: 320, y: 64,  w: 240, h: 76, kind: 'core',     label: 'Cortex-M4F control MCU', detail: '170 MHz · FPU · DSP' },
+    { id: 'hot',     x: 320, y: 178, w: 240, h: 56, kind: 'memory',   label: 'Hot-path resources', detail: 'CCM RAM · CORDIC · FMAC' },
+    { id: 'pwm',     x: 320, y: 272, w: 240, h: 64, kind: 'periph',   label: 'HRTIM / TIM1 PWM', detail: '16 kHz · dead-time · break' },
+    { id: 'sto',     x: 320, y: 374, w: 240, h: 56, kind: 'security', label: 'STO hardware lines', detail: 'safe torque off' },
+    { id: 'sense',   x: 620, y: 64,  w: 200, h: 76, kind: 'sensor',   label: 'Current + position sense', detail: 'shunts · op-amps · ADC · encoder' },
+    { id: 'gate',    x: 620, y: 206, w: 200, h: 64, kind: 'power',    label: 'Isolated gate drivers', detail: '6× half-bridge outputs' },
+    { id: 'inv',     x: 620, y: 314, w: 200, h: 64, kind: 'power',    label: '3-phase inverter', detail: 'SiC/IGBT · 50 A' },
+    { id: 'motor',   x: 620, y: 428, w: 200, h: 56, kind: 'external', label: 'PMSM motor', detail: 'phase currents + encoder' },
+    { id: 'mains',   x: 40,  y: 286, w: 220, h: 56, kind: 'power',    label: 'AC mains', detail: '400 V 3-phase' },
+    { id: 'pre',     x: 40,  y: 374, w: 220, h: 56, kind: 'power',    label: 'Pre-charge', detail: 'resistor + relay' },
+    { id: 'dclink',  x: 40,  y: 462, w: 220, h: 56, kind: 'power',    label: 'DC-link bus', detail: '400 V rectified' },
+  ]}
+  edges={[
+    { from: 'host',     to: 'fieldbus' },
+    { from: 'fieldbus', to: 'mcu',    label: 'SPI / CANopen', tone: 'success', arrow: 'both' },
+    { from: 'mcu',      to: 'hot',    label: 'FOC ISR' },
+    { from: 'mcu',      to: 'pwm',    label: 'CCR updates', tone: 'primary' },
+    { from: 'pwm',      to: 'gate',   label: '6× PWM', tone: 'primary' },
+    { from: 'gate',     to: 'inv',    tone: 'primary' },
+    { from: 'inv',      to: 'motor',  label: '3-phase', tone: 'warning' },
+    { from: 'motor',    to: 'sense',  label: 'feedback', tone: 'accent' },
+    { from: 'sense',    to: 'mcu',    label: 'ADC EOC IRQ', tone: 'accent' },
+    { from: 'sto',      to: 'gate',   label: 'STO', tone: 'destructive', style: 'dashed' },
+    { from: 'mains',    to: 'pre',    tone: 'warning' },
+    { from: 'pre',      to: 'dclink', tone: 'warning' },
+  ]}
+  caption="The control loop closes left → right → left: PWM duties drive the inverter; shunts sample current at PWM midpoint; ADC EOC fires the FOC ISR which runs Clarke → Park → PI → SVPWM in ~35 µs and writes new duties. STO is a hardware-only safety override."
+/>
+
+## Current sensing — the timing-critical part
+
+The 3-phase currents are measured with shunt resistors in the inverter's low-side legs. To get accurate readings you must **sample at PWM midpoint** — the only moment when all three low-side MOSFETs are conducting and the shunt currents represent phase current cleanly.
+
+```
+   PWM (centre-aligned):
+       ▲▲▲                  ▲▲▲                  ▲▲▲
+   ___╱   ╲_______________╱   ╲_______________╱   ╲___
+      
+   ADC trigger ↑ here       ↑ here              ↑ here
+   (PWM midpoint = ARR/2 of the timer counter)
+```
+
+The peripheral arrangement: **TIM1 / HRTIM generates the centre-aligned PWM**, **TRGO at compare match** triggers the **ADC**, **ADC sequence** samples 3 shunts (plus DC link voltage and temperature), **EOC interrupt** fires the FOC ISR which reads the 5 values out of the ADC regular sequence.
+
+```c
+// FOC ISR — fires at every PWM peak, ~62 µs at 16 kHz
+__attribute__((section(".ccmram.text")))  // place in CCM RAM for determinism
+void TIM1_UP_IRQHandler(void) {
+    // ~ 2 cycles to enter, registers stacked
+    TIM1->SR = 0;  // clear
+
+    // Read 3 ADC channels (already converted by hardware)
+    int16_t ia = ADC1->DR;   // phase A current
+    int16_t ib = ADC2->DR;   // phase B current
+    int16_t ic = ADC3->DR;   // phase C current (or compute: -iA-iB)
+
+    // Read encoder for theta
+    uint16_t theta_raw = TIM2->CNT;
+    float theta = theta_raw * THETA_SCALE;
+
+    // Clarke + Park
+    float ialpha = (2*ia - ib - ic) * (1.0f/3.0f);
+    float ibeta  = (ib - ic) * INV_SQRT3;
+    float c = __builtin_arm_cordic_cos(theta);
+    float s = __builtin_arm_cordic_sin(theta);
+    float id =  c*ialpha + s*ibeta;
+    float iq = -s*ialpha + c*ibeta;
+
+    // PI controllers
+    float ud = pi_d_update(id_ref - id);
+    float uq = pi_q_update(iq_ref - iq);
+
+    // Inverse Park
+    float ualpha = c*ud - s*uq;
+    float ubeta  = s*ud + c*uq;
+
+    // Space-vector modulation → 3 PWM duties
+    svpwm(ualpha, ubeta, &TIM1->CCR1, &TIM1->CCR2, &TIM1->CCR3);
+
+    // Done — total ≈ 35 µs out of 62 µs budget
+}
+```
+
+On the G4 / G474 the **CORDIC** is a hardware coprocessor that does sin/cos in ~20 cycles instead of 100+ via a Taylor expansion. The **FMAC** does block filter operations. Both fed via DMA-coupled mailboxes for absolute-best timing.
+
+## Safe Torque Off (STO)
+
+In any drive sold for industrial use, **STO** (Safe Torque Off) is mandatory. It's a hardware input — when asserted, **the gate drivers are unconditionally disabled in hardware**, regardless of firmware state. The motor coasts to a stop.
+
+```
+   ┌─────────┐         ┌──────────────┐
+   │ Safety  │── STO+ ─▶│ Gate driver │── PWM_A_HI ─▶ MOSFET
+   │ relay   │── STO- ─▶│ enable_pin   │
+   └─────────┘         └──────────────┘
+
+   When STO is open (de-energised):
+     - Gate driver outputs are forced LOW (off)
+     - Firmware cannot turn the MOSFETs on no matter what it tries
+```
+
+This is **separate from any software safety**. It's two redundant hardware inputs that physically gate the gate driver supplies. SIL-3 compliance requires this.
+
+## Communication: CANopen and EtherCAT
+
+The drive is one node on a fieldbus. The two most common protocols:
+
+**CANopen** (over CAN-FD): older, widely supported, ~1 ms cycle time.
+- PDOs (Process Data Objects) carry the real-time data: position commands, status.
+- SDOs (Service Data Objects) carry configuration: PI gains, motor parameters.
+- Synchronization via SYNC message.
+
+**EtherCAT**: modern, 100 Mbps Ethernet variant with hard 32 µs cycle times across hundreds of axes.
+- Distributed Clocks for synchronized motion across axes.
+- Each axis is a "slave" with an ESC (EtherCAT Slave Controller) ASIC alongside the MCU.
+- Drives sit on a single-cable daisy-chain.
+
+For modern multi-axis machines (robotics, CNC), EtherCAT has largely won. Each drive has an additional ESC chip (Beckhoff ET1100, Microchip LAN9252) that handles the Ethernet/EtherCAT side and presents a memory-mapped DPRAM to the Cortex-M for shared data.
+
+## Real products
+
+| Product | MCU | Notes |
+|---|---|---|
+| **Trinamic TMC4671** | Hardwired FOC core + Cortex-M | "FOC on a chip" — most of the math in hardware |
+| **TI DRV8x / TIDM-1** | Cortex-M4 (often ext'l) | Reference servo drive designs |
+| **STM32 motor control kit (NUCLEO + STSPIN)** | STM32G4 + STSPIN power stage | The de facto eval platform |
+| **ODrive Robotics ODrive 3.6 / S1** | STM32F405 (older) / STM32F722 | Open-source, popular in robotics |
+| **Klipper (3D printer)** | STM32F407 / RP2040 driving TMC2209 | Lower-end, but same principles |
+| **Beckhoff AX5000 servo** | Vendor + EtherCAT ESC | Industrial machine-tool standard |
+| **ABB MicroFlex e190** | Cortex-M class | Industrial servo, EtherCAT/POWERLINK |
+
+For learning, **ODrive** is exceptional — schematics + firmware + tuning guide all open source, runs FOC on hardware you can buy for ~$200.
+
+## What's hard about this
+
+- **Tuning** — the PI gains for current and velocity loops depend on motor inductance, back-EMF constant, inertia, and load. Auto-tuning algorithms exist but production-grade tuning is still half-art.
+- **EMC** — switching 50 A at 20 kHz radiates *a lot*. Layout, snubbers, gate driver slew rate all matter. Many drive designs spend more time in EMC chambers than in writing firmware.
+- **Sensor faults** — encoder failures, current-sensor offset drift, hall-sensor glitches must all be detected and handled without commanding torque excursions.
+- **Cogging compensation** — to get smooth motion at low speed, firmware compensates for motor cogging torque via a feed-forward table.
+
+## See also
+
+- [Cortex-M4](/docs/cortex-m/m4/) — the dominant servo MCU.
+- [Timers & PWM](/docs/peripherals/timers/) — centre-aligned PWM, advanced timer.
+- [ADC / DAC](/docs/peripherals/adc/) — synchronized current sensing.
+- [CAN](/docs/peripherals/can/) — for CANopen.
+- [STM32 family](/docs/vendors/stm32/) — STM32G4 is built for this.
+- [ODrive GitHub](https://github.com/odriverobotics/ODrive) (external) — open-source servo drive.
