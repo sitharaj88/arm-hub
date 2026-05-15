@@ -75,9 +75,16 @@ export function ProtocolFrame({
   const computedBitW = bitW ?? Math.max(6, (targetWidth - 32) / totalDisp);
   const totalW = totalDisp * computedBitW + 32;
   const rowH = 56;
-  const padT = title ? 30 : 8;
-  const padB = 26;
+  // padT: 14 px above the rects for the total-bits header so it doesn't kiss the boxes.
+  const padT = title ? 38 : 12;
+  const padB = 28;
   const H = padT + rowH + padB;
+
+  // Approximate text width per character at our chosen 11 px monospace font.
+  // ~6.6 px/char is a safe over-estimate that prevents tight-fitting labels.
+  const FONT_PX = 11;
+  const CHAR_W = 6.6;
+  const measure = (s: string) => s.length * CHAR_W;
 
   return (
     <figure className="not-prose my-8 overflow-hidden rounded-lg border bg-card">
@@ -92,11 +99,30 @@ export function ProtocolFrame({
           role="img"
           aria-label={title ?? 'Protocol frame'}
         >
+          {/* Per-field clip paths so a long label never spills into a neighbour. */}
+          <defs>
+            {fields.map((_, i) => {
+              const xStart = 16 + dispBits.slice(0, i).reduce((a, b) => a + b, 0) * computedBitW;
+              const w = dispBits[i] * computedBitW;
+              return (
+                <clipPath key={i} id={`pf-clip-${i}`}>
+                  <rect x={xStart} y={padT} width={w} height={rowH} />
+                </clipPath>
+              );
+            })}
+          </defs>
+
           {fields.map((f, i) => {
             const xStart = 16 + dispBits.slice(0, i).reduce((a, b) => a + b, 0) * computedBitW;
             const w = dispBits[i] * computedBitW;
             const tone = f.tone ?? 'primary';
-            const showName = w > 28;
+            // Show the full name only when the rect is genuinely wide enough.
+            // 6 px padding on each side keeps the text from kissing the border.
+            const labelW = measure(f.name);
+            const showFullName = w >= labelW + 12;
+            // For medium-narrow rects, fall back to a short label (just the bit count).
+            // Below 20 px we hide everything and rely on the <title> tooltip.
+            const showShortLabel = !showFullName && w >= 20;
             return (
               <g key={i} transform={`translate(${xStart}, ${padT})`}>
                 <rect
@@ -105,34 +131,47 @@ export function ProtocolFrame({
                   className={cn(toneFills[tone])}
                   strokeWidth="1.5"
                 />
-                {showName && (
+                {showFullName && (
                   <text
                     x={w / 2}
                     y={rowH / 2 + 4}
                     textAnchor="middle"
-                    className={cn('font-mono text-[11px] font-semibold', toneText[tone])}
+                    clipPath={`url(#pf-clip-${i})`}
+                    className={cn('font-mono font-semibold', toneText[tone])}
+                    style={{ fontSize: `${FONT_PX}px` }}
                   >
                     {f.name}
                   </text>
                 )}
+                {showShortLabel && (
+                  <text
+                    x={w / 2}
+                    y={rowH / 2 + 4}
+                    textAnchor="middle"
+                    className={cn('font-mono font-semibold', toneText[tone])}
+                    style={{ fontSize: `${FONT_PX}px` }}
+                  >
+                    {f.bits}
+                  </text>
+                )}
                 <text
                   x={w / 2}
-                  y={rowH + 16}
+                  y={rowH + 18}
                   textAnchor="middle"
                   className="fill-muted-foreground font-mono text-[10px]"
                 >
                   {f.flexible && f.bits > 24 ? `${f.bits} bits` : `${f.bits}`}
                 </text>
-                {!showName && (
+                {(!showFullName || w < labelW + 12) && (
                   <title>{f.name}: {f.bits} bits</title>
                 )}
               </g>
             );
           })}
-          {/* Top tick label for total */}
+          {/* Top header label — sits 14 px above the rects so they don't touch. */}
           <text
             x={totalW / 2}
-            y={padT - 8}
+            y={padT - 14}
             textAnchor="middle"
             className="fill-muted-foreground font-mono text-[10px] uppercase tracking-wider"
           >
