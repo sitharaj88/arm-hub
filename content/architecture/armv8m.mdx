@@ -49,14 +49,17 @@ Cortex-M23 looks superficially like a Cortex-M0+ with TrustZone. The key Baselin
 
 Cortex-M33 (and its descendants) has everything v7-M had, plus the v8 additions. The biggest non-security improvements you'll touch in everyday code are the new MPU layout (next section) and the stack-pointer limit registers.
 
-<StateDiagram title="v8-M Secure / Non-secure state transitions" width={760} height={260} states={[
-  { id: 's',    label: 'Secure', x: 60,  y: 90, w: 200, h: 80, tone: 'success', initial: true },
-  { id: 'ns',   label: 'Non-secure', x: 500, y: 90, w: 200, h: 80, tone: 'accent' },
-  { id: 'fault', label: 'SecureFault', x: 280, y: 30, w: 200, h: 60, tone: 'destructive' },
+<StateDiagram title="v8-M Secure / Non-secure state transitions" width={760} height={320} states={[
+  { id: 's',    label: 'Secure', x: 60,  y: 160, w: 160, h: 80, tone: 'success', initial: true },
+  { id: 'nsc',  label: 'NSC (Veneer)', x: 300, y: 160, w: 160, h: 80, tone: 'warning' },
+  { id: 'ns',   label: 'Non-secure', x: 540, y: 160, w: 160, h: 80, tone: 'accent' },
+  { id: 'fault', label: 'SecureFault', x: 300, y: 40, w: 160, h: 60, tone: 'destructive' },
 ]} transitions={[
-  { from: 's', to: 'ns', label: 'BLXNS / BXNS' },
-  { from: 'ns', to: 's', label: 'SG at NSC entry', curve: -50 },
-  { from: 'ns', to: 'fault', label: 'NS branch into S', curve: 40 },
+  { from: 's', to: 'ns', label: 'BLXNS / BXNS', curve: 60 },
+  { from: 'ns', to: 'nsc', label: 'BL (NSC entry)', curve: -20 },
+  { from: 'nsc', to: 's', label: 'SG executes', curve: -20 },
+  { from: 'ns', to: 'fault', label: 'Direct branch to S', curve: -40 },
+  { from: 'nsc', to: 'fault', label: 'Non-SG instruction', curve: -20 },
   { from: 'fault', to: 's', label: 'fault handler' },
 ]} caption="An NS thread can only enter Secure state through an SG instruction placed in a Non-Secure-Callable region; any other crossing raises a SecureFault. The reverse (Secure to NS) goes through BLXNS / BXNS." />
 

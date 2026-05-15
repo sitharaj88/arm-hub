@@ -56,14 +56,14 @@ Other APs you'll encounter:
 
 The DAP's CSW (Control/Status Word) register configures the access size (byte/halfword/word) and auto-increment behavior for the AHB-AP. Setting CSW correctly is the difference between "single-word reads" (slow but always works) and "auto-incrementing burst reads" (fast, for dumping RAM). Most probes auto-tune this.
 
-<BlockDiagram title="Probe to core debug interface" width={780} height={220} nodes={[
+<BlockDiagram title="Probe to core debug interface" width={880} height={220} nodes={[
   { id: 'probe', x: 20,  y: 80, w: 140, h: 60, kind: 'external', label: 'Probe', detail: 'J-Link / DAPLink' },
-  { id: 'swj',   x: 180, y: 80, w: 120, h: 60, kind: 'io',       label: 'SWJ-DP', detail: 'SWD/JTAG mux' },
-  { id: 'dap',   x: 320, y: 80, w: 120, h: 60, kind: 'security', label: 'DAP / DP', detail: 'CTRL/STAT, SELECT' },
-  { id: 'ahb',   x: 460, y: 30, w: 130, h: 60, kind: 'security', label: 'AHB-AP', detail: 'memory access' },
-  { id: 'apb',   x: 460, y: 130, w: 130, h: 60, kind: 'security', label: 'APB-AP', detail: 'debug peripherals' },
-  { id: 'core',  x: 620, y: 30, w: 140, h: 60, kind: 'core',     label: 'Core debug', detail: 'DHCSR, DCRSR' },
-  { id: 'fpb',   x: 620, y: 130, w: 140, h: 60, kind: 'periph',  label: 'FPB / DWT / ITM', detail: 'breakpoints, trace' },
+  { id: 'swj',   x: 180, y: 80, w: 140, h: 60, kind: 'io',       label: 'SWJ-DP', detail: 'SWD/JTAG mux' },
+  { id: 'dap',   x: 340, y: 80, w: 140, h: 60, kind: 'security', label: 'DAP / DP', detail: 'CTRL/STAT\\nSELECT' },
+  { id: 'ahb',   x: 500, y: 30, w: 160, h: 60, kind: 'security', label: 'AHB-AP', detail: 'memory access' },
+  { id: 'apb',   x: 500, y: 130, w: 160, h: 60, kind: 'security', label: 'APB-AP', detail: 'debug peripherals' },
+  { id: 'core',  x: 680, y: 30, w: 170, h: 60, kind: 'core',     label: 'Core debug', detail: 'DHCSR, DCRSR' },
+  { id: 'fpb',   x: 680, y: 130, w: 170, h: 70, kind: 'periph',  label: 'FPB / DWT / ITM', detail: 'breakpoints\\ntrace' },
 ]} edges={[
   { from: 'probe', to: 'swj', label: 'SWD/JTAG', tone: 'primary' },
   { from: 'swj', to: 'dap', tone: 'primary' },

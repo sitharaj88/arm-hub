@@ -109,18 +109,21 @@ GCC's `-mcmse` flag enables the CMSE (Cortex-M Security Extensions) intrinsics a
 <StateDiagram
   title="Security state transitions on ARMv8-M"
   width={780}
-  height={300}
+  height={340}
   states={[
-    { id: 'ns',  label: 'Non-secure',   x: 60,  y: 120, w: 200, h: 70, tone: 'muted',   initial: true },
-    { id: 'nsc', label: 'NSC veneer (SG)', x: 340, y: 120, w: 180, h: 70, tone: 'warning' },
-    { id: 's',   label: 'Secure',       x: 600, y: 120, w: 160, h: 70, tone: 'primary' },
+    { id: 'ns',  label: 'Non-secure',   x: 60,  y: 160, w: 180, h: 70, tone: 'muted',   initial: true },
+    { id: 'nsc', label: 'NSC veneer (SG)', x: 300, y: 160, w: 180, h: 70, tone: 'warning' },
+    { id: 's',   label: 'Secure',       x: 540, y: 160, w: 180, h: 70, tone: 'primary' },
+    { id: 'fault', label: 'SecureFault', x: 300, y: 40, w: 180, h: 60, tone: 'destructive' },
   ]}
   transitions={[
     { from: 'ns',  to: 'nsc', label: 'BL into NSC region' },
     { from: 'nsc', to: 's',   label: 'SG executes (state switches to S)' },
-    { from: 's',   to: 'ns',  label: 'BXNS / BLXNS (LR bit 0 = 0)', curve: 80 },
-    { from: 'ns',  to: 'ns',  label: 'wrong target → SecureFault', curve: -60 },
+    { from: 's',   to: 'ns',  label: 'BXNS / BLXNS (LR bit 0 = 0)', curve: 60 },
+    { from: 'ns',  to: 'fault',  label: 'Branch direct to S', curve: -40 },
+    { from: 'nsc', to: 'fault',  label: 'Missing/wrong SG', curve: -20 },
     { from: 's',   to: 's',   label: 'normal Secure call', curve: -50 },
+    { from: 'fault', to: 's', label: 'Fault Handler (in S)' },
   ]}
   caption="Non-secure code can only enter Secure through an SG instruction that sits at the very top of an NSC region; any other branch into Secure addresses raises SecureFault. The reverse path uses BXNS/BLXNS where the low bit of the target encodes the destination world."
 />

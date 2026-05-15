@@ -189,10 +189,12 @@ export function StateDiagram({
           {/* Transitions first (under) */}
           {transitions.map((t, i) => {
             const { d, mx, my } = edgePath(t, i);
-            // Pill width: 10 px font monospace is ~6.6 px/char, plus 12 px padding.
-            const CHAR_W = 6.6;
-            const pillW = t.label ? t.label.length * CHAR_W + 14 : 0;
-            const pillH = 18;
+            const lines = t.label ? t.label.split(/\\n|\n/) : [];
+            const maxLen = lines.length > 0 ? Math.max(...lines.map(l => l.length)) : 0;
+            // Pill width: ~6.6 px/char + generous padding.
+            const CHAR_W = 6.8;
+            const pillW = maxLen > 0 ? maxLen * CHAR_W + 20 : 0;
+            const pillH = lines.length > 0 ? lines.length * 12 + 10 : 0;
             return (
               <g key={i}>
                 <path d={d} fill="none" stroke="currentColor" strokeWidth="1.4" className="text-muted-foreground" markerEnd="url(#state-arrow)" />
@@ -203,17 +205,21 @@ export function StateDiagram({
                       y={-pillH / 2}
                       width={pillW}
                       height={pillH}
-                      rx={4}
+                      rx={6}
                       className="fill-background stroke-border"
                       strokeWidth="1"
                     />
                     <text
                       x={0}
-                      y={3}
+                      y={4}
                       textAnchor="middle"
                       className="fill-foreground font-mono text-[10px]"
                     >
-                      {t.label}
+                      {lines.map((line, idx, arr) => (
+                        <tspan key={idx} x={0} dy={idx === 0 ? -(arr.length - 1) * 6 : 12}>
+                          {line}
+                        </tspan>
+                      ))}
                     </text>
                   </g>
                 )}
@@ -244,7 +250,11 @@ export function StateDiagram({
                   textAnchor="middle"
                   className={cn('font-mono text-[12px] font-medium', tone.text)}
                 >
-                  {s.label}
+                  {s.label.split('\n').map((line, idx, arr) => (
+                    <tspan key={idx} x={w / 2} dy={idx === 0 ? -(arr.length - 1) * 8 : 16}>
+                      {line}
+                    </tspan>
+                  ))}
                 </text>
               </g>
             );

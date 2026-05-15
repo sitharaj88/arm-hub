@@ -37,20 +37,19 @@ The "granule" is implementation-defined — typically 8 bytes, sometimes 16, occ
 <StateDiagram
   title="Exclusive monitor lifecycle"
   width={780}
-  height={300}
+  height={320}
   states={[
-    { id: 'open',  label: 'Open',      x: 40,  y: 120, w: 180, h: 64, tone: 'muted',   initial: true },
-    { id: 'excl',  label: 'Exclusive', x: 300, y: 120, w: 180, h: 64, tone: 'primary' },
-    { id: 'clr',   label: 'Cleared',   x: 560, y: 120, w: 180, h: 64, tone: 'warning' },
+    { id: 'open', label: 'Open Access\n(No reservation)', x: 100, y: 120, w: 220, h: 70, tone: 'muted', initial: true },
+    { id: 'excl', label: 'Exclusive Access\n(Reservation active)', x: 460, y: 120, w: 220, h: 70, tone: 'primary' },
   ]}
   transitions={[
-    { from: 'open', to: 'excl', label: 'LDREX (set reservation)' },
-    { from: 'excl', to: 'open', label: 'STREX success (r0=0)', curve: 60 },
-    { from: 'excl', to: 'clr',  label: 'exception / other STREX / external store' },
-    { from: 'clr',  to: 'open', label: 'CLREX or next LDREX', curve: -50 },
-    { from: 'excl', to: 'excl', label: 'STREX fail (r0=1)', curve: -60 },
+    { from: 'open', to: 'excl', label: 'LDREX', curve: -20 },
+    { from: 'excl', to: 'open', label: 'STREX success (r0=0)', curve: -20 },
+    { from: 'excl', to: 'open', label: 'Exception / CLREX /\nExternal Store', curve: 20 },
+    { from: 'open', to: 'open', label: 'STREX (fails, r0=1)', curve: 50 },
+    { from: 'excl', to: 'excl', label: 'LDREX (updates addr)', curve: -50 },
   ]}
-  caption="LDREX moves the monitor into Exclusive; a successful STREX commits and returns to Open. Any context switch, other STREX, or external store to the granule kicks it to Cleared, where the next STREX is guaranteed to fail until a fresh LDREX restarts the cycle."
+  caption="The monitor is a strict two-state machine. LDREX transitions it to Exclusive Access. A matching STREX succeeds and returns to Open. Exceptions, CLREX, or external stores clear the reservation, reverting to Open where any STREX will safely fail."
 />
 
 ```asm

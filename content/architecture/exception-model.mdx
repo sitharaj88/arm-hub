@@ -92,18 +92,22 @@ This entire process is hardware-driven and takes **~12 cycles** on most Cortex-M
 
 <StateDiagram
   title="Thread mode vs Handler mode transitions"
-  width={720}
-  height={220}
+  width={780}
+  height={360}
   states={[
-    { id: 'thread', label: 'Thread mode',  x: 60,  y: 80, w: 200, h: 64, tone: 'muted', initial: true },
-    { id: 'handler', label: 'Handler mode', x: 460, y: 80, w: 200, h: 64, tone: 'primary' },
+    { id: 't_priv', label: 'Privileged Thread\n(MSP or PSP)',  x: 60,  y: 60, w: 220, h: 70, tone: 'muted', initial: true },
+    { id: 't_unpriv', label: 'Unprivileged Thread\n(MSP or PSP)', x: 60, y: 240, w: 220, h: 70, tone: 'accent' },
+    { id: 'handler', label: 'Handler mode\n(Always Privileged, MSP)', x: 480, y: 150, w: 240, h: 70, tone: 'primary' },
   ]}
   transitions={[
-    { from: 'thread', to: 'handler', label: 'exception taken (push frame, LR := EXC_RETURN)' },
-    { from: 'handler', to: 'thread', label: 'BX EXC_RETURN (pop frame)', curve: 60 },
-    { from: 'handler', to: 'handler', label: 'tail-chain / preempt', curve: -50 },
+    { from: 't_priv', to: 't_unpriv', label: 'MSR CONTROL (drop priv)' },
+    { from: 't_priv', to: 'handler', label: 'Exception Entry', curve: -20 },
+    { from: 't_unpriv', to: 'handler', label: 'Exception Entry (e.g. SVC)', curve: 20 },
+    { from: 'handler', to: 't_priv', label: 'BX EXC_RETURN', curve: -20 },
+    { from: 'handler', to: 't_unpriv', label: 'BX EXC_RETURN', curve: 20 },
+    { from: 'handler', to: 'handler', label: 'Tail-chain / Preempt', curve: -50 },
   ]}
-  caption="Reset starts in Thread mode using the MSP. Any exception flips to Handler mode (always MSP); the magic EXC_RETURN in LR encodes which stack and which mode to restore when the handler does its bx lr."
+  caption="Reset starts in Privileged Thread mode. Software can drop to Unprivileged Thread mode by setting CONTROL[0]. Any exception forces the core into Handler mode (which is always Privileged and uses MSP). Returning to Unprivileged mode requires an exception return."
 />
 
 <Callout type="tip" title="Tail-chaining">

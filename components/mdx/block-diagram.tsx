@@ -391,22 +391,30 @@ export function BlockDiagram({
                   />
                   <text
                     x={n.w / 2}
-                    y={n.detail ? n.h / 2 - 2 : n.h / 2 + 4}
+                    y={n.detail ? n.h / 2 - 4 : n.h / 2 + 4}
                     textAnchor="middle"
                     className={cn(s.text, 'font-medium')}
                     style={{ fontSize: 12 }}
                   >
-                    {n.label}
+                    {n.label.split(/\\n|\n/).map((line, idx, arr) => (
+                      <tspan key={idx} x={n.w / 2} dy={idx === 0 ? -(arr.length - 1) * 7 : 14}>
+                        {line}
+                      </tspan>
+                    ))}
                   </text>
                   {n.detail && (
                     <text
                       x={n.w / 2}
-                      y={n.h / 2 + 12}
+                      y={n.h / 2 + 10}
                       textAnchor="middle"
                       className="fill-muted-foreground font-mono"
                       style={{ fontSize: 9.5 }}
                     >
-                      {n.detail}
+                      {n.detail.split(/\\n|\n/).map((line, idx, arr) => (
+                        <tspan key={idx} x={n.w / 2} dy={idx === 0 ? 0 : 12}>
+                          {line}
+                        </tspan>
+                      ))}
                     </text>
                   )}
                 </g>
