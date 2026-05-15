@@ -54,6 +54,25 @@ const toneClasses: Record<Tone, { fill: string; stroke: string; text: string }> 
   muted:       { fill: 'fill-muted',          stroke: 'stroke-muted-foreground/60', text: 'fill-foreground' },
 };
 
+/** Exact intersection of a line from box centre toward target (tx, ty) with the
+ *  rectangle's edge — same math the BlockDiagram now uses, so arrows really do
+ *  land on the box border instead of somewhere inside it. */
+function edgePoint(n: State, tx: number, ty: number): { x: number; y: number } {
+  const w = n.w ?? 130;
+  const h = n.h ?? 56;
+  const cx = n.x + w / 2;
+  const cy = n.y + h / 2;
+  const dx = tx - cx;
+  const dy = ty - cy;
+  if (dx === 0 && dy === 0) return { x: cx, y: cy };
+  const halfW = w / 2;
+  const halfH = h / 2;
+  const sx = dx === 0 ? Infinity : halfW / Math.abs(dx);
+  const sy = dy === 0 ? Infinity : halfH / Math.abs(dy);
+  const s = Math.min(sx, sy);
+  return { x: cx + dx * s, y: cy + dy * s };
+}
+
 export function StateDiagram({
   title,
   states,
@@ -71,43 +90,81 @@ export function StateDiagram({
 }) {
   const lookup = Object.fromEntries(states.map((s) => [s.id, s]));
 
-  // edge curves -> path
-  function edgePath(t: Transition) {
+  // Detect anti-parallel pairs (A→B and B→A) and auto-curve them so they don't
+  // overlap. The first edge curves +28 and the reverse −28 — caller-supplied
+  // `curve` values still win.
+  const autoCurve = new Map<number, number>();
+  transitions.forEach((t, i) => {
+    if (t.curve !== undefined) return;
+    const j = transitions.findIndex(
+      (u, k) => k !== i && u.from === t.to && u.to === t.from && u.curve === undefined,
+    );
+    if (j >= 0 && !autoCurve.has(j) && !autoCurve.has(i)) {
+      autoCurve.set(i, 28);
+      autoCurve.set(j, -28);
+    }
+  });
+
+  function edgePath(t: Transition, idx: number) {
     const a = lookup[t.from];
     const b = lookup[t.to];
     if (!a || !b) return { d: '', mx: 0, my: 0 };
-    const aw = a.w ?? 130; const ah = a.h ?? 56;
-    const bw = b.w ?? 130; const bh = b.h ?? 56;
+
+    // ── Self-loop ───────────────────────────────────────────────────────────
+    if (a.id === b.id) {
+      const aw = a.w ?? 130;
+      const ah = a.h ?? 56;
+      // Loop above the box: out the top-right, arc up and around, back into the top-left.
+      const startX = a.x + aw * 0.7;
+      const startY = a.y;
+      const endX   = a.x + aw * 0.3;
+      const endY   = a.y + 1; // 1 px inside so the arrow head doesn't clip
+      const ctrl1X = a.x + aw * 0.7;
+      const ctrl1Y = a.y - 50;
+      const ctrl2X = a.x + aw * 0.3;
+      const ctrl2Y = a.y - 50;
+      const mx = a.x + aw / 2;
+      const my = a.y - 44;
+      return { d: `M${startX},${startY} C${ctrl1X},${ctrl1Y} ${ctrl2X},${ctrl2Y} ${endX},${endY}`, mx, my };
+    }
+
+    // ── Box-edge intersection on both ends ─────────────────────────────────
+    const aw = a.w ?? 130;
+    const ah = a.h ?? 56;
+    const bw = b.w ?? 130;
+    const bh = b.h ?? 56;
     const ax = a.x + aw / 2;
     const ay = a.y + ah / 2;
     const bx = b.x + bw / 2;
     const by = b.y + bh / 2;
+
+    const curve = t.curve ?? autoCurve.get(idx) ?? 0;
+
+    // Source endpoint aims toward the *visual midpoint* of the curve so we leave
+    // the box in the right direction even when the path bends.
     const dx = bx - ax;
     const dy = by - ay;
     const len = Math.hypot(dx, dy) || 1;
-    const ux = dx / len; const uy = dy / len;
-    // Clip to box edges (simple approximation)
-    const ax2 = ax + ux * Math.min(aw, ah) / 2;
-    const ay2 = ay + uy * Math.min(aw, ah) / 2;
-    const bx2 = bx - ux * Math.min(bw, bh) / 2;
-    const by2 = by - uy * Math.min(bw, bh) / 2;
-    // Self-loop
-    if (a.id === b.id) {
-      const cx = a.x + aw + 16;
-      const cy = a.y + ah / 2;
-      return { d: `M${a.x + aw},${a.y + ah / 2} C${cx + 40},${cy - 40} ${cx + 40},${cy + 40} ${a.x + aw},${a.y + ah / 2 + 6}`, mx: cx + 20, my: cy };
-    }
-    // Curve
-    const curve = t.curve ?? 0;
-    if (curve === 0) {
-      return { d: `M${ax2},${ay2} L${bx2},${by2}`, mx: (ax2 + bx2) / 2, my: (ay2 + by2) / 2 };
-    }
-    // Perpendicular offset for control
+    const ux = dx / len;
+    const uy = dy / len;
+    // Perpendicular for curve offset
     const px = -uy * curve;
     const py = ux * curve;
-    const cx = (ax2 + bx2) / 2 + px;
-    const cy = (ay2 + by2) / 2 + py;
-    return { d: `M${ax2},${ay2} Q${cx},${cy} ${bx2},${by2}`, mx: cx, my: cy };
+    const midX = (ax + bx) / 2 + px;
+    const midY = (ay + by) / 2 + py;
+
+    const start = edgePoint(a, midX, midY);
+    const end   = edgePoint(b, midX, midY);
+
+    if (curve === 0) {
+      return { d: `M${start.x},${start.y} L${end.x},${end.y}`, mx: (start.x + end.x) / 2, my: (start.y + end.y) / 2 };
+    }
+    // Quadratic curve through the offset midpoint
+    return {
+      d: `M${start.x},${start.y} Q${midX},${midY} ${end.x},${end.y}`,
+      mx: midX,
+      my: midY,
+    };
   }
 
   return (
@@ -131,18 +188,22 @@ export function StateDiagram({
 
           {/* Transitions first (under) */}
           {transitions.map((t, i) => {
-            const { d, mx, my } = edgePath(t);
+            const { d, mx, my } = edgePath(t, i);
+            // Pill width: 10 px font monospace is ~6.6 px/char, plus 12 px padding.
+            const CHAR_W = 6.6;
+            const pillW = t.label ? t.label.length * CHAR_W + 14 : 0;
+            const pillH = 18;
             return (
               <g key={i}>
                 <path d={d} fill="none" stroke="currentColor" strokeWidth="1.4" className="text-muted-foreground" markerEnd="url(#state-arrow)" />
                 {t.label && (
-                  <g transform={`translate(${mx}, ${my - 4})`}>
+                  <g transform={`translate(${mx}, ${my})`}>
                     <rect
-                      x={-(t.label.length * 3.4 + 10)}
-                      y={-9}
-                      width={t.label.length * 3.4 * 2 + 20}
-                      height={18}
-                      rx={3}
+                      x={-pillW / 2}
+                      y={-pillH / 2}
+                      width={pillW}
+                      height={pillH}
+                      rx={4}
                       className="fill-background stroke-border"
                       strokeWidth="1"
                     />
