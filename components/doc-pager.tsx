@@ -5,8 +5,17 @@ import type { NavSection } from '@/lib/nav';
 export function DocPager({ section, currentHref }: { section: NavSection; currentHref: string }) {
   const idx = section.links.findIndex((l) => l.href === currentHref);
   if (idx < 0) return null;
-  const prev = idx > 0 ? section.links[idx - 1] : null;
-  const next = idx < section.links.length - 1 ? section.links[idx + 1] : null;
+  const current = section.links[idx];
+
+  // If the current page belongs to a sub-group (e.g. a tutorial sequence), constrain
+  // prev/next to that group so the pager doesn't bleed into unrelated sibling links.
+  const inSameGroup = (other: typeof current) =>
+    current.group ? other.group === current.group : !other.group;
+
+  const prevCand = idx > 0 ? section.links[idx - 1] : null;
+  const nextCand = idx < section.links.length - 1 ? section.links[idx + 1] : null;
+  const prev = prevCand && inSameGroup(prevCand) ? prevCand : null;
+  const next = nextCand && inSameGroup(nextCand) ? nextCand : null;
   if (!prev && !next) return null;
 
   return (

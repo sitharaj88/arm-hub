@@ -26,11 +26,17 @@ export function MobileSectionNav({ section }: { section: NavSection }) {
               <Link
                 href={l.href}
                 className={cn(
-                  'flex min-h-11 items-center justify-between rounded-md px-2 py-2 transition-colors',
+                  'flex min-h-11 items-center justify-between rounded-md py-2 transition-colors',
+                  l.nested ? 'pl-6 pr-2 text-[0.85rem]' : 'px-2',
                   active ? 'bg-accent text-foreground font-medium' : 'text-muted-foreground hover:bg-accent/50 hover:text-foreground',
                 )}
               >
-                <span>{l.title}</span>
+                <span className="flex min-w-0 items-center gap-2">
+                  {l.nested && (
+                    <span aria-hidden className="h-px w-2.5 shrink-0 bg-muted-foreground/40" />
+                  )}
+                  <span className="truncate">{l.title}</span>
+                </span>
                 {l.badge && (
                   <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-[0.6rem] uppercase tracking-wide text-muted-foreground">
                     {l.badge}
