@@ -36,16 +36,38 @@ ARMv6-M's instruction set is almost entirely 16-bit Thumb encodings, with a smal
 
 Everything else — arithmetic, loads, stores, branches — is plain 16-bit Thumb. That gives ARMv6-M extremely good code density (often 30–40% smaller than equivalent ARMv7-M code, paradoxically, because v7-M emits a lot of 32-bit Thumb-2 mid-function).
 
-<ProtocolFrame title="Thumb 16-bit encoding families (top 6 bits)" fields={[
-  { name: '000xxx — shift / mov imm', bits: 3, tone: 'primary' },
-  { name: '001xxx — ADD/SUB/CMP/MOV imm8', bits: 3, tone: 'accent' },
-  { name: '0100xx — data-proc + special', bits: 3, tone: 'highlight' },
-  { name: '0101xx / 011 / 100 — load/store', bits: 3, tone: 'success' },
-  { name: '1010xx — ADR / ADD SP', bits: 3, tone: 'warning' },
-  { name: '1011xx — misc + push/pop', bits: 3, tone: 'muted' },
-  { name: '1101xx — Bcond / SVC', bits: 3, tone: 'destructive' },
-  { name: '11100x — B imm11', bits: 3, tone: 'primary' },
-]} caption="ARMv6-M's 16-bit Thumb opcodes split into eight major families decoded from the top three bits; the remaining 13 bits encode operands. Code density comes from never spending bits on a feature that isn't there (no IT, no LDREX, no divide)." />
+<ProtocolFrame
+  title="16-bit Thumb instruction — top-level decode"
+  fields={[
+    { name: 'opcode group [15:10]', bits: 6, tone: 'primary' },
+    { name: 'operand bits [9:0]', bits: 10, tone: 'accent' },
+  ]}
+  caption="Every 16-bit Thumb instruction is decoded primarily on bits [15:10] (the opcode group) — the remaining 10 bits hold registers and immediates. ARMv6-M Architecture Reference Manual, Table A5.1."
+/>
+
+The opcode-group field selects one of fourteen major families. The table below lists each family with its exact bit pattern (`x` = don't-care); within a family, finer sub-decoders use lower-order bits to pick the specific instruction.
+
+| Bits [15:10] | Family | Examples |
+|---|---|---|
+| `00 00xx` | Shift (immediate) | `LSL`, `LSR`, `ASR` |
+| `00 0110` / `00 0111` | Add / subtract (register, immediate) | `ADD Rd,Rn,Rm` · `SUB Rd,Rn,#imm3` |
+| `00 1xxx` | Add / subtract / compare / move (8-bit immediate) | `MOV Rd,#imm8` · `CMP Rn,#imm8` |
+| `01 0000` | Data-processing register | `AND`, `ORR`, `EOR`, `MUL` |
+| `01 0001` | Special data + branch-exchange | `MOV Rd,Rm` (any reg) · `BX Rm` · `BLX Rm` |
+| `01 001x` | Load from literal pool | `LDR Rt,[PC,#imm]` |
+| `01 01xx` | Load/store register offset | `STR Rt,[Rn,Rm]` · `LDRH`, `STRB` … |
+| `01 1xxx` | Load/store word/byte (5-bit immediate) | `LDR Rt,[Rn,#imm5]` · `STR Rt,[Rn,#imm5]` |
+| `10 00xx` | Load/store halfword (immediate) | `LDRH Rt,[Rn,#imm5]` · `STRH` |
+| `10 01xx` | Load/store SP-relative | `LDR Rt,[SP,#imm8]` · `STR Rt,[SP,#imm8]` |
+| `10 100x` | `ADR` (PC-relative address) | `ADR Rd,label` |
+| `10 101x` | `ADD SP, #imm8` | `ADD Rd,SP,#imm8` |
+| `10 11xx` | Miscellaneous 16-bit | `PUSH`, `POP`, `CPS`, `BKPT`, `REV`, `SXTH`/`SXTB` |
+| `11 00xx` | Load/store multiple | `LDMIA Rn!,{regs}` · `STMIA Rn!,{regs}` |
+| `11 01xx` | Conditional branch + SVC | `Bcond label` (`1101 cond`) · `SVC #imm8` (`11011111`) |
+| `11 100x` | Unconditional branch | `B label` (11-bit signed offset) |
+| `11 101x` – `11 111x` | 32-bit Thumb-2 (v6-M subset) | `BL`, `MSR`, `MRS`, `ISB`, `DSB`, `DMB` |
+
+Code density comes from never spending bits on a feature that isn't there: no IT-block prefix, no LDREX/STREX exclusive monitors, no integer divide, no DSP saturating math. Each freed slot in the opcode space is reused for shorter, denser everyday instructions.
 
 | Feature | ARMv6-M | ARMv7-M | Why removed |
 |---------|---------|---------|-------------|
