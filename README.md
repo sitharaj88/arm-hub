@@ -25,7 +25,7 @@ Written by a firmware engineer for firmware engineers. No marketing. No hand-wav
 
 ## What's inside
 
-**191 deep technical pages · 330,000+ words · 10 sections · 7 interactive tools · 15 visualization components · 2 hands-on tutorial series (22 lessons)**
+**223 deep technical pages · 410,000+ words · 10 sections · 7 interactive tools · 15 visualization components · 4 hands-on tutorial tracks (52 lessons)**
 
 ### Reference sections
 
@@ -37,7 +37,7 @@ Written by a firmware engineer for firmware engineers. No marketing. No hand-wav
 | **Cortex-R** | 8 | ISA compare, lockstep & ASIL, MPU + TCM, vectored interrupts, ECC, safety standards (ISO 26262 / IEC 61508), R52 cluster mode |
 | **Peripherals** | 19 | GPIO, UART, LIN/ISO7816, SPI, QSPI/OSPI, I²C, SMBus, CAN, CAN-FD, DMA (basic + advanced), timers + advanced control timers, ADC/DAC, USB device + host, Ethernet MAC, SDMMC |
 | **Systems** | 16 | Wi-Fi router, smartwatch, drone flight controller (+ IMU & ESC deep-dives), EV charger (+ power stage), smart thermostat, automotive ECU + AUTOSAR, motor drive + FOC, IoT sensor node, medical wearable, industrial gateway |
-| **Programming** | 23 | Embedded C patterns, volatile & MMIO, CMSIS, CMSIS-DSP, linker scripts, startup & vector table, C++ on Cortex-M, Rust on Cortex-M, inline assembly, bare-metal libc, bootloaders & DFU, OTA — **plus a 10-lesson hands-on C tutorial** |
+| **Programming** | 55 | Embedded C patterns, volatile & MMIO, CMSIS, CMSIS-DSP, linker scripts, startup & vector table, C++ on Cortex-M, Rust on Cortex-M, inline assembly, bare-metal libc, bootloaders & DFU, OTA — **plus 3 hands-on tutorial tracks: C language (15 lessons), C++ programming (15 lessons), bare-metal Cortex-M (10 lessons)** |
 | **RTOS** | 21 | Landscape, scheduling theory, priority inversion, IPC primitives, tickless idle, FreeRTOS, Zephyr, ThreadX, RT-Thread, safety-certified options — **plus a 10-lesson hands-on FreeRTOS tutorial** |
 | **Tools** | 10 | GCC/LLVM toolchain, GDB, OpenOCD & probes, build systems, QEMU & Renode, semihosting, SWO/ITM, profiling, static analysis, formal methods |
 | **Vendors** | 43 | STM32 (mainstream / low-power / wireless), NXP (Kinetis / i.MX RT / LPC), Nordic (nRF52 / nRF53 / nRF91), Raspberry Pi (RP2040 / RP2350), Renesas, TI (Tiva/MSP432 + Sitara), Microchip SAM, Silicon Labs, Infineon (XMC/PSoC + AURIX), **GigaDevice GD32 (F/L/W), Artery AT32 (F4/M), Nuvoton NuMicro (M0/M4/M23), Ambiq Apollo (4/5), Maxim/ADI MAX32 + MAX78000, NVIDIA Jetson (Orin Nano/NX/AGX), MediaTek (Genio/Filogic), Rockchip (RK3568/RK3588)** |

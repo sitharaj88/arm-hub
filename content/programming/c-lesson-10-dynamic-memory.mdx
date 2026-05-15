@@ -1,0 +1,531 @@
+---
+title: Lesson 10 — Dynamic memory
+description: malloc, calloc, realloc, free, the heap, double-free and use-after-free, leaks, valgrind, ownership patterns, a growable vector, and why embedded systems avoid malloc.
+order: 11
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, memory, malloc]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 10 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'malloc/calloc/realloc/free, the heap, every classic memory bug, valgrind, ownership patterns, a growable vector, why embedded avoids malloc' },
+    { label: 'Code provided', value: 'About 140 lines including a full vector_t implementation with push, get, free' },
+    { label: 'Time', value: '120-150 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 9 — Structs and unions' },
+  ]}
+/>
+
+Up to now, every variable we have used has lived either in **static storage** (globals and static locals — allocated at program start, live forever) or **automatic storage** (locals and function parameters — allocated on the stack on function entry, freed on return). Both forms have sizes known at compile time. For data whose size or lifetime is determined at runtime, C provides **dynamic allocation** via `malloc` and friends. Powerful, dangerous, and the source of most memory bugs you have ever heard of.
+
+## The heap
+
+When a C program starts, the OS gives it a chunk of memory called the **heap** — separate from stack and static memory. `malloc` carves blocks out of the heap and gives you pointers to them. `free` returns blocks to the heap so they can be reused. The OS does not track which block belongs to whom — that is your job.
+
+On hosted systems (Linux, macOS, Windows), the heap can grow dynamically — the runtime asks the OS for more pages when it runs out. On embedded systems, the heap is a fixed region in SRAM set aside at link time, and running out means `malloc` returns NULL.
+
+## `malloc`
+
+```c
+#include <stdlib.h>
+
+void *malloc(size_t size);
+```
+
+`malloc(n)` allocates `n` bytes and returns a pointer to the first byte. The returned memory is **uninitialised** — it contains whatever was there before. If allocation fails, `malloc` returns `NULL`.
+
+```c
+int *p = malloc(10 * sizeof(int));
+if (p == NULL) {
+    /* allocation failed */
+    return -1;
+}
+for (int i = 0; i < 10; i++) {
+    p[i] = i * i;
+}
+/* ... use p ... */
+free(p);
+```
+
+Three things to absorb.
+
+**The return type is `void *`.** You assign it directly to your typed pointer; the implicit conversion from `void *` to `int *` is allowed in C (not in C++, where you need an explicit cast). Old C code casts the result explicitly — `int *p = (int *)malloc(...)` — which works but is unnecessary and can hide a missing include.
+
+**Always check the return value.** On a busy embedded system or under heavy memory pressure on a desktop, `malloc` can fail. Ignoring the NUL leads to a NULL dereference later, often in a location far from the failed allocation. Make it a habit:
+
+```c
+T *p = malloc(sizeof *p);
+if (!p) { /* handle error */ return -1; }
+```
+
+Note `sizeof *p` not `sizeof(T)` — `sizeof *p` automatically tracks `p`'s type. If you later change the type of `p`, you do not have to update the allocation. This is the standard idiom in K&R-style C.
+
+**Always pair `malloc` with `free`.** Every block allocated must be freed exactly once. Forgetting to free is a **leak**; freeing twice is a **double-free** (undefined behavior); using after free is a **use-after-free** (undefined behavior). We will spend the rest of this lesson on those three.
+
+## `calloc`
+
+```c
+void *calloc(size_t nmemb, size_t size);
+```
+
+`calloc(n, size)` allocates `n * size` bytes and **zero-initialises** them. Useful when you need zero-initialised memory and do not want to follow `malloc` with `memset`.
+
+```c
+int *p = calloc(10, sizeof *p);    /* 10 ints, all zero */
+```
+
+`calloc` is slightly slower than `malloc` because it must zero the memory. On Linux it has a clever trick — for large allocations it returns zeroed pages directly from the OS, which the kernel pre-zeros. So for big allocations, `calloc` is almost as fast as `malloc`.
+
+`calloc` also checks for overflow in `n * size` — `malloc(SIZE_MAX)` would succeed-or-fail-cleanly, but `malloc(n * size)` where the multiplication overflows could under-allocate. `calloc(n, size)` does this multiplication safely.
+
+## `realloc`
+
+```c
+void *realloc(void *ptr, size_t new_size);
+```
+
+`realloc(ptr, new_size)` resizes a previously allocated block. Common pattern:
+
+```c
+T *p = malloc(initial_size * sizeof *p);
+/* ... fill ... */
+T *new_p = realloc(p, new_size * sizeof *p);
+if (!new_p) {
+    /* realloc failed — p is still valid! */
+    free(p);
+    return -1;
+}
+p = new_p;
+```
+
+The subtle trap: if `realloc` fails, it returns NULL **and does not free the original block**. If you wrote `p = realloc(p, ...)` and realloc fails, you have lost the original pointer and leaked it. The pattern above stores the result in a temporary and only overwrites `p` on success.
+
+`realloc(NULL, size)` is equivalent to `malloc(size)`. `realloc(ptr, 0)` is implementation-defined (older standards said it freed the block; C23 says it is undefined). Avoid the zero case.
+
+The block returned by `realloc` may have a different address than the original — `realloc` is free to copy your data to a new location if the old block cannot grow in place. After `realloc`, **any pointer that pointed into the original block is invalid** (use-after-free if you dereference it).
+
+## `free`
+
+```c
+void free(void *ptr);
+```
+
+Returns the block at `ptr` to the heap. After `free`, `ptr` no longer points to valid memory — dereferencing it is undefined.
+
+`free(NULL)` is **defined to be a no-op**. You do not need to check for NULL before freeing. This is a small convenience that allows the canonical cleanup pattern:
+
+```c
+T *p = NULL;
+p = malloc(sizeof *p);
+/* ... maybe assign or maybe goto cleanup ... */
+cleanup:
+    free(p);    /* fine even if p was never allocated */
+    return result;
+```
+
+## The classic bugs
+
+C's manual memory management produces a small set of bug classes that have plagued the field for half a century.
+
+### Leak
+
+```c
+void buggy(void) {
+    int *p = malloc(100 * sizeof(int));
+    if (!p) return;
+    /* ... use p ... */
+    /* forgot to free(p) */
+}
+```
+
+Every call to `buggy` allocates 400 bytes and never returns them. On a desktop, the process grows; on an embedded system, the heap runs out within minutes. Leaks are quiet — no immediate crash, just slow death.
+
+Tools: `valgrind --leak-check=full` on Linux/macOS tracks every allocation and reports leaks. `-fsanitize=address` (lesson 14) does the same with much less overhead — almost always-on during development.
+
+### Use after free
+
+```c
+int *p = malloc(sizeof(int));
+*p = 42;
+free(p);
+*p = 99;     /* use-after-free — UB */
+```
+
+After `free(p)`, the memory belongs to the allocator. It may already be in use for some other allocation. Writing through `p` corrupts that other allocation; reading through `p` reads stale data. The crash often manifests far from the bug.
+
+**Discipline:** set the pointer to NULL after freeing.
+
+```c
+free(p);
+p = NULL;
+```
+
+A subsequent `*p` then segfaults cleanly instead of silently corrupting. Some style guides prefer a macro:
+
+```c
+#define SAFE_FREE(p) do { free(p); (p) = NULL; } while (0)
+```
+
+### Double free
+
+```c
+free(p);
+free(p);     /* double-free — UB */
+```
+
+The allocator's internal state is corrupted when the same block is freed twice. Many allocators detect this at runtime and abort; some do not, and the heap silently corrupts. The NULL-after-free discipline helps because `free(NULL)` is a no-op:
+
+```c
+free(p);
+p = NULL;
+/* ... later ... */
+free(p);     /* no-op, safe */
+```
+
+### Buffer overflow on the heap
+
+```c
+int *p = malloc(10 * sizeof(int));
+p[10] = 42;     /* one past the end — UB */
+```
+
+Same trap as stack arrays: no bounds checking. The compiler emits the access and the runtime corrupts whatever is at that address. Address Sanitizer catches this at runtime.
+
+### Forgetting to free in error paths
+
+```c
+int load(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    char *buf = malloc(1024);
+    if (!buf) return -1;     /* LEAKED f */
+
+    /* ... */
+}
+```
+
+When you have multiple resources to release, error paths get tedious. The "goto cleanup" pattern from lesson 4 is the standard answer:
+
+```c
+int load(const char *path) {
+    int err = 0;
+    FILE *f = NULL;
+    char *buf = NULL;
+
+    f = fopen(path, "r");
+    if (!f) { err = -1; goto cleanup; }
+
+    buf = malloc(1024);
+    if (!buf) { err = -1; goto cleanup; }
+
+    /* ... use f and buf ... */
+
+cleanup:
+    free(buf);
+    if (f) fclose(f);
+    return err;
+}
+```
+
+Single exit point, every resource released exactly once. Sometimes called RAII for C, even though C lacks destructors.
+
+## Ownership
+
+The hardest part of C memory management is **knowing whose job it is to free a block**. The block does not know; the language does not enforce; the convention has to be documented and followed.
+
+**Pattern 1: caller allocates, caller frees.**
+
+```c
+typedef struct { int x, y; } point;
+
+point *make_point(int x, int y) {
+    point *p = malloc(sizeof *p);
+    if (!p) return NULL;
+    p->x = x;
+    p->y = y;
+    return p;
+}
+
+void use(void) {
+    point *p = make_point(3, 4);
+    if (!p) return;
+    /* ... use p ... */
+    free(p);    /* the caller owns it, so the caller frees it */
+}
+```
+
+**Pattern 2: function takes ownership.**
+
+```c
+/* "Consumes" arr — frees it before returning. Caller must not free arr afterwards. */
+void consume(int *arr) {
+    /* ... use arr ... */
+    free(arr);
+}
+
+void use(void) {
+    int *arr = malloc(100 * sizeof *arr);
+    consume(arr);
+    /* must NOT free(arr) here */
+}
+```
+
+**Pattern 3: function borrows.**
+
+```c
+/* "Borrows" arr — does not free it. Caller still owns it. */
+int sum(const int *arr, size_t n) {
+    int s = 0;
+    for (size_t i = 0; i < n; i++) s += arr[i];
+    return s;
+}
+```
+
+**The convention has to be documented.** Comments, naming, or a project-wide style. Common conventions: `_new` / `_create` functions return owned pointers; `_destroy` / `_free` functions take and consume them; everything else borrows. Rust formalises this; C requires discipline.
+
+## A growable vector
+
+The canonical example of dynamic memory in C is a growable array — like `std::vector` in C++ or `list` in Python. Let us build one.
+
+```c
+/* vec.h */
+#pragma once
+#include <stddef.h>
+#include <stdbool.h>
+#include <stdint.h>
+
+typedef struct {
+    int32_t *data;
+    size_t   len;
+    size_t   cap;
+} vec_t;
+
+bool vec_init(vec_t *v);
+void vec_free(vec_t *v);
+bool vec_push(vec_t *v, int32_t value);
+int32_t vec_get(const vec_t *v, size_t i);
+size_t  vec_len(const vec_t *v);
+```
+
+```c
+/* vec.c */
+#include "vec.h"
+#include <stdlib.h>
+#include <assert.h>
+
+bool vec_init(vec_t *v) {
+    v->data = NULL;
+    v->len = 0;
+    v->cap = 0;
+    return true;
+}
+
+void vec_free(vec_t *v) {
+    free(v->data);
+    v->data = NULL;
+    v->len = 0;
+    v->cap = 0;
+}
+
+static bool vec_grow(vec_t *v, size_t needed) {
+    if (v->cap >= needed) return true;
+    size_t new_cap = v->cap == 0 ? 8 : v->cap * 2;
+    while (new_cap < needed) new_cap *= 2;
+
+    int32_t *new_data = realloc(v->data, new_cap * sizeof *new_data);
+    if (!new_data) return false;
+    v->data = new_data;
+    v->cap = new_cap;
+    return true;
+}
+
+bool vec_push(vec_t *v, int32_t value) {
+    if (!vec_grow(v, v->len + 1)) return false;
+    v->data[v->len++] = value;
+    return true;
+}
+
+int32_t vec_get(const vec_t *v, size_t i) {
+    assert(i < v->len);
+    return v->data[i];
+}
+
+size_t vec_len(const vec_t *v) {
+    return v->len;
+}
+```
+
+```c
+/* main.c — using the vector */
+#include <stdio.h>
+#include "vec.h"
+
+int main(void) {
+    vec_t v;
+    vec_init(&v);
+
+    for (int32_t i = 0; i < 1000; i++) {
+        if (!vec_push(&v, i * i)) {
+            fprintf(stderr, "out of memory\n");
+            vec_free(&v);
+            return 1;
+        }
+    }
+
+    printf("len=%zu, first=%d, last=%d\n",
+           vec_len(&v), vec_get(&v, 0), vec_get(&v, vec_len(&v) - 1));
+
+    vec_free(&v);
+    return 0;
+}
+```
+
+Things to absorb.
+
+The **capacity** (allocated size) and **length** (used size) are separate. `cap` is the size of the underlying buffer; `len` is how many elements have been pushed. We grow capacity by doubling — amortised O(1) per push.
+
+`realloc` handles both the initial allocation (when `v->data` is NULL) and subsequent growth. Storing the result in `new_data` before assigning to `v->data` protects against the realloc-fails-leak bug.
+
+`vec_init` takes a pointer to a struct the caller allocated (probably on the stack). Alternative: `vec_new` could `malloc` the struct itself. Both patterns are common; init-into-caller is more flexible because it works for stack, static, and heap-allocated vectors.
+
+`assert` (from `<assert.h>`) checks `i < v->len`. In debug builds, the assertion crashes with a useful message if the bound is violated. In release builds (`-DNDEBUG`), the assertion is compiled out. We will return to assert in lesson 13.
+
+`vec_free` zeros the struct's fields so a subsequent use after free is more likely to crash visibly. Discipline, not magic.
+
+## Why embedded systems often avoid `malloc`
+
+For most embedded firmware, the answer to "where should I allocate this?" is "statically, at compile time". Here is why.
+
+**Fragmentation.** Repeated `malloc`/`free` of variable sizes fragments the heap. After hours or days of run time, the heap is full of small holes that are individually too small to satisfy any allocation, even though the total free memory is large. The system silently starts failing allocations and crashing.
+
+**Worst-case bound is unknown.** Static allocation makes peak memory use a compile-time, link-time property — you can look at the .map file and see exactly how much memory the program uses. With malloc, you only know the worst-case use after exhaustive testing or formal analysis.
+
+**Determinism.** `malloc` and `free` may take variable time depending on heap state. For a hard real-time system, that variance is unacceptable. Static allocation has zero runtime overhead.
+
+**Failure handling.** When `malloc` returns NULL on an embedded device, what do you do? Probably reset. Avoiding malloc means avoiding that failure mode.
+
+Common patterns instead of malloc:
+
+- **Static buffers.** `static uint8_t buf[1024];` at file scope.
+- **Pool allocators.** A fixed-size array of N slots, each holding one struct of a fixed type. `pool_alloc` returns a free slot; `pool_free` releases it. Zero fragmentation by construction.
+- **Slab allocators.** Pools-of-pools, one per common size class.
+- **Region allocators.** A single bump pointer in a fixed buffer; free everything at once at end-of-task.
+
+See [The C standard library on embedded](/docs/programming/libc/) for the libc options that omit or replace malloc entirely.
+
+<Callout type="tip" title="Valgrind catches memory bugs at runtime">
+On Linux, `valgrind ./my_program` runs your binary under a heavyweight instrumented interpreter and reports leaks, use-after-free, invalid reads/writes, and double-frees. It is 10-50× slower than native, but you only need to run it occasionally — during a test run, during a code review. The clean run is worth hours of debugging time saved.
+
+Newer projects use `-fsanitize=address` (AddressSanitizer / ASan), built into clang and gcc, which is faster than valgrind (2-3× slowdown) and catches a similar set of bugs. It is almost always on during development. See lesson 14.
+</Callout>
+
+## Exercises
+
+**Exercise 10.1.** This function leaks. Find the leak and fix it.
+
+```c
+int process(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+
+    char *buf = malloc(1024);
+    if (!buf) return -1;
+
+    if (fread(buf, 1, 1024, f) != 1024) {
+        return -1;
+    }
+
+    free(buf);
+    fclose(f);
+    return 0;
+}
+```
+
+<Callout type="spec" title="Answer">
+Two leaks. The first `return -1` (when malloc fails) does not `fclose(f)`. The middle `return -1` (when fread fails) leaks both `buf` and `f`. The goto-cleanup pattern fixes both:
+
+```c
+int process(const char *path) {
+    int err = 0;
+    FILE *f = NULL;
+    char *buf = NULL;
+
+    f = fopen(path, "r");
+    if (!f) { err = -1; goto cleanup; }
+
+    buf = malloc(1024);
+    if (!buf) { err = -1; goto cleanup; }
+
+    if (fread(buf, 1, 1024, f) != 1024) { err = -1; goto cleanup; }
+
+cleanup:
+    free(buf);
+    if (f) fclose(f);
+    return err;
+}
+```
+</Callout>
+
+**Exercise 10.2.** Add a `vec_pop` function to the vector. It should return the last element via an out-parameter and decrement `len`. Should it ever shrink the capacity?
+
+<Callout type="spec" title="Answer">
+```c
+bool vec_pop(vec_t *v, int32_t *out) {
+    if (v->len == 0) return false;
+    *out = v->data[--v->len];
+    return true;
+}
+```
+
+Whether to shrink: usually no. Shrinking risks thrashing if the caller alternates push and pop near a capacity boundary, and frees memory that will likely be needed again. Most production vector implementations (C++ std::vector, Rust Vec) do not shrink on pop. Some expose an explicit `shrink_to_fit` for callers who know they are done growing.
+</Callout>
+
+**Exercise 10.3.** Explain why this code, which "looks correct", is wrong:
+
+```c
+int *create(void) {
+    int x = 42;
+    return &x;
+}
+int main(void) {
+    int *p = create();
+    printf("%d\n", *p);
+    return 0;
+}
+```
+
+<Callout type="spec" title="Answer">
+`x` is a **local variable** of `create` — allocated on the stack on entry, destroyed on return. Returning `&x` returns a pointer into a stack frame that no longer exists. Dereferencing it in `main` is undefined behavior. The memory may still hold `42` if no other function has overwritten the stack yet, so the program may "work" — a particularly insidious form of UB because tests pass.
+
+The fix depends on intent:
+
+- If `create` should return an allocated int: use `malloc`.
+- If the caller has its own int: pass `int *` to `create`.
+- If the value is small and the caller wants ownership without allocation: return by value (`int create(void) { return 42; }`).
+
+Never return a pointer to a local.
+</Callout>
+
+## What you learned
+
+- The **heap** is dynamic memory; `malloc` allocates, `free` releases.
+- `malloc(n)` returns uninitialised memory or NULL. **Always check the return.**
+- `calloc(n, size)` is malloc-then-zero, with overflow check on the multiplication.
+- `realloc(p, new_size)` resizes a block, possibly moving it. Store in a temporary to avoid the failure-leak trap.
+- `free(NULL)` is a no-op — useful for cleanup paths.
+- Classic bugs: leak, use-after-free, double-free, buffer overflow, leak-in-error-path.
+- The "goto cleanup" pattern handles multi-resource error paths cleanly.
+- Ownership is a documented convention, not a language feature. Caller-allocates-caller-frees is the safest default.
+- A growable vector pairs `data`, `len`, `cap` and uses `realloc` to grow by doubling.
+- Embedded systems usually avoid `malloc` due to fragmentation, lack of bounded peak use, and non-determinism — prefer static allocation, pools, or regions.
+- Valgrind and AddressSanitizer catch most heap bugs at runtime.
+
+In lesson 11 we cover the preprocessor — `#include`, `#define`, conditional compilation, macros, stringification, X-macros, and when not to use macros.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 9 — Structs and unions](/docs/programming/c-lesson-09-structs/) | [Lesson 11 — The preprocessor](/docs/programming/c-lesson-11-preprocessor/) |

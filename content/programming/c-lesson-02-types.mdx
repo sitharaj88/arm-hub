@@ -1,0 +1,330 @@
+---
+title: Lesson 2 — Types and literals
+description: Integer types and the standard's actual guarantees, fixed-width types from stdint.h, floating point, every integer literal form, sizeof, and the implicit-conversion rules that bite.
+order: 3
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, types, integers]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 2 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'C integer types and what the standard actually guarantees, stdint.h fixed-width types, floats, every literal form, sizeof, type promotion, casts' },
+    { label: 'Code provided', value: 'About 70 lines across several short programs and a 32-bit timestamp parser' },
+    { label: 'Time', value: '90-120 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 1 — Hello, C' },
+  ]}
+/>
+
+If you come from Python or JavaScript, you are used to numbers that just work. `42 + 3` is 45 whether 42 is a 32-bit integer, a 64-bit integer, or a 53-bit float pretending to be an integer. In C, you are responsible for the width of every variable, the implicit conversions that happen at every operator, and the surprises that come from mixing signed and unsigned types. This lesson is where C gets noticeably different from the language you already know.
+
+## The historical integer types
+
+C inherited five integer types from its 1970s heritage on the PDP-11:
+
+```c
+char       /* at least 8 bits */
+short      /* at least 16 bits */
+int        /* at least 16 bits — historically the "natural word size" */
+long       /* at least 32 bits */
+long long  /* at least 64 bits — added in C99 */
+```
+
+Each can be `signed` or `unsigned`. Default signedness is **`signed` for everything except `char`**, where signedness is implementation-defined — some compilers default `char` to signed, some to unsigned. If you care, write `signed char` or `unsigned char` explicitly.
+
+Notice the words "at least". The C standard guarantees minimums, not exact widths. On every modern desktop and server CPU running a modern OS:
+
+- `char` is 8 bits.
+- `short` is 16 bits.
+- `int` is 32 bits.
+- `long` is 32 bits on Windows and 64 bits on Linux/macOS — the famous "LLP64 vs LP64" split.
+- `long long` is 64 bits.
+
+On microcontrollers, `int` is often still 16 bits (8-bit AVR, some 16-bit PIC). On older systems, `int` was 16 bits and `long` was 32. On 32-bit DSPs, `char` is sometimes 16 bits because the hardware cannot address smaller units. The standard does not promise you any specific width — only that they are non-decreasing: `sizeof(char) <= sizeof(short) <= sizeof(int) <= sizeof(long) <= sizeof(long long)`.
+
+This is unlike Python or Java, where `int` is exactly 64 bits (Python int is bignum, but the underlying machine int is 64) or 32 bits (Java) by language definition. **C ints are not portable across architectures unless you use `<stdint.h>`.**
+
+## `<stdint.h>` — the fixed-width types
+
+C99 added a header that gives you types with **exact** width. This is the only sensible way to write portable code in 2026.
+
+```c
+#include <stdint.h>
+
+int8_t   a;   /* exactly  8 bits, signed   — range -128 to 127            */
+int16_t  b;   /* exactly 16 bits, signed   — range -32768 to 32767        */
+int32_t  c;   /* exactly 32 bits, signed   — range ~ +/- 2.1 billion      */
+int64_t  d;   /* exactly 64 bits, signed   — range ~ +/- 9.2 quintillion  */
+
+uint8_t  e;   /* exactly  8 bits, unsigned — range 0 to 255               */
+uint16_t f;   /* exactly 16 bits, unsigned — range 0 to 65535             */
+uint32_t g;   /* exactly 32 bits, unsigned — range 0 to ~4.3 billion      */
+uint64_t h;   /* exactly 64 bits, unsigned — range 0 to ~1.8e19           */
+```
+
+There are also "at least" types (`int_least32_t`), "fastest at least" types (`int_fast32_t`), and `intmax_t`/`uintmax_t` for the widest available integer. In practice, 99% of the time you want the exact-width form, so just use those.
+
+**The rule for modern C code:** never write bare `int` or `long` when you care about width. Use `int32_t`, `uint32_t`, etc. The exceptions are loop counters where you do not care (use `int` or `size_t`) and interop with library functions that take `int` (use `int`).
+
+<Callout type="tip" title="size_t and ptrdiff_t">
+Two more critical types live in `<stddef.h>`: `size_t` (unsigned, big enough to hold any object size — typically 32-bit on 32-bit systems, 64-bit on 64-bit systems) and `ptrdiff_t` (signed, big enough to hold the difference between two pointers). `sizeof`, `strlen`, and `malloc` all return or take `size_t`. Using `int` for array indices is a common bug source on 64-bit systems with large arrays.
+</Callout>
+
+## Floating point
+
+Three floating-point types, all from IEEE 754:
+
+```c
+float       /* single precision, 32 bits, ~7 decimal digits */
+double      /* double precision, 64 bits, ~15-17 decimal digits */
+long double /* extended precision, 80 bits on x86, 64 or 128 elsewhere */
+```
+
+On most CPUs `double` is the natural type — single-precision arithmetic is sometimes the same speed and sometimes faster depending on architecture. **Use `double` unless you have a reason not to.** Reasons might include: memory pressure (storing a million coordinates), interop with hardware (some MCUs only have a single-precision FPU), or a specific algorithm whose numerical behaviour matters.
+
+`long double` is a portability minefield — its width varies between platforms and compilers. Most code does not need it; when it does, you know why.
+
+Floating-point numbers cannot represent most decimal fractions exactly. `0.1 + 0.2` in C is `0.30000000000000004`, the same surprise as in JavaScript. This is not a C bug — it is how IEEE 754 works, and every language using it has the same behaviour.
+
+## Integer literals
+
+A literal is a value baked into the source code. C has many forms:
+
+```c
+42         /* decimal — type int */
+-42        /* decimal int */
+42u        /* unsigned int */
+42L        /* long */
+42UL       /* unsigned long */
+42LL       /* long long */
+42ULL      /* unsigned long long */
+
+0x2A       /* hexadecimal — value 42, type int */
+0x2Au      /* hex unsigned int */
+0X2A       /* hex (uppercase X also legal) */
+
+052        /* OCTAL — leading zero! value 42 in decimal */
+0          /* zero — but also "octal zero" syntactically */
+
+0b101010   /* binary — C2x (C23). For C17 use 0x2A */
+
+'A'        /* character literal — type int in C (not char!), value 65 */
+'\n'       /* newline character, value 10 */
+'\0'       /* NUL character, value 0 — vital for strings */
+'\x1B'     /* hex escape, value 27 (ESC) */
+'\033'     /* octal escape, value 27 (ESC) */
+
+"hello"    /* string literal — type char[6], pointer-to-char in expressions */
+```
+
+Two traps live here.
+
+**The octal trap.** A leading zero on an integer literal means "octal". So `010` is **8**, not 10. People write `int day = 09;` thinking it is decimal 9, and get a compile error because 9 is not a valid octal digit. The original IP-address parsing convention of writing `192.168.001.005` quietly turns each octet into octal in some languages. C is one of them. Avoid leading zeros unless you specifically want octal.
+
+**The character literal type.** `'A'` in C has type `int`, not `char`. This rarely matters but can produce subtle warnings. In C++, `'A'` has type `char`. (See lesson 15's C23 note — C23 aligned this with C++.)
+
+The suffix letters compose: `42ULL` is unsigned long long. Case does not matter for the prefix (`0x` or `0X`) or suffix (`u`, `U`, `l`, `L`), with one rule of style: prefer lowercase `u` and uppercase `L` because `l` looks like `1` in many fonts. `42UL`, not `42ul`.
+
+## Floating-point literals
+
+```c
+3.14         /* double */
+3.14f        /* float — note the f */
+3.14L        /* long double */
+
+1.0e9        /* 1 billion as double */
+1.5e-3       /* 0.0015 */
+
+0x1.8p+1     /* hexadecimal float — 1.5 * 2^1 = 3.0 */
+```
+
+The bare `3.14` is a **double**, not a float. To get a float literal, suffix `f`: `3.14f`. This matters for performance on systems without a hardware double — `double x = 3.14;` may emit a runtime double-to-float (well, the other way around) operation that `float x = 3.14f;` would not.
+
+The exponent form `1.5e-3` means 1.5 × 10⁻³. Useful for scientific code and timing constants.
+
+The hex-float form `0x1.8p+1` is rare but exact — it lets you write a floating-point constant in terms of its IEEE 754 representation, with no decimal-to-binary conversion happening at compile time. Useful when you need bit-exact constants.
+
+## `sizeof` and `size_t`
+
+`sizeof` is a **compile-time operator** (not a function) that returns the size in bytes of a type or an expression. The result type is `size_t`, which is unsigned and platform-dependent (32-bit on 32-bit systems, 64-bit on 64-bit systems).
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    printf("sizeof(char)       = %zu\n", sizeof(char));
+    printf("sizeof(short)      = %zu\n", sizeof(short));
+    printf("sizeof(int)        = %zu\n", sizeof(int));
+    printf("sizeof(long)       = %zu\n", sizeof(long));
+    printf("sizeof(long long)  = %zu\n", sizeof(long long));
+    printf("sizeof(float)      = %zu\n", sizeof(float));
+    printf("sizeof(double)     = %zu\n", sizeof(double));
+    printf("sizeof(int32_t)    = %zu\n", sizeof(int32_t));
+    printf("sizeof(void *)     = %zu\n", sizeof(void *));
+    return 0;
+}
+```
+
+Output on a typical 64-bit Linux:
+
+```text
+sizeof(char)       = 1
+sizeof(short)      = 2
+sizeof(int)        = 4
+sizeof(long)       = 8
+sizeof(long long)  = 8
+sizeof(float)      = 4
+sizeof(double)     = 8
+sizeof(int32_t)    = 4
+sizeof(void *)     = 8
+```
+
+Note the format specifier `%zu` — that is `size_t` printed as unsigned. Use `%zu` for `size_t`, `%d` for `int`, `%ld` for `long`, `%lld` for `long long`. There is a complete set in `<inttypes.h>` for the fixed-width types — `%" PRId32 "` for `int32_t` etc. — covered in lesson 13.
+
+`sizeof` of an expression does **not** evaluate the expression. `sizeof(x++)` does not increment x. The compiler just determines the type of the expression and returns the size of that type. This is occasionally useful.
+
+`sizeof(char)` is **always** 1 by definition. The "byte" in C is whatever size `char` is; on systems where a hardware byte is 9 bits, `sizeof(char)` is still 1 but a "byte" is 9 bits. On any modern computer, a byte is 8 bits.
+
+## Type promotion and implicit conversion
+
+Now we get to the part that has bitten every C programmer. When C evaluates an arithmetic expression, it applies the **usual arithmetic conversions** before computing.
+
+The headline rules:
+
+1. **Integer promotion.** Any operand of type `char` or `short` (signed or unsigned) is promoted to `int` (if `int` can hold its values) or `unsigned int` (otherwise) before any arithmetic. So `(char)100 + (char)100` does not overflow — both promote to `int`, the sum is 200, and only if you assign it back to a `char` do you get truncation.
+
+2. **Common type.** If the two operands after promotion differ in type, both are converted to the "wider" type. Ranking: `int < unsigned int < long < unsigned long < long long < unsigned long long`. Floats outrank integers.
+
+3. **Signed/unsigned mixing.** This is where it gets interesting:
+
+```c
+int          a = -1;
+unsigned int b =  1;
+if (a < b) {
+    printf("a < b\n");
+} else {
+    printf("a >= b\n");
+}
+```
+
+What does this print? Surprise: it prints `a >= b`. The `<` operator sees `int` vs `unsigned int`, and the rule says convert both to `unsigned int`. `-1` as `unsigned int` is `0xFFFFFFFF`, which is larger than 1. The comparison was supposed to be "is negative-one less than positive-one"; the language quietly answered "is 4294967295 less than 1".
+
+`-Wall -Wextra` will warn here: `warning: comparison of integer expressions of different signedness`. **Take signed/unsigned warnings seriously.** They almost always indicate either a bug or a sloppy type choice.
+
+4. **Casting.** You can force a conversion with `(type)expr`:
+
+```c
+double pi = 3.14;
+int i = (int)pi;        /* i = 3, truncation toward zero (not rounding!) */
+
+uint32_t big = 0xFFFFFFFFu;
+int8_t  small = (int8_t)big;  /* small = -1 (truncation + reinterpret as signed) */
+```
+
+Cast syntax in C is `(type)expression`. In C++ there are four named casts (`static_cast`, `reinterpret_cast`, etc.) — we will discuss them when we get to the C++ tutorial.
+
+`(int)3.7` is **3**, not 4. Float-to-int conversion truncates toward zero. To round, use `lround()` from `<math.h>`.
+
+<Callout type="warn" title="Signed integer overflow is undefined">
+Adding 1 to `INT_MAX` in C is **undefined behavior** — the program may produce any result, including crashing or "working" most of the time. Unsigned integer overflow, in contrast, wraps modulo 2^N by definition. So `(unsigned)0xFFFFFFFF + 1 == 0` is well-defined, but `(int)INT_MAX + 1` is a bug. See lesson 14.
+</Callout>
+
+## A real example: reading a 32-bit timestamp from a byte buffer
+
+Embedded code is full of code that reads multi-byte fields out of byte buffers — packet parsers, protocol decoders, file format readers. The wrong way:
+
+```c
+/* WRONG — depends on host endianness and pointer alignment */
+uint32_t timestamp = *(uint32_t *)&buffer[4];
+```
+
+This violates strict aliasing (covered in lesson 14) and breaks on machines with the wrong endianness or alignment constraints. The right way reads each byte explicitly:
+
+```c
+#include <stdint.h>
+
+/* Read a 32-bit little-endian unsigned integer from a byte buffer. */
+static uint32_t read_u32_le(const uint8_t *p) {
+    return  (uint32_t)p[0]
+         | ((uint32_t)p[1] <<  8)
+         | ((uint32_t)p[2] << 16)
+         | ((uint32_t)p[3] << 24);
+}
+
+/* Read a 32-bit big-endian variant — common in network protocols. */
+static uint32_t read_u32_be(const uint8_t *p) {
+    return  (uint32_t)p[3]
+         | ((uint32_t)p[2] <<  8)
+         | ((uint32_t)p[1] << 16)
+         | ((uint32_t)p[0] << 24);
+}
+```
+
+Three details worth absorbing.
+
+**Cast each byte to `uint32_t` before shifting.** If you write `p[1] << 8`, the `p[1]` is a `uint8_t`, which promotes to `int` (not `uint32_t`!) before the shift. Shifting an 8-bit value by 8 produces 256 as an `int` — that part works. But shifting by 24 produces a value that may overflow `int` on systems where `int` is 32 bits, and that overflow is **undefined behavior** for signed types. The explicit `(uint32_t)p[1]` upgrades the operand to unsigned 32-bit, where shifts of less than 32 are always well-defined.
+
+**Use `|` not `+`.** Both work for non-overlapping bit positions, but `|` is the canonical "combine bit fields" operator and communicates intent.
+
+**Mark `p` as `const`.** This function reads from the buffer; it does not write. The `const` is documentation that helps callers — and helps the compiler optimise — and is enforced by the compiler. We will return to const-correctness in lesson 7.
+
+## Exercises
+
+**Exercise 2.1.** Predict the output of this program, then run it:
+
+```c
+#include <stdio.h>
+int main(void) {
+    int a = -1;
+    unsigned int b = 1;
+    printf("%d\n", a < b);
+    printf("%d\n", a + b);
+    return 0;
+}
+```
+
+<Callout type="spec" title="Answer">
+Output: `0` and `0`. Both lines have signed/unsigned mixing. `a < b` converts `a` to unsigned, so `0xFFFFFFFF < 1` is false (0). `a + b` is also computed as unsigned: `0xFFFFFFFF + 1 = 0`. The `-Wall -Wextra` flags will both warn about the signedness mismatch. The fix is to choose one type consistently; if you need negative values, use `int` everywhere; if you do not, use `unsigned int` everywhere.
+</Callout>
+
+**Exercise 2.2.** Write `write_u32_le` — the inverse of `read_u32_le`. Given a `uint32_t value` and a `uint8_t *p`, write the four bytes in little-endian order to `p[0..3]`.
+
+<Callout type="spec" title="Answer">
+```c
+static void write_u32_le(uint8_t *p, uint32_t value) {
+    p[0] = (uint8_t)(value      );
+    p[1] = (uint8_t)(value >>  8);
+    p[2] = (uint8_t)(value >> 16);
+    p[3] = (uint8_t)(value >> 24);
+}
+```
+The explicit `(uint8_t)` casts silence `-Wconversion` warnings about narrowing from `uint32_t` to `uint8_t`. The truncation is what we want — only the low 8 bits of each shifted value get stored.
+</Callout>
+
+**Exercise 2.3.** What does `sizeof("hello")` return? What about `sizeof("")`? What is the type of a string literal?
+
+<Callout type="spec" title="Answer">
+`sizeof("hello")` is **6** — five characters plus the NUL terminator. `sizeof("")` is **1** — just the NUL terminator. A string literal `"hello"` has type `char[6]` (an array of 6 chars). When the array name appears in an expression it usually decays to `char *` pointing at the first character — but inside `sizeof`, the array does not decay, so `sizeof` gives the array size. This is the same array-decay rule we will explore in lesson 6.
+</Callout>
+
+## What you learned
+
+- C's classic integer types (`char`, `short`, `int`, `long`, `long long`) have **minimum** widths, not exact ones. Width depends on the platform.
+- `<stdint.h>` provides exact-width types (`int32_t`, `uint8_t`, etc.). Use these whenever the width matters.
+- `<stddef.h>` provides `size_t` for sizes and array indices, `ptrdiff_t` for pointer differences.
+- Integer literals can be decimal, hex (`0x...`), octal (leading `0` — careful!), or binary (`0b...`, C23 only). Suffixes pick the type: `u`, `L`, `ULL`.
+- Floating-point literals are `double` by default; suffix `f` for `float`.
+- `sizeof` is a compile-time operator returning `size_t`. Use `%zu` to print it.
+- Integer promotion converts `char`/`short` to `int` before arithmetic. Signed/unsigned mixing converts to unsigned silently.
+- Signed integer overflow is undefined; unsigned overflow wraps cleanly.
+- Read multi-byte fields from byte buffers explicitly with shifts — do not cast pointers.
+
+In lesson 3 we look at expressions and operators in detail: arithmetic, bitwise, shifts, the precedence table, and the sequence-point rules that make `a[i] = i++` undefined.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 1 — Hello, C](/docs/programming/c-lesson-01-hello/) | [Lesson 3 — Expressions and operators](/docs/programming/c-lesson-03-expressions/) |

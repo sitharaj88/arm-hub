@@ -1,0 +1,280 @@
+---
+title: Lesson 1 — Hello, C
+description: The anatomy of a C program, printf and format specifiers, what every gcc flag in the strict build command actually does, exit codes, and why "void main" is wrong.
+order: 2
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, hello-world]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 1 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'The C program skeleton, printf format specifiers, gcc strict-mode flags, exit codes, why "void main" is wrong, where to get a compiler' },
+    { label: 'Code provided', value: 'About 30 lines across three example programs' },
+    { label: 'Time', value: '60-90 minutes' },
+    { label: 'Pre-reqs', value: 'A working gcc/clang and a terminal. Basic command-line literacy.' },
+  ]}
+/>
+
+Every C tutorial starts with hello world. Most of them get it wrong — they show you the program, you type it, it prints, and you have learned nothing about why the program looks like that. This lesson is the opposite. We will dissect every character of the smallest useful C program until there is nothing left to be confused about, then build it with a compiler invocation whose every flag you understand.
+
+## The program
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    printf("hello, C\n");
+    return 0;
+}
+```
+
+Five lines. Save it as `hello.c`. Compile and run:
+
+```bash
+$ gcc -std=c17 -Wall -Wextra -Wpedantic hello.c -o hello
+$ ./hello
+hello, C
+```
+
+That is the whole program. Now we take it apart.
+
+## `#include <stdio.h>`
+
+The `#` makes this a **preprocessor directive**, not a C statement. The preprocessor is a separate pass that runs before the compiler proper. `#include <stdio.h>` literally tells the preprocessor: find the file `stdio.h` in the system include path, paste its contents in here. By the time the compiler sees the file, the `#include` line has been replaced by hundreds of lines of declarations.
+
+`stdio.h` is the **standard I/O header**. It declares `printf`, `scanf`, `fopen`, `fread`, `fwrite`, `fclose`, the `FILE` type, and dozens of related things. We need it because we are calling `printf`. Without the include, the compiler does not know that `printf` exists, does not know its return type, does not know that its first argument is a `const char *` followed by a variable number of arguments. In modern C (C99 and later, enforced strictly by C23) calling an undeclared function is an error.
+
+Angle brackets `<stdio.h>` mean "look in the system include paths". Double quotes `"myheader.h"` mean "look in the current directory first, then the system paths". We use angle brackets for standard library headers, double quotes for our own headers. See lesson 11 for the preprocessor in detail and lesson 12 for how multi-file projects organise their headers.
+
+## `int main(void)`
+
+This is the **entry point**. When the operating system loads your program, it eventually calls a function named `main`. C only recognises a few valid signatures for `main`:
+
+- `int main(void)` — takes no arguments, returns an `int`.
+- `int main(int argc, char *argv[])` — takes command-line argument count and array, returns an `int`.
+- Implementation-defined alternatives, such as `int main(int argc, char *argv[], char *envp[])` on Unix.
+
+The return type **must** be `int`. The argument list **must** be either `(void)` or `(int, char *[])` or implementation-defined. Anything else is non-standard, and the popular `void main()` you may have seen in old tutorials is **wrong**. We will explain why in a moment.
+
+`void` inside the parentheses means "this function takes no arguments". Note that `int main()` — empty parens — is **not** the same as `int main(void)` in C, although it is the same in C++. We dig into this trap in lesson 5; for now, always write `(void)` when you mean "no arguments".
+
+## The body and `return 0;`
+
+The curly braces enclose the **function body**. Inside, we have two statements:
+
+```c
+printf("hello, C\n");
+return 0;
+```
+
+`printf` is the workhorse I/O function. The first argument is a **format string** with optional format specifiers; subsequent arguments fill in the specifiers. With no specifiers — as here — `printf` just prints the string verbatim, then the `\n` produces a newline.
+
+`return 0;` ends `main` and returns 0 to the operating system. By convention, **0 means success**; any non-zero value means failure. Shell scripts check `$?` to see your exit code:
+
+```bash
+$ ./hello
+hello, C
+$ echo $?
+0
+```
+
+If you change `return 0;` to `return 7;`, then `$?` will be 7. Conventionally programs use a small range of exit codes — 0 success, 1 generic error, 2 misuse — but anything 0..255 is fair game.
+
+If you omit `return 0;` from `main` entirely, C99 and later guarantee an implicit `return 0;` at the closing brace **of `main` specifically** (no other function gets this courtesy). Older textbooks insist on the explicit `return 0;`; modern style says either is fine, with a slight preference for being explicit because it documents intent.
+
+## Compilation, in slow motion
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic hello.c -o hello
+```
+
+Six flags and arguments. Walk through each.
+
+**`gcc`** — the GNU C compiler binary. On macOS, `gcc` is usually a symlink to `clang`. Both compilers accept the same flags here. On Windows under WSL, you have gcc through your distribution package manager.
+
+**`-std=c17`** — pin the language standard to C17 (officially ISO/IEC 9899:2018, but called "C17" because the technical work concluded in 2017). Without this flag, gcc 13 defaults to gnu17 (C17 plus GNU extensions). Pinning the standard explicitly is good practice because:
+
+- It documents intent — anyone reading the build command knows what language version this code targets.
+- It catches accidental use of GNU extensions that would not port to clang or MSVC.
+- It is a one-character change to upgrade to `-std=c23` when you are ready (lesson 15).
+
+For the rest of the tutorial we use `-std=c17` because it is the most widely supported modern standard. C23 features get a separate lesson.
+
+**`-Wall`** — enable "all" common warnings. Misleading name — it is not literally all warnings, just the ones that experienced developers agree are usually bugs. Things like "you declared this variable and never used it", "this function has no return statement but is declared to return int", "this comparison is always true".
+
+**`-Wextra`** — enable additional warnings beyond `-Wall`. Catches things like unused function parameters, signed/unsigned comparisons, and missing field initialisers. Some of these warnings are noisy in legacy codebases; in new code there is no reason to disable them.
+
+**`-Wpedantic`** — warn on anything that is not strict ISO C. If you accidentally use a GNU extension (like nested functions, statement expressions, or `__attribute__((packed))`), `-Wpedantic` will tell you. Combined with `-std=c17`, this gives you a strict ISO C build.
+
+**`hello.c`** — the input source file. You can list multiple `.c` files here; gcc will compile each, link them together, and produce one output binary. We will do exactly that in lesson 12.
+
+**`-o hello`** — name the output file `hello`. Without `-o`, gcc names the output `a.out` (the original Unix linker default from 1971, still going strong).
+
+The result, a binary named `hello`, is **already linked** against the C standard library — that is what gcc does by default when you do not pass `-c` (compile only, do not link). Running `./hello` runs the binary directly; running `hello` (without `./`) would try to find a program named hello in `$PATH`, which probably is not there.
+
+## The lazy version, and why we do not use it
+
+You can compile the same file with much less:
+
+```bash
+gcc hello.c
+./a.out
+```
+
+This works. The compiler will accept your code and produce `a.out`. But you have given up three things:
+
+- **Warnings.** Without `-Wall -Wextra -Wpedantic`, the compiler will silently accept code that almost certainly has bugs. Try compiling `int main(void){ int x; return x; }` with no flags vs with `-Wall`: the strict build flags the uninitialised use; the lazy build does not.
+- **A pinned language standard.** Without `-std=...`, gcc picks whichever default it shipped with. That changes between gcc versions. Today gcc 13 defaults to gnu17; gcc 15 may default to gnu23. Code that compiled silently last year may now warn or break.
+- **Predictable output naming.** `a.out` is fine for throwaway test programs; it is annoying when you have three different programs in the same directory.
+
+For the rest of this tutorial, every code example assumes you compile with the full strict flag set. When the tutorial introduces a new flag (like `-O2` in lesson 14), it will be called out explicitly.
+
+<Callout type="tip" title="Make a build alias">
+After typing the full gcc command a few times, you will get tired. Put this in your shell config:
+
+```bash
+alias cc17='gcc -std=c17 -Wall -Wextra -Wpedantic'
+```
+
+Then `cc17 hello.c -o hello` is enough. Some editors and IDEs have similar build commands built in. The important part is not which mechanism you use; it is that the strict flags are *always on*, not something you add when you remember.
+</Callout>
+
+## `printf` format specifiers, briefly
+
+We will return to `printf` in detail in lesson 13. For now, the four you will use constantly:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int i = 42;
+    double d = 3.14159;
+    char c = 'A';
+    const char *s = "world";
+
+    printf("integer:  %d\n", i);
+    printf("float:    %f\n", d);
+    printf("char:     %c\n", c);
+    printf("string:   %s\n", s);
+    printf("hex int:  %x\n", i);
+    printf("pointer:  %p\n", (void *)&i);
+    return 0;
+}
+```
+
+Output:
+
+```text
+integer:  42
+float:    3.141590
+char:     A
+string:   world
+hex int:  2a
+pointer:  0x7ffe9c4a5b2c
+```
+
+The mnemonic: **`%d` for "decimal integer", `%f` for "float", `%c` for "char", `%s` for "string", `%x` for "hex", `%p` for "pointer"**. The format string and the arguments must agree. If you write `printf("%d\n", 3.14)` — passing a double where `printf` expects an int — the behaviour is undefined. The compiler with `-Wall` will catch this:
+
+```text
+warning: format '%d' expects argument of type 'int', but argument 2 has type 'double'
+```
+
+This is one of many reasons the strict build flags are not optional in practice. We will see lots more.
+
+## Why `void main` is wrong
+
+Some old textbooks and tutorials show:
+
+```c
+void main() {
+    printf("hello\n");
+}
+```
+
+This compiles on most compilers. It still works. But it is **not standard C**, and the standard makes no promises about what happens. Specifically:
+
+- The ISO C standard explicitly says `main` must return `int` or have an implementation-defined return type. `void` is not in that list.
+- Some C runtimes look at `main`'s return value to set the process exit status. If `main` returns void, the exit status may be whatever happened to be in the return register, which can confuse parent processes and scripts.
+- C++ is stricter — `void main` is a hard error in C++.
+
+The fix is trivial: write `int main(void)` and either `return 0;` or rely on the implicit return-0 at the closing brace. There is no benefit to `void main`. It exists in old material because some pre-standard compilers (Turbo C in the 1990s) accepted it as a convenience. We have had 35 years to do better.
+
+## Where to get a compiler
+
+A quick reference:
+
+**Linux (Ubuntu/Debian/derivatives):**
+```bash
+sudo apt update
+sudo apt install build-essential
+```
+This installs gcc, g++, make, and the standard development headers. On Fedora/RHEL: `sudo dnf install gcc make`. On Arch: `sudo pacman -S gcc make`.
+
+**macOS:**
+```bash
+xcode-select --install
+```
+This installs the Command Line Tools, which give you `clang` aliased as `gcc`, plus `make`. If you prefer real gcc (sometimes useful for GNU-specific extensions), `brew install gcc` from Homebrew gives you `gcc-13` or `gcc-14` alongside the system clang.
+
+**Windows:**
+The recommended path is WSL2 with Ubuntu — install from the Microsoft Store, open a WSL terminal, then follow the Linux instructions. If you must stay native, MSYS2/MinGW-w64 gives you gcc; MSVC (the Microsoft compiler in Visual Studio) compiles C with `cl.exe` but uses different flags. Visual Studio is fine but every C tutorial on the internet (including this one) assumes Unix-style tooling, so WSL saves you constant translation.
+
+## Exercises
+
+**Exercise 1.1.** Compile `hello.c` first without warnings (`gcc hello.c -o hello`), then with full strict warnings. Now introduce a bug — declare a variable but do not use it (`int unused;` inside `main`). Re-compile both ways. Which catches the bug?
+
+<Callout type="spec" title="Answer">
+The strict build (`-Wall -Wextra -Wpedantic`) prints `warning: unused variable 'unused'`. The lazy build prints nothing — the program compiles silently and links. This is the entire argument for strict flags: many bugs become warnings that you actually see.
+</Callout>
+
+**Exercise 1.2.** Modify `hello.c` to take a name from the command line (e.g. `./hello Sitharaj` prints `hello, Sitharaj`). You will need `int main(int argc, char *argv[])` and to use `argv[1]`. What happens if you run `./hello` with no argument? Why?
+
+<Callout type="spec" title="Answer">
+```c
+#include <stdio.h>
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        printf("usage: %s <name>\n", argv[0]);
+        return 1;
+    }
+    printf("hello, %s\n", argv[1]);
+    return 0;
+}
+```
+
+Without the `argc < 2` check, accessing `argv[1]` when no argument was given reads past the array — `argv[argc]` is required to be `NULL`, and `argv[argc+1]` is not yours to look at. The check is mandatory. Note we return 1 on usage error and 0 on success — standard Unix convention.
+</Callout>
+
+**Exercise 1.3.** What does this print, and why?
+
+```c
+#include <stdio.h>
+int main(void) {
+    printf("%d\n", 3.14);
+    return 0;
+}
+```
+
+<Callout type="spec" title="Answer">
+Compiling with `-Wall` will warn: `format '%d' expects argument of type 'int', but argument 2 has type 'double'`. If you ignore the warning and run it, the output is **undefined**. On x86-64 Linux it might print something like `1374389535` or `0`. The reason: `%d` makes printf read an `int`-sized integer from the calling convention's int-register slot, but the double was passed in an xmm register. printf reads from the wrong place and prints garbage. This is your first encounter with **undefined behavior** — the subject of lesson 14, and the single most important concept in C.
+</Callout>
+
+## What you learned
+
+- A C program's entry point is `int main(void)` (or `int main(int argc, char *argv[])`) — always returning `int`.
+- `#include <stdio.h>` is a preprocessor directive that inlines a header file's declarations before the compiler sees your code.
+- `printf` uses format specifiers (`%d`, `%f`, `%c`, `%s`, `%x`, `%p`) to interpolate arguments into a format string.
+- The strict gcc build is `gcc -std=c17 -Wall -Wextra -Wpedantic` — pin the standard, enable warnings, treat your code as strict ISO C.
+- Exit code 0 means success; non-zero means failure. The convention is enforced by shells and scripts.
+- `void main` is non-standard and discouraged. Always `int main`.
+
+In lesson 2 we look at every type C provides — char, short, int, long, fixed-width types from `<stdint.h>`, floats — and the implicit conversion rules that lurk behind every arithmetic expression.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [C tutorial overview](/docs/programming/c-tutorial/) | [Lesson 2 — Types and literals](/docs/programming/c-lesson-02-types/) |

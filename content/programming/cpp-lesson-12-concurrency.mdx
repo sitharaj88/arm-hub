@@ -1,0 +1,420 @@
+---
+title: C++ Lesson 12 — Concurrency
+description: std::thread, mutex and lock_guard, condition variables, atomics with memory ordering, async/future, jthread, and a lock-free SPSC queue example.
+order: 13
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, concurrency, atomics, threads]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 12 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'std::thread and jthread, mutex and scoped_lock, condition variables, atomic memory ordering, std::async and future, barrier and latch' },
+    { label: 'Code provided', value: 'About 160 lines — a lock-free SPSC queue and a producer-consumer demo' },
+    { label: 'Time', value: '90-120 minutes' },
+    { label: 'Pre-reqs', value: 'Lessons 1-11 (move semantics, lambdas, error handling)' },
+  ]}
+/>
+
+C++11 brought the language into the multi-core era with a standard threading model. C++20 added `std::jthread` (auto-joining) and synchronisation primitives like `std::barrier` and `std::latch`. This lesson covers the practical subset: threads, mutexes, condition variables, atomics with their notoriously subtle memory ordering, and asynchronous futures. We end with a lock-free single-producer-single-consumer queue — the pattern that drives most high-throughput data pipelines, including most embedded ones running an RTOS.
+
+A note up front. On a bare-metal Cortex-M you typically use an RTOS (FreeRTOS, Zephyr, Threadx) for thread-like constructs, not `std::thread`. But `std::atomic` works fine on Cortex-M3 and later via the LDREX/STREX exclusive-monitor instructions, and the memory-ordering rules apply identically. So the parts of this lesson worth studying for embedded are atomics and the ring-buffer pattern.
+
+## `std::thread`
+
+The minimal threading primitive. You construct a thread with a callable (function, lambda, member function) and arguments; it starts running immediately.
+
+```cpp
+#include <thread>
+#include <print>
+
+void worker(int id) {
+    std::println("worker {} running", id);
+}
+
+int main() {
+    std::thread t(worker, 1);
+    t.join();           // block until t finishes
+    std::println("done");
+}
+```
+
+You must either `join()` (wait for completion) or `detach()` (let it run independently) before the `std::thread` is destroyed. A destructible-but-not-joined-or-detached thread calls `std::terminate`. This catches forgotten joins early.
+
+### `std::jthread` (C++20) — auto-joining
+
+`std::jthread` is `std::thread` plus a destructor that joins automatically. It also supports cooperative cancellation via `std::stop_token`.
+
+```cpp
+#include <thread>
+#include <stop_token>
+#include <chrono>
+
+void worker(std::stop_token st, int id) {
+    while (!st.stop_requested()) {
+        // do work
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    std::println("worker {} stopping", id);
+}
+
+int main() {
+    std::jthread t(worker, 1);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    // destructor of t requests stop and joins
+}
+```
+
+Use `std::jthread` for all new code. It eliminates the "forgot to join" footgun and adds a clean cancellation channel.
+
+## Mutex and locks
+
+A `std::mutex` protects shared data from being accessed by more than one thread at a time. You never lock and unlock it directly — RAII wrappers do it for you.
+
+```cpp
+#include <mutex>
+#include <vector>
+
+class Counter {
+public:
+    void increment() {
+        std::lock_guard lk(m_);
+        ++value_;
+    }
+    int get() const {
+        std::lock_guard lk(m_);
+        return value_;
+    }
+private:
+    mutable std::mutex m_;
+    int               value_ = 0;
+};
+```
+
+`std::lock_guard` locks on construction, unlocks on destruction. It is `const`-safe (the `mutable` qualifier on the mutex lets `get()` lock it). It cannot be moved, copied, or reused.
+
+`std::unique_lock` is a more flexible variant — it can be unlocked early, transferred, or used with condition variables (which need to release the lock while waiting):
+
+```cpp
+std::unique_lock lk(m_);
+do_some_work();
+lk.unlock();        // release early
+do_unprotected_work();
+lk.lock();          // reacquire
+do_more_protected_work();
+```
+
+`std::scoped_lock` (C++17) locks multiple mutexes simultaneously without risk of deadlock. It uses an internal deadlock-avoidance algorithm:
+
+```cpp
+void transfer(Account &from, Account &to, int amt) {
+    std::scoped_lock lk(from.mtx, to.mtx);   // both locked atomically
+    from.balance -= amt;
+    to.balance   += amt;
+}
+```
+
+This is the right idiom for multi-mutex code. Never lock mutexes individually in a different order — that's how deadlocks happen.
+
+## Condition variables
+
+A condition variable lets one thread wait until another thread signals that a condition has changed. The pattern: lock the mutex, check the condition, if not satisfied wait on the cv (which atomically unlocks and waits, then relocks on wake-up).
+
+```cpp
+#include <condition_variable>
+#include <queue>
+
+class Channel {
+public:
+    void send(int v) {
+        {
+            std::lock_guard lk(m_);
+            q_.push(v);
+        }
+        cv_.notify_one();
+    }
+
+    int recv() {
+        std::unique_lock lk(m_);
+        cv_.wait(lk, [this] { return !q_.empty(); });
+        int v = q_.front();
+        q_.pop();
+        return v;
+    }
+
+private:
+    std::mutex              m_;
+    std::condition_variable cv_;
+    std::queue<int>         q_;
+};
+```
+
+The lambda in `cv_.wait(lk, predicate)` guards against spurious wake-ups. Without it, you would need a manual `while (q_.empty()) cv_.wait(lk);` loop. The predicate form is preferred.
+
+## `std::atomic`
+
+`std::atomic<T>` is the foundation of lock-free programming. Loads, stores, and read-modify-write operations on an atomic are guaranteed to be indivisible — no other thread can observe a partial update.
+
+```cpp
+#include <atomic>
+
+std::atomic<int> counter{0};
+
+void inc() {
+    counter.fetch_add(1);                          // atomic ++
+}
+
+int load() {
+    return counter.load();
+}
+```
+
+### Lock-free vs not
+
+`std::atomic<T>` is lock-free only when the hardware natively supports atomic operations on `T`. Check at compile time:
+
+```cpp
+static_assert(std::atomic<int>::is_always_lock_free);
+static_assert(std::atomic<std::int64_t>::is_always_lock_free);
+// std::atomic<BigStruct> may not be — falls back to a mutex.
+```
+
+On Cortex-M3 and later, atomic loads and stores of 32-bit aligned values are lock-free using LDR/STR. Atomic read-modify-write uses LDREX/STREX (load-exclusive / store-exclusive), which is also lock-free. 64-bit atomic RMW on Cortex-M is generally not lock-free — it falls back to a critical section.
+
+### Memory ordering
+
+This is the part that trips everyone up. Modern CPUs (and modern compilers) reorder loads and stores aggressively for performance. An atomic operation, by default, prevents *any* reordering of *any* memory operation across it — `memory_order_seq_cst`, sequentially consistent, the strongest and most expensive. The other orderings let you relax that requirement.
+
+The four useful orderings:
+
+- **`memory_order_relaxed`** — atomicity only. No ordering with respect to other memory operations. Cheapest. Use for counters that do not synchronise with anything else.
+- **`memory_order_acquire`** (on a load) — atomic load that prevents *later* operations from being reordered *before* it. Pairs with a release store.
+- **`memory_order_release`** (on a store) — atomic store that prevents *earlier* operations from being reordered *after* it. Pairs with an acquire load.
+- **`memory_order_seq_cst`** — the default, full barrier in both directions. Expensive but safest.
+
+The acquire/release pair is the workhorse. It says "everything I wrote before the release store is visible to anyone who acquire-loads what I stored." This is exactly what you need for producer-consumer queues.
+
+```cpp
+std::atomic<bool> ready{false};
+int               payload = 0;
+
+// Producer
+payload = 42;
+ready.store(true, std::memory_order_release);    // publish
+
+// Consumer
+while (!ready.load(std::memory_order_acquire)) { }
+// payload is guaranteed to be 42 here.
+int x = payload;
+```
+
+Without the acquire/release pair, the reader could see `ready == true` but `payload == 0` because the compiler or CPU reordered the writes. With it, the release store synchronises-with the acquire load, and everything before the producer's release is visible after the consumer's acquire.
+
+<Callout type="note" title="Cortex-M3+ supports atomics via LDREX/STREX">
+Even bare-metal firmware can use `std::atomic` for inter-context communication (main loop ↔ ISR, or across two ISRs of different priorities). On Cortex-M3 and later the exclusive-monitor instructions LDREX/STREX implement lock-free atomic RMW; aligned 32-bit loads and stores are already atomic. The memory-ordering rules apply, though Cortex-M is weakly ordered for I/O — you may still need `__DMB` between atomic operations and peripheral writes. For pure RAM-to-RAM atomic operations, the ordering hints generate the right barriers automatically.
+</Callout>
+
+## `std::async` and `std::future`
+
+`std::async` is "run this function on a thread, give me a `std::future` to its result". A `std::future<T>` is a handle to a value that will eventually be computed.
+
+```cpp
+#include <future>
+
+int slow_compute(int x) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    return x * x;
+}
+
+int main() {
+    auto f1 = std::async(std::launch::async, slow_compute, 5);
+    auto f2 = std::async(std::launch::async, slow_compute, 7);
+    std::println("{} + {} = {}", f1.get(), f2.get(), f1.get() + f2.get());
+}
+```
+
+Wait — `f1.get()` was called twice in the print. That is undefined behaviour; `get()` can be called only once per future. Use `.wait()` to block without consuming, or store the result in a local first.
+
+`std::launch::async` forces a new thread. The other option, `std::launch::deferred`, runs the function lazily on the calling thread when `.get()` is called. The default is implementation-defined and may surprise you — always specify a policy.
+
+## C++20 barriers and latches
+
+`std::latch` is a one-shot countdown. Threads call `count_down()`; the latch fires when the count reaches zero, and `wait()` unblocks all waiters.
+
+```cpp
+std::latch start{1};
+std::jthread t1([&] { start.wait(); /* go */ });
+std::jthread t2([&] { start.wait(); /* go */ });
+start.count_down();   // both threads released simultaneously
+```
+
+`std::barrier` is reusable — threads call `arrive_and_wait()`, and the barrier releases all of them once the expected count have arrived, then resets for the next phase. Useful for phase-synchronised parallel algorithms.
+
+## A lock-free SPSC queue
+
+Single-producer-single-consumer queues are the most common lock-free structure — one thread pushes, another pops, no mutex needed. They're at the heart of most audio pipelines, USB ring buffers, and inter-CPU mailboxes.
+
+The invariant: the producer writes `head`, the consumer writes `tail`. They use `acquire`/`release` ordering to ensure that data written before `head` is published is visible after `head` is acquire-loaded.
+
+```cpp
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <new>
+#include <optional>
+
+template <typename T, std::size_t Capacity>
+class SpscQueue {
+    static_assert((Capacity & (Capacity - 1)) == 0, "Capacity must be power of 2");
+
+public:
+    bool push(T value) {
+        const auto head = head_.load(std::memory_order_relaxed);
+        const auto next = (head + 1) & mask_;
+        if (next == tail_.load(std::memory_order_acquire)) {
+            return false;   // full
+        }
+        buf_[head] = std::move(value);
+        head_.store(next, std::memory_order_release);
+        return true;
+    }
+
+    std::optional<T> pop() {
+        const auto tail = tail_.load(std::memory_order_relaxed);
+        if (tail == head_.load(std::memory_order_acquire)) {
+            return std::nullopt;   // empty
+        }
+        T value = std::move(buf_[tail]);
+        tail_.store((tail + 1) & mask_, std::memory_order_release);
+        return value;
+    }
+
+private:
+    static constexpr std::size_t mask_ = Capacity - 1;
+    std::array<T, Capacity>      buf_{};
+    alignas(64) std::atomic<std::size_t> head_{0};   // producer writes
+    alignas(64) std::atomic<std::size_t> tail_{0};   // consumer writes
+};
+```
+
+Three points worth dwelling on.
+
+First, the `alignas(64)` on `head_` and `tail_`. Modern CPUs have 64-byte cache lines. If `head_` and `tail_` share a line, every producer write invalidates the consumer's cache and vice versa — "false sharing". Padding them apart costs 128 bytes and gives an order-of-magnitude speedup on contended workloads.
+
+Second, the orderings. Push uses `relaxed` to load `head_` (only the producer writes it, so no synchronisation needed), `acquire` to load `tail_` (we need to see the consumer's progress), and `release` to store `head_` (publish the write to `buf_[head]` for the consumer). Pop is symmetric. Anything weaker would let the compiler reorder the buffer write past the head update, breaking the invariant.
+
+Third, the power-of-two capacity and mask. `(head + 1) & mask_` wraps cheaply, faster than `% Capacity`. The capacity static-assert catches misuse at compile time.
+
+## A complete producer-consumer demo
+
+Build with `g++ -std=c++23 -O2 -pthread spsc.cpp`:
+
+```cpp
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <optional>
+#include <print>
+#include <thread>
+
+// ... SpscQueue from above ...
+
+int main() {
+    SpscQueue<int, 1024> q;
+
+    std::jthread producer([&](std::stop_token st) {
+        for (int i = 0; !st.stop_requested() && i < 100'000; ++i) {
+            while (!q.push(i)) {
+                std::this_thread::yield();
+            }
+        }
+    });
+
+    std::jthread consumer([&](std::stop_token st) {
+        std::int64_t sum = 0;
+        int           count = 0;
+        while (!st.stop_requested() && count < 100'000) {
+            if (auto v = q.pop()) {
+                sum += *v;
+                ++count;
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        std::println("consumed {} items, sum={}", count, sum);
+    });
+
+    // jthread destructors join automatically at scope exit.
+}
+```
+
+The producer pushes 100k integers; the consumer pops and sums them. On a modern machine this runs in single-digit milliseconds — the queue itself is the bottleneck, but it's a fast bottleneck. Replace `std::jthread` with FreeRTOS tasks and the same queue works on a Cortex-M.
+
+## What you learned
+
+- `std::thread` and `std::jthread` (auto-joining, cancellable) — prefer the latter.
+- `std::lock_guard`, `std::unique_lock`, `std::scoped_lock` for mutex RAII; never lock by hand.
+- `std::condition_variable` for "wait until condition" patterns; always use the predicate overload.
+- `std::atomic<T>` for lock-free operations; check `is_always_lock_free`.
+- Memory orderings: relaxed, acquire (loads), release (stores), seq_cst. Acquire/release pair is the workhorse for producer-consumer.
+- `std::async` + `std::future` for one-shot async results; always specify launch policy.
+- `std::latch` (one-shot countdown) and `std::barrier` (reusable phase sync).
+- Cortex-M3+ supports lock-free atomics via LDREX/STREX; RTOS replaces `std::thread`.
+
+## Exercises
+
+**Exercise 12.1.** Modify the SPSC queue to support multiple producers using a mutex. What's the simplest change?
+
+<Callout type="spec" title="Answer">
+Add a mutex that serialises producers. The consumer side can stay as-is because there's still only one consumer.
+
+```cpp
+template <typename T, std::size_t Capacity>
+class MpscQueue {
+public:
+    bool push(T value) {
+        std::lock_guard lk(push_mtx_);
+        return base_.push(std::move(value));
+    }
+    std::optional<T> pop() { return base_.pop(); }
+private:
+    SpscQueue<T, Capacity> base_;
+    std::mutex             push_mtx_;
+};
+```
+
+This is not lock-free on the producer side, but it is correct. True lock-free MPSC requires more work — typically a CAS-based linked structure (see Vyukov's MPSC queue).
+</Callout>
+
+**Exercise 12.2.** Why does the SPSC queue need `acquire` on the consumer's load of `head_` but only `relaxed` on the load of `tail_` (its own variable)?
+
+<Callout type="spec" title="Answer">
+The consumer reads `tail_` only to compute the next position; it is the only writer to `tail_`, so its previous writes are trivially visible to itself — relaxed is enough. But it reads `head_` to find out if the producer has published new data; that read must synchronise with the producer's release store, otherwise the consumer could see `head_` updated but the corresponding `buf_[head]` write not yet visible. Acquire is required.
+
+The general rule: load with acquire when you need to see another thread's writes that happened before it published. Store with release when you want to publish your writes to another thread.
+</Callout>
+
+**Exercise 12.3.** On Cortex-M4 with FreeRTOS, you want an ISR to push events into a queue read by a task. Why is the SPSC queue from this lesson nearly perfect, and what one thing might you change?
+
+<Callout type="spec" title="Answer">
+It's a perfect fit because there is exactly one producer (the ISR) and one consumer (the task), and the lock-free design means the ISR never blocks waiting for a mutex (you cannot block in an ISR). The acquire/release pair maps to `__DMB` barriers on Cortex-M.
+
+The change: on Cortex-M, the producer cannot `yield` if full — the ISR must either drop the event or return early. A typical embedded pattern is:
+
+```cpp
+if (!q.push(event)) {
+    dropped_events.fetch_add(1, std::memory_order_relaxed);
+}
+```
+
+Track drops with another atomic counter; alarm if drops exceed a threshold; never block the ISR. The task on the other side polls or wakes on a notification.
+</Callout>
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [C++ Lesson 11 — Error handling](/docs/programming/cpp-lesson-11-error-handling/) | [C++ Lesson 13 — Modules](/docs/programming/cpp-lesson-13-modules/) |
+
+See also: [C++ on Cortex-M](/docs/programming/cpp/), [Bare-metal C tutorial](/docs/programming/tutorial/), [Embedded C patterns](/docs/programming/embedded-c/).

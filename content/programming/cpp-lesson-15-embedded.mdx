@@ -1,0 +1,352 @@
+---
+title: C++ Lesson 15 — C++ on Cortex-M
+description: Building a real Cortex-M firmware in C++23. The flag list, the global-constructor fiasco, STL without exceptions, and a small worked driver bringing every previous lesson together.
+order: 16
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, embedded, cortex-m]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 15 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'The embedded C++ flag list, static init order, function-local statics, new/delete overrides, STL on bare metal, and a complete Cortex-M4 driver example' },
+    { label: 'Code provided', value: 'About 150 lines — a Cortex-M4 example using RAII, std::array, lambdas, and constexpr' },
+    { label: 'Time', value: '75-90 minutes' },
+    { label: 'Pre-reqs', value: 'Lessons 1-14 plus basic familiarity with Cortex-M memory map' },
+  ]}
+/>
+
+We've spent fourteen lessons on modern C++. Now the question that decides whether any of it is useful in firmware: which parts survive contact with a Cortex-M4? The answer is "most of them, with three specific flags and a handful of patterns". This lesson is the bridge from hosted C++ to embedded C++. By the end you should be able to build a real driver in C++23 that fits in 16 KB of flash and runs deterministically.
+
+The companion piece for this lesson is the [C++ on Cortex-M reference](/docs/programming/cpp/), which is the cheat-sheet. Read both. This lesson explains *why* the rules are what they are; the reference is the lookup table.
+
+## What of standard C++ is OK to use on bare-metal
+
+Safe and free:
+
+- **Classes, inheritance, templates, `constexpr`/`consteval`** — compile-time only or near-zero runtime cost.
+- **`std::array`, `std::span`, `std::string_view`, `std::optional`, `std::expected`, `std::variant`, `std::tuple`** — no allocation, no exceptions in their public API.
+- **Lambdas** — non-capturing ones decay to function pointers (lesson 10), perfect for ISR vector entries.
+- **`std::atomic`** on 32-bit aligned scalars — lock-free on Cortex-M3+ via LDREX/STREX.
+- **References, `auto`, `if constexpr`, concepts, `<=>`** — all compile-time, all free.
+
+Needs care:
+
+- **`std::function`** — heap-allocates if the lambda exceeds the small-buffer optimisation. Use a templated callback or `inplace_function`.
+- **Virtual functions** — pay vtable cost. For one-derived-per-base patterns, prefer CRTP.
+- **Function-local statics** — generate thread-safe-init guards unless `-fno-threadsafe-statics`.
+
+Avoid in firmware:
+
+- **Exceptions, RTTI, `iostream`** — disable or replace.
+- **`std::vector`, `std::map`, `std::string`, `std::shared_ptr`, `std::make_unique`** — heap allocators. Use ETL or fixed-capacity alternatives.
+
+## The flag list
+
+Every embedded C++ project should compile with at least this set. Each is explained below.
+
+```
+-std=c++23
+-fno-exceptions
+-fno-rtti
+-fno-threadsafe-statics
+-fno-use-cxa-atexit
+-ffunction-sections -fdata-sections
+-Wl,--gc-sections
+```
+
+### `-fno-exceptions`
+
+Disables C++ exceptions (lesson 11). `throw` becomes a compile error. STL containers fall back to `std::terminate` on OOM instead of throwing. `.eh_frame` disappears — 50-200 KB saved. Use `std::expected` for error propagation instead.
+
+### `-fno-rtti`
+
+Disables runtime type information. `typeid()` and `dynamic_cast<>` no longer work. Each polymorphic class loses its `type_info` symbol — several KB per class. For closed-set dynamic dispatch, prefer `std::variant`.
+
+### `-fno-threadsafe-statics`
+
+C++11 made function-local static initialisation thread-safe by adding a guard variable and a global lock. On bare-metal with no preemption, this is useless overhead. Disabling saves the guards and `__cxa_guard_acquire` glue.
+
+### `-fno-use-cxa-atexit`
+
+By default every namespace-scope object with a non-trivial destructor is registered with `__cxa_atexit` for "run at program exit". On a microcontroller, there is no exit. Disabling drops the registration chain and `__dso_handle`.
+
+### `-ffunction-sections -fdata-sections` + `-Wl,--gc-sections`
+
+Each function and data item goes into its own ELF section. The linker drops sections unreferenced from `Reset_Handler`. The highest-impact flag pair for binary size — typical savings 20-60%. C++ benefits proportionally more than C because of inlines and template instantiations.
+
+## Static initialisation order — the global-constructor fiasco
+
+C++ initialises every namespace-scope object before `main()`. The order within a translation unit is the order of declaration; the order across translation units is unspecified. Hence the famous static-initialisation-order fiasco:
+
+```cpp
+// a.cpp
+extern int b_value;
+int        a_value = b_value + 1;     // depends on b_value being initialised first.
+
+// b.cpp
+extern int a_value;
+int        b_value = 42;               // independent, value 42.
+```
+
+If `a.cpp` is initialised first, `a_value` is `1` (read of uninitialised `b_value`, which is zero-initialised before dynamic init runs). If `b.cpp` first, `a_value` is `43`. The order depends on link order, which depends on build-system whim.
+
+Three fixes, in order of preference:
+
+1. **Use function-local statics.** A function-local static is initialised on first call, in a defined order:
+
+   ```cpp
+   int &b_value() { static int v = 42; return v; }
+   int &a_value() { static int v = b_value() + 1; return v; }
+   ```
+
+   Now `a_value()` lazily initialises and triggers `b_value()` to initialise first. (With `-fno-threadsafe-statics`, this is one function call plus a guard check — cheap.)
+
+2. **`constinit` (C++20).** Marks a namespace-scope object as guaranteed to have constant initialisation — no dynamic init. Initialisation happens at compile time, embedded in the binary, no order issue.
+
+   ```cpp
+   constinit int b_value = 42;
+   constinit int a_value = 43;
+   ```
+
+   If the initialiser is not actually constant, the compiler errors at compile time. This is the best fix when the values are known at compile time.
+
+3. **Manual init lists.** A `system_init()` called from `main()` that initialises subsystems in a documented order. Conservative, explicit, no surprises.
+
+The startup code iterates over `.init_array` to run dynamic constructors before `main()`. With `constinit` everywhere, `.init_array` is empty.
+
+## `new` and `delete` overrides for no-heap
+
+Even with `-fno-exceptions` and ETL containers, the standard library occasionally calls `operator new`. Many implementations of `std::exception` (which exists even with exceptions off, used by the runtime) include `operator new` in their fallback path. The fix is to provide your own overrides that panic if called:
+
+```cpp
+#include <cstddef>
+#include <cstdlib>
+
+void *operator new(std::size_t)                       { std::abort(); }
+void *operator new[](std::size_t)                     { std::abort(); }
+void  operator delete(void *) noexcept                { std::abort(); }
+void  operator delete[](void *) noexcept              { std::abort(); }
+void  operator delete(void *, std::size_t) noexcept   { std::abort(); }
+void  operator delete[](void *, std::size_t) noexcept { std::abort(); }
+```
+
+If anything in your binary ever calls `new`, this triggers a hard fault (or your `std::abort` implementation's equivalent). With link-time-gc and a clean codebase, none of these symbols should remain in the final binary. Verify with `nm firmware.elf | grep '_Znw\|_Znd'` — those are the mangled names for `new`. An empty list means no allocation.
+
+If you want a placement-pool allocator instead, replace the abort versions with calls into your pool.
+
+## STL on bare metal — what works
+
+Heap-free and exception-clean in public API:
+
+- **`<array>`, `<span>`, `<string_view>`** — fixed-size or non-owning views.
+- **`<optional>`, `<expected>`, `<variant>`, `<tuple>`, `<pair>`** — value types, all stack.
+- **`<bit>`, `<numeric>`, `<algorithm>`** — pure functions, free.
+- **`<atomic>`** — lock-free on 32-bit scalars (Cortex-M3+).
+
+Compile but misbehave on OOM (call `std::terminate`):
+
+- **`<vector>`, `<map>`, `<set>`, `<unordered_*>`, `<string>`, `<deque>`, `<list>`** — replace with ETL or fixed-capacity types.
+
+Too heavy:
+
+- **`<iostream>`** — use `printf`, `{fmt}`, or `emio`.
+- **`<regex>`** — use a hand-rolled parser.
+
+<Callout type="warn" title="STL containers can still terminate the process on OOM">
+Even with `-fno-exceptions`, `std::vector::push_back` will call `std::terminate` if allocation fails — and `std::terminate` typically calls `abort`. On a firmware target this is a hard fault. If you must use `std::vector`, pre-reserve and never grow, or use `at_capacity()` checks before push. Easier: do not use `std::vector` on bare metal.
+</Callout>
+
+## A complete Cortex-M4 example
+
+Here is a USART driver for STM32F4 that exercises every previous lesson: a class with RAII, a `std::array` for the buffer, a non-capturing lambda for the ISR vector entry, `constexpr` for the peripheral base-address table, `std::expected` for fallible operations, and `noexcept` everywhere.
+
+This is the kind of code I would write today for a new STM32F4 project. Build with `arm-none-eabi-g++ -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard -std=c++23 -O2 -ffreestanding -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-use-cxa-atexit -ffunction-sections -fdata-sections -Wl,--gc-sections`.
+
+```cpp
+#include <array>
+#include <cstdint>
+#include <expected>
+#include <span>
+
+// ---- Peripheral base addresses, all compile-time.
+
+namespace mmio {
+
+constexpr std::array<std::uintptr_t, 8> usart_bases = {
+    0x40011000,   // USART1
+    0x40004400,   // USART2
+    0x40004800,   // USART3
+    0x40004C00,   // UART4
+    0x40005000,   // UART5
+    0x40011400,   // USART6
+    0x40007800,   // UART7
+    0x40007C00,   // UART8
+};
+
+constexpr std::uintptr_t rcc_apb1enr = 0x40023840;
+constexpr std::uintptr_t rcc_apb2enr = 0x40023844;
+constexpr std::uintptr_t gpioa_base  = 0x40020000;
+
+} // namespace mmio
+
+// ---- Typed register access (lesson 5/8 pattern).
+
+template <std::uintptr_t Addr>
+struct Reg32 {
+    static std::uint32_t read() noexcept {
+        return *reinterpret_cast<volatile std::uint32_t *>(Addr);
+    }
+    static void write(std::uint32_t v) noexcept {
+        *reinterpret_cast<volatile std::uint32_t *>(Addr) = v;
+    }
+};
+
+// ---- USART driver — RAII over the peripheral.
+
+enum class UsartError { TxFull, ParityError, FramingError };
+
+template <std::uintptr_t Base>
+class Usart {
+public:
+    Usart(std::uint32_t baud, std::uint32_t pclk) noexcept {
+        // BRR = pclk / baud.
+        reg<0x08>().write(pclk / baud);
+        // CR1: UE (13) | TE (3) | RE (2).
+        reg<0x0C>().write((1u << 13) | (1u << 3) | (1u << 2));
+    }
+
+    ~Usart() noexcept {
+        reg<0x0C>().write(0);   // CR1 = 0 (disable)
+    }
+
+    // Non-copyable, non-movable — a peripheral has identity.
+    Usart(const Usart &)            = delete;
+    Usart &operator=(const Usart &) = delete;
+    Usart(Usart &&)                 = delete;
+    Usart &operator=(Usart &&)      = delete;
+
+    std::expected<void, UsartError> putc(char c) noexcept {
+        if (!(reg<0x00>().read() & (1u << 7))) return std::unexpected(UsartError::TxFull);
+        reg<0x04>().write(static_cast<std::uint32_t>(c));
+        return {};
+    }
+
+    void write(std::span<const char> s) noexcept {
+        for (char c : s) {
+            while (!(reg<0x00>().read() & (1u << 7))) { }   // wait TXE
+            reg<0x04>().write(static_cast<std::uint32_t>(c));
+        }
+    }
+
+private:
+    template <std::uintptr_t Offset>
+    static Reg32<Base + Offset> reg() noexcept { return {}; }
+};
+
+// ---- Compile-time selection of which USART to instantiate.
+
+using Usart2 = Usart<mmio::usart_bases[1]>;
+
+// ---- ISR vector entry — non-capturing lambda decays to function pointer (lesson 10).
+
+extern "C" void USART2_IRQHandler();
+
+constexpr void (*usart2_irq)() = [] {
+    // Drain RX into a ring buffer here.
+    auto sr = Reg32<mmio::usart_bases[1] + 0x00>::read();
+    if (sr & (1u << 5)) {                                  // RXNE
+        [[maybe_unused]] auto data =
+            Reg32<mmio::usart_bases[1] + 0x04>::read();
+        // Push into ring buffer (omitted for brevity).
+    }
+};
+
+extern "C" void USART2_IRQHandler() { usart2_irq(); }
+
+// ---- main.
+
+constinit std::array<char, 64> tx_buffer{};   // .bss, zero-init at startup, no dynamic init.
+
+int main() {
+    // Enable clocks (GPIOA, USART2). RCC bits are runtime-shared, init at startup only.
+    Reg32<mmio::rcc_apb1enr>::write(Reg32<mmio::rcc_apb1enr>::read() | (1u << 17));
+    Reg32<mmio::rcc_apb2enr>::write(Reg32<mmio::rcc_apb2enr>::read() | (1u <<  0));
+
+    // GPIOA AF setup omitted for brevity.
+
+    Usart2 uart(115200, 84'000'000);
+
+    constexpr std::array<char, 14> hello{'H','e','l','l','o',',',' ','w','o','r','l','d','\r','\n'};
+    uart.write(hello);
+
+    while (true) {
+        if (auto r = uart.putc('.'); !r) {
+            // Backpressure — sleep, retry, or count drops.
+            __asm__ volatile("wfi");
+        }
+    }
+}
+```
+
+Every previous lesson is in there: templates (`Reg32<Base + Offset>`), classes with RAII (`Usart<>` constructor/destructor), `constexpr` (`mmio::usart_bases[1]`), the rule of five (`= delete` for moves because hardware has identity), non-capturing lambdas decaying to function pointers (`usart2_irq` as the ISR), `std::expected` for fallible `putc`, and `constinit` for `tx_buffer` (no dynamic init).
+
+The whole driver fits in roughly 600 bytes of flash on Cortex-M4 with `-O2`. No allocation. No exceptions. No RTTI. No virtual functions. Modern C++ doing what an embedded engineer in 2010 wrote with raw register pokes — type-safe, composable, with the compiler catching mistakes.
+
+## Bridge to bare-metal C
+
+The natural next step is the [bare-metal C tutorial](/docs/programming/tutorial/) — 15 lessons on the same Cortex-M4 from the C and assembly side. Many teams write the low layers (startup, vector table, linker scripts) in C and the application layers in C++; that tutorial walks through the startup code your C++ inherits. The [C++ on Cortex-M reference](/docs/programming/cpp/) is the cheat-sheet form of this lesson, and [embedded C patterns](/docs/programming/embedded-c/) covers the idioms — circular buffers, ISR-safe queues, hardware abstraction — that mix into C++ drivers.
+
+## What you learned
+
+- The five flags every embedded C++ build needs: `-fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-use-cxa-atexit -ffunction-sections -fdata-sections`.
+- Static-init-order fiasco solutions: function-local statics, `constinit`, or explicit init lists.
+- Override `operator new`/`delete` with abort stubs; verify they are unreferenced after link.
+- STL containers without allocation: `<array>`, `<span>`, `<string_view>`, `<optional>`, `<expected>`, `<variant>`, `<atomic>`.
+- A class with RAII for a peripheral; non-capturing lambdas as ISR vectors; `constexpr` base-address tables; `std::expected` for fallible operations — these are the modern Cortex-M C++ idioms.
+
+## Exercises
+
+**Exercise 15.1.** A colleague has a 600 KB firmware. After adding `-fno-exceptions -fno-rtti`, it drops to 480 KB. Where did the 120 KB go?
+
+<Callout type="spec" title="Answer">
+Two main contributors. First, `.eh_frame` and `.eh_frame_hdr` — the unwinding tables — were typically 60-150 KB. With exceptions off, the compiler emits no unwinding records and the linker drops the sections entirely. Second, RTTI brought in a `type_info` object for every polymorphic class plus the `__cxa_throw` and `__cxa_demangle` machinery; another 30-80 KB.
+
+The remainder is usually `libsupc++` (C++ runtime support) glue that the linker can now drop because nothing references it. Verify with `arm-none-eabi-size firmware.elf` before and after, and `arm-none-eabi-nm --size-sort firmware.elf | tail -50` to see which symbols are still in the binary.
+</Callout>
+
+**Exercise 15.2.** Why is the `Usart<>` class marked non-movable, and what would break if you allowed moves?
+
+<Callout type="spec" title="Answer">
+The class represents a hardware peripheral that exists at a fixed memory address. There is exactly one USART2 in the chip; you cannot "move" it to a different address. The class owns the peripheral's *configuration* (set in the constructor, cleared in the destructor) and that ownership is meaningful: if a moved-from `Usart` tried to disable the peripheral in its destructor while a moved-to `Usart` was actively using it, you'd get a hardware fault.
+
+By `= delete`ing the move operations, the compiler refuses to compile any code that tries to relocate a `Usart`. The peripheral has identity. The class enforces it. This is the rule-of-five pattern (lesson 9) applied correctly for hardware-owning classes.
+</Callout>
+
+**Exercise 15.3.** Inspect the `.map` file from compiling the example. Find symbols starting with `__cxa_`, `_Znw`, `_Znd`, or `vtable for`. What does each indicate, and which should be empty in a well-tuned build?
+
+<Callout type="spec" title="Answer">
+
+- `__cxa_atexit`, `__cxa_finalize` — destructor registration. With `-fno-use-cxa-atexit` these should disappear.
+- `__cxa_guard_acquire`, `__cxa_guard_release` — thread-safe static-init guards. With `-fno-threadsafe-statics` these should disappear.
+- `__cxa_throw`, `__cxa_allocate_exception`, `_Unwind_*` — exception runtime. With `-fno-exceptions` these should disappear.
+- `_Znw...`, `_Znd...` — mangled forms of `operator new` and `operator delete`. Should be empty if your override stubs are reachable from the link graph but unused; if present, find what's allocating.
+- `vtable for X` — present for each polymorphic class. Each costs ~16 bytes of flash plus the vtable pointer per instance. Reduce by using CRTP or templated polymorphism for classes with a single concrete derived type.
+- `typeinfo for X` — RTTI metadata. Should be empty with `-fno-rtti`.
+
+A well-tuned firmware build of the example above has none of these symbols. If you see any, the flags or the code need investigation.
+</Callout>
+
+## Next
+
+This is the last lesson of the C++ tutorial. From here:
+
+- [Bare-metal C tutorial](/docs/programming/tutorial/) — same Cortex-M4 target, in C and assembly. Recommended next step.
+- [C++ on Cortex-M reference](/docs/programming/cpp/) — the cheat-sheet form of this lesson.
+- [Embedded C patterns](/docs/programming/embedded-c/) — circular buffers, hardware abstraction, common idioms.
+- [GCC flag reference](/tools/gcc-flags/) — the flag list explained in full.
+
+| Previous | Next |
+| --- | --- |
+| [C++ Lesson 14 — Modern C++23](/docs/programming/cpp-lesson-14-modern/) | [Bare-metal C tutorial — Lesson 1](/docs/programming/tutorial/) |

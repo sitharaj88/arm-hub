@@ -1,0 +1,417 @@
+---
+title: Lesson 6 — STL containers
+description: std::vector, std::array, std::string with SSO, std::map vs std::unordered_map, std::set, std::deque and std::list, std::span — when to use each, what they cost, and which to avoid on embedded.
+order: 9
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, stl, vector, array, string, map, span]
+badge: tutorial
+---
+
+
+<SpecSheet
+  title="Lesson 6 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'The everyday STL containers, their memory layouts, the operations they make cheap or expensive, when to pick which, and which ones allocate on the heap (so you avoid them on embedded).' },
+    { label: 'Code provided', value: 'About 120 lines across short examples for each container, plus an "input a list of integers, print sorted" capstone' },
+    { label: 'Time', value: '120-150 minutes' },
+    { label: 'Pre-reqs', value: 'Lessons 1-5' },
+  ]}
+/>
+
+The STL containers are the everyday vocabulary of C++. You almost never write a hand-rolled linked list or hash table in modern code — you pick a container from the standard library and trust the implementation. That trust is earned: `std::vector`'s growth strategy, `std::unordered_map`'s open hashing, and `std::string`'s small-string optimisation are all carefully tuned. This lesson covers the containers you will reach for every day, the ones you should reach for rarely, and the embedded-flavoured replacements you may need on Cortex-M.
+
+## std::vector — the workhorse
+
+`std::vector<T>` is a dynamically resizable contiguous array. Use it as your default for "I need to store a sequence of T".
+
+```cpp
+#include <iostream>
+#include <vector>
+
+int main() {
+    std::vector<int> v;             // empty
+    v.push_back(1);
+    v.push_back(2);
+    v.push_back(3);
+
+    std::vector<int> w{10, 20, 30}; // initialised from a brace list
+    std::vector<int> z(5, 42);      // 5 elements, all initialised to 42
+
+    for (int x : v) std::cout << x << " ";   // 1 2 3
+    std::cout << "\n";
+    std::cout << "size: " << v.size() << ", capacity: " << v.capacity() << "\n";
+}
+```
+
+What it looks like in memory:
+
+```
+v
+├── pointer ──> [ 1 | 2 | 3 | _ | _ ]    heap-allocated buffer
+├── size = 3                              elements actually present
+└── capacity = 5                          slots allocated
+```
+
+Three values: a pointer to the heap buffer, the current size, and the current capacity. When you `push_back` and `size == capacity`, the vector allocates a larger buffer (typically `2 * capacity`), copies (or moves) the existing elements over, and frees the old buffer. Push-back is amortised O(1) — most pushes are constant-time, the occasional reallocation is O(n) but happens rarely.
+
+Operations you should know:
+
+| Operation | Cost | Notes |
+| --- | --- | --- |
+| `v[i]` | O(1) | No bounds check |
+| `v.at(i)` | O(1) | Throws on out-of-bounds |
+| `v.push_back(x)` | O(1) amortised | May reallocate |
+| `v.pop_back()` | O(1) | |
+| `v.insert(it, x)` | O(n) | Shifts later elements |
+| `v.erase(it)` | O(n) | Shifts later elements |
+| `v.size()`, `v.empty()` | O(1) | |
+| `v.reserve(n)` | O(n) once | Preallocates capacity; avoid later reallocations |
+| `v.clear()` | O(n) | Calls destructors, sets size to 0 |
+
+The performance lesson: **always `reserve` if you know roughly how many elements you will have.** A vector that pushes 100000 elements with no `reserve` will reallocate around 20 times. With `reserve(100000)` it allocates once.
+
+```cpp
+std::vector<int> v;
+v.reserve(100000);            // one allocation
+for (int i = 0; i < 100000; ++i) v.push_back(i);
+```
+
+<Callout type="warn" title="Iterators are invalidated by reallocation">
+If you hold an iterator into a vector and then push_back something that causes reallocation, the iterator now points into freed memory. The same goes for references and pointers to vector elements. Either reserve enough capacity up front, or use an index (which stays valid) instead of an iterator.
+</Callout>
+
+## std::array — fixed-size, stack-allocated
+
+`std::array<T, N>` is a thin wrapper around a raw `T[N]` array. Size is part of the type. No heap allocation.
+
+```cpp
+#include <array>
+
+std::array<int, 4> a{1, 2, 3, 4};
+for (int x : a) std::cout << x << " ";   // 1 2 3 4
+std::cout << "\nsize: " << a.size() << "\n";
+```
+
+Why not just use a C array `int a[4]`? Three reasons:
+
+- `a.size()` is constant-time and the compiler knows the answer at compile time.
+- Range-based `for (auto x : a)` works because `std::array` has `begin()` and `end()`.
+- `std::array` does not decay to a pointer when passed to a function. You can write `void f(std::array<int, 4>& a)` and the function knows the size.
+
+`std::array<int, N>` and `int[N]` have identical memory layout. No overhead at all. Use `std::array` instead of raw C arrays in modern C++; the API is strictly nicer.
+
+<Callout type="spec" title="Embedded callout — std::array is the embedded default">
+On a no-heap embedded target, std::array is your everyday sequence container. It allocates from the stack or .data/.bss, never the heap. The compiler-known size enables range-checks at compile time, loop unrolling, and clean iteration. Use it everywhere you would have used a fixed-size C array — register tables, lookup tables, message buffers.
+</Callout>
+
+## std::string — what it actually does
+
+`std::string` is essentially `std::vector<char>` with extra string-specific methods (`find`, `substr`, `replace`). It manages a heap-allocated buffer of characters and a null terminator.
+
+```cpp
+#include <string>
+
+std::string s = "hello";
+s += " world";
+s.append(", how are you?");
+std::cout << s << " (length " << s.size() << ")\n";
+```
+
+The wrinkle is **SSO — the Small String Optimisation**. Most `std::string` implementations reserve about 15-22 bytes inside the string object itself (overlapping with the pointer/size/capacity fields via a union), and use them to store short strings without ever touching the heap. So:
+
+```cpp
+std::string short_s = "hi";        // stored inline, no heap allocation
+std::string long_s  = "this is a longer string that won't fit inline";
+                                    // heap allocation
+```
+
+The exact threshold varies (libstdc++: 15 bytes, libc++: 22 bytes, MSVC: 15 bytes). The user-visible behaviour is identical; only the allocation pattern differs.
+
+`std::string_view` (C++17) is a non-owning view of a character range — a pointer plus a length, no allocation. Use it for function parameters that read but do not store the string:
+
+```cpp
+void log(std::string_view message) {     // accepts string, string literal, or substring
+    std::cout << "[log] " << message << "\n";
+}
+
+log("hello");                    // const char*
+log(std::string{"hello"});       // std::string
+log(some_string.substr(0, 5));   // a substring view, no allocation
+```
+
+`std::string_view` is the right choice for any parameter that just reads characters; `const std::string&` is the older idiom that forces the caller to provide a `std::string` (allocating one if they had a `const char*`).
+
+## std::map and std::unordered_map
+
+Two associative containers; pick based on whether you care about iteration order.
+
+**`std::map<K, V>`** stores key-value pairs in a balanced binary tree (typically red-black). Iteration is in key order. All operations are O(log n).
+
+**`std::unordered_map<K, V>`** is a hash table. Iteration order is unspecified. All operations are O(1) average, O(n) worst case (on hash collisions). Requires `std::hash<K>` to exist for the key type — built-in for primitives, `std::string`, and a few others; you write your own for custom types.
+
+```cpp
+#include <map>
+#include <unordered_map>
+#include <string>
+
+std::map<std::string, int> ordered{{"alice", 30}, {"bob", 25}, {"carol", 35}};
+for (const auto& [name, age] : ordered) {
+    std::cout << name << " " << age << "\n";    // alphabetical
+}
+
+std::unordered_map<std::string, int> fast;
+fast["alice"] = 30;
+fast["bob"]   = 25;
+std::cout << "alice: " << fast["alice"] << "\n";
+std::cout << "exists: " << fast.contains("alice") << "\n";   // C++20
+```
+
+When to use which:
+
+| Need | Container |
+| --- | --- |
+| Lookup by key, no order requirement | `unordered_map` (faster) |
+| Iterate keys in sorted order | `map` |
+| Range queries (`lower_bound`, `upper_bound`) | `map` |
+| Hash function not available or expensive | `map` |
+| Memory-tight environment | neither — both allocate per insertion |
+
+Both allocate one node per insertion. `unordered_map` additionally allocates a bucket array. **Neither is appropriate for embedded targets without a heap.** Embedded replacements: `etl::map`, `etl::unordered_map` from the Embedded Template Library, or hand-rolled fixed-capacity hash tables.
+
+`map::operator[](key)` inserts a default-constructed value if the key is absent, which is sometimes surprising. Use `map::find` (returns iterator) or `map::contains` (returns bool, C++20) for pure lookup.
+
+## std::set and std::unordered_set
+
+`std::set<T>` and `std::unordered_set<T>` are like the maps but store only keys, no values. Use cases: "what unique things have I seen so far?", "is this element in the collection?". Same trade-offs as the maps.
+
+```cpp
+#include <unordered_set>
+
+std::unordered_set<int> seen;
+for (int x : {1, 2, 3, 2, 1, 4}) {
+    auto [it, inserted] = seen.insert(x);
+    if (inserted) std::cout << "first time: " << x << "\n";
+}
+```
+
+## std::deque and std::list
+
+Two containers you will rarely reach for, included here so you can read code that uses them.
+
+**`std::deque<T>`** (double-ended queue) supports O(1) push and pop at both ends. Implemented as a sequence of fixed-size chunks, not a contiguous buffer. Iteration is slower than `std::vector` because of the chunked layout. Use when you genuinely need push-front efficiency and `std::vector` would force you to shift elements every time.
+
+**`std::list<T>`** is a doubly linked list. O(1) insert and erase anywhere given an iterator. But: every element is a separate heap allocation, iteration is slow (each element is a pointer chase), and the cache behaviour is terrible. **`std::list` is almost never the right answer.** The traditional CS argument for linked lists ("O(1) insert in the middle") assumes you already have an iterator to the position, which means you have already done an O(n) scan to find it. In modern hardware, scanning a contiguous `std::vector` is faster than chasing pointers in a `std::list` even for sizes where the asymptotic complexity disagrees.
+
+If you find yourself reaching for `std::list`, almost always `std::vector` (or `std::deque` if you really need both ends) is better.
+
+## std::span (C++20)
+
+`std::span<T>` is a non-owning view of a contiguous sequence — a pointer plus a length, like `std::string_view` but for any element type. It is the right parameter type for "I need to read or write a sequence and I don't care how it was allocated."
+
+```cpp
+#include <span>
+#include <vector>
+#include <array>
+
+void zero_out(std::span<int> data) {
+    for (auto& x : data) x = 0;
+}
+
+int main() {
+    std::vector<int> v{1, 2, 3, 4, 5};
+    std::array<int, 3> a{10, 20, 30};
+    int raw[4] = {100, 200, 300, 400};
+
+    zero_out(v);
+    zero_out(a);
+    zero_out(raw);
+    zero_out({raw, 4});      // explicit construction from pointer + length
+}
+```
+
+A function taking `std::span<int>` accepts a `vector`, an `array`, a raw array, or a manually constructed pointer-plus-length. No allocation. No template gymnastics. This is the modern C++ idiom for "pass me a sequence of T" — the equivalent of Rust's `&[T]`.
+
+`std::span<const T>` for read-only access. `std::span<T, N>` for compile-time-known size.
+
+## Working example: read integers, print sorted
+
+```cpp
+#include <algorithm>
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+int main() {
+    std::cout << "Enter integers separated by spaces:\n";
+    std::string line;
+    std::getline(std::cin, line);
+
+    std::vector<int> numbers;
+    std::istringstream iss{line};
+    int n;
+    while (iss >> n) {
+        numbers.push_back(n);
+    }
+
+    std::sort(numbers.begin(), numbers.end());
+
+    std::cout << "Sorted: ";
+    for (int x : numbers) {
+        std::cout << x << " ";
+    }
+    std::cout << "\n";
+}
+```
+
+Compile and run:
+
+```
+$ g++ -std=c++23 -Wall -Wextra -Wpedantic sort.cpp -o sort
+$ ./sort
+Enter integers separated by spaces:
+5 2 8 1 9 3
+Sorted: 1 2 3 5 8 9
+```
+
+What's happening:
+
+- `std::getline` reads a line into a string. We use the line-based read because the user may type any number of integers and we don't know how many up front.
+- `std::istringstream` wraps the string in a stream so we can use `>>` to extract integers one at a time. Each `iss >> n` returns the stream; the stream is truthy if the extraction succeeded.
+- `std::vector<int>` accumulates the parsed integers without us needing to think about capacity.
+- `std::sort` (from `<algorithm>`, lesson 7) sorts the vector in place in O(n log n).
+- Range-based `for (int x : numbers)` prints each element.
+
+40 lines of C would have taken longer and had more places for bugs (off-by-one in parsing, manual allocation, manual sort). This is the STL payoff.
+
+## Picking the right container
+
+A flowchart that covers 90% of cases:
+
+1. **Need a sequence of T?** → `std::vector<T>` if size is dynamic. `std::array<T, N>` if size is known at compile time.
+2. **Sequence with frequent push/pop at both ends?** → `std::deque<T>`.
+3. **Lookup by key?** → `std::unordered_map<K, V>` for speed, `std::map<K, V>` if you need sorted iteration or `K` has no hash.
+4. **Set membership?** → `std::unordered_set<T>` or `std::set<T>` (same trade-off).
+5. **Function parameter that reads a sequence?** → `std::span<const T>` (or `std::string_view` for characters).
+6. **You think you want `std::list`?** → No, use `std::vector`.
+
+For 95% of code, `std::vector` is the right answer and you should default to it.
+
+<Callout type="warn" title="Embedded reality: none of std::vector, std::map, std::string survive without a heap">
+Every one of std::vector, std::map, std::set, std::string, std::deque, std::list allocates. On a target with no heap (or a heap you've forbidden via -fno-exceptions and -DTU_NO_MALLOC), you cannot use them as-is. Three options:
+
+1. `std::array<T, N>` for fixed-size sequences. Always heap-free.
+2. The Embedded Template Library (etlcpp.com) — `etl::vector`, `etl::map`, `etl::string` with fixed capacity baked into the type.
+3. Roll your own (you have written a `RingBuffer` in lesson 5; the same templated-on-capacity pattern works for fixed-capacity vector and map).
+
+The reference page /docs/programming/cpp/ covers these patterns in detail. Lesson 15 will use them on real hardware.
+</Callout>
+
+## Exercises
+
+**Exercise 6.1.** Modify the "sort integers" program to also print the median. (For an even-length list, average the two middle values.)
+
+<Callout type="spec" title="Answer">
+
+```cpp
+// After std::sort(numbers.begin(), numbers.end());
+double median = 0;
+auto n = numbers.size();
+if (n == 0) {
+    std::cout << "No integers entered.\n";
+    return 0;
+} else if (n % 2 == 1) {
+    median = numbers[n / 2];
+} else {
+    median = (numbers[n / 2 - 1] + numbers[n / 2]) / 2.0;
+}
+std::cout << "Median: " << median << "\n";
+```
+
+Notice the `2.0` in the division — without it, integer division would truncate `(3 + 4) / 2` to 3 instead of 3.5. C++ does not save you from this; the compiler will warn (`-Wfloat-conversion`) only if you assign an int back to a double.
+</Callout>
+
+**Exercise 6.2.** Write a function `count_words(std::string_view text)` that returns a `std::unordered_map<std::string, int>` mapping each unique word to its occurrence count. Test it on a paragraph.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <sstream>
+
+std::unordered_map<std::string, int> count_words(std::string_view text) {
+    std::unordered_map<std::string, int> counts;
+    std::string buffer{text};
+    std::istringstream iss{buffer};
+    std::string word;
+    while (iss >> word) {
+        ++counts[word];
+    }
+    return counts;
+}
+
+int main() {
+    auto counts = count_words("the quick brown fox jumps over the lazy fox");
+    for (const auto& [word, count] : counts) {
+        std::cout << word << ": " << count << "\n";
+    }
+}
+```
+
+`++counts[word]` works because `operator[]` default-constructs an int (to 0) if the key is missing, then `++` brings it to 1. Subsequent occurrences increment normally. This is one of the rare places where `operator[]`'s auto-insert behaviour is the right tool.
+
+The structured binding `const auto& [word, count] : counts` unpacks each `std::pair<const std::string, int>` into two named variables. C++17 feature.
+</Callout>
+
+**Exercise 6.3.** Write a function that takes a `std::span<const int>` and returns the sum of its elements. Call it with a `std::vector<int>`, a `std::array<int, 5>`, and a raw `int[10]`.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <span>
+#include <vector>
+#include <array>
+#include <iostream>
+
+int sum(std::span<const int> data) {
+    int total = 0;
+    for (int x : data) total += x;
+    return total;
+}
+
+int main() {
+    std::vector<int> v{1, 2, 3, 4, 5};
+    std::array<int, 5> a{10, 20, 30, 40, 50};
+    int raw[5] = {100, 200, 300, 400, 500};
+
+    std::cout << sum(v) << "\n";     // 15
+    std::cout << sum(a) << "\n";     // 150
+    std::cout << sum(raw) << "\n";   // 1500
+}
+```
+
+One function, three different sequence types, no template instantiation cost (the function is non-template; `std::span` does the type-erasure at the call site). This is the modern C++ idiom for "I want to read a sequence; I don't care how it was stored."
+
+Use `std::accumulate(data.begin(), data.end(), 0)` if you want the standard library to do the summing — covered in lesson 7.
+</Callout>
+
+## What you learned
+
+- `std::vector<T>` is the default sequence container. Reserve capacity when you know it. Iterators invalidate on reallocation.
+- `std::array<T, N>` is the fixed-size, no-heap equivalent. The embedded default.
+- `std::string` is `std::vector<char>` with string methods, plus the small-string optimisation for short strings. `std::string_view` is the non-owning view.
+- `std::map` (ordered, log n) vs `std::unordered_map` (hashed, average O(1)). Both allocate per insertion.
+- `std::set` and `std::unordered_set` are the value-only versions of the maps.
+- `std::deque` for double-ended push/pop. `std::list` is almost never right — prefer `std::vector`.
+- `std::span<T>` (C++20) is the non-owning view of a contiguous range. The modern "sequence parameter" type.
+- For embedded targets, fall back to `std::array` and the Embedded Template Library.
+
+In lesson 7 we look at iterators and algorithms — the operations that work across all of the containers above, plus the C++20 ranges that make them feel modern.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 5 — Templates](/docs/programming/cpp-lesson-05-templates/) | [Lesson 7 — Iterators and algorithms](/docs/programming/cpp-lesson-07-iterators-algorithms/) |

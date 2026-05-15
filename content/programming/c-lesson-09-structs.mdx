@@ -1,0 +1,534 @@
+---
+title: Lesson 9 — Structs and unions
+description: Struct declaration, field access, padding and alignment, packed structs for wire formats, anonymous structs, unions as tagged sum types, bit fields, designated initializers.
+order: 10
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, structs, unions, alignment]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 9 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'struct declaration, field access via . and ->, padding and alignment rules, _Alignas, packed structs, anonymous structs, unions and tagged unions, bit fields, designated initializers' },
+    { label: 'Code provided', value: 'About 120 lines including a packet header parser and a tagged union' },
+    { label: 'Time', value: '90-120 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 8 — Strings' },
+  ]}
+/>
+
+Structs are how C composes data. They look identical to records or simple classes in any other language — until you ask how many bytes one occupies. The answer is "more than you think, because of padding". This lesson covers structs and the closely-related union, including the alignment rules you have to understand to write protocol parsers and embedded driver code.
+
+## Struct declaration and use
+
+```c
+struct point {
+    int x;
+    int y;
+};
+
+struct point p;       /* declared an instance — note the struct keyword */
+p.x = 3;
+p.y = 4;
+```
+
+In C, you have to write `struct point` every time you refer to the type. The `typedef` shortcut is so common that almost all C code uses it:
+
+```c
+typedef struct {
+    int x;
+    int y;
+} point;
+
+point p;              /* no struct keyword needed */
+p.x = 3;
+```
+
+Or, with the struct tag preserved (useful for forward declarations):
+
+```c
+typedef struct point {
+    int x;
+    int y;
+} point;
+```
+
+Either form works. The C standard library does not typedef the structs it exposes (`struct timespec`, `struct stat`, `struct sockaddr`), but most application and embedded code does. Use whichever convention your codebase already uses.
+
+Field access:
+
+```c
+point p;
+p.x = 3;              /* struct value — use . */
+
+point *pp = &p;
+pp->x = 5;            /* struct pointer — use -> */
+
+(*pp).x = 7;          /* equivalent to pp->x but uglier */
+```
+
+`->` is shorthand for "dereference then dot". It is the standard way to access fields through a pointer.
+
+## Initializers
+
+Three ways to initialise a struct:
+
+```c
+point p1 = { 3, 4 };               /* positional — depends on declaration order */
+point p2 = { .x = 3, .y = 4 };     /* designated (C99+) — explicit, reorderable */
+point p3 = { .x = 3 };             /* designated, .y defaults to 0 */
+point p4 = { 0 };                  /* all fields zero */
+```
+
+**Always use designated initializers in new code.** The positional form is brittle — reorder the struct's fields and every initialiser in your codebase silently produces the wrong values. The designated form survives reorderings.
+
+`{ 0 }` is the canonical "zero everything" — equivalent to `memset(&p, 0, sizeof p)` for most struct types. (Strictly, zero-initialising a struct is type-aware — for a pointer field it makes a null pointer, for a float field a 0.0; memset just writes zero bytes. For trivial structs the two are equivalent.)
+
+## Padding and alignment
+
+Now the surprising part. Look at this struct:
+
+```c
+struct example {
+    uint8_t  a;
+    uint32_t b;
+    uint16_t c;
+};
+```
+
+What is `sizeof(struct example)`? You might say 1 + 4 + 2 = 7. The compiler says 12.
+
+The reason is **alignment**. Each scalar type has a natural alignment — `uint32_t` requires alignment to a 4-byte boundary on most CPUs, `uint16_t` to a 2-byte boundary, `uint8_t` to any byte. The compiler inserts **padding bytes** between fields and at the end of the struct so that:
+
+- Every field is aligned according to its type.
+- The struct as a whole is aligned to the strictest alignment of any field.
+- A trailing pad is added so that an array of the struct keeps the next instance aligned.
+
+For our example, the layout is:
+
+```text
+offset 0:  a  (1 byte)
+offset 1:  pad (3 bytes)    -- to align b
+offset 4:  b  (4 bytes)
+offset 8:  c  (2 bytes)
+offset 10: pad (2 bytes)    -- so total size is multiple of 4
+total size: 12
+```
+
+To see this:
+
+```c
+#include <stdio.h>
+#include <stddef.h>
+#include <stdint.h>
+
+struct example {
+    uint8_t  a;
+    uint32_t b;
+    uint16_t c;
+};
+
+int main(void) {
+    printf("sizeof = %zu\n", sizeof(struct example));   /* 12 */
+    printf("offsetof a = %zu\n", offsetof(struct example, a));   /* 0 */
+    printf("offsetof b = %zu\n", offsetof(struct example, b));   /* 4 */
+    printf("offsetof c = %zu\n", offsetof(struct example, c));   /* 8 */
+    return 0;
+}
+```
+
+`offsetof` (from `<stddef.h>`) gives the offset of a field in bytes. Indispensable for protocol parsing, hardware register layouts, and any code that needs to know where a field lives.
+
+**Reorder for compactness.** If we put the wider fields first:
+
+```c
+struct compact {
+    uint32_t b;
+    uint16_t c;
+    uint8_t  a;
+};
+```
+
+The size becomes 8: b at 0, c at 4, a at 6, pad at 7. **Generally: order fields from largest to smallest.** Saves memory, often improves cache performance.
+
+For embedded code where every byte matters, this is mandatory. For desktop code with one or two struct instances, it does not matter, but it is a good habit.
+
+## `_Alignas` and `_Alignof`
+
+C11 added explicit alignment control:
+
+```c
+#include <stdalign.h>
+
+alignas(64) static uint8_t dma_buf[1024];     /* 64-byte aligned */
+size_t a = alignof(uint32_t);                  /* 4 on most systems */
+```
+
+`alignas(N)` requires the variable to be allocated at an N-byte aligned address. Useful for DMA buffers (which often need to be cache-line aligned), SIMD code (16-byte for SSE, 32-byte for AVX), and stack-allocated buffers passed to hardware.
+
+`alignof(T)` gives the natural alignment of type T.
+
+Without `<stdalign.h>`, you can use the raw `_Alignas` / `_Alignof` keywords. The macro versions are nicer.
+
+## Packed structs
+
+For protocol parsing or memory-mapped hardware registers with mixed widths, you sometimes need a struct with **no padding** — fields packed contiguously regardless of alignment.
+
+The standard does not provide this; GCC, clang, and most other compilers do, via `__attribute__((packed))`:
+
+```c
+struct __attribute__((packed)) frame_header {
+    uint8_t  type;
+    uint32_t length;
+    uint16_t crc;
+};
+
+/* sizeof(frame_header) == 7 — exactly the sum of field sizes */
+```
+
+The compiler now emits load/store sequences that respect the actual offsets, even if they require unaligned accesses.
+
+**Pitfalls:**
+
+- **Unaligned access cost.** On Cortex-M3 and above, unaligned word accesses cost a few extra cycles. On Cortex-M0 / M0+, they trigger a fault — the CPU does not support unaligned access at all.
+- **Pointer-to-field is unsafe.** `&frame.length` has type `uint32_t *` but is not necessarily 4-aligned. Passing it to a function expecting an aligned pointer is undefined behavior on architectures that care.
+- **Compiler-specific syntax.** `__attribute__((packed))` is GCC/clang. MSVC uses `#pragma pack(1)` / `#pragma pack()`. Cross-platform code wraps both behind a macro.
+
+Packed structs are the right tool when:
+
+1. You are parsing a wire format whose layout you cannot change.
+2. You are mapping a hardware peripheral register that does not follow C alignment rules.
+3. You need a 7-byte protocol header exactly.
+
+For internal data, prefer natural alignment.
+
+<Callout type="warn" title="Taking the address of a packed struct field">
+```c
+struct __attribute__((packed)) header h;
+uint32_t *p = &h.length;        /* warning: pointer to unaligned member */
+foo(p);                          /* the function may assume aligned — UB on M0 */
+```
+GCC since 9 warns about this with `-Waddress-of-packed-member`. The safe pattern: `memcpy` the field into an aligned local, then pass the local.
+</Callout>
+
+## Anonymous structs and unions (C11)
+
+C11 allows a struct or union member with no name — its fields become directly accessible through the outer struct:
+
+```c
+struct outer {
+    int id;
+    struct {
+        int x;
+        int y;
+    };    /* no field name */
+};
+
+struct outer o;
+o.id = 1;
+o.x = 3;     /* not o.something.x — directly! */
+o.y = 4;
+```
+
+Useful for protocol structures with named sub-groups, and for tagged unions (next section).
+
+## Unions
+
+A union is a struct whose fields **share the same memory**. Only one field is meaningfully valid at a time.
+
+```c
+union value {
+    int32_t  as_int;
+    float    as_float;
+    uint8_t  as_bytes[4];
+};
+
+union value v;
+v.as_int = 0x40490FDB;     /* bit pattern of pi as float */
+printf("%f\n", v.as_float);/* approximately 3.14159 — type punning */
+```
+
+`sizeof(union)` is the size of the largest field (plus padding for alignment). All fields start at offset 0.
+
+Unions are used for:
+
+- **Type punning** (reading the same bits as different types). Strictly, this is implementation-defined in C; in practice gcc, clang, and MSVC all support it. (Strict aliasing — lesson 14 — has a carve-out for unions.)
+- **Tagged unions** (sum types) — the next pattern.
+- **Memory-saving variants** where you know which field is active.
+
+## Tagged unions (sum types)
+
+A tagged union pairs a discriminator (a tag) with a union of payload types. This is C's idiom for "one of several things":
+
+```c
+typedef enum { EVENT_BUTTON, EVENT_TIMER, EVENT_UART } event_kind_t;
+
+typedef struct {
+    event_kind_t kind;
+    union {
+        struct { uint32_t button_id; bool pressed; }       button;
+        struct { uint32_t timer_id;  uint32_t deadline; }  timer;
+        struct { uint8_t  ch;        uint16_t flags; }     uart;
+    };
+} event_t;
+
+void handle(const event_t *e) {
+    switch (e->kind) {
+        case EVENT_BUTTON: handle_button(e->button.button_id, e->button.pressed); break;
+        case EVENT_TIMER:  handle_timer(e->timer.timer_id, e->timer.deadline); break;
+        case EVENT_UART:   handle_uart(e->uart.ch, e->uart.flags); break;
+    }
+}
+
+int main(void) {
+    event_t evt = { .kind = EVENT_BUTTON, .button = { .button_id = 1, .pressed = true } };
+    handle(&evt);
+    return 0;
+}
+```
+
+The anonymous union (no name on the `union { ... }` block) means we can write `e->button.button_id` instead of `e->payload.button.button_id`.
+
+The discipline is: **always read the tag first, then access only the union member matching the tag**. Accessing the wrong member after a different one was last written is implementation-defined (and a recipe for bugs).
+
+This pattern appears throughout embedded code: event queues, command parsers, FSM transitions, protocol messages. Modern languages spell it `enum` (Rust) or `case class` (Scala) or `data` (Haskell); C lets you build it from struct, union, and enum primitives.
+
+## Bit fields
+
+C lets you specify the bit width of a struct field:
+
+```c
+struct status_register {
+    uint32_t enable    : 1;
+    uint32_t mode      : 3;
+    uint32_t reserved  : 4;
+    uint32_t count     : 24;
+};
+```
+
+The compiler packs these into the underlying type (`uint32_t` here), letting you read and write individual fields without manual shift-and-mask.
+
+```c
+struct status_register s = { 0 };
+s.enable = 1;
+s.mode = 5;
+s.count = 100000;
+```
+
+**Pitfalls:**
+
+- **Bit order within the underlying type is implementation-defined.** Whether `enable` is the LSB or MSB of the underlying word depends on the compiler. This makes bit fields unsuitable for wire formats.
+- **Whether bit fields can span underlying-type boundaries is implementation-defined.**
+- **The underlying integer type that holds the bits is implementation-defined**, though most compilers allow you to specify it.
+- **The padding rules are complex** and surprise people.
+
+In practice, bit fields are usable for **internal** structures where you only need named access (you do not need to interact with anything external). For hardware registers and wire formats, use explicit shift-and-mask with named macros — predictable and portable.
+
+```c
+/* Better than bit fields for hardware registers: */
+#define STATUS_ENABLE      (1u <<  0)
+#define STATUS_MODE_MASK   (0x7u << 1)
+#define STATUS_MODE_SHIFT  1
+#define STATUS_COUNT_MASK  (0xFFFFFFu << 8)
+#define STATUS_COUNT_SHIFT 8
+```
+
+Verbose, but portable across compilers and toolchains.
+
+## A real example: a packet header
+
+A common task in embedded code: parsing a packet header from a byte buffer. Suppose we have a wire format:
+
+```text
++--------+----------------+-----------------+--------+
+| type   | length         | sequence number | flags  |
+| 1 byte | 2 bytes (LE)   | 4 bytes (LE)    | 1 byte |
++--------+----------------+-----------------+--------+
+total: 8 bytes
+```
+
+A packed struct gives you direct field access:
+
+```c
+#include <stdint.h>
+
+struct __attribute__((packed)) packet_header {
+    uint8_t  type;
+    uint16_t length;
+    uint32_t sequence;
+    uint8_t  flags;
+};
+
+/* sizeof(packet_header) == 8, exactly. */
+```
+
+But as noted above, `&header.length` may be unaligned, and on M0/M0+ that traps. The portable, safe form uses the byte-by-byte reader from lesson 2:
+
+```c
+#include <stdint.h>
+#include <string.h>
+
+typedef struct {
+    uint8_t  type;
+    uint16_t length;
+    uint32_t sequence;
+    uint8_t  flags;
+} packet_header;
+
+static bool parse_header(const uint8_t *buf, size_t len, packet_header *out) {
+    if (len < 8) return false;
+    out->type     = buf[0];
+    out->length   = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
+    out->sequence = (uint32_t)buf[3]
+                  | ((uint32_t)buf[4] <<  8)
+                  | ((uint32_t)buf[5] << 16)
+                  | ((uint32_t)buf[6] << 24);
+    out->flags    = buf[7];
+    return true;
+}
+```
+
+The struct is naturally aligned (no `packed`). The byte-by-byte read works on any architecture, any endianness, any alignment. The cost is a few extra instructions; the benefit is correctness on every target.
+
+## Comparing structs
+
+C does **not** provide structural equality on structs. `s1 == s2` is a compile error. You write your own comparison:
+
+```c
+bool point_eq(point a, point b) {
+    return a.x == b.x && a.y == b.y;
+}
+```
+
+`memcmp(&s1, &s2, sizeof s1)` works for trivial structs **if there is no padding** — otherwise the padding bytes (which contain unspecified data) make the comparison unreliable. For safety, write field-by-field comparators.
+
+## Forward declarations
+
+You can declare a struct without defining it:
+
+```c
+struct node;          /* forward declaration */
+typedef struct node *node_ptr;
+
+void process(node_ptr p);
+```
+
+Forward-declared structs are **incomplete types** — you can hold pointers to them but cannot create instances or access fields. Define the struct fully somewhere accessible before you actually use it.
+
+Useful for hiding implementation: a public header forward-declares the struct, the implementation file defines it. Users of the API only manipulate pointers — opaque handle pattern.
+
+```c
+/* my_lib.h — public header */
+typedef struct my_lib_state my_lib_state_t;
+my_lib_state_t *my_lib_create(void);
+void my_lib_destroy(my_lib_state_t *s);
+int  my_lib_action(my_lib_state_t *s, int arg);
+
+/* my_lib.c — implementation */
+struct my_lib_state {
+    int x;
+    int y;
+    /* hidden fields */
+};
+```
+
+This is the closest C gets to "private fields". Callers physically cannot access the internals because they cannot include the definition.
+
+## Exercises
+
+**Exercise 9.1.** Compute by hand the `sizeof` of this struct on a 64-bit system, then verify with code:
+
+```c
+struct s {
+    char     a;
+    double   b;
+    char     c;
+    int32_t  d;
+    char     e;
+};
+```
+
+<Callout type="spec" title="Answer">
+24 bytes. Layout: `a` at 0, then 7 pad bytes to align `b`, `b` at 8, `c` at 16, 3 pad bytes to align `d`, `d` at 20, `e` at 24, 7 pad bytes so total is a multiple of 8 (the strictest alignment). Total 32. (Some compilers may pack the trailing char into the alignment slack at byte 25 — exact depends on ABI.)
+
+Reordered largest-first:
+
+```c
+struct s_packed {
+    double   b;     /* 8 bytes at offset 0 */
+    int32_t  d;     /* 4 bytes at offset 8 */
+    char     a, c, e; /* 3 bytes at offset 12, 13, 14 */
+    /* 1 pad byte */
+};
+```
+
+16 bytes — half the size. Always order fields largest to smallest in embedded code.
+</Callout>
+
+**Exercise 9.2.** Implement a tagged union for arithmetic expressions: literal-int, addition (two sub-expressions), and negation (one sub-expression). Write an `eval` function.
+
+<Callout type="spec" title="Answer">
+```c
+typedef enum { EXPR_LIT, EXPR_ADD, EXPR_NEG } expr_kind_t;
+
+typedef struct expr {
+    expr_kind_t kind;
+    union {
+        int32_t lit;
+        struct { struct expr *lhs, *rhs; } add;
+        struct { struct expr *operand; }   neg;
+    };
+} expr_t;
+
+int32_t eval(const expr_t *e) {
+    switch (e->kind) {
+        case EXPR_LIT: return e->lit;
+        case EXPR_ADD: return eval(e->add.lhs) + eval(e->add.rhs);
+        case EXPR_NEG: return -eval(e->neg.operand);
+    }
+    return 0; /* unreachable */
+}
+```
+
+Note the anonymous union and anonymous structs inside — the C11 feature that makes `e->lit`, `e->add.lhs`, `e->neg.operand` direct accesses without intermediate names. The result is a clean sum type. (Real code would also need allocation/deallocation for the recursive sub-expressions.)
+</Callout>
+
+**Exercise 9.3.** Why is taking `&h.length` (where `h` is a packed-struct field) potentially dangerous? What is the safe alternative?
+
+<Callout type="spec" title="Answer">
+On a packed struct, `&h.length` produces a `uint16_t *` (or `uint32_t *`, depending on field type) that may not be properly aligned for the type. On Cortex-M0/M0+, an unaligned load instruction triggers a usage fault. On Cortex-M3 and above, it works but emits slower code. On x86, unaligned access works but a few cycles slower.
+
+The safe alternative: copy into an aligned local before use.
+
+```c
+uint16_t length;
+memcpy(&length, &h.length, sizeof length);
+/* use length */
+```
+
+`memcpy` is special-cased by the compiler — for small, known-size copies it emits whatever instruction sequence is fastest, taking alignment into account. This is the canonical safe pattern for accessing fields of packed structs.
+</Callout>
+
+## What you learned
+
+- Structs compose fields by name. `typedef struct { ... } name;` is the standard idiom.
+- Field access: `.` for values, `->` for pointers.
+- Use designated initializers (`{ .x = 3 }`) — they survive field reordering.
+- Padding inserts bytes to align each field; the struct's size may exceed the sum of its fields.
+- Order fields largest-first to minimise padding.
+- `offsetof` (from `<stddef.h>`) gives the byte offset of a field — essential for parsing and protocol work.
+- `__attribute__((packed))` removes padding; pay attention to unaligned access traps.
+- `alignas(N)` requires a specific alignment for variables.
+- Anonymous structs and unions (C11) let you flatten access paths.
+- Unions share memory across members; combined with an enum tag, they implement sum types.
+- Bit fields are usable for internal data; prefer explicit shift-mask macros for hardware and wire formats.
+- C does not auto-generate struct equality; write your own.
+- Forward declarations let you hide struct internals — the opaque-handle pattern.
+
+In lesson 10 we cover dynamic memory: `malloc`, `free`, the heap, leaks, double-free, use-after-free, and a growable vector implementation.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 8 — Strings](/docs/programming/c-lesson-08-strings/) | [Lesson 10 — Dynamic memory](/docs/programming/c-lesson-10-dynamic-memory/) |

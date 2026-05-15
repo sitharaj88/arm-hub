@@ -1,0 +1,395 @@
+---
+title: C++ Lesson 9 — Move semantics
+description: R-value references, move constructors, std::move, the rule of five and the rule of zero, noexcept moves, and why STL containers fall back to copy without it.
+order: 10
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, move-semantics]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 9 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'R-value references, move constructor and assignment, std::move, rule of five vs rule of zero, noexcept moves, perfect forwarding in templates' },
+    { label: 'Code provided', value: 'About 140 lines — a Buffer class with full move semantics' },
+    { label: 'Time', value: '60-75 minutes' },
+    { label: 'Pre-reqs', value: 'Lessons 1-8 (classes, templates, STL, smart pointers)' },
+  ]}
+/>
+
+In the first eight lessons you wrote classes that owned resources. Every one of those classes — implicitly or otherwise — had a copy constructor. When the resource was a heap-allocated buffer, copying meant `new[]`-ing a second buffer and copying every byte. When the resource was a 1 MB image, that copy was 1 MB of needless work. Move semantics, introduced in C++11 and refined ever since, lets you say "I do not need the source object after this point — just transfer the resource pointer". The cost drops from O(N) to O(1) and the code stays readable.
+
+This lesson is about the mechanics. The next two — lambdas and error handling — both depend on understanding moves, so spend the time.
+
+## The problem: gratuitous copies
+
+Consider a buffer class that owns a heap array:
+
+```cpp
+class BufferV1 {
+public:
+    explicit BufferV1(std::size_t n) : size_(n), data_(new std::byte[n]) {}
+    ~BufferV1() { delete[] data_; }
+
+    BufferV1(const BufferV1 &other)
+        : size_(other.size_), data_(new std::byte[other.size_]) {
+        std::copy_n(other.data_, size_, data_);
+    }
+
+    BufferV1 &operator=(const BufferV1 &other) {
+        if (this == &other) return *this;
+        delete[] data_;
+        size_ = other.size_;
+        data_ = new std::byte[size_];
+        std::copy_n(other.data_, size_, data_);
+        return *this;
+    }
+
+private:
+    std::size_t size_;
+    std::byte  *data_;
+};
+
+BufferV1 make_zero_buffer(std::size_t n) {
+    BufferV1 b(n);
+    return b;          // copy on return? maybe RVO, maybe not.
+}
+
+void f() {
+    BufferV1 a = make_zero_buffer(1'000'000);   // 1 MB copy candidate
+}
+```
+
+The compiler may apply named return value optimisation (NRVO) and elide the copy entirely. It may not — NRVO is an optimisation, not a guarantee, and any change to the function (multiple return paths, a non-trivial destructor sequence) can disable it. Without move semantics, you are at the mercy of the optimiser. With move semantics, you tell the language explicitly: "treat the return value as a temporary; steal its guts."
+
+## R-value references
+
+The new piece of syntax is `T&&` — an r-value reference. Where `T&` binds to an l-value (an object with a name, something you can assign to), `T&&` binds to an r-value (a temporary, the result of an expression, something about to die).
+
+```cpp
+int x = 42;
+int &lr  = x;            // OK — l-value reference to l-value
+int &&rr = x;            // ERROR — r-value reference will not bind to l-value
+int &&rr2 = 42;          // OK — r-value reference to r-value
+int &&rr3 = std::move(x); // OK — std::move casts l-value to r-value
+```
+
+Function overloading on r-value reference lets you write two versions of the same operation — one for "I am going to read your value, please leave it intact" (the const-l-value-reference copy) and one for "you are about to be destroyed anyway, give me your guts" (the r-value-reference move).
+
+```cpp
+void take(const Buffer &b);    // copy version
+void take(Buffer &&b);         // move version
+
+Buffer b(100);
+take(b);              // calls const-ref version (b is an l-value)
+take(std::move(b));   // calls r-value version (b is now a moved-from husk)
+take(Buffer(50));     // calls r-value version (temporary is an r-value)
+```
+
+That overload selection is the whole foundation. Everything else — move constructors, move assignment, `std::move` itself — is just applying this rule.
+
+## `std::move` is just a cast
+
+The name is misleading. `std::move(x)` does not move anything; it casts `x` to an r-value reference so that an overload taking `T&&` can be selected.
+
+```cpp
+// Roughly what std::move does:
+template <typename T>
+constexpr std::remove_reference_t<T> &&move(T &&t) noexcept {
+    return static_cast<std::remove_reference_t<T> &&>(t);
+}
+```
+
+After `std::move(x)`, the variable `x` still exists. It still has its destructor scheduled. It is just marked "you may treat me as a temporary". Whether anything actually gets stolen depends on whether the move constructor or move assignment operator is called next.
+
+<Callout type="warn" title="Moved-from objects are still alive">
+The standard says moved-from standard-library objects are "in a valid but unspecified state". They can be destroyed and assigned to; reading their value is well-defined but the value is implementation-specified. For your own types, define what "moved-from" means and stick to it. A common convention: a moved-from buffer has `size_ == 0` and `data_ == nullptr`, which means the destructor's `delete[] nullptr` is a no-op.
+</Callout>
+
+## The move constructor and move assignment
+
+A class with a movable resource implements two new special members:
+
+```cpp
+class Buffer {
+public:
+    explicit Buffer(std::size_t n)
+        : size_(n), data_(new std::byte[n]) {}
+
+    ~Buffer() { delete[] data_; }
+
+    // Copy: deep copy.
+    Buffer(const Buffer &other)
+        : size_(other.size_), data_(new std::byte[other.size_]) {
+        std::copy_n(other.data_, size_, data_);
+    }
+    Buffer &operator=(const Buffer &other) {
+        if (this == &other) return *this;
+        Buffer tmp(other);                    // copy-and-swap idiom
+        std::swap(size_, tmp.size_);
+        std::swap(data_, tmp.data_);
+        return *this;
+    }
+
+    // Move: steal pointer, leave source empty.
+    Buffer(Buffer &&other) noexcept
+        : size_(other.size_), data_(other.data_) {
+        other.size_ = 0;
+        other.data_ = nullptr;
+    }
+    Buffer &operator=(Buffer &&other) noexcept {
+        if (this == &other) return *this;
+        delete[] data_;
+        size_ = other.size_;
+        data_ = other.data_;
+        other.size_ = 0;
+        other.data_ = nullptr;
+        return *this;
+    }
+
+    std::size_t       size() const noexcept { return size_; }
+    std::byte       * data()       noexcept { return data_; }
+    const std::byte * data() const noexcept { return data_; }
+
+private:
+    std::size_t size_ = 0;
+    std::byte  *data_ = nullptr;
+};
+```
+
+The move constructor takes the source's `data_` pointer and `size_`, then nulls the source. The destructor of the moved-from object sees `data_ == nullptr` and a `delete[] nullptr` is a defined no-op. The move-assignment operator destroys our existing resource first, then steals.
+
+Now compare the cost:
+
+```cpp
+Buffer make_buffer(std::size_t n) { return Buffer(n); }
+
+Buffer a = make_buffer(1'000'000);   // move-construct from temporary, no copy
+Buffer b(1'000);
+Buffer c = std::move(b);             // move-construct, b is now empty
+```
+
+Each of those is two pointer assignments plus two writes. Whether the buffer is 1 KB or 1 GB does not matter.
+
+## The rule of five
+
+If a class needs any one of (destructor, copy constructor, copy assignment, move constructor, move assignment), it usually needs all five. The reason is that the compiler-generated versions of the others probably do the wrong thing for a class with an owning raw pointer. A common bug:
+
+```cpp
+class Leaky {
+public:
+    Leaky() : p_(new int[100]) {}
+    ~Leaky() { delete[] p_; }
+    // No copy/move declared — compiler synthesises copies by member-wise copy.
+private:
+    int *p_;
+};
+
+Leaky a;
+Leaky b = a;       // a.p_ and b.p_ point to the same array.
+// At scope exit, both destructors run, double-free.
+```
+
+The rule of five says: declare all five if you declare any. Often the right declarations are `= default` (use the compiler's version) or `= delete` (forbid the operation).
+
+## The rule of zero — preferred
+
+The rule of zero is the modern best practice: write classes that own resources through standard-library types (`std::vector`, `std::unique_ptr`, `std::string`) and write **none** of the five. The compiler synthesises correct copy/move/destruct by recursing into those members, which already handle ownership correctly.
+
+```cpp
+class BufferRuleOfZero {
+public:
+    explicit BufferRuleOfZero(std::size_t n) : data_(n) {}
+
+    std::size_t size() const noexcept { return data_.size(); }
+    std::byte * data()       noexcept { return data_.data(); }
+    // No destructor, no copy/move declarations.
+private:
+    std::vector<std::byte> data_;
+};
+```
+
+This class has correct deep-copy semantics, correct move semantics, correct destruction, and is exception-safe — all because `std::vector` already does the work. Every line of special-member code is a line you do not write, do not test, and cannot get wrong.
+
+Use the rule of zero whenever possible. Drop to the rule of five only when you genuinely own a non-RAII resource (a raw OS handle, an MMU page, a hardware DMA channel) that no standard wrapper covers.
+
+## `noexcept` moves and the STL fallback
+
+The STL is paranoid. When `std::vector` reallocates, it has to move every element from the old buffer to the new one. If a move constructor throws partway through, the vector has a problem: some elements have already been moved (the originals are corrupted husks), and the operation cannot be rolled back. So the standard says: **if the move constructor is not `noexcept`, `std::vector` falls back to copying**.
+
+```cpp
+class Slow {
+public:
+    Slow(Slow &&) /* not noexcept */ { /* ... */ }
+};
+
+class Fast {
+public:
+    Fast(Fast &&) noexcept = default;
+};
+
+std::vector<Slow> v1;   // reallocations copy — defeats move semantics
+std::vector<Fast> v2;   // reallocations move — fast
+```
+
+The rule: **every move constructor and move assignment operator should be `noexcept`** unless you have a specific reason otherwise. The compiler-generated moves for rule-of-zero classes are `noexcept` when all members' moves are `noexcept`, so this comes for free.
+
+<Callout type="tip" title="Mark moves noexcept">
+On `g++ -O2 -std=c++23`, swapping a `std::vector<NotNoexcept>` to `std::vector<Noexcept>` typically gives a 5-10x speedup on push-back-driven workloads. The fix is one keyword.
+</Callout>
+
+## Perfect forwarding (a brief glimpse)
+
+In a function template, `T&&` has a special meaning called a "forwarding reference". It can bind to either l-values or r-values, depending on what's passed:
+
+```cpp
+template <typename T>
+void wrapper(T &&x) {
+    process(std::forward<T>(x));   // preserves value category
+}
+
+int a = 5;
+wrapper(a);     // T is int&,  x is int&,  forward<int&>(x) is l-value
+wrapper(42);    // T is int,   x is int&&, forward<int>(x)  is r-value
+```
+
+`std::forward<T>` is a conditional cast: it forwards an l-value as an l-value and an r-value as an r-value. This pattern shows up constantly in factory functions (`std::make_unique`, `emplace_back`).
+
+You will not be writing perfect-forwarding code from scratch in this tutorial, but you should recognise `T&&` in a template as a forwarding reference (not a plain r-value reference) and know what `std::forward<T>(x)` does. When you see code like
+
+```cpp
+template <typename... Args>
+std::unique_ptr<Widget> make_widget(Args &&...args) {
+    return std::unique_ptr<Widget>(new Widget(std::forward<Args>(args)...));
+}
+```
+
+you can now read it: a variadic template that perfectly forwards every constructor argument into `Widget`'s constructor without unnecessary copies.
+
+## A complete worked example
+
+Here is `Buffer` with full rule-of-five and a quick driver. Compile with `g++ -std=c++23 -O2 -Wall buffer.cpp`:
+
+```cpp
+#include <algorithm>
+#include <cstddef>
+#include <cstdio>
+#include <vector>
+
+class Buffer {
+public:
+    explicit Buffer(std::size_t n)
+        : size_(n), data_(n ? new std::byte[n]{} : nullptr) {
+        std::printf("ctor(%zu) @ %p\n", n, (void *)this);
+    }
+
+    ~Buffer() {
+        std::printf("dtor      @ %p (size=%zu)\n", (void *)this, size_);
+        delete[] data_;
+    }
+
+    Buffer(const Buffer &o)
+        : size_(o.size_), data_(o.size_ ? new std::byte[o.size_] : nullptr) {
+        std::copy_n(o.data_, size_, data_);
+        std::printf("copy-ctor @ %p from %p\n", (void *)this, (const void *)&o);
+    }
+
+    Buffer &operator=(const Buffer &o) {
+        if (this == &o) return *this;
+        Buffer tmp(o);
+        std::swap(size_, tmp.size_);
+        std::swap(data_, tmp.data_);
+        std::printf("copy-asgn @ %p\n", (void *)this);
+        return *this;
+    }
+
+    Buffer(Buffer &&o) noexcept
+        : size_(o.size_), data_(o.data_) {
+        o.size_ = 0;
+        o.data_ = nullptr;
+        std::printf("move-ctor @ %p from %p\n", (void *)this, (void *)&o);
+    }
+
+    Buffer &operator=(Buffer &&o) noexcept {
+        if (this == &o) return *this;
+        delete[] data_;
+        size_ = o.size_;
+        data_ = o.data_;
+        o.size_ = 0;
+        o.data_ = nullptr;
+        std::printf("move-asgn @ %p\n", (void *)this);
+        return *this;
+    }
+
+    std::size_t size() const noexcept { return size_; }
+
+private:
+    std::size_t size_ = 0;
+    std::byte  *data_ = nullptr;
+};
+
+int main() {
+    std::vector<Buffer> v;
+    v.reserve(4);                  // avoid reallocations during the demo
+
+    v.emplace_back(1000);          // construct in place
+    Buffer big(50'000'000);
+    v.push_back(std::move(big));   // move-construct into vector
+    Buffer copy_me(10);
+    v.push_back(copy_me);          // copy-construct (l-value, no std::move)
+
+    std::printf("sizes: %zu %zu %zu\n", v[0].size(), v[1].size(), v[2].size());
+    std::printf("big.size() after move: %zu\n", big.size());
+}
+```
+
+The trace output shows exactly which special member runs for each line. Notice that `std::move(big)` produces no allocation — just pointer transfer — while `copy_me` deep-copies its 10 bytes.
+
+## What you learned
+
+- R-value references (`T&&`) bind to temporaries; overloads on them give you the "I am about to die, take my guts" channel.
+- `std::move` is a cast, not an operation. The actual transfer happens in the move constructor or move assignment.
+- Rule of five: declare all five if you declare any. Rule of zero: prefer to declare none, by storing resources in standard wrappers.
+- Mark moves `noexcept` or the STL silently falls back to copying.
+- `T&&` in a function template is a forwarding reference; use `std::forward<T>` to preserve value category.
+
+## Exercises
+
+**Exercise 9.1.** A colleague writes `Buffer b = std::move(some_other_buffer);` then ten lines later does `some_other_buffer.write(0, 0xFF);`. What is the failure mode and where in the trace would you see it?
+
+<Callout type="spec" title="Answer">
+After `std::move`, `some_other_buffer` has `size_ == 0` and `data_ == nullptr`. The subsequent `write(0, 0xFF)` dereferences `nullptr` — undefined behaviour, typically a hard fault on a Cortex-M or a SIGSEGV on a hosted target. The trace would show a `move-ctor @ ... from <addr of some_other_buffer>` line; from that moment on, reads or writes through `some_other_buffer.data_` are invalid. The convention "do not touch a moved-from object except to destroy or reassign it" is for this exact reason.
+</Callout>
+
+**Exercise 9.2.** Rewrite `Buffer` using `std::vector<std::byte>` as the storage (rule of zero). Confirm that move construction is still O(1) — `std::vector`'s move is a three-pointer swap.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+class Buffer {
+public:
+    explicit Buffer(std::size_t n) : data_(n) {}
+    std::size_t       size()       const noexcept { return data_.size(); }
+    std::byte       * data()             noexcept { return data_.data(); }
+    const std::byte * data()       const noexcept { return data_.data(); }
+private:
+    std::vector<std::byte> data_;
+};
+```
+
+No destructor, no copy/move declarations. The compiler synthesises them, recursing into `std::vector`'s own move (which is `noexcept` and O(1)). The trace from a `g++ -fsanitize=address` build shows no `delete[]` calls for moves — just pointer swaps inside `std::vector`. This is the rule-of-zero advantage in one paragraph.
+</Callout>
+
+**Exercise 9.3.** Take the non-`noexcept` version of `Buffer`'s move constructor (remove the `noexcept`) and put 1000 instances in a `std::vector`. Measure how much slower `push_back` is in a tight loop. Why?
+
+<Callout type="spec" title="Answer">
+Without `noexcept`, `std::vector` chooses `std::move_if_noexcept`, which evaluates to a copy for non-`noexcept` types when there is a copy constructor. Every reallocation copies all existing elements instead of moving them — that's O(N) bytes per reallocation, where N is the buffer's size, not the count. For 1000 buffers of 1 KB each you allocate roughly 1 MB extra per growth event. Restoring `noexcept` brings the time back. This is one of the cleanest demonstrations of why `noexcept` on moves is mandatory in practice.
+</Callout>
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [C++ Lesson 8 — Smart pointers](/docs/programming/cpp-lesson-08-smart-pointers/) | [C++ Lesson 10 — Lambdas](/docs/programming/cpp-lesson-10-lambdas/) |
+
+See also: [C++ on Cortex-M](/docs/programming/cpp/), [C++ tutorial index](/docs/programming/cpp-tutorial/), [GCC flag reference](/tools/gcc-flags/).

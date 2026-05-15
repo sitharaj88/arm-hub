@@ -1,0 +1,377 @@
+---
+title: C++ Lesson 11 — Error handling
+description: Return codes, exceptions, and std::expected (C++23). Exception cost, noexcept, exception safety guarantees, and why most embedded builds use -fno-exceptions.
+order: 12
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, error-handling, expected, exceptions]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 11 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Return codes vs exceptions vs std::expected, exception cost on Cortex-M, noexcept, exception safety guarantees, when each approach fits' },
+    { label: 'Code provided', value: 'About 130 lines — a parser returning std::expected, both with and without exceptions' },
+    { label: 'Time', value: '60-75 minutes' },
+    { label: 'Pre-reqs', value: 'Lessons 1-10 (classes, templates, STL, smart pointers, move, lambdas)' },
+  ]}
+/>
+
+Every non-trivial function can fail. The disk is full. The network timed out. The user typed `abc` where you expected a number. C++ gives you three ways to report that: C-style return codes, exceptions, and (since C++23) `std::expected<T, E>`. Each is good for some situations, bad for others. This lesson walks through all three, the cost of each, and the embedded constraint that pushes most firmware to `-fno-exceptions` and `std::expected`.
+
+## Approach 1: return codes (C-style)
+
+The oldest approach: the function returns an `int` (or `enum`) indicating success or failure, and the actual result goes through an out-pointer.
+
+```cpp
+enum class Status { Ok, NotFound, Overflow, BadInput };
+
+Status parse_uint(const char *s, std::uint32_t *out) {
+    if (!s || !out) return Status::BadInput;
+    std::uint32_t v = 0;
+    for (const char *p = s; *p; ++p) {
+        if (*p < '0' || *p > '9') return Status::BadInput;
+        if (v > (UINT32_MAX - (*p - '0')) / 10) return Status::Overflow;
+        v = v * 10 + (*p - '0');
+    }
+    *out = v;
+    return Status::Ok;
+}
+
+std::uint32_t value = 0;
+if (parse_uint("12345", &value) != Status::Ok) {
+    handle_error();
+}
+```
+
+Pros: no runtime overhead, no special machinery, deterministic. Compiles to a few branches and a return. Friendly to embedded, friendly to C interop.
+
+Cons: out-parameters are ugly. The caller has to declare a variable, pass its address, and then check the status. Failure paths are easy to forget. The function signature does not visually distinguish "always succeeds" from "may fail". And if you compose three fallible calls, the error-checking boilerplate dwarfs the actual logic.
+
+```cpp
+Status process(const char *a, const char *b, const char *c) {
+    std::uint32_t va, vb, vc;
+    if (auto s = parse_uint(a, &va); s != Status::Ok) return s;
+    if (auto s = parse_uint(b, &vb); s != Status::Ok) return s;
+    if (auto s = parse_uint(c, &vc); s != Status::Ok) return s;
+    // ... use va, vb, vc ...
+    return Status::Ok;
+}
+```
+
+Three lines of logic, three lines of error propagation. This is what every C program looks like at scale.
+
+## Approach 2: exceptions
+
+C++ exceptions let you write the happy path linearly and centralise error handling at the top of the call stack.
+
+```cpp
+class ParseError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+std::uint32_t parse_uint(const char *s) {
+    if (!s) throw ParseError("null input");
+    std::uint32_t v = 0;
+    for (const char *p = s; *p; ++p) {
+        if (*p < '0' || *p > '9') throw ParseError("non-digit");
+        if (v > (UINT32_MAX - (*p - '0')) / 10) throw ParseError("overflow");
+        v = v * 10 + (*p - '0');
+    }
+    return v;
+}
+
+void process(const char *a, const char *b, const char *c) {
+    auto va = parse_uint(a);
+    auto vb = parse_uint(b);
+    auto vc = parse_uint(c);
+    // ... use va, vb, vc ...
+}
+
+int main() {
+    try {
+        process("12", "34", "abc");
+    } catch (const ParseError &e) {
+        std::println("parse failed: {}", e.what());
+    }
+}
+```
+
+The happy path is three lines. Errors propagate up automatically. The `try/catch` block is the one place that handles failure.
+
+### The cost of exceptions
+
+The reason exceptions are controversial — and disabled on most embedded targets — is the cost. There are two parts:
+
+**Throw is expensive.** When `throw ParseError(...)` runs, the runtime allocates space for the exception object (often via `malloc`), then walks the stack frame by frame, looking up unwinding tables to find destructors to call and a matching catch handler. On a moderately complex stack, this can take tens of microseconds. It also requires the runtime to be present, which means tens to hundreds of KB of `.eh_frame` and unwinding-info sections in the binary.
+
+**`try`/`catch` is nearly free.** Modern implementations use the "Itanium ABI" zero-cost model — there is no code emitted at `try`/`catch` entry; the unwinding tables are consulted only when an exception is actually in flight. So in the no-throw case, `try`/`catch` has the same cost as the bare code.
+
+**`.eh_frame` adds up.** Each function that could be unwound through has an unwinding table entry. On a typical Cortex-M project compiled with `-fexceptions`, this section is 50-200 KB. With `-fno-exceptions` it is zero.
+
+### `noexcept`
+
+A function marked `noexcept` promises not to throw. The compiler can omit unwinding-info for functions called only from `noexcept` paths and optimise more aggressively. If a `noexcept` function does throw (e.g., it calls something that throws and does not catch), `std::terminate` is called immediately — no unwinding.
+
+```cpp
+int add(int a, int b) noexcept { return a + b; }
+void buffer_move(Buffer &&b) noexcept;   // move constructors should be noexcept
+```
+
+You saw this in lesson 9: STL containers fall back to copying if a move is not `noexcept`. The keyword has real performance consequences in container-heavy code.
+
+### Exception safety guarantees
+
+When a function throws partway through, the question is "what state is the system in now?" There are four documented levels:
+
+1. **No-throw guarantee.** The function never throws. Marked `noexcept`. Strongest. Required for destructors, deallocators, swap.
+2. **Strong guarantee.** If the function throws, the program state is unchanged. Effectively transactional. Common pattern: build a result in a temporary, then `swap` into place at the end (no-throw swap = transaction commit).
+3. **Basic guarantee.** If the function throws, invariants are preserved and no resources leak, but state may be partially updated. RAII members give you this for free.
+4. **No guarantee.** Throw leaves the system in an indeterminate state. Avoid.
+
+The basic guarantee is the default and is achieved automatically when every owning member is RAII — destructors run on stack unwind, resources release. The strong guarantee requires extra work (the copy-then-swap idiom from lesson 9 gives it to you for assignment).
+
+<Callout type="warn" title="-fno-exceptions is the default for embedded C++">
+Most embedded C++ projects build with `-fno-exceptions`. Compiling under that flag:
+
+- `throw` becomes a compile error (some toolchains call `std::abort()` instead).
+- `try/catch` becomes a compile error.
+- STL containers still build, but their failure modes change. `std::vector::push_back` on OOM calls `std::terminate()` instead of throwing `std::bad_alloc`. `std::vector::at` on out-of-bounds does the same.
+- `.eh_frame` shrinks to zero. Binary is typically 30-100 KB smaller for a moderate project.
+- All control flow becomes explicit (returns and gotos only). Deterministic worst-case execution time.
+
+What you give up: the convenience of exception-based error propagation. The standard answer in 2026 is `std::expected` (below) — it gives you most of the ergonomics without the runtime cost.
+</Callout>
+
+## Approach 3: `std::expected<T, E>` (C++23) and `std::optional<T>`
+
+`std::optional<T>` is "a T or nothing". `std::expected<T, E>` is "a T or an E". Both are sum types implemented as discriminated unions. Both encode failure in the return value itself, with no out-parameter and no exception machinery.
+
+```cpp
+#include <expected>
+#include <string>
+
+enum class ParseError { Empty, NonDigit, Overflow };
+
+std::expected<std::uint32_t, ParseError> parse_uint(const char *s) {
+    if (!s || !*s) return std::unexpected(ParseError::Empty);
+    std::uint32_t v = 0;
+    for (const char *p = s; *p; ++p) {
+        if (*p < '0' || *p > '9') return std::unexpected(ParseError::NonDigit);
+        if (v > (UINT32_MAX - (*p - '0')) / 10)
+            return std::unexpected(ParseError::Overflow);
+        v = v * 10 + (*p - '0');
+    }
+    return v;
+}
+
+void use() {
+    auto r = parse_uint("12345");
+    if (r) {
+        std::println("got {}", *r);              // dereference for value
+    } else {
+        std::println("error: {}", static_cast<int>(r.error()));
+    }
+}
+```
+
+`std::expected<T, E>` is contextually convertible to bool (true if it holds a value). `*r` gets the value, `r.error()` gets the error. There is no global state, no exception, no allocation.
+
+### Chaining with monadic operations
+
+C++23 added `and_then`, `or_else`, and `transform`, which compose expected-returning functions cleanly:
+
+```cpp
+auto result = parse_uint("42")
+    .and_then([](std::uint32_t n) -> std::expected<std::uint32_t, ParseError> {
+        if (n > 100) return std::unexpected(ParseError::Overflow);
+        return n * 2;
+    })
+    .transform([](std::uint32_t n) { return n + 1; });
+```
+
+`and_then` applies a function if the expected holds a value, passing the value through. The chained function returns its own expected, and errors short-circuit the rest of the chain. `transform` applies a non-fallible function to the value. `or_else` lets you recover from an error.
+
+### Cost
+
+`std::expected<T, E>` is a value type — typically two words (a `T` or `E`, plus a discriminator). Returning one is just returning a value. No allocation, no unwinding, no special machinery. The cost is identical to returning a struct with a status code and a result field, because that is what it is.
+
+This makes `std::expected` the right answer for embedded firmware in 2026. You get exception-like ergonomics with return-code-like cost.
+
+## When to use which
+
+- **Return codes (C-style).** C interop, deepest hot paths, or when you want absolute clarity for every reader.
+- **Exceptions.** Hosted code where binary size and latency are not constraints and "happy path dominant" holds.
+- **`std::expected` / `std::optional`.** The modern default — especially for embedded. Errors in the type, no overhead, no allocator dependency.
+
+For new C++23 projects on Cortex-M, the baseline is `-fno-exceptions -fno-rtti` plus `std::expected`. On hosted, mix exceptions for "should never happen" with `std::expected` for "may legitimately happen".
+
+## A complete worked example
+
+A parser that returns `std::expected<Result, ParseError>`. Build with `g++ -std=c++23 -O2 -Wall parser.cpp`. The same code works under `-fno-exceptions`:
+
+```cpp
+#include <expected>
+#include <print>
+#include <string_view>
+#include <variant>
+
+enum class ParseError {
+    Empty,
+    UnexpectedChar,
+    Overflow,
+    TrailingGarbage,
+};
+
+constexpr std::string_view name_of(ParseError e) {
+    switch (e) {
+        case ParseError::Empty:           return "empty input";
+        case ParseError::UnexpectedChar:  return "unexpected character";
+        case ParseError::Overflow:        return "numeric overflow";
+        case ParseError::TrailingGarbage: return "trailing garbage";
+    }
+    return "unknown";
+}
+
+struct KeyValue {
+    std::string_view key;
+    std::uint32_t    value;
+};
+
+namespace {
+
+std::expected<std::uint32_t, ParseError>
+parse_uint(std::string_view &s) {
+    if (s.empty() || s.front() < '0' || s.front() > '9')
+        return std::unexpected(ParseError::UnexpectedChar);
+    std::uint32_t v = 0;
+    while (!s.empty() && s.front() >= '0' && s.front() <= '9') {
+        std::uint32_t d = static_cast<std::uint32_t>(s.front() - '0');
+        if (v > (UINT32_MAX - d) / 10)
+            return std::unexpected(ParseError::Overflow);
+        v = v * 10 + d;
+        s.remove_prefix(1);
+    }
+    return v;
+}
+
+std::expected<std::string_view, ParseError>
+parse_ident(std::string_view &s) {
+    auto begin = s;
+    while (!s.empty() && (s.front() == '_' ||
+            (s.front() >= 'a' && s.front() <= 'z') ||
+            (s.front() >= 'A' && s.front() <= 'Z'))) {
+        s.remove_prefix(1);
+    }
+    if (begin.data() == s.data())
+        return std::unexpected(ParseError::UnexpectedChar);
+    return std::string_view(begin.data(),
+                            static_cast<std::size_t>(s.data() - begin.data()));
+}
+
+} // namespace
+
+std::expected<KeyValue, ParseError> parse_kv(std::string_view s) {
+    if (s.empty()) return std::unexpected(ParseError::Empty);
+    auto key = parse_ident(s);
+    if (!key) return std::unexpected(key.error());
+    if (s.empty() || s.front() != '=')
+        return std::unexpected(ParseError::UnexpectedChar);
+    s.remove_prefix(1);
+    auto val = parse_uint(s);
+    if (!val) return std::unexpected(val.error());
+    if (!s.empty())
+        return std::unexpected(ParseError::TrailingGarbage);
+    return KeyValue{*key, *val};
+}
+
+int main() {
+    for (auto input : {"x=42", "count=1000", "bad=abc", "=10", "ok=12 ", ""}) {
+        auto kv = parse_kv(input);
+        if (kv) {
+            std::println("OK: '{}' -> {}={}", input, kv->key, kv->value);
+        } else {
+            std::println("ERR '{}': {}", input, name_of(kv.error()));
+        }
+    }
+}
+```
+
+Every fallible function returns `std::expected`. Errors short-circuit. Successes flow through. The `main` loop tests all the failure modes — and the program compiles and runs identically under `-fno-exceptions` because we never use `throw`.
+
+## What you learned
+
+- Three error-handling styles: return codes, exceptions, `std::expected`/`std::optional`.
+- Exceptions are nearly free for the no-throw path but expensive on throw, and they add `.eh_frame` to the binary.
+- `noexcept` documents and enforces "this function will not throw"; it also gates STL move/copy fallback (lesson 9).
+- Exception safety has four levels; basic safety is automatic with RAII.
+- `-fno-exceptions` is standard for embedded; the cost is no `throw`, the gain is smaller, deterministic binaries.
+- `std::expected<T, E>` (C++23) is the modern default for fallible functions — typed error, value-based, no runtime cost, works under `-fno-exceptions`.
+
+## Exercises
+
+**Exercise 11.1.** Take the `parse_kv` example and chain a transformation: after parsing, multiply the value by 2 if the key is `"double"`, otherwise leave unchanged. Use `.and_then` or `.transform`.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+auto result = parse_kv("double=21")
+    .transform([](KeyValue kv) {
+        if (kv.key == "double") kv.value *= 2;
+        return kv;
+    });
+
+if (result) std::println("{}={}", result->key, result->value);   // double=42
+```
+
+`transform` applies the function if the expected holds a value and passes the error through unchanged. Use `and_then` instead if the transformation itself can fail (returns its own `std::expected`).
+</Callout>
+
+**Exercise 11.2.** Compile the example with `g++ -std=c++23 -fno-exceptions -O2 parser.cpp` and confirm it builds and runs. Now add a `throw std::runtime_error("oops");` somewhere — what does the compiler say?
+
+<Callout type="spec" title="Answer">
+The first build succeeds — the example does not use `throw`. Adding `throw` under `-fno-exceptions` produces an error along the lines of "exception handling disabled, use -fexceptions to enable". This is the embedded sanity check: the build will refuse to silently link in exception machinery you did not ask for.
+
+Equivalent failure modes:
+
+- `try/catch` is also a compile error under `-fno-exceptions`.
+- A function called only via templates that throws compiles only if no instantiation actually invokes the throw site under the constraints.
+</Callout>
+
+**Exercise 11.3.** Why is the strong exception guarantee hard to provide for a function that modifies two unrelated containers? Sketch the problem.
+
+<Callout type="spec" title="Answer">
+The strong guarantee says: if the function throws, the program state is unchanged. For a function that does
+
+```cpp
+void transfer(Account &from, Account &to, int amount) {
+    from.debit(amount);
+    to.credit(amount);       // if this throws, from has been debited but to was not credited
+}
+```
+
+you cannot easily provide the strong guarantee, because the first operation has already committed and the second cannot be replayed. The standard idiom is to use a transactional pattern — stage all changes into temporaries, then swap them in atomically:
+
+```cpp
+void transfer(Account &from, Account &to, int amount) {
+    Account new_from = from;
+    Account new_to   = to;
+    new_from.debit(amount);
+    new_to.credit(amount);
+    // Both succeeded — commit via swap (noexcept).
+    swap(from, new_from);
+    swap(to, new_to);
+}
+```
+
+Now if any of the staging operations throws, neither `from` nor `to` has been modified. The two `swap`s at the end must be `noexcept` — otherwise the commit could fail halfway. This is the same copy-and-swap idiom from lesson 9, generalised.
+</Callout>
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [C++ Lesson 10 — Lambdas](/docs/programming/cpp-lesson-10-lambdas/) | [C++ Lesson 12 — Concurrency](/docs/programming/cpp-lesson-12-concurrency/) |
+
+See also: [C++ on Cortex-M](/docs/programming/cpp/), [GCC flag reference](/tools/gcc-flags/), [C++ tutorial index](/docs/programming/cpp-tutorial/).

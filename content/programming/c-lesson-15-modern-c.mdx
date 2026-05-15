@@ -1,0 +1,370 @@
+---
+title: Lesson 15 — Modern C, C11/C17/C23
+description: What each revision added — Static_assert, Generic, atomics, nullptr, constexpr, attributes, typeof, BitInt, embed. Which compilers support what and when to use them.
+order: 16
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, c11, c17, c23, modern]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 15 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'What C11, C17, and C23 added; which compilers support what; when to upgrade your -std flag; the trajectory toward a less-error-prone C' },
+    { label: 'Code provided', value: 'About 90 lines of examples for each major C11 and C23 feature' },
+    { label: 'Time', value: '90-120 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 14 — Undefined behavior' },
+  ]}
+/>
+
+C has been revised five times since ANSI standardised it in 1989: C89, C99, C11, C17, and C23. Each revision added language features and standard library headers. Modern C (C11 onwards) is meaningfully more pleasant and safer to write than C89, and C23 brings the language closer to what programmers in 2026 expect — `nullptr`, `constexpr`, attributes, binary literals, type inference. This lesson covers what each revision changed and which features are safe to use today.
+
+## A brief timeline
+
+- **C89 / C90** (1989, 1990). The original ANSI/ISO standardisation. The C that books from the 1990s described.
+- **C99** (1999). Big revision — `<stdint.h>`, fixed-width integers, designated initializers, declarations after statements, `inline`, complex numbers, VLAs, variadic macros, `_Bool`, single-line comments standardised.
+- **C11** (2011). `_Static_assert`, `_Generic`, atomics, thread-local storage, anonymous structs/unions, alignment specifiers, `gets` removed.
+- **C17** (2018). Bug-fix release. No new features; clarifications to C11.
+- **C23** (2023). Major modernisation: `nullptr`, `bool`/`true`/`false` as keywords, `constexpr`, `auto` for type deduction, attributes `[[...]]`, `typeof`, binary literals as standard, `#embed`, `_BitInt(N)`, `static_assert` (without underscore), C++-style empty `()` means `(void)`, and many smaller cleanups.
+
+Most production code today targets **C17** because it has broad compiler support and includes everything from C99 and C11. **C23** is well-supported in GCC 13+ and clang 16+ but not universally; for embedded toolchains it may lag. The strategy: use C17 as the default, opt into C23 when your compiler set supports it.
+
+## C11 — what to know
+
+### `_Static_assert`
+
+Compile-time assertions. Useful for checking that struct sizes, type widths, and other constants are what you expect:
+
+```c
+#include <assert.h>
+#include <stdint.h>
+
+_Static_assert(sizeof(int32_t) == 4, "int32_t must be 4 bytes");
+_Static_assert(CHAR_BIT == 8, "this code assumes 8-bit bytes");
+
+struct frame { uint8_t type; uint32_t len; uint8_t flags; };
+_Static_assert(sizeof(struct frame) == 12, "frame layout changed");
+```
+
+If the condition is false at compile time, the build fails with the message. Cost-free; the check disappears from the compiled output.
+
+`<assert.h>` provides a `static_assert` macro (without the underscore) that maps to `_Static_assert` in C11/C17. In C23 the keyword `static_assert` is in the language directly.
+
+### `_Generic`
+
+Compile-time type-dispatched expressions (we saw this in lesson 11):
+
+```c
+#define ABS(x) _Generic((x), \
+    int: abs, long: labs, float: fabsf, double: fabs)(x)
+```
+
+Used by `<tgmath.h>` (type-generic math) to provide overloaded math functions.
+
+### Anonymous structs and unions
+
+```c
+struct event {
+    int kind;
+    union {
+        struct { int x; int y; } click;
+        struct { char key;     } key;
+    };  /* anonymous */
+};
+
+struct event e;
+e.click.x = 10;     /* direct access, no intermediate name */
+```
+
+Heavily used in tagged-union patterns (lesson 9).
+
+### `_Alignas` and `_Alignof`
+
+Explicit alignment control (lesson 9). With `<stdalign.h>`, the macros `alignas` and `alignof` provide the lowercase form:
+
+```c
+#include <stdalign.h>
+alignas(64) static uint8_t dma_buffer[1024];
+```
+
+### `<stdatomic.h>` — atomic types and operations
+
+```c
+#include <stdatomic.h>
+
+atomic_int counter = 0;
+atomic_fetch_add(&counter, 1);                       /* increment with full sequential consistency */
+atomic_fetch_add_explicit(&counter, 1, memory_order_relaxed);
+```
+
+Atomic operations with explicit memory ordering. Essential for lock-free data structures and any multi-threaded code that touches shared state. On Cortex-M3 and above, GCC emits LDREX/STREX pairs; on Cortex-M0 it falls back to interrupt-disabling.
+
+For embedded firmware with ISRs, this is the right way to do shared counters and flags — much better than `volatile`-plus-fingers-crossed.
+
+### `<threads.h>` — standard threads (mostly aspirational)
+
+C11 specified `thrd_create`, `mtx_lock`, etc. — a small thread API. **Most platforms still do not implement it.** Linux/Mac default to POSIX threads (`pthread.h`); Windows uses its own API. C11 threads exist on some libc implementations but adoption is poor.
+
+For threaded code in 2026, use platform threads, not `<threads.h>`.
+
+### Thread-local storage: `_Thread_local`
+
+```c
+_Thread_local int tls_counter;
+```
+
+Each thread gets its own copy. Useful for thread-local caches, per-thread random state, etc. `errno` is implemented as thread-local on most modern systems.
+
+### `gets` is gone
+
+Removed from the standard library. Use `fgets` (lesson 8).
+
+## C17 — almost nothing new
+
+C17 (also called C18 because publication happened in 2018) is a maintenance release. No new features. Bug fixes to C11 wording. If your build supports C11, switching to C17 is a no-op other than the `-std=c17` flag.
+
+Use C17 as the default for new projects until C23 is reliably available.
+
+## C23 — the big modernisation
+
+C23 is the most user-visible C revision since C99. Many additions are clearly inspired by C++ or Rust.
+
+### `nullptr` and `nullptr_t`
+
+```c
+#include <stddef.h>
+
+int *p = nullptr;     /* type-safe null pointer constant */
+```
+
+Better than `NULL` because `NULL` is sometimes `(void *)0` and sometimes plain `0`, which causes subtle problems in variadic calls and `_Generic`. `nullptr` is unambiguous.
+
+### `bool`, `true`, `false` as keywords
+
+```c
+bool ready = false;        /* no need to #include <stdbool.h> */
+if (ready) { ... }
+```
+
+`bool`, `true`, and `false` are language keywords. No header required. The behavior is the same as `<stdbool.h>` in earlier standards — what changed is the spelling.
+
+### `static_assert` without underscore
+
+```c
+static_assert(sizeof(int) == 4, "int is 32-bit");
+```
+
+The underscore-prefix forms (`_Static_assert`) still work; the no-underscore form is now a keyword.
+
+### `constexpr` for compile-time constants
+
+```c
+constexpr int MAX_USERS = 1024;
+constexpr double PI = 3.14159265358979;
+```
+
+Unlike `static const`, a `constexpr` is a true constant expression — usable as an array size, in case labels, in `#if`. Replaces most uses of `#define` for typed constants. The compiler verifies the initialiser is a constant expression.
+
+### `auto` for type deduction
+
+```c
+auto x = 42;             /* x is int */
+auto p = some_function();/* p is whatever the function returns */
+```
+
+C23's `auto` is borrowed from C++ (and finally adapted from its original C89 meaning of "stack-allocated by default", which everyone already had).
+
+For complex iterator-like types it is a real convenience. For simple cases, explicit types are usually clearer.
+
+### `typeof` and `typeof_unqual`
+
+```c
+int x = 5;
+typeof(x) y = x;        /* y has the type of x — int */
+```
+
+Borrowed from GCC's long-standing extension. Useful in macros that need to operate on whatever type the caller passed.
+
+### Attributes: `[[...]]`
+
+C23 adopts C++-style attribute syntax for many things that were previously `__attribute__((...))`:
+
+```c
+[[nodiscard]] int compute(void);
+[[maybe_unused]] int helper(int x);
+[[deprecated("use new_api instead")]] void old_api(void);
+[[fallthrough]];                 /* in a switch */
+[[noreturn]] void die(const char *msg);
+```
+
+`[[nodiscard]]` warns if the caller ignores the return value — great for error-returning functions. `[[maybe_unused]]` silences the unused-warning for a parameter or variable. `[[deprecated]]` warns at every call site. `[[fallthrough]]` replaces the older `/* fall through */` comment. `[[noreturn]]` says the function does not return (useful for fatal-error helpers — the compiler can optimise away code after the call).
+
+### Binary literals: `0b...`
+
+```c
+uint8_t mask = 0b00001111;     /* same as 0x0F, but visually mirrors bit positions */
+uint32_t flags = 0b0001'0000'0000_0001;   /* digit separators (next item) */
+```
+
+Native binary literals. Available as a GCC extension since forever; finally standardised.
+
+### Digit separators
+
+```c
+int million = 1'000'000;
+uint32_t addr = 0xDEAD'BEEF;
+```
+
+Single-quote can appear between digits in numeric literals. Pure readability. Note: confusing for non-English readers used to other thousands separators, but the C standard adopted the single quote.
+
+### `#embed` — include binary data
+
+```c
+const uint8_t logo_data[] = {
+    #embed "logo.bin"
+};
+```
+
+`#embed` is the long-awaited official way to include binary data in a C source file. Before C23, you used `xxd -i` or similar tools to convert binary to a C array; now the preprocessor does it.
+
+Useful for embedded firmware that ships fonts, splash screens, configuration data, or wavetables compiled into the binary.
+
+### `_BitInt(N)` — exact-width integers
+
+```c
+_BitInt(7)  signed_7bit;
+_BitInt(40) signed_40bit;
+unsigned _BitInt(128) huge;
+```
+
+Integer types of arbitrary bit width. `_BitInt(40)` is exactly 40 bits — useful for protocol fields that do not fit standard sizes. Compiler emits whatever instruction sequence is needed; on most hardware, `_BitInt(40)` is implemented as 64-bit operations with masking.
+
+Niche but powerful for specialised work like cryptography (`_BitInt(521)`) and certain DSP fields.
+
+### Empty `()` means `(void)`
+
+In C23, `int f()` is finally a declaration that `f` takes no parameters and is type-checked — same as `int f(void)`. The historical "unspecified parameters" meaning of `()` is gone (lesson 5).
+
+```c
+int f();             /* C17: dangerous. C23: same as f(void). */
+```
+
+After 35 years, the trap is closed. You can stop writing `(void)` in new C23 code — although for cross-standard portability, `(void)` is still the safe spelling.
+
+### `unreachable()`
+
+```c
+#include <stddef.h>
+
+int classify(int x) {
+    if (x < 0) return -1;
+    if (x > 0) return  1;
+    if (x == 0) return 0;
+    unreachable();        /* tells the compiler this point is impossible */
+}
+```
+
+Maps to `__builtin_unreachable` on GCC/clang. Tells the optimiser the path is impossible, removing the implicit "missing return" warning and enabling further optimisations. Misuse is UB — make sure the path is genuinely unreachable.
+
+## Compiler support, rough state of play in 2026
+
+- **GCC 13+** — full C23 support for nearly everything; pass `-std=c23` (or `-std=gnu23` for GNU extensions).
+- **clang 16+** — full C23 support; pass `-std=c23`.
+- **MSVC** — C17 is supported with `/std:c17`; C23 is partial as of MSVC 17.10. Microsoft historically prioritised C++; C support lagged. Improving.
+- **arm-none-eabi-gcc** — whatever GCC version your toolchain bundles. The ARM Embedded Toolchain GCC 13 supports C23.
+- **xtensa-esp32-elf-gcc** — Espressif's ESP-IDF toolchain. Recent versions (5.x+) support C17; C23 is partial.
+
+**The strategy for a new project in 2026:**
+
+1. Default to `-std=c17`. Broad support, has C11's `_Static_assert`, `_Generic`, atomics, anonymous structs.
+2. If your toolchain set is all C23-capable, upgrade to `-std=c23`. The benefit is mostly quality-of-life: `nullptr`, `bool` as keyword, `constexpr`, `[[nodiscard]]`, binary literals.
+3. For maximum portability (compiling on older systems, MISRA-C compliance), stay on C99 — but accept that you give up most modern features.
+
+## What did not make it into modern C
+
+Things that other languages have and C deliberately does not (or has not yet):
+
+- **Generics** beyond `_Generic`. No template-style parametric polymorphism. Macros and `_Generic` cover most needs awkwardly.
+- **Destructors / RAII.** No automatic cleanup. The `cleanup` attribute (GCC/clang extension) provides a partial substitute.
+- **Modules.** Headers are still text inclusion. C23 considered modules; they did not make it.
+- **Pattern matching beyond `switch`.** No `match` expressions like Rust.
+- **A safer string type.** Strings are still NUL-terminated char arrays.
+- **Bounds-checked arrays as a language feature.** Sanitizers catch issues at runtime; the language does not enforce.
+
+These are why C++ exists for some workloads and Rust exists for others. C remains C: small, close to the machine, portable to anywhere there is a compiler.
+
+## A C23 example bringing several features together
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+constexpr int MAX_SAMPLES = 256;
+
+typedef struct {
+    int32_t samples[MAX_SAMPLES];
+    size_t  count;
+} buffer_t;
+
+[[nodiscard]] static bool buffer_push(buffer_t *buf, int32_t value) {
+    if (buf->count >= MAX_SAMPLES) return false;
+    buf->samples[buf->count++] = value;
+    return true;
+}
+
+static auto sample_average(const buffer_t *buf) -> double {
+    if (buf->count == 0) return 0.0;
+    int64_t sum = 0;
+    for (size_t i = 0; i < buf->count; i++) sum += buf->samples[i];
+    return (double)sum / (double)buf->count;
+}
+
+int main() {       /* C23: () means no args */
+    buffer_t buf = { 0 };
+    for (int i = 0; i < 10; i++) {
+        if (!buffer_push(&buf, i * i)) break;
+    }
+    printf("count = %zu, avg = %.2f\n", buf.count, sample_average(&buf));
+    return 0;
+}
+```
+
+Features used:
+
+- `constexpr` for the buffer size constant.
+- `bool` as a keyword (no `<stdbool.h>` needed).
+- `[[nodiscard]]` on `buffer_push` — the compiler warns if the caller ignores the result.
+- `auto` and trailing return type `-> double` for the average function (a C23/C++-style syntax).
+- `()` parameter list in `main` — explicit "no arguments".
+- `0b...` could replace some hex literals (not used here for variety).
+
+Compile:
+
+```bash
+gcc -std=c23 -Wall -Wextra -Wpedantic example.c -o example
+```
+
+## What you learned
+
+- **C11** added `_Static_assert`, `_Generic`, atomics, thread-local storage, anonymous structs, `_Alignas` — and removed `gets`.
+- **C17** is C11 plus bug fixes. The widely-supported "modern" default.
+- **C23** is a major modernisation: `nullptr`, `bool`/`true`/`false` as keywords, `constexpr`, `auto`, `typeof`, `[[nodiscard]]` and friends, binary literals, digit separators, `#embed`, `_BitInt(N)`, `unreachable()`, and the fix to `f()` vs `f(void)`.
+- GCC 13+ and clang 16+ have strong C23 support. MSVC is improving. Embedded toolchains lag but are catching up.
+- Pick C17 today if you need broad support. Pick C23 if your toolchain set allows it.
+
+That is the language. The next step is to apply it to embedded hardware in the [bare-metal C tutorial](/docs/programming/tutorial/), or to bring object-oriented features and RAII via the upcoming [C++ tutorial](/docs/programming/cpp-tutorial/). C is small enough that you now know almost all of it; what you do not know are the patterns and idioms that come from experience, which you will pick up by writing code.
+
+## Where to go next
+
+- **[Bare-metal C tutorial](/docs/programming/tutorial/)** — apply this C to a Cortex-M microcontroller. Toolchain, blink, registers, linker scripts, interrupts, DMA.
+- **[Embedded C patterns](/docs/programming/embedded-c/)** — the patterns and idioms common in firmware code.
+- **[volatile and memory-mapped I/O](/docs/programming/volatile-mmio/)** — what volatile means at the silicon level.
+- **[The C standard library on embedded](/docs/programming/libc/)** — newlib, picolibc, and what to do when malloc is off the table.
+- **[C++ tutorial](/docs/programming/cpp-tutorial/)** — when you are ready for classes, RAII, templates.
+- **[GCC flags reference](/tools/gcc-flags/)** — every flag in our build commands explained.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 14 — Undefined behavior](/docs/programming/c-lesson-14-ub/) | [Bare-metal C tutorial](/docs/programming/tutorial/) |

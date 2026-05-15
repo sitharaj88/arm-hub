@@ -1,0 +1,421 @@
+---
+title: Lesson 5 — Functions
+description: Declarations vs definitions, headers and prototypes, pass-by-value (C has nothing else), static and inline, recursion, and the f() vs f(void) trap that bit everyone before C23.
+order: 6
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, functions]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 5 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Function declarations and prototypes, pass-by-value semantics, returning by value, static linkage, inline functions, recursion, and the empty-parens vs (void) trap' },
+    { label: 'Code provided', value: 'About 80 lines including max3, a recursive factorial, and inline accessor patterns' },
+    { label: 'Time', value: '60-90 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 4 — Control flow' },
+  ]}
+/>
+
+Functions in C look like functions in any C-family language: a return type, a name, a parameter list, a body. What differs is how arguments are passed (always by value), how the language distinguishes "I am telling you this function exists" from "here is its body", and a handful of historical quirks that survived in the language for 40 years and got cleaned up in C23.
+
+## Declaration vs definition
+
+```c
+/* Declaration: tells the compiler "this function exists, with this signature" */
+int add(int a, int b);
+
+/* Definition: gives the body */
+int add(int a, int b) {
+    return a + b;
+}
+```
+
+A function **declaration** is a promise to the compiler. It tells the compiler the function's name, return type, and parameter types so that calls to the function can be type-checked. A **definition** provides the actual code.
+
+You may declare a function many times across translation units. You may define it **exactly once** across the whole program (the one-definition rule, lesson 12). Multiple declarations of the same function must agree on the signature.
+
+Inside a source file, the order matters: a function must be **declared** (or defined) before it is used. Otherwise the compiler does not know its signature. Two patterns to satisfy this:
+
+**Pattern 1: define the helper first.**
+
+```c
+static int helper(int x) { return x * 2; }
+
+int main(void) {
+    return helper(21);
+}
+```
+
+**Pattern 2: declare at the top, define lower.**
+
+```c
+static int helper(int x);            /* declaration */
+
+int main(void) {
+    return helper(21);
+}
+
+static int helper(int x) { return x * 2; }   /* definition */
+```
+
+For multi-file programs, declarations live in **headers** (`.h` files) and definitions live in **source files** (`.c` files). We cover this in detail in lesson 12.
+
+## Function prototypes
+
+A **prototype** is the declaration including parameter types:
+
+```c
+int add(int, int);          /* prototype — parameter names optional */
+int add(int a, int b);      /* prototype — names are documentation */
+```
+
+The names in a declaration are pure documentation; the compiler ignores them. The same applies in headers:
+
+```c
+/* mathlib.h */
+int add(int a, int b);
+int sub(int a, int b);
+int mul(int a, int b);
+```
+
+Prototype declarations let the compiler check call sites for type mismatches:
+
+```c
+int x = add(1.5, 2.5);     /* warning: implicit conversion of double to int */
+int y = add(1, 2, 3);      /* error: too many arguments */
+```
+
+Without a prototype, the compiler would silently convert what it could and let the rest become an undefined-behavior runtime mystery. **Always have a prototype visible at every call site.** That is what headers exist for.
+
+## Pass-by-value (always)
+
+C functions take their arguments **by value**. The argument is a fresh local variable, initialised from the caller's expression. Modifying it does not affect the caller.
+
+```c
+#include <stdio.h>
+
+void try_to_set(int x) {
+    x = 42;                /* modifies our local copy, not the caller's variable */
+}
+
+int main(void) {
+    int a = 5;
+    try_to_set(a);
+    printf("%d\n", a);     /* prints 5 */
+    return 0;
+}
+```
+
+If you come from Python (where mutable arguments are passed by reference-like semantics) or JavaScript (where objects pass a reference but primitives pass by value), C's uniformity may feel strange. There is exactly one rule: every argument is a copy.
+
+To let the function modify the caller's variable, you pass a **pointer to it**:
+
+```c
+void set_to_42(int *x) {
+    *x = 42;
+}
+
+int main(void) {
+    int a = 5;
+    set_to_42(&a);
+    printf("%d\n", a);     /* prints 42 */
+    return 0;
+}
+```
+
+The pointer is still passed by value — `x` inside the function is a new local pointer. But it points to the caller's `a`, so dereferencing it accesses the original. This is what other languages call "pass by reference"; in C, it is explicitly pass-a-pointer-by-value. The difference is that C makes the indirection visible at every call site (`&a`) and every dereference (`*x`).
+
+Arrays, when passed to functions, decay to pointers — covered in lesson 6.
+
+## Returning structs by value
+
+C lets you return structs by value:
+
+```c
+typedef struct { double x, y, z; } vec3;
+
+vec3 add_vec(vec3 a, vec3 b) {
+    return (vec3){ a.x + b.x, a.y + b.y, a.z + b.z };
+}
+```
+
+This is **allowed** and increasingly common in modern C. Historically people avoided it because returning a large struct meant a stack copy on every call. Modern compilers under modern calling conventions (System V AMD64, AAPCS) often pass and return small structs in registers, and for larger structs they pass a hidden pointer to the return slot and write directly into it — no copy. The performance difference vs returning a pointer is usually negligible.
+
+The syntax `(vec3){ a.x + b.x, ... }` is a **compound literal** (C99). It creates an anonymous `vec3` on the spot for use in the return statement.
+
+For very large structs (KB-scale), prefer passing a pointer to a caller-owned struct that the function fills in. For small structs (a few fields), return by value — it reads cleaner and modern compilers optimise it well.
+
+## `static` for file-local linkage
+
+By default, a function defined in a `.c` file is **externally visible** — other translation units can declare and call it. Often that is not what you want. A helper function private to one source file should be `static`:
+
+```c
+static int helper(int x) {
+    return x * 2 + 1;
+}
+```
+
+`static` here means "file-local linkage". The function exists, but its name is not exported to the linker. Other `.c` files cannot see it. This:
+
+- Keeps your namespace clean (no chance of accidentally clashing with someone else's `helper`).
+- Lets the compiler inline more aggressively, because it knows all call sites.
+- Documents intent: "this helper is internal".
+
+`static` on a function is **different** from `static` on a local variable inside a function (which makes the variable persist between calls — a single instance shared across calls). Same keyword, different meaning depending on context. We will see the local-variable form in lesson 10.
+
+In headers, never define `static` functions — they would be a separate copy in every translation unit that includes the header. Define `static` only in `.c` files (or use `static inline` in a header, see below).
+
+## `inline`
+
+```c
+static inline int square(int x) {
+    return x * x;
+}
+```
+
+`inline` is a **hint** to the compiler that this function is a good candidate for inlining at call sites. The compiler is free to ignore it. Modern compilers inline aggressively at higher optimisation levels (`-O2`, `-O3`) regardless of the keyword.
+
+The pattern `static inline` is the canonical way to put a small function in a header. Each translation unit that includes the header gets its own internal copy; the compiler can inline at every call site; the linker does not complain about duplicate definitions because each copy has internal linkage.
+
+```c
+/* counter.h */
+#pragma once
+#include <stdint.h>
+
+static inline uint32_t counter_next(uint32_t *c) {
+    return ++(*c);
+}
+```
+
+For a one-liner like this, `static inline` is much faster than a regular function call — no call/return overhead. The trade-off is binary size: if 100 files include this header and all call `counter_next`, the inlined code appears at every call site. For a one-liner that is fine; for a 100-line function, it is bloat.
+
+Plain `inline` (without `static`) has subtle external-definition rules that mostly trip people up. Stick with `static inline` for header inlines and you will not have a problem.
+
+## Recursion
+
+C supports recursion like any other function call:
+
+```c
+unsigned long long factorial(unsigned int n) {
+    if (n <= 1) return 1;
+    return n * factorial(n - 1);
+}
+```
+
+Each call gets its own stack frame holding its parameters and locals. The recursion unwinds when the base case returns.
+
+**Stack depth is finite.** A typical desktop OS gives a thread an 8 MB stack; embedded systems might give 4-16 KB. A recursive function that calls itself a few thousand times will overflow the stack. The OS may catch this with a guard page and crash cleanly; embedded systems often just corrupt adjacent memory.
+
+For algorithms with shallow recursion (`O(log n)` like binary search, or `O(d)` like tree traversal where d is depth) recursion is fine. For deep recursion, rewrite iteratively. Tail-call optimisation can save you in some cases — GCC at `-O2` will often convert tail-recursive calls into loops — but the standard does not guarantee it, so do not rely on it.
+
+For embedded systems, **avoid deep or unbounded recursion**. The stack is too precious. Many embedded coding standards (MISRA-C, CERT-C, JPL) forbid recursion outright for the same reason.
+
+## Forward declarations and mutual recursion
+
+If two functions call each other, you need at least one to be declared before its first call site:
+
+```c
+static bool is_even(int n);    /* forward declaration */
+
+static bool is_odd(int n) {
+    if (n == 0) return false;
+    return is_even(n - 1);
+}
+
+static bool is_even(int n) {
+    if (n == 0) return true;
+    return is_odd(n - 1);
+}
+```
+
+The forward declaration tells the compiler "trust me, this function exists with this signature". The definition comes later.
+
+This is a contrived example (recursion to test parity is silly), but mutual recursion appears in real code: parser combinators, state machines, tree-walking algorithms.
+
+## The `()` vs `(void)` trap
+
+This is the one historical wart you must know.
+
+In **C17 and earlier**, an empty parameter list `()` in a function declaration means "unspecified parameters" — the function takes some arguments but the compiler does not know which. In a function definition, `()` means "no parameters". This asymmetry exists because pre-ANSI C (before 1989) allowed declarations like `int f();` to mean "f exists, I do not know what arguments it takes".
+
+The consequence:
+
+```c
+int f();       /* C17: "f takes unspecified arguments" — no type checking */
+int g(void);   /* C17: "g takes no arguments" — explicit */
+
+int main(void) {
+    f(1, 2, 3);    /* compiles silently — possible bug */
+    g(1, 2, 3);    /* compile error — too many arguments */
+    return 0;
+}
+```
+
+For 35 years, the safe rule has been: **always write `(void)` for no-argument functions**. `f()` and `f(void)` look identical but behave differently in the type-checker.
+
+**C23 finally fixed this.** In C23, `int f()` means the same as `int f(void)` — no arguments, type-checked. But until you can rely on C23 everywhere, keep writing `(void)`. It is also harmless on C23.
+
+```c
+void initialise(void);     /* always safe */
+void initialise();          /* C17: dangerous. C23: same as (void). */
+```
+
+## A real example: `int max3(int a, int b, int c)`
+
+```c
+#include <stdio.h>
+
+static int max2(int a, int b) {
+    return (a > b) ? a : b;
+}
+
+int max3(int a, int b, int c) {
+    return max2(max2(a, b), c);
+}
+
+int main(void) {
+    printf("%d\n", max3(3, 7, 5));   /* 7 */
+    printf("%d\n", max3(-1, -2, -3));/* -1 */
+    return 0;
+}
+```
+
+Three things to notice.
+
+`max2` is `static` because it is a helper used only inside this file. We do not want to export it.
+
+`max3` is **not** `static` because, conceptually, it is the API the rest of the program might call. If `max3` were defined in a `.c` file and declared in a header, the declaration would be in the header and the definition in the `.c`.
+
+`max3` builds on `max2` — composition of small functions is the C style. We do not write `max3` as a single expression with two ternaries (although you could); we build it from a helper.
+
+## A `static inline` accessor pattern
+
+Common in embedded code: short inline helpers that wrap a register access or a small operation. From lesson 3 of the bare-metal tutorial:
+
+```c
+/* gpio.h */
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+
+typedef struct { volatile uint32_t MODER, OTYPER, OSPEEDR, PUPDR, IDR, ODR, BSRR; } GPIO_TypeDef;
+
+static inline void gpio_set(GPIO_TypeDef *port, uint32_t pin)   { port->BSRR = (1u << pin); }
+static inline void gpio_clear(GPIO_TypeDef *port, uint32_t pin) { port->BSRR = (1u << (pin + 16)); }
+static inline bool gpio_read(GPIO_TypeDef *port, uint32_t pin)  { return (port->IDR & (1u << pin)) != 0; }
+```
+
+At `-O2`, each call inlines to one or two machine instructions — no function call overhead, full type safety, clear names. This is the canonical embedded C pattern.
+
+<Callout type="tip" title="When to inline, when not">
+A function is a good inline candidate when it is small (a few lines), called many times, and hot. A function is a bad inline candidate when it is large, called rarely, or has complex control flow. The compiler will usually make the right call at `-O2` regardless of the keyword. Use `static inline` mainly to put the function in a header where it can be inlined across translation units, not as a performance directive.
+</Callout>
+
+## Variadic functions (briefly)
+
+`printf` takes a variable number of arguments. You can write your own variadic functions using `<stdarg.h>`:
+
+```c
+#include <stdarg.h>
+#include <stdio.h>
+
+int sum(int count, ...) {
+    va_list args;
+    va_start(args, count);
+    int total = 0;
+    for (int i = 0; i < count; i++) {
+        total += va_arg(args, int);
+    }
+    va_end(args);
+    return total;
+}
+
+int main(void) {
+    printf("%d\n", sum(4, 10, 20, 30, 40));   /* 100 */
+    return 0;
+}
+```
+
+Variadics are awkward and type-unsafe (you have to tell `va_arg` the expected type at each call). Reserve them for genuinely variable-argument APIs like `printf`. Otherwise prefer arrays, or `_Generic` (lesson 11) for type-dispatched APIs.
+
+## Exercises
+
+**Exercise 5.1.** Without running, predict what this prints:
+
+```c
+#include <stdio.h>
+int add(int a, int b);    /* prototype */
+
+int main(void) {
+    printf("%d\n", add(2.5, 3.5));
+    return 0;
+}
+
+int add(int a, int b) { return a + b; }
+```
+
+<Callout type="spec" title="Answer">
+Prints `5`. The prototype tells the compiler `add` takes two `int`s, so the call converts `2.5` to `2` and `3.5` to `3` (truncation toward zero). With `-Wconversion` you would get warnings about the narrowing. Without a prototype the call would be undefined — that is precisely why prototypes are mandatory in modern C.
+</Callout>
+
+**Exercise 5.2.** Write a function `void swap(int *a, int *b)` that swaps the values of two ints in the caller's frame. Show how main would call it.
+
+<Callout type="spec" title="Answer">
+```c
+void swap(int *a, int *b) {
+    int tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+int main(void) {
+    int x = 3, y = 5;
+    swap(&x, &y);
+    printf("%d %d\n", x, y);   /* 5 3 */
+}
+```
+
+The function takes pointers because C is pass-by-value — passing the ints directly would only swap local copies. The caller uses `&x` and `&y` to take addresses. We will revisit pointer mechanics in lesson 7.
+</Callout>
+
+**Exercise 5.3.** Convert this recursive factorial to iterative. Why is iterative better for embedded?
+
+```c
+unsigned long long fact(unsigned int n) {
+    return (n <= 1) ? 1 : n * fact(n - 1);
+}
+```
+
+<Callout type="spec" title="Answer">
+```c
+unsigned long long fact(unsigned int n) {
+    unsigned long long result = 1;
+    for (unsigned int i = 2; i <= n; i++) {
+        result *= i;
+    }
+    return result;
+}
+```
+
+The iterative version uses constant stack (one frame, regardless of `n`); the recursive version uses O(n) stack frames. On an embedded system with a 4 KB stack, the recursive factorial blows up around n=200 or so — well within reasonable input. The iterative version has no such limit. (You will overflow `unsigned long long` long before you overflow the stack, but that is a separate problem.)
+</Callout>
+
+## What you learned
+
+- Function declarations announce a signature; definitions provide the body. Multiple declarations are allowed; exactly one definition.
+- Prototypes (declarations with parameter types) let the compiler check calls. Always have one visible at every call site — that is what headers are for.
+- C is **pass-by-value**, always. To modify a caller's variable, pass a pointer to it.
+- Returning structs by value is fine in modern C — the compiler optimises it well.
+- `static` on a function gives it file-local linkage — invisible to other translation units.
+- `static inline` is the canonical pattern for small functions defined in headers.
+- Recursion uses stack frames — finite. Avoid deep or unbounded recursion in embedded systems.
+- Before C23, `f()` and `f(void)` differ: `()` means "unspecified parameters", `(void)` means "no parameters". Always write `(void)`.
+
+In lesson 6 we cover arrays — declaration, indexing, the famous array-to-pointer decay, multi-dimensional arrays, and a fixed-size circular buffer.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 4 — Control flow](/docs/programming/c-lesson-04-control-flow/) | [Lesson 6 — Arrays](/docs/programming/c-lesson-06-arrays/) |

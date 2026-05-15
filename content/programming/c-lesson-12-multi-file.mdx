@@ -1,0 +1,590 @@
+---
+title: Lesson 12 — Multi-file projects
+description: Translation units, the header/source split, extern, the one-definition rule, static linkage, avoiding cyclic includes, building a 5-file project, and a 30-line Makefile.
+order: 13
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, build, makefile, linkage]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 12 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Translation units, header/source split, extern declarations, the one-definition rule, static for file-local symbols, the include-cycle pattern, a 30-line Makefile' },
+    { label: 'Code provided', value: 'About 100 lines across five files, plus a working Makefile' },
+    { label: 'Time', value: '90-120 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 11 — The preprocessor' },
+  ]}
+/>
+
+So far every example has been a single source file. Real projects span dozens to thousands of source files, organised by topic, compiled separately, and linked together. This is C's "build model" and it has stayed remarkably stable since the 1970s. This lesson covers how multi-file projects work, the rules that govern them, and how to drive a build with `make`.
+
+## Translation units
+
+A **translation unit** is the input to one compiler invocation: a single source file, plus everything it includes after preprocessing. When you run `gcc file.c -c`, you compile file.c into an object file `file.o`. The translation unit is "the contents of file.c after every `#include` has been pasted in".
+
+Each translation unit is compiled independently. The compiler does not know about any other source file in the project — only what the preprocessor has shown it. The compiler emits an object file containing the compiled machine code, the symbols (function and variable names) defined, and the symbols referenced.
+
+The **linker** then takes one or more object files and combines them into an executable or library, resolving the cross-references between them.
+
+```text
+file1.c ──[gcc -c]──> file1.o ──┐
+file2.c ──[gcc -c]──> file2.o ──┼──[ld]──> myprogram
+file3.c ──[gcc -c]──> file3.o ──┘
+```
+
+This is why C builds scale: each translation unit can be compiled in parallel. It is also why C builds are slow on huge projects: every translation unit re-processes every header it includes, and a header included by 100 sources is parsed 100 times.
+
+## Headers and source files
+
+The convention:
+
+- **`.h` files (headers)** contain **declarations** — types, function prototypes, `extern` variable declarations, macros.
+- **`.c` files (sources)** contain **definitions** — function bodies, variable storage, `static` helpers.
+
+A header is meant to be included by multiple `.c` files; a source file is compiled by itself.
+
+```c
+/* counter.h */
+#pragma once
+#include <stdint.h>
+
+void counter_init(void);
+void counter_inc(void);
+uint32_t counter_get(void);
+```
+
+```c
+/* counter.c */
+#include "counter.h"
+
+static uint32_t value = 0;
+
+void counter_init(void) { value = 0; }
+void counter_inc(void)  { value++; }
+uint32_t counter_get(void) { return value; }
+```
+
+```c
+/* main.c */
+#include <stdio.h>
+#include "counter.h"
+
+int main(void) {
+    counter_init();
+    counter_inc();
+    counter_inc();
+    counter_inc();
+    printf("%u\n", counter_get());   /* 3 */
+    return 0;
+}
+```
+
+`counter.h` is the public API. `counter.c` implements it. `main.c` uses it.
+
+Build:
+
+```bash
+$ gcc -std=c17 -Wall -Wextra -Wpedantic counter.c main.c -o app
+$ ./app
+3
+```
+
+You can pass multiple `.c` files to gcc; it compiles each and links them together in one step. For larger projects, you compile separately and link separately:
+
+```bash
+$ gcc -std=c17 -Wall -Wextra -Wpedantic -c counter.c -o counter.o
+$ gcc -std=c17 -Wall -Wextra -Wpedantic -c main.c    -o main.o
+$ gcc counter.o main.o -o app
+```
+
+The `-c` flag says "compile only, do not link". Separate compilation lets you rebuild only the `.o` files whose source has changed — the basis of `make` and every other build system.
+
+## The one-definition rule (ODR)
+
+Every function and global variable must be defined **exactly once** across the entire program. Declared many times (in headers, before the use, etc.) but defined once.
+
+Violations come in two flavours:
+
+**Multiple definitions** — same name defined in two `.c` files:
+
+```c
+/* a.c */
+int counter = 0;
+
+/* b.c */
+int counter = 0;     /* linker error: counter is defined twice */
+```
+
+The linker complains: `multiple definition of 'counter'`. To share the variable, declare it in a header with `extern` and define it once:
+
+```c
+/* counter.h */
+extern int counter;          /* declaration only */
+
+/* counter.c */
+int counter = 0;             /* definition — exactly one */
+
+/* a.c, b.c */
+#include "counter.h"
+counter++;                   /* both files see the same counter */
+```
+
+`extern` is the keyword that says "this variable exists somewhere; I am just declaring it here so the type-checker knows about it". Without `extern`, every `.c` that includes `counter.h` would emit its own definition.
+
+**No definition** — declared but never defined:
+
+```c
+/* counter.h */
+extern int counter;
+
+/* nothing defines counter */
+/* main.c */
+#include "counter.h"
+int main(void) { return counter; }      /* linker error: undefined reference to 'counter' */
+```
+
+Same with functions: declare in a header, define in a source. If you forget the definition, the linker errors out.
+
+The same rule applies to inline functions defined in headers — `static inline` is the safe form because each translation unit gets its own internal copy. `inline` (without `static`) has more nuanced rules. Stick with `static inline` for header-defined inlines and you do not have a problem.
+
+## `static` at file scope
+
+`static` on a global variable or non-inline function makes it **file-local** — its name is not exported to the linker:
+
+```c
+/* counter.c */
+static uint32_t value = 0;   /* file-local — invisible to main.c */
+
+void counter_init(void) { value = 0; }
+```
+
+Why file-local matters:
+
+- **Encapsulation.** `value` is implementation; nobody else should touch it.
+- **No name clashes.** Two files can each have their own `static int helper(void)` without collision.
+- **Optimisation.** The compiler knows all callers and can inline more aggressively.
+
+The discipline: in a `.c` file, mark everything **not** intended as public API with `static`. The compiler will then enforce the encapsulation.
+
+```c
+/* counter.c */
+#include "counter.h"
+
+static uint32_t value;
+static uint32_t saved;
+
+static void log_change(uint32_t old, uint32_t new);   /* private helper */
+
+void counter_init(void) { ... }     /* public */
+void counter_inc(void)  { ... }     /* public */
+```
+
+## Headers should declare, not define
+
+The principle: a header is a contract. Multiple `.c` files include it; each compiles its own object file. If the header **defines** something — a function with a body, a non-`static`-non-`inline` variable — every including `.c` emits a copy, and the linker chokes.
+
+```c
+/* BAD bad bad — header.h */
+int helper(int x) { return x + 1; }   /* defined in a header → multiple definitions */
+
+int global = 0;                        /* defined in a header → multiple definitions */
+```
+
+What goes in a header:
+
+- **Function prototypes:** `int foo(int);`
+- **`extern` variable declarations:** `extern int counter;`
+- **Type definitions:** `typedef struct { int x; } point;`
+- **Struct/union/enum tags:** `struct point { int x; };`
+- **Macros:** `#define MAX(a, b) ...`
+- **`static inline` functions:** they get a separate copy per TU, which is fine.
+
+What goes in a source file:
+
+- **Function definitions** (with bodies).
+- **Variable definitions** (allocating storage).
+- **`static` everything that is not in the public API.**
+
+## Avoiding cyclic includes
+
+If `a.h` includes `b.h`, and `b.h` includes `a.h`, you have a cycle. With include guards (`#pragma once` or `#ifndef`), the cycle terminates — the second include is a no-op — but the result is one of the headers seeing only part of the other. Forward-references break.
+
+The standard fix: replace one of the includes with a **forward declaration**.
+
+```c
+/* a.h */
+#pragma once
+struct b;                   /* forward declaration — does not include b.h */
+struct a {
+    struct b *peer;         /* OK because we only need the pointer, not the full b */
+    int data;
+};
+
+/* b.h */
+#pragma once
+struct a;                   /* forward declaration */
+struct b {
+    struct a *peer;
+    int data;
+};
+```
+
+Forward declarations work because **C only needs the full type when it has to compute sizes** — sizeof, allocation, field access through `.`. Pointers and prototypes only need the name.
+
+Most cyclic-include problems disappear once you commit to the rule: include only what you must, forward-declare the rest.
+
+## A 5-file project
+
+Let us assemble a small project. The structure:
+
+```text
+calc/
+├── Makefile
+├── main.c          (program entry — orchestrates)
+├── stack.h         (public stack API)
+├── stack.c         (stack implementation)
+├── eval.h          (public expression-evaluator API)
+└── eval.c          (eval implementation, uses stack)
+```
+
+```c
+/* stack.h */
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#define STACK_MAX 64
+
+typedef struct {
+    int32_t data[STACK_MAX];
+    size_t  top;
+} stack_t;
+
+void stack_init(stack_t *s);
+bool stack_push(stack_t *s, int32_t v);
+bool stack_pop(stack_t *s, int32_t *out);
+size_t stack_size(const stack_t *s);
+```
+
+```c
+/* stack.c */
+#include "stack.h"
+
+void stack_init(stack_t *s) { s->top = 0; }
+
+bool stack_push(stack_t *s, int32_t v) {
+    if (s->top >= STACK_MAX) return false;
+    s->data[s->top++] = v;
+    return true;
+}
+
+bool stack_pop(stack_t *s, int32_t *out) {
+    if (s->top == 0) return false;
+    *out = s->data[--s->top];
+    return true;
+}
+
+size_t stack_size(const stack_t *s) { return s->top; }
+```
+
+```c
+/* eval.h */
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+
+/* Evaluates a postfix expression of tokens like "3 4 + 2 *" and writes the result to *out.
+   Returns false on syntax error or arithmetic overflow. */
+bool eval_postfix(const char *expr, int32_t *out);
+```
+
+```c
+/* eval.c */
+#include "eval.h"
+#include "stack.h"
+#include <ctype.h>
+#include <stdlib.h>
+#include <string.h>
+
+static bool apply(int32_t a, int32_t b, char op, int32_t *out) {
+    switch (op) {
+        case '+': *out = a + b; return true;
+        case '-': *out = a - b; return true;
+        case '*': *out = a * b; return true;
+        case '/': if (b == 0) return false; *out = a / b; return true;
+        default:  return false;
+    }
+}
+
+bool eval_postfix(const char *expr, int32_t *out) {
+    stack_t s;
+    stack_init(&s);
+    const char *p = expr;
+
+    while (*p) {
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == '\0') break;
+
+        if (isdigit((unsigned char)*p) || (*p == '-' && isdigit((unsigned char)p[1]))) {
+            char *end;
+            long v = strtol(p, &end, 10);
+            if (!stack_push(&s, (int32_t)v)) return false;
+            p = end;
+        } else if (strchr("+-*/", *p)) {
+            int32_t a, b;
+            if (!stack_pop(&s, &b)) return false;
+            if (!stack_pop(&s, &a)) return false;
+            int32_t r;
+            if (!apply(a, b, *p, &r)) return false;
+            if (!stack_push(&s, r)) return false;
+            p++;
+        } else {
+            return false;
+        }
+    }
+
+    if (stack_size(&s) != 1) return false;
+    return stack_pop(&s, out);
+}
+```
+
+```c
+/* main.c */
+#include <stdio.h>
+#include "eval.h"
+
+int main(int argc, char *argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s \"<postfix expr>\"\n", argv[0]);
+        return 1;
+    }
+    int32_t result;
+    if (!eval_postfix(argv[1], &result)) {
+        fprintf(stderr, "evaluation failed\n");
+        return 1;
+    }
+    printf("%d\n", result);
+    return 0;
+}
+```
+
+Build by hand:
+
+```bash
+$ gcc -std=c17 -Wall -Wextra -Wpedantic -c stack.c -o stack.o
+$ gcc -std=c17 -Wall -Wextra -Wpedantic -c eval.c  -o eval.o
+$ gcc -std=c17 -Wall -Wextra -Wpedantic -c main.c  -o main.o
+$ gcc stack.o eval.o main.o -o calc
+$ ./calc "3 4 + 2 *"
+14
+```
+
+That works, but typing four commands every build is tedious. Hence `make`.
+
+## A 30-line Makefile
+
+`make` is a 1976 build tool that uses a dependency graph to rebuild only what needs rebuilding. The Makefile for our project:
+
+```make
+# Makefile for the calc project
+
+CC      := gcc
+CFLAGS  := -std=c17 -Wall -Wextra -Wpedantic -O2 -g
+LDFLAGS :=
+
+SRCS := main.c eval.c stack.c
+OBJS := $(SRCS:.c=.o)
+TARGET := calc
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+# Pattern rule: any .c becomes a .o
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Explicit header dependencies (in a real project, generate these with gcc -MMD)
+main.o:  eval.h
+eval.o:  eval.h stack.h
+stack.o: stack.h
+
+clean:
+	rm -f $(OBJS) $(TARGET)
+```
+
+Annotation:
+
+- `CC`, `CFLAGS`, `LDFLAGS` are variables — by convention uppercase. The compiler, compile flags, and link flags respectively.
+- `$(SRCS:.c=.o)` substitutes — turns `.c` extensions into `.o`, giving us the object file list automatically.
+- `.PHONY: all clean` tells make these target names are not actual files. Without it, a file named `all` in the directory would confuse make.
+- `$(TARGET): $(OBJS)` — the executable depends on all object files. If any is newer than the target, relink.
+- `$(CC) ... -o $@ $^` — `$@` is the target name, `$^` is the list of dependencies. Standard make abbreviations.
+- The pattern rule `%.o: %.c` says "to build foo.o, run gcc on foo.c". `$<` is the first dependency (the .c file).
+- The explicit `main.o: eval.h` says "if eval.h changes, rebuild main.o". Real projects have many such rules; you generate them automatically with `gcc -MMD` which emits a `.d` file with the dependency list.
+
+Build:
+
+```bash
+$ make
+gcc -std=c17 -Wall -Wextra -Wpedantic -O2 -g -c main.c -o main.o
+gcc -std=c17 -Wall -Wextra -Wpedantic -O2 -g -c eval.c -o eval.o
+gcc -std=c17 -Wall -Wextra -Wpedantic -O2 -g -c stack.c -o stack.o
+gcc  -o calc main.o eval.o stack.o
+$ ./calc "10 2 3 * +"
+16
+$ make clean
+rm -f main.o eval.o stack.o calc
+```
+
+After the first build, make only rebuilds what is needed:
+
+```bash
+$ touch eval.c
+$ make
+gcc ... -c eval.c -o eval.o
+gcc  -o calc main.o eval.o stack.o
+```
+
+Only eval.o was rebuilt; main.o and stack.o were already current.
+
+For real projects you typically use a more capable build system — CMake, Meson, Bazel, or hand-rolled make with auto-generated dependencies. The principles are identical: each translation unit is a node; recompile when dependencies change.
+
+<Callout type="tip" title="Auto-generate header dependencies">
+Manually listing `main.o: eval.h` is tedious and bug-prone. GCC and clang can emit dependency files automatically:
+
+```bash
+gcc -MMD -c main.c -o main.o
+# also produces main.d with: main.o: main.c eval.h
+```
+
+The Makefile then includes the .d files:
+
+```make
+DEPS := $(OBJS:.o=.d)
+-include $(DEPS)
+%.o: %.c
+	$(CC) $(CFLAGS) -MMD -c $< -o $@
+```
+
+Now every `.o` knows its full set of header dependencies and rebuilds when any of them change.
+</Callout>
+
+## Header style: forward declarations only
+
+A well-designed header includes the minimum necessary. The pattern:
+
+```c
+/* good_header.h */
+#pragma once
+#include <stdint.h>      /* needed for uint32_t in our prototypes */
+#include <stdbool.h>     /* needed for bool */
+
+struct other_thing;      /* forward decl, not include — we only take pointers */
+
+typedef struct {
+    uint32_t id;
+    bool     ready;
+} good_thing_t;
+
+bool good_thing_init(good_thing_t *t, uint32_t id);
+bool good_thing_attach(good_thing_t *t, struct other_thing *o);
+```
+
+Notice:
+
+- Only includes that the header itself requires.
+- Forward declarations where pointers suffice.
+- No function bodies, no non-inline globals.
+- `#pragma once` (or include guards).
+
+A header that includes 30 other headers makes every including TU process 30 headers. If 50 TUs include it, that is 1500 header reads per build. Discipline in header includes is the difference between a 5-second incremental build and a 60-second one.
+
+## Exercises
+
+**Exercise 12.1.** What's the difference between these two:
+
+```c
+/* in header.h */
+int counter = 0;
+extern int counter2;
+```
+
+When does each cause a linker error, and why?
+
+<Callout type="spec" title="Answer">
+`int counter = 0;` in a header is a **definition**. Every `.c` file that includes the header emits its own definition. The linker sees multiple definitions of `counter` and errors with "multiple definition of 'counter'".
+
+`extern int counter2;` is a **declaration**, not a definition. Every including `.c` knows the name exists somewhere, but no `.c` emits storage for it. To avoid a linker error of "undefined reference to 'counter2'", exactly one `.c` file must define it (`int counter2 = 0;` somewhere).
+
+The rule: definitions in `.c` files only; declarations (with `extern`) in headers.
+</Callout>
+
+**Exercise 12.2.** Two headers `a.h` and `b.h` need to mutually reference each other's struct types. Show the simplest pattern that avoids cyclic include problems.
+
+<Callout type="spec" title="Answer">
+Use forward declarations.
+
+```c
+/* a.h */
+#pragma once
+struct b;                  /* forward decl — no #include "b.h" */
+struct a {
+    struct b *partner;     /* OK with forward decl since we only take pointer */
+    int x;
+};
+
+/* b.h */
+#pragma once
+struct a;
+struct b {
+    struct a *partner;
+    int y;
+};
+```
+
+If either struct's full type is needed (e.g., to compute sizeof or access fields), then in the `.c` file you `#include` both headers — but the headers themselves do not need to include each other.
+</Callout>
+
+**Exercise 12.3.** Modify the Makefile to add a `test` target that builds and runs a test program `test.c` linked against `eval.o` and `stack.o`. Running `make test` should build everything required and run the test.
+
+<Callout type="spec" title="Answer">
+```make
+test_calc: test.o eval.o stack.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+.PHONY: test
+test: test_calc
+	./test_calc
+
+# also: add test.c to your dependency list as needed
+test.o: eval.h stack.h
+```
+
+Running `make test` first ensures `test_calc` is built (which in turn ensures all its `.o` files are up to date), then runs the binary. Make's dependency graph handles the rest. This is the standard pattern for a "run tests" target in C projects.
+</Callout>
+
+## What you learned
+
+- A **translation unit** is one source file plus everything it includes after preprocessing. Compiled into one `.o`. Linked with other `.o`s into a binary.
+- Headers (`.h`) hold **declarations**; sources (`.c`) hold **definitions**.
+- The **one-definition rule**: every function and global is defined exactly once across the program; declared as many times as needed.
+- `extern` declares a variable that lives elsewhere — used in headers to share a variable defined in one source.
+- `static` at file scope makes a name file-local — invisible to the linker.
+- `static inline` functions defined in headers get a per-TU copy and are inlined at call sites.
+- Avoid cyclic includes with forward declarations; include only what you need.
+- A 5-file project compiles with separate `gcc -c` steps and one final link.
+- `make` automates rebuilds by checking dependency timestamps. A 30-line Makefile handles a small project.
+
+In lesson 13 we tour the C standard library — what is in each major header, the I/O functions, qsort/bsearch, and the memcpy-vs-memmove distinction.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 11 — The preprocessor](/docs/programming/c-lesson-11-preprocessor/) | [Lesson 13 — The C standard library](/docs/programming/c-lesson-13-stdlib/) |

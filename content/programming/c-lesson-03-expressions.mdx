@@ -1,0 +1,404 @@
+---
+title: Lesson 3 — Expressions and operators
+description: Every C operator, the precedence and associativity table, short-circuit evaluation, sequence points, and why a[i] = i++ is undefined behavior.
+order: 4
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, operators, expressions]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 3 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Every operator C provides, the precedence table, short-circuit evaluation, the sequence-point rule, why parentheses everywhere is the only sane policy' },
+    { label: 'Code provided', value: 'About 80 lines of working examples plus a precedence demo' },
+    { label: 'Time', value: '60-90 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 2 — Types and literals' },
+  ]}
+/>
+
+Most of C's operators behave exactly as they do in any C-family language. Where C differs is in the edge cases — pre/post increment in the same expression, signed/unsigned promotion at every step, the sequence-point rules that make some expressions undefined, the operator precedence table that no one fully memorises. This lesson is the reference you will come back to.
+
+## The five categories
+
+C operators fall into roughly five groups:
+
+- **Arithmetic:** `+`, `-`, `*`, `/`, `%`, unary `+` and `-`, `++`, `--`.
+- **Comparison and logical:** `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`.
+- **Bitwise and shift:** `&`, `|`, `^`, `~`, `<<`, `>>`.
+- **Assignment:** `=`, plus the compound forms `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=`.
+- **Miscellaneous:** `,` (comma), `?:` (ternary), `sizeof`, `&` (address-of), `*` (dereference), `->` and `.` (member access), `()` (function call and grouping), `[]` (subscript).
+
+We will walk each. Even if 80% of this is review from your other languages, the 20% that is C-specific is precisely where bugs live.
+
+## Arithmetic
+
+The five binary arithmetic operators:
+
+```c
+int a = 7, b = 3;
+printf("%d %d %d %d %d\n", a + b, a - b, a * b, a / b, a % b);
+/* 10 4 21 2 1 */
+```
+
+`/` on integers is **truncating integer division** (toward zero). `7 / 3` is `2`, not `2.333...`. To get floating division, one operand must be float: `7 / 3.0` is `2.333333...`. Or cast: `(double)7 / 3`.
+
+`/` and `%` on signed integers truncate toward zero (since C99 — earlier versions allowed implementation-defined rounding). So `-7 / 3` is `-2` (not `-3`), and `-7 % 3` is `-1` (not `2`). This is what most programmers expect coming from other C-family languages.
+
+**Division by zero is undefined behavior.** Not "returns infinity" like floating point — actually undefined. The program may crash, may silently produce garbage, may keep running. Always check the denominator if it could be zero.
+
+`%` only applies to integers. For floating-point modulo, use `fmod()` from `<math.h>`.
+
+The unary forms:
+
+```c
+int x = 5;
+int neg = -x;     /* -5 */
+int pos = +x;     /* 5 — unary + is rarely useful, but it exists */
+```
+
+Increment and decrement come in two flavours:
+
+```c
+int i = 5;
+int a = i++;      /* a = 5, then i = 6 — post-increment: use old value, then increment */
+int j = 5;
+int b = ++j;      /* j = 6, then b = 6 — pre-increment: increment first, then use new value */
+```
+
+When you do not use the result, `i++` and `++i` are identical — the compiler emits the same code for `for (int i = 0; i < n; i++)` and `for (int i = 0; i < n; ++i)`. When you do use the result, pre and post differ. We will return to this in the section on sequence points, where some uses are undefined.
+
+## Comparison and logical
+
+```c
+int a = 5, b = 3;
+a == b   /* equal — false */
+a != b   /* not equal — true */
+a < b    /* less — false */
+a <= b   /* less or equal — false */
+a > b    /* greater — true */
+a >= b   /* greater or equal — true */
+```
+
+Comparison operators return `int` (0 or 1), not `bool`. In modern C, you can `#include <stdbool.h>` and write `bool`, `true`, `false` — these are macros that resolve to `_Bool`, `1`, `0`. C23 made `bool`, `true`, `false` keywords directly. The result of a comparison is always 0 or 1, no other values.
+
+The single biggest beginner trap: `=` is assignment, `==` is comparison. `if (x = 5)` is **always true** (and silently assigns 5 to x); `if (x == 5)` tests equality. `-Wall` warns about assignments inside conditions, which catches this. Some style guides require `if (5 == x)` ("Yoda conditions") so that the typo `5 = x` becomes a compile error — that is overkill in modern code, but the underlying concern is real.
+
+Logical operators:
+
+```c
+int x = 1, y = 0;
+x && y     /* logical AND — false */
+x || y     /* logical OR — true */
+!x         /* logical NOT — false */
+```
+
+**Logical operators short-circuit.** `a && b` does not evaluate `b` if `a` is false. `a || b` does not evaluate `b` if `a` is true. This is the canonical way to guard a dereference:
+
+```c
+if (p != NULL && p->value > 0) { ... }   /* safe — p->value is not evaluated if p is NULL */
+```
+
+Short-circuiting is **guaranteed by the standard**, unlike in some assembly-optimised constructs. You can rely on it.
+
+## Bitwise and shift
+
+```c
+uint32_t a = 0xF0;
+uint32_t b = 0x0F;
+a & b      /* AND — 0x00 */
+a | b      /* OR  — 0xFF */
+a ^ b      /* XOR — 0xFF */
+~a         /* NOT — 0xFFFFFF0F (top bits set!) */
+a << 4     /* shift left  — 0xF00 */
+a >> 4     /* shift right — 0x0F */
+```
+
+Three things to know.
+
+**`~` is bitwise NOT, not logical NOT.** `~0` is `0xFFFFFFFF` (all bits set), not `0`. For logical, use `!`.
+
+**Shift amount must be less than the operand's width.** `(uint32_t)1 << 32` is **undefined behavior**. `(uint32_t)1 << 31` is fine. This catches people writing portable code — the safe maximum shift is `width - 1`.
+
+**Right shift on signed types is implementation-defined.** Most compilers do an "arithmetic right shift" that preserves sign (so `-8 >> 1 == -4`), but the standard does not require it. **For bit manipulation, always use unsigned types.** That is one of the iron rules of low-level C.
+
+## Assignment and compound assignment
+
+Plain `=` returns the assigned value, which is why chained assignment works:
+
+```c
+int a, b, c;
+a = b = c = 5;   /* all three become 5 */
+```
+
+This works because `c = 5` returns `5`, then `b = (c = 5)` makes `b` 5 and returns 5, then `a = (b = c = 5)` makes `a` 5. Read right-to-left.
+
+Compound assignment is shorthand:
+
+```c
+x += 5;   /* same as x = x + 5 */
+x -= 5;
+x *= 5;
+x /= 5;
+x %= 5;
+x &= 0xFF;
+x |= 0x01;
+x ^= 0x80;
+x <<= 1;
+x >>= 1;
+```
+
+Each evaluates `x` once on the left and once on the right of the equivalent expansion — useful when the left-hand side is a complex expression like `arr[get_index()] += 1` (you do not want `get_index()` called twice).
+
+## Conditional (ternary)
+
+```c
+int max = (a > b) ? a : b;
+```
+
+Reads "if a > b, then a, else b". Equivalent to:
+
+```c
+int max;
+if (a > b) max = a;
+else       max = b;
+```
+
+The ternary is an **expression**, so it can appear anywhere a value can — function arguments, initialisers, return statements:
+
+```c
+printf("Status: %s\n", connected ? "online" : "offline");
+return (x < 0) ? -x : x;
+```
+
+The two branches must have compatible types (both `int`, or one promotes to the other). Mixing very different types — `(cond) ? 1 : "foo"` — does not compile.
+
+## Comma operator
+
+The comma operator evaluates its left side, discards the result, evaluates the right side, returns that. Used almost exclusively in `for` loops:
+
+```c
+for (int i = 0, j = 10; i < j; i++, j--) {
+    ...
+}
+```
+
+Here the commas in the variable declaration are **not** the comma operator (they are part of the declarator syntax), but the `i++, j--` is. Both increments happen each iteration.
+
+Outside of `for`, the comma operator is rare and often a smell. Do not confuse it with the comma that separates function arguments — those are part of the call syntax, not the comma operator.
+
+## The precedence table
+
+C has 15 levels of operator precedence. You will never memorise the whole table. The rule of thumb that works in practice:
+
+1. `*`, `/`, `%` bind tighter than `+`, `-`.
+2. `+`, `-` bind tighter than the shift operators.
+3. Shifts bind tighter than comparisons (`<`, `<=`, `>`, `>=`).
+4. Comparisons bind tighter than `==`, `!=`.
+5. `==`, `!=` bind tighter than `&`.
+6. `&` binds tighter than `^`.
+7. `^` binds tighter than `|`.
+8. Bitwise operators bind tighter than `&&`.
+9. `&&` binds tighter than `||`.
+10. `||` binds tighter than `?:`.
+11. Everything binds tighter than `=`.
+
+The traps:
+
+```c
+if (x & MASK == VALUE)   /* WRONG — parsed as x & (MASK == VALUE) */
+if ((x & MASK) == VALUE) /* correct */
+```
+
+`==` has **higher precedence than `&`**, so without parens the masked compare is wrong. This is the single most common precedence bug in C.
+
+```c
+uint32_t y = 1 << n + 1;   /* WRONG — parsed as 1 << (n + 1) */
+uint32_t y = (1 << n) + 1; /* probably what you meant */
+```
+
+`+` has higher precedence than `<<`. Without parens the shift includes the +1.
+
+The rule that experienced C programmers settle on: **parenthesise every non-trivial expression.** Compilers do not care about extra parens; readers thank you for them. The few cases where parens are unambiguous and obvious (`a + b * c`, `x == 5`) you can leave bare. Everything else, parens.
+
+## Sequence points and undefined evaluation order
+
+Now the bit that surprises people from other languages. C evaluates the **operands** of most operators in unspecified order. The compiler may evaluate left-then-right, right-then-left, or interleaved — for the same operator at different points in the program.
+
+The only operators that guarantee evaluation order are:
+
+- `&&` and `||` — left first, then right (and right only if needed for short-circuit).
+- `?:` — condition first, then either then-branch or else-branch.
+- `,` — left first, then right.
+- Function call argument evaluation is unspecified between arguments, but all arguments are evaluated before the function is called.
+
+What that means in practice:
+
+```c
+int i = 0;
+int x = i++ + i++;     /* UNDEFINED — i is modified twice without a sequence point */
+```
+
+This is undefined behavior. The compiler is allowed to give you `0 + 0`, `0 + 1`, `1 + 0`, `2 + 0`, or anything else, including crash. The reason: the two `++` updates to `i` are unsequenced relative to each other, and the standard says you cannot modify the same object twice without a sequence point between modifications.
+
+```c
+int a[10];
+int i = 5;
+a[i] = i++;       /* UNDEFINED — a's subscript expression and i++ are unsequenced */
+```
+
+Same problem. The subscript `i` and the update `i++` race.
+
+```c
+printf("%d %d\n", i++, i++);   /* UNDEFINED — order of argument evaluation unspecified */
+```
+
+The two `i++` arguments may be evaluated in either order. Their side effects (the increments) are unsequenced relative to each other, which is undefined.
+
+The rule, more carefully stated: in any expression between sequence points (roughly, between `;` semicolons), an object may be modified at most once, and if it is modified, its value may only be read for the purpose of computing the new value. `i = i + 1` is fine — the read of `i` computes the new value. `i = i++` violates this — there are two modifications.
+
+**Practical advice:** never write expressions that modify the same variable twice. When in doubt, split into separate statements:
+
+```c
+int x = i++;
+x += i++;     /* now well-defined: the two i++ are in different statements */
+```
+
+## Working examples for each operator family
+
+Arithmetic on a unit conversion:
+
+```c
+#include <stdio.h>
+int main(void) {
+    double celsius = 25.0;
+    double fahrenheit = celsius * 9.0 / 5.0 + 32.0;
+    printf("%.1f C = %.1f F\n", celsius, fahrenheit);
+    return 0;
+}
+```
+
+Bitwise to extract a field:
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+int main(void) {
+    uint32_t reg = 0xABCD1234;
+    uint32_t low_byte  = reg & 0xFF;          /* 0x34 */
+    uint32_t high_byte = (reg >> 24) & 0xFF;  /* 0xAB */
+    uint32_t middle    = (reg >> 8) & 0xFFFF; /* 0xCD12 */
+    printf("low=%02X mid=%04X high=%02X\n", low_byte, middle, high_byte);
+    return 0;
+}
+```
+
+Short-circuit guard:
+
+```c
+#include <stdio.h>
+#include <string.h>
+int safe_eq(const char *a, const char *b) {
+    return a != NULL && b != NULL && strcmp(a, b) == 0;
+}
+int main(void) {
+    printf("%d\n", safe_eq(NULL, "x"));      /* 0, no crash */
+    printf("%d\n", safe_eq("foo", "foo"));   /* 1 */
+    return 0;
+}
+```
+
+Ternary in a print:
+
+```c
+#include <stdio.h>
+int main(void) {
+    int n = 5;
+    printf("%d apple%s\n", n, (n == 1) ? "" : "s");
+    return 0;
+}
+```
+
+<Callout type="warn" title="Compound assignment evaluates the LHS once">
+`x[i++] += 1` evaluates the subscript expression `x[i++]` **once**, then adds 1 to that location, then stores. Compare with `x[i++] = x[i++] + 1` — which is **undefined**, because `i++` happens twice with no sequence point. The compound form is the safe spelling.
+</Callout>
+
+<Callout type="tip" title="Why parentheses everywhere">
+The C precedence table is well-defined but unmemorable. Even experienced engineers reach for parens around bitwise expressions, shift expressions, and anything involving a mix of arithmetic and comparison. The cost is one extra character per binding; the benefit is that the code says what it does. Most production codebases enforce parens around macro arguments and complex expressions through style guides. Adopt the habit early.
+</Callout>
+
+## Exercises
+
+**Exercise 3.1.** Predict the output, then run:
+
+```c
+#include <stdio.h>
+int main(void) {
+    int a = 5;
+    int b = ++a + a++;
+    printf("a=%d b=%d\n", a, b);
+    return 0;
+}
+```
+
+<Callout type="spec" title="Answer">
+Trick question — this is **undefined behavior**. The expression `++a + a++` modifies `a` twice with no sequence point between the modifications, which violates the C rules. Different compilers and optimisation levels may print different values. GCC 13 at `-O0` happens to print `a=7 b=12`, but you cannot rely on it. The correct fix is to split:
+
+```c
+int b = ++a;
+b += a++;
+```
+
+Now both operations have well-defined effects.
+</Callout>
+
+**Exercise 3.2.** Find the precedence bug and fix it:
+
+```c
+#define PERMISSION_READ  0x04
+uint32_t flags = read_flags();
+if (flags & PERMISSION_READ == 0) {
+    deny();
+}
+```
+
+<Callout type="spec" title="Answer">
+`==` binds tighter than `&`, so the condition parses as `flags & (PERMISSION_READ == 0)`, which is `flags & 0`, which is `0`. The `deny()` is unreachable. The fix:
+
+```c
+if ((flags & PERMISSION_READ) == 0) { deny(); }
+```
+
+This is the most common precedence bug in C. Always parenthesise around the masked-compare.
+</Callout>
+
+**Exercise 3.3.** Write an expression that returns the absolute value of an `int32_t` without an `if`, using only arithmetic and bitwise operators.
+
+<Callout type="spec" title="Answer">
+```c
+int32_t abs32(int32_t x) {
+    int32_t mask = x >> 31;            /* 0 if x >= 0, all 1s if x < 0 */
+    return (x ^ mask) - mask;
+}
+```
+
+The trick: arithmetic right shift of a signed 32-bit int by 31 produces 0 for non-negative inputs and `-1` (all bits set) for negative inputs. XORing with all-ones flips every bit (two's complement negation minus 1), and subtracting `-1` (== adding 1) completes the negation. For non-negative input, mask is 0, so we return `(x ^ 0) - 0 == x`. Note: **`INT32_MIN` is still a problem** — its absolute value does not fit in a signed 32-bit int. Most "abs" implementations have this corner case; the standard `abs()` function in `<stdlib.h>` is undefined for `INT_MIN`.
+</Callout>
+
+## What you learned
+
+- C's operators fall into arithmetic, comparison/logical, bitwise/shift, assignment, and miscellaneous.
+- `/` on integers truncates toward zero. `%` is integer-only. Division by zero is undefined.
+- `&&` and `||` short-circuit, guaranteed by the standard. Useful for guarding dereferences.
+- Right shift on signed types is implementation-defined — always use unsigned for bit manipulation.
+- The precedence table is long and unmemorable. The infamous trap: `==` binds tighter than `&`. **Parenthesise**.
+- Sequence points constrain when side effects "land". Modifying the same variable twice in one expression without a sequence point is undefined behavior.
+- Compound assignment (`x += y`) evaluates the LHS once, which makes it safer than the manual expansion.
+
+In lesson 4 we work through control flow — if, switch, while, do/while, for — and the loop-bound overflow trap that catches every embedded engineer at least once.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 2 — Types and literals](/docs/programming/c-lesson-02-types/) | [Lesson 4 — Control flow](/docs/programming/c-lesson-04-control-flow/) |

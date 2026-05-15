@@ -1,0 +1,280 @@
+---
+title: Lesson 1 — Hello, C++
+description: Your first C++ program, std::cout and stream insertion, auto type deduction, nullptr, the using-namespace debate, and a roadmap of the four C++ super-features.
+order: 4
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, hello-world, iostream]
+badge: tutorial
+---
+
+
+<SpecSheet
+  title="Lesson 1 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'How a C++ program is structured, std::cout and the << operator, auto, nullptr, the using-namespace debate, and the four C++ super-features as a roadmap for the tutorial' },
+    { label: 'Code provided', value: 'Three short programs, about 40 lines total' },
+    { label: 'Time', value: '60-90 minutes' },
+    { label: 'Pre-reqs', value: 'A working C++ compiler (gcc 13+, clang 17+, or msvc 19.30+) and a terminal' },
+  ]}
+/>
+
+Every C tutorial starts with `printf("hello, world\n");`. Every C++ tutorial reaches for `std::cout << "hello, world\n";` and then has to spend the next five pages explaining why it looks like that. We will do the same thing because the explanation is the most concentrated dose of "what C++ adds over C" you can get in 30 lines.
+
+## The program
+
+Save the following as `hello.cpp`:
+
+```cpp
+#include <iostream>
+
+int main() {
+    std::cout << "hello, world\n";
+    return 0;
+}
+```
+
+Compile and run:
+
+```
+g++ -std=c++23 -Wall -Wextra -Wpedantic hello.cpp -o hello
+./hello
+```
+
+You should see `hello, world` followed by a newline. If you don't, your toolchain isn't right; revisit the setup section of the [tutorial landing page](/docs/programming/cpp-tutorial/) before continuing.
+
+The flags matter. `-std=c++23` selects the language version (fall back to `-std=c++20` on older compilers). `-Wall -Wextra -Wpedantic` turn on the warning sets every C++ codebase should ship with. We will leave them on for every example in this tutorial.
+
+## What is different from C?
+
+Five things, in order of subtlety.
+
+**`#include <iostream>` not `#include <stdio.h>`.** C++ standard headers have no `.h`. `<iostream>` is the streams library. `<cstdio>` is the C++ wrapper around C's `<stdio.h>` — same functions, in the `std::` namespace.
+
+**`std::cout` not `stdout`.** `std::cout` is an object of type `std::ostream`, defined in `<iostream>`. The `std::` prefix is the namespace; everything in the C++ standard library lives in `std`. We will come back to namespaces in lesson 2.
+
+**`<<` is not bitshift here.** The `<<` between `std::cout` and the string is the **overloaded stream insertion operator**. C++ lets you define operators on your own types; `<<` between an `ostream` and a `const char*` is defined to print the string. Same symbol, different meaning depending on the types it operates on. This is operator overloading, and you will meet it again in lesson 3.
+
+**`int main()` not `int main(void)`.** In C, `int main()` declares a function taking unspecified arguments. In C++, `int main()` declares a function taking *no* arguments — the empty parameter list means empty, not unknown. C++ never had the `(void)` requirement. (You can still write `int main(void)`; the compiler doesn't care.)
+
+**`return 0;` is optional in `main`.** C++ guarantees that falling off the end of `main` is equivalent to `return 0;`. We keep it for clarity. Every other function still needs an explicit return.
+
+## std::endl vs '\n'
+
+You will see code that writes:
+
+```cpp
+std::cout << "hello, world" << std::endl;
+```
+
+instead of `"hello, world\n"`. `std::endl` writes a newline **and** flushes the stream's buffer. The flush is what you almost never want — it forces an immediate write to the OS, defeating the whole point of buffered output. If you want the flush behaviour, use `std::flush` explicitly. Otherwise prefer `"\n"`.
+
+Most embedded contexts buffer differently or not at all, so the distinction matters less there. On the host, `endl` in a tight loop will tank your performance by a factor of 100. Use `"\n"`.
+
+<Callout type="warn" title="endl is almost never what you want">
+The flushing behaviour of std::endl is a footgun. There are exactly two situations where you want it: just before a long-running computation when you want the user to see the prompt, and just before a crash-prone section when you want the log line to survive. Every other use of endl is wasted I/O. Make "\n" your default.
+</Callout>
+
+## Streaming multiple values
+
+You can chain `<<`:
+
+```cpp
+#include <iostream>
+
+int main() {
+    int x = 42;
+    double pi = 3.14159;
+    const char* greeting = "hello";
+
+    std::cout << greeting << ", x = " << x << ", pi = " << pi << "\n";
+    return 0;
+}
+```
+
+Each `<<` evaluates left-to-right and returns the stream, so the result can be chained. `std::cout << x` automatically formats the integer 42 as the characters "42". `std::cout << pi` formats the double. The compiler picks the right overload based on the type of the right-hand operand — there is no format string, no `%d`, no chance of mismatching the format to the type. That type safety is the original selling point of `iostream`.
+
+It is also the reason `iostream` is enormous. The compiler instantiates a stream overload for every type you print, dragging in formatting machinery that printf can do with one function. On the host this is fine. On a 256 KB Cortex-M, this is why we use `printf` or [`std::format`](/docs/programming/cpp/) instead.
+
+## auto
+
+C++11 added `auto` for type deduction:
+
+```cpp
+auto x = 42;          // int
+auto pi = 3.14159;    // double
+auto greeting = "hello";   // const char*
+auto v = std::vector<int>{1, 2, 3};   // std::vector<int>
+```
+
+The compiler deduces the type from the initialiser. `auto` is the same machinery as template parameter deduction, applied to ordinary variables. Use `auto` when:
+
+- The type is obvious from the right-hand side (`auto it = v.begin();` is clearer than the full iterator type).
+- The exact type would be hideous to spell (template instantiations, lambda types, range views).
+- You want the variable to track the return type of a function — refactor-resistant code.
+
+Do not use `auto` when:
+
+- The type is the whole point of the line (`auto count = read_count();` hides whether `count` is `int`, `std::size_t`, or `int64_t`, and that matters).
+- The right-hand side returns a reference or a const-qualified type and you want to keep that (`auto x = obj.get();` always strips references and top-level const; use `auto&` or `const auto&` to keep them).
+
+`auto&&` is "universal reference" — we will meet it properly in lesson 9.
+
+## nullptr
+
+C's `NULL` is `((void*)0)`. C++'s `nullptr` is a literal of type `std::nullptr_t`, convertible to any pointer type but not to integers.
+
+```cpp
+void f(int);
+void f(char*);
+
+f(NULL);      // ambiguous in C++; some compilers pick f(int)
+f(nullptr);   // unambiguous: f(char*)
+```
+
+Use `nullptr` everywhere `NULL` would have appeared in C. It is type-safe, harder to misuse, and is what every modern C++ codebase writes.
+
+## The using-namespace debate
+
+You will see this in tutorials:
+
+```cpp
+using namespace std;
+
+int main() {
+    cout << "hello, world\n";
+}
+```
+
+`using namespace std;` brings every name from `std` into the current scope, so you can write `cout` instead of `std::cout`. It looks cleaner. **Don't do it in real code.**
+
+Reasons:
+
+- `std` has thousands of names. Importing all of them risks collisions with your own identifiers (`distance`, `transform`, `count` are all in `std`).
+- In a header file, `using namespace std;` leaks into every translation unit that includes the header, polluting their namespace too.
+- The `std::` prefix is information: it tells the reader "this is standard library". Removing it makes code harder to read for everyone but the author.
+
+The acceptable uses are:
+
+- Tiny example code in a tutorial or a Stack Overflow answer where brevity is the whole point.
+- Inside a function body where you want to type `std::chrono` literals without the prefix every line.
+- A specific `using std::string;` style "using declaration" that imports only the names you need.
+
+Throughout this tutorial we write `std::` explicitly. Get the habit.
+
+## The four C++ super-features
+
+Most of the C++ feature surface area boils down to four ideas. The rest of this tutorial covers each.
+
+**RAII (Resource Acquisition Is Initialisation).** Tie a resource's lifetime to an object's scope. The constructor acquires; the destructor releases. Files close when their `File` object goes out of scope. Mutexes unlock when their `lock_guard` does. Memory frees when `unique_ptr` does. No `goto cleanup` like in C, no `try/finally` like in Java. Covered in lesson 3.
+
+**Templates.** Compile-time generic programming. Write code once, instantiate for every type. `std::vector<int>` and `std::vector<std::string>` are two distinct types generated by one template definition. Templates make the STL possible and make zero-overhead abstractions possible. Covered in lesson 5.
+
+**Object-oriented programming.** Classes, inheritance, virtual functions, polymorphism. Less central than the textbooks pretend — composition often beats inheritance — but still useful when you have a true "interface and several implementations" pattern. Covered in lessons 3 and 4.
+
+**The STL (Standard Template Library).** Containers (`vector`, `map`, `string`), iterators, algorithms (`sort`, `find`, `transform`), and now ranges. A library so good that it shapes how all subsequent C++ libraries look. Covered in lessons 6 and 7.
+
+Smart pointers (lesson 8), move semantics (lesson 9), lambdas (lesson 10), and the post-C++17 additions build on these four foundations. Once you have the four, the rest of the language clicks into place quickly.
+
+## g++ vs clang++ vs cl.exe
+
+Three major C++ compilers. They produce identical results for conforming code, but the command-line interfaces differ:
+
+- **g++** (GCC): `-std=c++23 -Wall -Wextra -Wpedantic`. The default on Linux. Available everywhere via Homebrew, MSYS2.
+- **clang++** (LLVM/Clang): identical flags for most purposes. Default on macOS. Better diagnostics than GCC on tricky template errors.
+- **cl.exe** (MSVC): `/std:c++latest /W4`. Default on Windows. Slightly different standard-library behaviour and a less-pretty command line, but supports modern C++ well.
+
+This tutorial uses `g++`. Every example compiles identically with `clang++` if you replace the binary. For MSVC, translate the flags and you are fine.
+
+<Callout type="spec" title="Embedded callout — arm-none-eabi-g++">
+When we get to lesson 15, the compiler will be arm-none-eabi-g++ — the same GCC, configured to emit Thumb-2 instructions for Cortex-M and to link against newlib instead of glibc. The language is identical; only the target and the standard library implementation differ. Every C++ feature you learn in lessons 1-14 transfers to embedded with at most a flag tweak.
+</Callout>
+
+## A second program: input
+
+```cpp
+#include <iostream>
+#include <string>
+
+int main() {
+    std::cout << "what is your name? ";
+    std::string name;
+    std::getline(std::cin, name);
+    std::cout << "hello, " << name << "\n";
+    return 0;
+}
+```
+
+`std::string` from `<string>` is a heap-allocated, dynamically sized string. `std::getline` reads a whole line of input (up to but not including the newline) into it. The string's destructor frees its memory automatically when `main` returns — that is RAII in action, even on this tiny example.
+
+Compile and run:
+
+```
+g++ -std=c++23 -Wall -Wextra -Wpedantic input.cpp -o input
+./input
+what is your name? Alice
+hello, Alice
+```
+
+You did not write a `malloc`. You did not write a `free`. The string took care of itself. This is the C++ value proposition in one example.
+
+## Exercises
+
+**Exercise 1.1.** Modify the input program to ask for the user's age (an `int`) and print "you will be N+1 next year". Hint: `std::cin >> age;`.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <iostream>
+
+int main() {
+    std::cout << "what is your age? ";
+    int age;
+    std::cin >> age;
+    std::cout << "you will be " << (age + 1) << " next year\n";
+    return 0;
+}
+```
+
+Note that `std::cin >> age` reads whitespace-separated tokens, so it stops at the first space or newline. `std::getline` reads a whole line. Mixing them gets you into trouble because `>>` leaves the newline in the buffer; we will fix that in a later lesson. For now, only use `>>` for the simple input.
+</Callout>
+
+**Exercise 1.2.** What happens if you replace `std::cout << "hello, world\n";` with `std::cout << "hello, world\n" << std::flush;`? With `std::endl`? Time both variants with `time` running in a loop of 100000 iterations.
+
+<Callout type="spec" title="Answer">
+`std::flush` writes a newline and forces the buffer to the OS. `std::endl` does the same. Both will be roughly 10-100x slower than plain "\n" in a tight loop because they trigger one OS write per iteration instead of letting the runtime batch them. The exact factor depends on whether stdout is a terminal (line-buffered, so "\n" also flushes) or a pipe (block-buffered, where the difference is enormous).
+
+```
+$ time ./hello-loop > /dev/null    # with "\n"
+0.05s
+$ time ./hello-endl > /dev/null    # with std::endl
+2.30s
+```
+
+This is why `endl` is a footgun.
+</Callout>
+
+**Exercise 1.3.** Try compiling without `-std=c++23`. Try compiling without `-Wall`. What changes?
+
+<Callout type="spec" title="Answer">
+Without an explicit `-std=` flag, GCC defaults to `-std=gnu++17` or `-std=gnu++20` depending on the version. Most C++20 features work; C++23 features (lesson 11's `std::expected`, lesson 14's `std::print`) do not. Lessons 1-10 mostly survive on C++17 or C++20 with minor adjustments.
+
+Without `-Wall`, GCC stays silent about unused variables, signed/unsigned mismatches, missing returns in non-void functions, and a dozen other footguns. Real codebases enable `-Wall -Wextra -Wpedantic` and treat them as errors (`-Werror`). Get the habit now — the warnings will save you hours later.
+</Callout>
+
+## What you learned
+
+- The structure of a minimal C++ program: `#include <iostream>`, `int main()`, `std::cout << "...\n"`.
+- `std::cout` is an object; `<<` is an overloaded operator; the type-safe formatting comes from templates, which we will see in lesson 5.
+- Prefer `"\n"` over `std::endl`. The flush is rarely what you want.
+- `auto` deduces types from initialisers. Use it where the type is obvious or hideous; spell it out when the type itself is documentation.
+- `nullptr` is type-safe; use it everywhere `NULL` would appear.
+- Avoid `using namespace std;` in real code. Write `std::` explicitly.
+- The four super-features — RAII, templates, OOP, the STL — will structure the next seven lessons.
+
+In lesson 2 we look at the basic language scaffolding: references, namespaces, function overloading, default arguments, and `enum class`. The features that make C++ feel different from C even before you reach classes.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [C++ tutorial — landing page](/docs/programming/cpp-tutorial/) | [Lesson 2 — References, namespaces, and the basics](/docs/programming/cpp-lesson-02-references/) |

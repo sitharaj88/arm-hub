@@ -1,0 +1,488 @@
+---
+title: Lesson 7 — Iterators and algorithms
+description: Iterator categories, range-based for, the std::algorithm header (sort, find, transform, accumulate), and C++20 ranges and views — the operations that work across every STL container.
+order: 10
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, iterators, algorithms, ranges, stl]
+badge: tutorial
+---
+
+
+<SpecSheet
+  title="Lesson 7 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'How iterators generalise pointers, the five iterator categories, range-based for, the everyday algorithms in <algorithm> and <numeric>, and how C++20 ranges and views improve on the iterator-pair interface.' },
+    { label: 'Code provided', value: 'About 130 lines covering iterator basics, range-based for, sort/find/transform/accumulate, and a ranges pipeline computing the average of even numbers' },
+    { label: 'Time', value: '120-150 minutes' },
+    { label: 'Pre-reqs', value: 'Lessons 1-6' },
+  ]}
+/>
+
+A vector is a contiguous array. A map is a tree. A list is a chain of nodes. They store data in completely different ways. Yet `std::sort`, `std::find`, and a hundred other algorithms work on all of them. The magic is **iterators**: a unified abstraction over "how to step through a sequence" that lets each container provide its own implementation. This lesson covers iterators, the most useful algorithms in the standard library, and the C++20 ranges that finally fix the verbosity of the iterator-pair interface.
+
+## Iterators — generalised pointers
+
+An iterator is an object that points to an element in a sequence and supports the operations you would expect from a pointer: dereference (`*it`), increment (`++it`), comparison (`it != end`).
+
+```cpp
+#include <iostream>
+#include <vector>
+
+int main() {
+    std::vector<int> v{10, 20, 30, 40};
+
+    for (auto it = v.begin(); it != v.end(); ++it) {
+        std::cout << *it << " ";       // 10 20 30 40
+    }
+    std::cout << "\n";
+}
+```
+
+Every container provides `.begin()` (iterator to first element) and `.end()` (iterator one past the last). The loop continues while `it` is not equal to `end()`; on each iteration, `*it` reads the current element and `++it` advances.
+
+For a `std::vector<int>`, the iterator is essentially an `int*` under the hood. For a `std::map`, it is a more complex object that knows how to step through the tree in sorted order. The caller does not care about the difference.
+
+You can write iterator types directly, but in practice always use `auto`:
+
+```cpp
+// Verbose:
+std::vector<int>::iterator it = v.begin();
+
+// Sensible:
+auto it = v.begin();
+```
+
+Container iterators also come in const flavours:
+
+```cpp
+for (auto it = v.cbegin(); it != v.cend(); ++it) {
+    // *it is const — read-only iteration
+}
+```
+
+`v.cbegin()` and `v.cend()` return `const_iterator`s. You also get const iterators automatically when iterating a `const std::vector`.
+
+## Iterator categories
+
+Not all iterators support the same operations. The standard library defines five categories, in increasing order of capability:
+
+1. **Input iterator** — can read each element once, in order. Examples: `std::istream_iterator`. Single-pass.
+2. **Output iterator** — can write each element once, in order. Example: `std::ostream_iterator`.
+3. **Forward iterator** — read-and-step, multi-pass. Example: `std::forward_list::iterator`.
+4. **Bidirectional iterator** — can also step backward (`--it`). Example: `std::list::iterator`, `std::map::iterator`.
+5. **Random-access iterator** — can jump by any offset (`it + 5`), compare with `<`. Example: `std::vector::iterator`, `std::deque::iterator`.
+
+C++20 adds **contiguous iterator** — random-access plus the guarantee that elements are contiguous in memory, which means `&*it` gives you a pointer that can be used like a C pointer. `std::vector::iterator` and pointers into `std::array` are contiguous.
+
+Why care? Some algorithms require certain capabilities. `std::sort` needs random-access — it does O(n log n) work by indexing into the sequence. So you cannot `std::sort` a `std::list` directly; the list provides only bidirectional iterators. Instead, `std::list` has its own `list::sort()` member function that uses merge sort.
+
+When you write a generic algorithm, you constrain the iterators you accept:
+
+```cpp
+template <typename ForwardIt>
+ForwardIt my_find(ForwardIt first, ForwardIt last, const auto& value) {
+    while (first != last) {
+        if (*first == value) return first;
+        ++first;
+    }
+    return last;
+}
+```
+
+This function works with any iterator that supports `*`, `++`, `!=` — which is anything from forward iterator upward.
+
+## Range-based for
+
+The iterator pair pattern is verbose. Almost every loop you write is "from begin to end, do something with each element." C++11 added the range-based for loop:
+
+```cpp
+std::vector<int> v{1, 2, 3, 4, 5};
+
+for (int x : v)         std::cout << x << " ";       // copy each element
+for (int& x : v)        x *= 2;                       // modify each element
+for (const int& x : v)  std::cout << x << " ";       // read each element without copying
+
+const std::vector<std::string> names{"alice", "bob"};
+for (const auto& name : names) std::cout << name << "\n";
+```
+
+This is the modern default for traversal. Use:
+
+- `for (auto x : ...)` for cheap-to-copy types when you do not need to modify.
+- `for (auto& x : ...)` when you need to modify the elements.
+- `for (const auto& x : ...)` for expensive-to-copy types when you only read.
+
+The compiler translates the range-based for into the iterator pair internally — `auto it = std::begin(v); for (; it != std::end(v); ++it) { auto& x = *it; ... }`. So it works for anything with `begin()` and `end()`, including C arrays.
+
+## The `<algorithm>` header
+
+The standard library ships dozens of algorithms in `<algorithm>` (and a few more in `<numeric>`). Here are the ones you will reach for most.
+
+### std::sort
+
+```cpp
+#include <algorithm>
+#include <vector>
+
+std::vector<int> v{5, 2, 8, 1, 9, 3};
+std::sort(v.begin(), v.end());                                  // ascending
+std::sort(v.begin(), v.end(), std::greater<int>{});             // descending
+std::sort(v.begin(), v.end(),
+          [](int a, int b) { return std::abs(a) < std::abs(b); });   // by absolute value
+```
+
+`std::sort` is introsort — a hybrid of quicksort, heapsort, and insertion sort. O(n log n) worst case. The third argument is a comparator: a function or function object taking two elements and returning whether the first should come before the second.
+
+### std::find
+
+```cpp
+auto it = std::find(v.begin(), v.end(), 8);
+if (it != v.end()) {
+    std::cout << "found at index " << (it - v.begin()) << "\n";
+}
+```
+
+Linear scan. Returns an iterator to the first matching element, or `end()` if not found. For sorted sequences, `std::binary_search`, `std::lower_bound`, and `std::upper_bound` are O(log n) alternatives.
+
+### std::count and std::count_if
+
+```cpp
+int n_eights = std::count(v.begin(), v.end(), 8);
+
+int n_even = std::count_if(v.begin(), v.end(),
+    [](int x) { return x % 2 == 0; });
+```
+
+`std::count_if` takes a predicate (a function returning bool). The `[](int x) { ... }` syntax is a **lambda** — an inline function literal. We cover lambdas in lesson 10; for now, treat the syntax as a compact way to define a one-line function.
+
+### std::copy and std::transform
+
+```cpp
+std::vector<int> src{1, 2, 3, 4};
+std::vector<int> dst(4);
+std::copy(src.begin(), src.end(), dst.begin());
+
+std::vector<int> doubled(4);
+std::transform(src.begin(), src.end(), doubled.begin(),
+    [](int x) { return x * 2; });
+```
+
+`std::copy` writes each element of `src` to the output starting at `dst.begin()`. `std::transform` applies a function as it copies. Both require the output range to be pre-sized — `std::vector<int> dst(4)` creates a 4-element vector initialised to 0; the copy then overwrites it. If you want the output container to grow as you write, use `std::back_inserter(dst)`:
+
+```cpp
+std::vector<int> dst;          // empty
+std::copy(src.begin(), src.end(), std::back_inserter(dst));
+                               // dst grows via push_back
+```
+
+### std::accumulate (from `<numeric>`)
+
+```cpp
+#include <numeric>
+
+std::vector<int> v{1, 2, 3, 4, 5};
+int sum = std::accumulate(v.begin(), v.end(), 0);            // 15
+int product = std::accumulate(v.begin(), v.end(), 1,
+    std::multiplies<int>{});                                  // 120
+```
+
+The third argument is the initial value (also the accumulator's type — `0` is `int`, so the result is `int`; use `0.0` for `double` accumulation). The fourth argument (optional) is a binary operation. Default is `+`.
+
+`std::reduce` (C++17) is the parallel-friendly version of `std::accumulate` — it does not promise a fixed evaluation order, which lets the implementation parallelise.
+
+### std::for_each
+
+```cpp
+std::for_each(v.begin(), v.end(),
+    [](int x) { std::cout << x << " "; });
+```
+
+Applies a function to each element. Mostly redundant with range-based for, but useful when you want to pass a named function or interact with parallel execution policies.
+
+### Other useful ones
+
+- `std::min`, `std::max`, `std::min_element`, `std::max_element` — pretty much what they sound like.
+- `std::all_of`, `std::any_of`, `std::none_of` — predicates over the whole range.
+- `std::unique` (with `std::sort` first) for de-duplication.
+- `std::partition`, `std::stable_partition` for splitting by predicate.
+- `std::lower_bound`, `std::upper_bound`, `std::binary_search` for sorted ranges.
+- `std::rotate`, `std::reverse` for in-place rearrangement.
+- `std::fill`, `std::iota` for filling a range with a value or a sequence.
+
+The full list is at [cppreference.com/w/cpp/algorithm](https://en.cppreference.com/w/cpp/algorithm). Skim it once; you will be surprised how many of the loops you would otherwise write have a named algorithm.
+
+<Callout type="spec" title="Embedded callout — most algorithms work on fixed arrays too">
+std::sort, std::find, std::accumulate, and all the rest work on raw arrays, std::array, and std::span just as well as on std::vector. They take iterator pairs (or, in C++20 ranges, ranges) — they don't care whether the underlying storage is heap-allocated. On a no-heap embedded target you can still use the full algorithm header, as long as the containers you operate on are heap-free (std::array, std::span, or ETL containers).
+</Callout>
+
+## C++20 ranges
+
+The iterator-pair interface has a verbosity problem. Compare:
+
+```cpp
+// Pre-C++20
+std::sort(v.begin(), v.end());
+auto it = std::find(v.begin(), v.end(), 42);
+
+// C++20
+std::ranges::sort(v);
+auto it = std::ranges::find(v, 42);
+```
+
+The `std::ranges::` versions accept the whole container (or any "range" — anything with begin and end). Same algorithms, cleaner calls.
+
+The bigger win is **views**: lazy, composable transformations of a range.
+
+```cpp
+#include <ranges>
+#include <vector>
+#include <iostream>
+
+int main() {
+    std::vector<int> v{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+    auto evens_doubled = v
+        | std::views::filter([](int x) { return x % 2 == 0; })
+        | std::views::transform([](int x) { return x * 2; });
+
+    for (int x : evens_doubled) {
+        std::cout << x << " ";       // 4 8 12 16 20
+    }
+    std::cout << "\n";
+}
+```
+
+`std::views::filter` produces a view that yields only the elements satisfying the predicate. `std::views::transform` produces a view that maps each element through a function. The `|` (pipe) operator chains them.
+
+The views are **lazy**: no work happens until you iterate. No intermediate vector is allocated. The example above iterates `v` once, picks out the evens, doubles them on the fly, and prints them. Performance is the same as a hand-written loop.
+
+Other useful views:
+
+- `std::views::take(n)` — first n elements.
+- `std::views::drop(n)` — skip first n.
+- `std::views::reverse` — iterate backward.
+- `std::views::iota(0, 10)` — generate the sequence 0..9.
+- `std::views::zip(a, b)` (C++23) — pairs from two ranges.
+- `std::views::enumerate(r)` (C++23) — pairs of index and value.
+
+To "materialise" a view into a container, use `std::ranges::to` (C++23):
+
+```cpp
+auto result = v
+    | std::views::filter([](int x) { return x > 5; })
+    | std::ranges::to<std::vector>();
+```
+
+On older standards, you copy into a vector manually:
+
+```cpp
+auto filtered = v | std::views::filter([](int x) { return x > 5; });
+std::vector<int> result;
+for (int x : filtered) result.push_back(x);
+```
+
+Ranges replace many lines of iterator-pair plumbing with a single pipeline. The performance is identical to hand-rolled loops (the views compile away under `-O2`); the readability gain is large.
+
+## Working example: average of even numbers
+
+```cpp
+#include <algorithm>
+#include <iostream>
+#include <numeric>
+#include <ranges>
+#include <vector>
+
+int main() {
+    std::vector<int> v{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+    // Approach 1: std::accumulate with a lambda
+    int sum = 0;
+    int count = 0;
+    std::for_each(v.begin(), v.end(), [&](int x) {
+        if (x % 2 == 0) { sum += x; ++count; }
+    });
+    double avg1 = count > 0 ? static_cast<double>(sum) / count : 0;
+    std::cout << "approach 1: " << avg1 << "\n";
+
+    // Approach 2: std::count_if + std::accumulate with a conditional
+    int total   = std::accumulate(v.begin(), v.end(), 0,
+        [](int acc, int x) { return acc + (x % 2 == 0 ? x : 0); });
+    int n_evens = std::count_if(v.begin(), v.end(),
+        [](int x) { return x % 2 == 0; });
+    double avg2 = n_evens > 0 ? static_cast<double>(total) / n_evens : 0;
+    std::cout << "approach 2: " << avg2 << "\n";
+
+    // Approach 3: ranges and views
+    auto evens = v | std::views::filter([](int x) { return x % 2 == 0; });
+    int total3 = std::ranges::fold_left(evens, 0, std::plus{});       // C++23
+    auto count3 = std::ranges::distance(evens);
+    double avg3 = count3 > 0 ? static_cast<double>(total3) / count3 : 0;
+    std::cout << "approach 3: " << avg3 << "\n";
+}
+```
+
+All three print `6` (the average of 2, 4, 6, 8, 10 is 6.0). Approach 3 (ranges + `std::ranges::fold_left`) is the most readable on a C++23 compiler. Approach 1 (plain `for_each` with capture-by-reference) works on every compiler since C++11.
+
+On older compilers without `std::ranges::fold_left` (C++20 without the C++23 fold extensions), use `std::accumulate` instead:
+
+```cpp
+int total3 = std::accumulate(evens.begin(), evens.end(), 0);
+```
+
+The lambda `[&](int x) { ... }` captures everything in the enclosing scope by reference. Lambdas and captures get full treatment in lesson 10.
+
+## Iterator invalidation, again
+
+A reminder that bites everyone at least once: many container operations invalidate iterators.
+
+- `std::vector::push_back` may reallocate, invalidating all iterators.
+- `std::vector::insert` and `erase` invalidate iterators at and after the modification point.
+- `std::map::erase` invalidates the erased iterator (the rest stay valid).
+- `std::unordered_map::insert` may rehash, invalidating all iterators.
+
+The classic bug:
+
+```cpp
+for (auto it = v.begin(); it != v.end(); ++it) {
+    if (*it == 5) v.erase(it);     // BUG: it is now invalid
+}
+```
+
+Fix:
+
+```cpp
+for (auto it = v.begin(); it != v.end(); ) {
+    if (*it == 5) it = v.erase(it);
+    else ++it;
+}
+```
+
+Or the cleaner C++20 form:
+
+```cpp
+std::erase_if(v, [](int x) { return x == 5; });
+```
+
+Use the named algorithm when one exists. `std::erase` and `std::erase_if` are the "remove these elements" answer in modern C++.
+
+## Exercises
+
+**Exercise 7.1.** Given `std::vector<int> v{5, 3, 8, 1, 9, 3, 5, 8};`, write code (using algorithms) that prints (a) the maximum value, (b) the number of times `5` appears, and (c) the sum of all values greater than 4.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <algorithm>
+#include <iostream>
+#include <numeric>
+#include <vector>
+
+int main() {
+    std::vector<int> v{5, 3, 8, 1, 9, 3, 5, 8};
+
+    int max_val = *std::max_element(v.begin(), v.end());
+    std::cout << "max: " << max_val << "\n";
+
+    int count_5 = std::count(v.begin(), v.end(), 5);
+    std::cout << "5s: " << count_5 << "\n";
+
+    int sum_gt_4 = std::accumulate(v.begin(), v.end(), 0,
+        [](int acc, int x) { return acc + (x > 4 ? x : 0); });
+    std::cout << "sum > 4: " << sum_gt_4 << "\n";
+}
+```
+
+Output: `max: 9`, `5s: 2`, `sum > 4: 35`.
+
+Equivalent ranges version:
+
+```cpp
+auto max_val   = std::ranges::max(v);
+auto count_5   = std::ranges::count(v, 5);
+auto sum_gt_4  = std::accumulate(v.begin(), v.end(), 0,
+                  [](int acc, int x) { return acc + (x > 4 ? x : 0); });
+```
+
+`std::ranges::max` works directly on the container; no iterator pair.
+</Callout>
+
+**Exercise 7.2.** Write a function that takes a `std::vector<std::string>&` and removes all empty strings in place. Use `std::erase_if`.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <string>
+#include <vector>
+
+void remove_empty(std::vector<std::string>& v) {
+    std::erase_if(v, [](const std::string& s) { return s.empty(); });
+}
+
+int main() {
+    std::vector<std::string> v{"hello", "", "world", "", "!"};
+    remove_empty(v);
+    for (const auto& s : v) std::cout << s << " ";   // hello world !
+}
+```
+
+`std::erase_if` (C++20) is the modern way to do "remove elements matching a predicate". Pre-C++20 you had to write the erase-remove idiom by hand:
+
+```cpp
+v.erase(std::remove_if(v.begin(), v.end(),
+        [](const std::string& s) { return s.empty(); }),
+        v.end());
+```
+
+That works on any C++11+ compiler but is much less readable. Use `std::erase_if` if you have C++20.
+</Callout>
+
+**Exercise 7.3.** Use C++20 ranges to compute the sum of squares of odd numbers in `std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}`. Then write the same calculation as a plain `for` loop.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <numeric>
+#include <ranges>
+#include <vector>
+
+int main() {
+    std::vector<int> v{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+
+    // Ranges version
+    auto pipeline = v
+        | std::views::filter([](int x) { return x % 2 != 0; })
+        | std::views::transform([](int x) { return x * x; });
+    int sum_ranges = std::accumulate(pipeline.begin(), pipeline.end(), 0);
+
+    // Loop version
+    int sum_loop = 0;
+    for (int x : v) {
+        if (x % 2 != 0) sum_loop += x * x;
+    }
+
+    std::cout << sum_ranges << " " << sum_loop << "\n";    // 165 165
+}
+```
+
+Both produce 165 (1 + 9 + 25 + 49 + 81). The ranges version reads as a pipeline; the loop version is shorter for this small case. For more complex pipelines (multiple filters, transformations, take/drop), ranges win on readability. For simple one-shot operations, a plain loop is fine.
+
+Both compile to nearly identical machine code under `-O2`; the views are compiled-away abstractions.
+</Callout>
+
+## What you learned
+
+- Iterators generalise pointers and let one algorithm work across many containers.
+- Iterator categories (input, output, forward, bidirectional, random-access, contiguous) determine what operations are available.
+- Range-based for is the everyday traversal idiom. Pick `auto`, `auto&`, or `const auto&` based on intent.
+- `<algorithm>` has dozens of named operations — `sort`, `find`, `count`, `copy`, `transform`, `accumulate`, `for_each`, and many more. Use them.
+- C++20 `std::ranges` versions accept the whole container instead of iterator pairs.
+- Views (`std::views::filter`, `std::views::transform`, ...) are lazy, composable, zero-cost transformations chained with `|`.
+- Iterator invalidation is real. Use `std::erase_if` and named algorithms to avoid the classic bugs.
+
+In lesson 8 we cover smart pointers — the C++ answer to manual `new` and `delete`, and the way modern code manages owning vs non-owning pointers.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 6 — STL containers](/docs/programming/cpp-lesson-06-stl-containers/) | [Lesson 8 — Smart pointers](/docs/programming/cpp-lesson-08-smart-pointers/) |

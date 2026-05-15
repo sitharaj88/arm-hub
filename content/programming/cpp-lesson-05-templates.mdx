@@ -1,0 +1,479 @@
+---
+title: Lesson 5 — Templates
+description: Function and class templates, type deduction, template specialisation, variadic packs, if constexpr, concepts (C++20), and a RingBuffer with N as a template parameter — the zero-overhead polymorphism mechanism.
+order: 8
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, templates, concepts, constexpr, ring-buffer]
+badge: tutorial
+---
+
+
+<SpecSheet
+  title="Lesson 5 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Function and class templates, template parameter deduction, full and partial specialisation, variadic templates and parameter packs, if constexpr, constexpr functions, the SFINAE-to-concepts story, and a RingBuffer<T, N> example.' },
+    { label: 'Code provided', value: 'About 200 lines covering function templates, class templates, specialisation, variadic templates, and the RingBuffer' },
+    { label: 'Time', value: '150-180 minutes' },
+    { label: 'Pre-reqs', value: 'Lessons 1-4' },
+  ]}
+/>
+
+Templates are the other half of polymorphism in C++. Virtual functions give you runtime polymorphism — one piece of code that handles many types, with a vtable lookup at each call site. Templates give you **compile-time polymorphism** — one piece of code that generates a separate, fully specialised version for each type used, with zero runtime cost. The STL is built on templates. `constexpr` is built on templates. Modern zero-overhead C++ is built on templates. This lesson teaches them properly.
+
+## Function templates
+
+The simplest template: a function that works for any type.
+
+```cpp
+#include <iostream>
+
+template <typename T>
+T max_of(T a, T b) {
+    return (a > b) ? a : b;
+}
+
+int main() {
+    std::cout << max_of(3, 7) << "\n";          // T = int
+    std::cout << max_of(3.14, 2.71) << "\n";    // T = double
+    std::cout << max_of<long>(3, 7L) << "\n";   // explicit T = long
+}
+```
+
+The `template <typename T>` line declares `T` as a type parameter. Inside the function, `T` stands for "whatever type the compiler picks". The compiler examines each call site, deduces `T` from the argument types, and generates a separate copy of the function for each distinct `T` it sees. `max_of(3, 7)` instantiates `max_of<int>`; `max_of(3.14, 2.71)` instantiates `max_of<double>`. These are two distinct functions in the final binary.
+
+Two notes:
+
+- `typename T` and `class T` mean the same thing in template parameter lists. Most modern code uses `typename` for type parameters and reserves `class` for actual class declarations.
+- The compiler must see the full definition of the template at each call site, which is why templates almost always live in header files. (C++20 modules change this; we cover modules in lesson 13.)
+
+If you call `max_of(3, 3.14)`, you get a compile error: the compiler cannot deduce `T` because the two arguments have different types. You can fix it either by explicit instantiation (`max_of<double>(3, 3.14)`) or by writing two parameters with separate types:
+
+```cpp
+template <typename A, typename B>
+auto max_of(A a, B b) {
+    return (a > b) ? a : b;
+}
+```
+
+Now `A` and `B` are independent, and the return type uses `auto` to deduce whatever the conditional expression yields.
+
+## Class templates
+
+A class can be templated too:
+
+```cpp
+template <typename T>
+class Box {
+public:
+    explicit Box(T value) : value_(std::move(value)) {}
+
+    const T& value() const { return value_; }
+    void set_value(T v)    { value_ = std::move(v); }
+
+private:
+    T value_;
+};
+
+int main() {
+    Box<int> bi{42};
+    Box<std::string> bs{"hello"};
+    std::cout << bi.value() << " " << bs.value() << "\n";
+}
+```
+
+`Box<int>` and `Box<std::string>` are two distinct types generated from one template. They share no code at runtime — each is fully specialised. That is why we say templates are zero-overhead: the generated code for `Box<int>` is identical to what you would have hand-written for a `Box` that stores an `int`.
+
+C++17 added **class template argument deduction (CTAD)**, so you can sometimes write the template without the angle brackets:
+
+```cpp
+Box b{42};           // CTAD deduces Box<int>
+Box s{std::string{"hi"}};   // Box<std::string>
+```
+
+This works only when the compiler can deduce all parameters from the constructor arguments.
+
+## Non-type template parameters
+
+Templates can take non-type parameters as well as type parameters. The classic use is sizes known at compile time:
+
+```cpp
+template <typename T, std::size_t N>
+class Array {
+public:
+    T& operator[](std::size_t i)             { return data_[i]; }
+    const T& operator[](std::size_t i) const { return data_[i]; }
+
+    constexpr std::size_t size() const { return N; }
+
+private:
+    T data_[N];
+};
+
+Array<int, 16> a;
+Array<double, 100> b;
+```
+
+`N` is a value, not a type. `Array<int, 16>` and `Array<int, 32>` are distinct types — the compiler can do array bounds analysis on each separately. This is how `std::array<T, N>` works internally.
+
+Non-type template parameters must be of integer, enum, pointer, reference, or (C++20) literal class types. The classic restriction is that they must be **compile-time constants** — values the compiler knows during compilation.
+
+## Template specialisation
+
+You can provide a custom implementation for specific template arguments:
+
+```cpp
+template <typename T>
+struct TypeName {
+    static const char* get() { return "unknown"; }
+};
+
+// Full specialisation for int
+template <>
+struct TypeName<int> {
+    static const char* get() { return "int"; }
+};
+
+// Full specialisation for std::string
+template <>
+struct TypeName<std::string> {
+    static const char* get() { return "std::string"; }
+};
+
+std::cout << TypeName<int>::get() << "\n";          // int
+std::cout << TypeName<double>::get() << "\n";       // unknown
+std::cout << TypeName<std::string>::get() << "\n";  // std::string
+```
+
+This is **full specialisation**. The `template <>` says "this template takes no parameters here — I am specifying everything." `TypeName<int>::get` returns `"int"`; for any type not specialised, you get the primary template's `"unknown"`.
+
+**Partial specialisation** lets you specialise on a pattern rather than a single type. It works only for class templates:
+
+```cpp
+template <typename T>
+struct IsPointer {
+    static constexpr bool value = false;
+};
+
+template <typename T>
+struct IsPointer<T*> {           // partial: "anything that is a pointer"
+    static constexpr bool value = true;
+};
+
+static_assert(IsPointer<int>::value == false);
+static_assert(IsPointer<int*>::value == true);
+static_assert(IsPointer<std::string*>::value == true);
+```
+
+Partial specialisation is how `std::vector<bool>`'s notorious bit-packing trick is implemented, how iterator traits choose the right algorithm for each iterator category, and how most of the template metaprogramming machinery in the standard library works.
+
+## Variadic templates
+
+A template can take any number of parameters:
+
+```cpp
+template <typename... Args>
+void print_all(const Args&... args) {
+    ((std::cout << args << " "), ...);    // C++17 fold expression
+    std::cout << "\n";
+}
+
+print_all(1, "hello", 3.14, 'A');      // 1 hello 3.14 A
+```
+
+`Args...` is a **parameter pack**: zero or more types. `args...` is the corresponding pack of values. The C++17 fold expression `((std::cout << args << " "), ...)` expands to `(std::cout << arg1 << " "), (std::cout << arg2 << " "), ...` with the comma operator joining them.
+
+Before C++17 you wrote this with recursive templates: a base case and a recursive case. The fold expression is the modern, shorter form.
+
+Variadic templates power `std::tuple`, `std::variant`, `std::make_unique`, `std::format`, and most modern factory functions.
+
+## if constexpr
+
+Sometimes a template needs to do different things for different types. **`if constexpr`** (C++17) lets you branch at compile time:
+
+```cpp
+#include <type_traits>
+
+template <typename T>
+void describe(const T& value) {
+    if constexpr (std::is_integral_v<T>) {
+        std::cout << "integer: " << value << "\n";
+    } else if constexpr (std::is_floating_point_v<T>) {
+        std::cout << "float: " << value << "\n";
+    } else {
+        std::cout << "other type\n";
+    }
+}
+
+describe(42);          // integer: 42
+describe(3.14);        // float: 3.14
+describe("hello");     // other type
+```
+
+The branch *not* taken is not compiled for each instantiation. That is a big deal: code that would fail to compile in the not-taken branch is fine as long as it never gets selected. Compare with regular `if`, where both branches must compile for every type — making certain template patterns impossible without specialisation.
+
+`std::is_integral_v`, `std::is_floating_point_v`, and friends are **type traits** from `<type_traits>`. They are compile-time predicates over types, returning `bool`. The `_v` suffix is the C++17 shortcut for `std::is_integral<T>::value`.
+
+## constexpr functions
+
+A **`constexpr` function** can be evaluated at compile time when its arguments are compile-time constants:
+
+```cpp
+constexpr int factorial(int n) {
+    return (n <= 1) ? 1 : n * factorial(n - 1);
+}
+
+constexpr int five_factorial = factorial(5);     // computed at compile time
+int x = read_input();
+int y = factorial(x);                            // computed at runtime
+```
+
+The same function works in both contexts. Mark anything you can as `constexpr`; it costs you nothing and unlocks compile-time computation. C++20 added `consteval` for functions that must run at compile time (refuse to compile if used at runtime) and `constinit` for variables that must be initialised at compile time.
+
+`constexpr` plus templates is how modern C++ encodes computation in the type system. Lookup tables generated at compile time. Register addresses computed from board configs. Whole DSLs implemented in templates and `constexpr`. This is the corner of C++ that surprises C programmers most.
+
+<Callout type="spec" title="Embedded callout — templates replace runtime polymorphism">
+On a Cortex-M, virtual function dispatch costs cycles you may not have for a hot ISR. Templates let you pick the polymorphism at compile time: a `Driver<Spi1>` and a `Driver<Spi2>` are distinct types, each with direct calls to its specific peripheral. No vtable, no indirect branch, all parameters constant-folded. This is the pattern the reference page at /docs/programming/cpp/ uses for the templated USART driver. Lesson 15 will show it on real hardware.
+</Callout>
+
+## SFINAE and concepts
+
+"SFINAE" stands for **Substitution Failure Is Not An Error**. Historically, if you wanted to constrain a template to only work for certain types, you wrote something like:
+
+```cpp
+#include <type_traits>
+
+// Only enabled for integer types
+template <typename T,
+          typename = std::enable_if_t<std::is_integral_v<T>>>
+T double_it(T x) {
+    return x * 2;
+}
+
+double_it(5);       // OK
+// double_it(3.14); // compile error: no matching function
+```
+
+The trick: if `T` is not integral, the `enable_if_t` substitution fails, and the compiler treats the template as not-a-match rather than as an error. The function disappears from the overload set. SFINAE is powerful and ugly.
+
+C++20 introduced **concepts**, which make the same intent readable:
+
+```cpp
+#include <concepts>
+
+template <std::integral T>
+T double_it(T x) {
+    return x * 2;
+}
+
+double_it(5);       // OK
+// double_it(3.14); // compile error: 'double' does not satisfy 'std::integral'
+```
+
+`std::integral` is a concept — a named compile-time predicate over types. Concepts can be combined (`std::integral && std::signed_integral`), used with `requires` clauses, and produce error messages a human can actually read.
+
+You can write your own concepts:
+
+```cpp
+template <typename T>
+concept Addable = requires(T a, T b) {
+    { a + b } -> std::same_as<T>;
+};
+
+template <Addable T>
+T sum(T a, T b) { return a + b; }
+```
+
+The `requires(T a, T b) { ... }` block lists expressions that must be valid for `T` to satisfy the concept. If `a + b` works and returns `T`, you are Addable.
+
+Modern code prefers concepts to SFINAE. Older code is full of `std::enable_if`; you should be able to read it but should not write new code in the old style.
+
+## A complete example: `RingBuffer<T, N>`
+
+A ring buffer is a fixed-capacity circular FIFO. Templating it on the element type and capacity lets the compiler size the storage at compile time, optimise the modulo arithmetic into bit-masks when N is a power of two, and produce zero-overhead code.
+
+```cpp
+#include <array>
+#include <cstddef>
+#include <optional>
+
+template <typename T, std::size_t N>
+class RingBuffer {
+    static_assert(N > 0, "RingBuffer capacity must be positive");
+
+public:
+    bool push(T value) {
+        if (full()) return false;
+        data_[write_] = std::move(value);
+        write_ = (write_ + 1) % N;
+        ++count_;
+        return true;
+    }
+
+    std::optional<T> pop() {
+        if (empty()) return std::nullopt;
+        T value = std::move(data_[read_]);
+        read_ = (read_ + 1) % N;
+        --count_;
+        return value;
+    }
+
+    constexpr std::size_t capacity() const { return N; }
+    std::size_t size()  const { return count_; }
+    bool empty() const { return count_ == 0; }
+    bool full()  const { return count_ == N; }
+
+private:
+    std::array<T, N> data_{};
+    std::size_t read_  = 0;
+    std::size_t write_ = 0;
+    std::size_t count_ = 0;
+};
+
+int main() {
+    RingBuffer<int, 4> rb;
+    rb.push(1); rb.push(2); rb.push(3);
+
+    while (auto v = rb.pop()) {
+        std::cout << *v << " ";
+    }
+    std::cout << "\n";    // 1 2 3
+}
+```
+
+Things to note:
+
+- **`static_assert(N > 0)`** runs at compile time. If you write `RingBuffer<int, 0>`, the compile fails with the message. Compile-time sanity checks are free.
+- **`std::array<T, N>`** stores N elements inline, no heap. The whole `RingBuffer<int, 4>` is 36 bytes (16 bytes for the array, plus three `std::size_t`s) and lives entirely on the stack or in static memory.
+- **`% N`** is constant-folded. If `N == 4`, GCC will recognise `(x + 1) % 4` as `(x + 1) & 3` (a single AND instruction) because 4 is a power of two. For non-power-of-two `N`, the modulo is a real division — slightly slower. For an embedded ring buffer, pick a power of two.
+- **`std::optional<T>` for the `pop` return** signals "may be empty" without needing exceptions or sentinel values. We will see optional properly in lesson 11.
+
+This pattern — a templated container with the capacity as a non-type template parameter — is exactly the right tool for embedded contexts where the standard `std::vector` is forbidden (it allocates). The [ETL library](https://www.etlcpp.com/) provides production versions of this pattern for every common container.
+
+## When templates go wrong
+
+Two failure modes to know about.
+
+**Code bloat.** Each template instantiation is a separate copy of the code. If you instantiate `RingBuffer<int, 16>`, `RingBuffer<int, 32>`, and `RingBuffer<int, 64>`, you get three full copies. On a Cortex-M with 64 KB of flash this matters. Mitigation: avoid unnecessary parameterisation (don't template on capacity unless you need to), share a non-templated base class for common code.
+
+**Cryptic error messages.** Template errors used to be famous for their length and incomprehensibility. Concepts (C++20) and improved diagnostics in clang and gcc have made this much better, but a misuse of a heavily templated library can still produce 50-line errors. Read them top-down; the first line usually points to your actual mistake.
+
+## Exercises
+
+**Exercise 5.1.** Write a function template `min_of(a, b)` that works for any type with `operator<`. Test it with `int`, `double`, and `std::string`.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+template <typename T>
+const T& min_of(const T& a, const T& b) {
+    return (a < b) ? a : b;
+}
+
+int main() {
+    std::cout << min_of(3, 7) << "\n";                    // 3
+    std::cout << min_of(3.14, 2.71) << "\n";              // 2.71
+    std::cout << min_of(std::string{"abc"},
+                         std::string{"abd"}) << "\n";     // abc
+}
+```
+
+Note the use of `const T&` for parameters and return type — avoids copying large objects like `std::string`. Returning by reference is safe here because both inputs outlive the return.
+
+If you want to constrain it to types that actually support `operator<`, the C++20 form uses a concept:
+
+```cpp
+#include <concepts>
+
+template <typename T>
+    requires std::totally_ordered<T>
+const T& min_of(const T& a, const T& b) { return (a < b) ? a : b; }
+```
+
+The constraint makes the error message readable when someone passes a type without `<`.
+</Callout>
+
+**Exercise 5.2.** Modify the `RingBuffer` to use a power-of-two `N` only, enforced by `static_assert`. Replace `% N` with `& (N - 1)`. Compile both versions and look at the generated assembly with `-O2 -S` to see the difference.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+template <typename T, std::size_t N>
+class RingBuffer {
+    static_assert(N > 0, "capacity must be positive");
+    static_assert((N & (N - 1)) == 0, "capacity must be a power of two");
+
+public:
+    bool push(T value) {
+        if (full()) return false;
+        data_[write_ & (N - 1)] = std::move(value);
+        ++write_;
+        return true;
+    }
+
+    std::optional<T> pop() {
+        if (empty()) return std::nullopt;
+        T value = std::move(data_[read_ & (N - 1)]);
+        ++read_;
+        return value;
+    }
+
+    std::size_t size()  const { return write_ - read_; }
+    bool empty() const { return write_ == read_; }
+    bool full()  const { return size() == N; }
+
+private:
+    std::array<T, N> data_{};
+    std::size_t read_  = 0;
+    std::size_t write_ = 0;
+};
+```
+
+The power-of-two requirement enables three improvements: the modulo becomes a single AND, the `count_` field disappears (size is just `write_ - read_`), and the unsigned overflow of `read_` and `write_` is well-defined and harmless because we always mask before indexing.
+
+Looking at `g++ -O2 -S` output for `push`, the modulo version emits a `udiv`-style instruction sequence; the AND version emits a single `AND`. On Cortex-M4, the difference is a couple of cycles per push.
+</Callout>
+
+**Exercise 5.3.** Write a variadic function template `sum(args...)` that accepts any number of arithmetic values and returns their sum. Use a C++17 fold expression. Constrain it with a C++20 concept to require arithmetic types only.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <concepts>
+
+template <typename... Args>
+    requires (std::is_arithmetic_v<Args> && ...)
+auto sum(Args... args) {
+    return (args + ...);
+}
+
+int main() {
+    std::cout << sum(1, 2, 3, 4) << "\n";              // 10
+    std::cout << sum(1.5, 2.5, 3.0) << "\n";           // 7.0
+    std::cout << sum(1, 2.5) << "\n";                  // 3.5
+    // sum(1, "hello");    // compile error: not arithmetic
+}
+```
+
+Two fold expressions: `(std::is_arithmetic_v<Args> && ...)` folds the type predicate over all parameters, requiring all of them to be arithmetic. `(args + ...)` folds `+` over the parameter pack, producing the sum. The return type is deduced — adding an `int` and a `double` returns a `double`.
+
+If your compiler does not support concepts, drop the `requires` clause and rely on the function failing to compile when given non-arithmetic types.
+</Callout>
+
+## What you learned
+
+- Function templates and class templates instantiate separate code for each type used. Zero runtime overhead.
+- Non-type template parameters (like `N`) let the compiler size data at compile time. Foundation of `std::array` and the RingBuffer.
+- Full specialisation (`template <>`) provides per-type customisation. Partial specialisation works for class templates.
+- Variadic templates with parameter packs accept any number of arguments; C++17 fold expressions are the modern way to operate on them.
+- `if constexpr` branches at compile time; the untaken branch is not compiled.
+- `constexpr` functions can run at compile time when their arguments are constants. Mark everything you can.
+- SFINAE was the old constraint mechanism; C++20 **concepts** replace it with readable named predicates.
+- Templates are the C++ tool for zero-overhead polymorphism. On embedded targets, they often replace virtual dispatch entirely.
+
+In lesson 6 we tour the STL containers — `vector`, `array`, `string`, `map`, `unordered_map`, `set`, `span` — when to use each, and which to avoid on embedded.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 4 — Inheritance and polymorphism](/docs/programming/cpp-lesson-04-inheritance/) | [Lesson 6 — STL containers](/docs/programming/cpp-lesson-06-stl-containers/) |

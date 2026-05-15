@@ -1,0 +1,443 @@
+---
+title: Lesson 2 — References, namespaces, and the basics
+description: References vs pointers, const T& parameters, namespaces, function overloading, default arguments, and strongly typed enum class — the scaffolding that makes C++ feel different from C.
+order: 5
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, references, namespaces, enum-class]
+badge: tutorial
+---
+
+
+<SpecSheet
+  title="Lesson 2 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'References (T& and const T&), namespaces, function overloading, default arguments, enum class. The non-class language features that distinguish C++ from C.' },
+    { label: 'Code provided', value: 'About 100 lines across four short programs' },
+    { label: 'Time', value: '90-120 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 1 (Hello, C++)' },
+  ]}
+/>
+
+Before we get to classes — the headline C++ feature — there is a set of smaller features that make C++ code look unlike C even when you are not using objects. References instead of pointers for output parameters. Namespaces instead of `prefix_` underscores. Overloaded functions sharing a name. Default arguments. Strongly typed enums. These are the everyday vocabulary of modern C++; once they are in your fingers, the rest of the language reads more cleanly.
+
+## References
+
+A **reference** is an alias for another object. Once bound, it cannot be rebound. It can never be null. It is dereferenced implicitly — no `*` to read or write through it.
+
+```cpp
+#include <iostream>
+
+int main() {
+    int x = 10;
+    int& r = x;        // r is now an alias for x
+
+    r = 20;            // writes through to x
+    std::cout << x << "\n";   // prints 20
+
+    int y = 99;
+    r = y;             // assigns y's value to x (which r refers to); does NOT rebind r
+    std::cout << x << "\n";   // prints 99
+    std::cout << &r << " " << &x << "\n";   // same address
+}
+```
+
+Three properties matter:
+
+1. **A reference must be initialised at the point of declaration.** `int& r;` does not compile. There is no "null reference" — every reference refers to a real object.
+2. **A reference cannot be rebound.** Once `r` refers to `x`, `r = y` copies the value of `y` into `x`. There is no syntax to make `r` refer to `y` instead. (If you want rebindable references, you want a pointer.)
+3. **A reference has no separate identity at runtime.** The compiler usually implements `int& r` as a pointer under the hood, but the language guarantees you cannot tell the difference except for the dereference-implicitly behaviour.
+
+When to use a reference vs a pointer:
+
+| Use case | Reference | Pointer |
+| --- | --- | --- |
+| Function parameter that must always refer to an object | yes | only if the function explicitly checks for null |
+| Function parameter that may be optional | no — use pointer or `std::optional<T&>` (C++26) | yes |
+| Rebindable handle | no | yes |
+| Return value referring to a stored object | yes | yes |
+| Iterator-like wrapping a memory location | rarely | usually |
+
+The rule of thumb: **prefer references when the object must exist; use pointers when null is a real possibility.**
+
+## const T& — the canonical pass-by-reference parameter
+
+C passes large objects by pointer to avoid copying:
+
+```c
+/* C */
+void print_user(const struct User *u);
+```
+
+C++ passes them by const reference:
+
+```cpp
+// C++
+void print_user(const User& u);
+```
+
+The difference is syntactic. The semantics are the same — the function receives a handle to the existing object without copying. The C++ form is preferred because:
+
+- The caller writes `print_user(alice);` instead of `print_user(&alice);`. Less ceremony.
+- The function body writes `u.name` instead of `u->name`. Less ceremony.
+- The compiler guarantees `u` is not null, so the function body does not have to defend against null.
+- The `const` makes it explicit that the function will not modify the argument.
+
+For built-in types (`int`, `double`, pointers), pass by value. References are for things big enough to be worth not copying — usually anything with a non-trivial destructor or larger than 16 bytes.
+
+```cpp
+void scale(int x, double factor);                   // pass by value
+void normalise(std::string& s);                      // mutate the caller's string
+void log_message(const std::string& message);        // read the caller's string
+void replace_with(std::vector<int>& target,
+                   const std::vector<int>& source);   // mutate target, read source
+```
+
+This is the dominant idiom for function parameters in modern C++.
+
+<Callout type="tip" title="Const correctness is contagious">
+A const reference can only be assigned from a const-or-better reference. If you write a function that takes `const std::string&`, you can pass any string. If you write a function that takes `std::string&` (non-const), you cannot pass a string literal or a temporary. Decide up front whether the function needs to mutate — that is your "intent" annotation as much as your type annotation.
+</Callout>
+
+## Namespaces
+
+A **namespace** groups names together so they do not collide with names elsewhere. C++ standard library names all live in `std`. Your library's names should live in your own namespace.
+
+```cpp
+// math/geometry.hpp
+namespace math::geometry {
+    double area(double radius);
+    double circumference(double radius);
+}
+
+// math/geometry.cpp
+#include "geometry.hpp"
+#include <numbers>
+
+namespace math::geometry {
+    double area(double radius) {
+        return std::numbers::pi * radius * radius;
+    }
+    double circumference(double radius) {
+        return 2.0 * std::numbers::pi * radius;
+    }
+}
+
+// main.cpp
+#include "math/geometry.hpp"
+#include <iostream>
+
+int main() {
+    std::cout << math::geometry::area(1.5) << "\n";
+}
+```
+
+`namespace math::geometry { ... }` (C++17) is shorthand for nested namespaces. Pre-C++17 you wrote `namespace math { namespace geometry { ... } }`.
+
+To use a name from a namespace without writing the full prefix every time, you have three options:
+
+```cpp
+// 1. Fully qualified — the safest
+math::geometry::area(1.5);
+
+// 2. Using declaration — imports one name into the current scope
+using math::geometry::area;
+area(1.5);
+area(2.0);
+
+// 3. Using directive — imports everything (avoid in headers!)
+using namespace math::geometry;
+area(1.5);
+```
+
+The using-directive (option 3) is the dangerous one. In a header file it leaks into every translation unit that includes the header. In a function body it is fine and sometimes nice (e.g. `using namespace std::chrono_literals;` inside a function to enable `100ms`).
+
+**Anonymous namespaces** make names file-local, equivalent to C's `static` at file scope:
+
+```cpp
+namespace {
+    constexpr int kBufferSize = 1024;
+    void helper() { /* visible only in this .cpp file */ }
+}
+```
+
+Prefer anonymous namespaces over `static` for file-local definitions in C++. They handle templates and inline functions correctly where `static` does not.
+
+## Function overloading
+
+C++ allows multiple functions to share a name, distinguished by parameter types:
+
+```cpp
+#include <iostream>
+#include <string>
+
+void print(int x)              { std::cout << "int: "    << x << "\n"; }
+void print(double x)           { std::cout << "double: " << x << "\n"; }
+void print(const std::string& s) { std::cout << "string: " << s << "\n"; }
+void print(const char* s)      { std::cout << "cstr: "   << s << "\n"; }
+
+int main() {
+    print(42);
+    print(3.14);
+    print(std::string{"alice"});
+    print("hello");
+}
+```
+
+The compiler picks the best match at the call site. This is purely a compile-time mechanism — `print(int)` and `print(double)` produce two distinct functions in the binary, and the call site is hard-wired to call the right one.
+
+Overloading is how `std::cout << x` works for every type. The `<<` operator is overloaded for `int`, `double`, `const char*`, `const std::string&`, and dozens more.
+
+Two pitfalls:
+
+- **Implicit conversions can pick a surprising overload.** `print(0)` calls `print(int)`. `print('A')` calls `print(int)` because `char` promotes to `int`. `print(nullptr)` is ambiguous because `nullptr` converts to several pointer types — write `print(static_cast<const char*>(nullptr))` if you need to.
+- **Return type is not part of the overload set.** You cannot have `int f()` and `double f()` distinguished only by their return type — the compiler would have nothing to pick on.
+
+## Default arguments
+
+A parameter can have a default value, provided at the declaration:
+
+```cpp
+void greet(const std::string& name, const std::string& greeting = "hello") {
+    std::cout << greeting << ", " << name << "\n";
+}
+
+greet("alice");                // "hello, alice"
+greet("bob", "good morning");  // "good morning, bob"
+```
+
+Default arguments must be the trailing parameters — once you skip one, you must skip all subsequent ones.
+
+Defaults are evaluated at the call site, which has two consequences:
+
+1. The default value must be visible to the caller. Put defaults in the header declaration, not the .cpp definition.
+2. Changing a default value requires recompiling every caller. Default arguments are part of your library's ABI in a way that internal logic is not.
+
+For simple cases (a sensible default for a rarely overridden parameter) default arguments are fine. For configuration-heavy functions, prefer an explicit `Options` struct:
+
+```cpp
+struct ConnectOptions {
+    std::chrono::milliseconds timeout = 5000ms;
+    int retries = 3;
+    bool tls = true;
+};
+
+void connect(const std::string& host, const ConnectOptions& opts = {});
+
+connect("api.example.com", {.timeout = 1000ms, .retries = 0});
+```
+
+The designated-initialiser syntax (C++20) makes the call site self-documenting and resilient to adding new options later.
+
+## Strongly typed enums — enum class
+
+C's `enum` is a thin wrapper around integers. Values implicitly convert to and from `int`. Two unrelated enums can be compared. The names leak into the enclosing scope.
+
+```c
+/* C */
+enum Color { RED, GREEN, BLUE };
+enum Status { OK, ERROR };
+
+enum Color c = RED;
+int x = c;              /* implicit conversion to int */
+if (c == OK) { }        /* compiles. RED == 0 and OK == 0. wrong, but compiles. */
+```
+
+C++11 added **`enum class`** (sometimes called "scoped enum") that fixes all of this:
+
+```cpp
+enum class Color  : std::uint8_t { Red, Green, Blue };
+enum class Status : std::uint8_t { Ok, Error };
+
+Color c = Color::Red;
+// int x = c;              // compile error: no implicit conversion
+// if (c == Status::Ok) {} // compile error: comparing different enum types
+int x = static_cast<int>(c);    // explicit, when you really mean it
+```
+
+Three improvements:
+
+1. **Scoped.** `Color::Red` is qualified by its enum name. Two enums with `Red` and `Red` no longer collide.
+2. **Strongly typed.** No implicit conversion to `int`, no comparison with unrelated enums.
+3. **Specifiable underlying type.** `enum class Color : std::uint8_t` says "store these in 8 bits, not the default int". Useful for register fields, packed structs, and any case where size matters.
+
+Use `enum class` for every new enum. Reserve plain `enum` for two cases: drop-in C compatibility (when you must), and tiny convenience enums where the implicit-int behaviour is part of the design (rare).
+
+<Callout type="spec" title="Embedded callout — enum class for state machines">
+On Cortex-M, an enum class with a uint8_t underlying type is the right way to represent a state in a state machine. One byte of RAM per state variable. No implicit conversion to int hiding bugs. Combined with switch statements that the compiler can check for exhaustiveness (with -Wswitch-enum), the strict typing pays for itself the first time a refactor adds a new state and the compiler flags every switch that forgot to handle it.
+</Callout>
+
+## A real example: C-style vs C++-style API
+
+Compare the C and C++ versions of a small string-processing function.
+
+C version:
+
+```c
+/* find the position of the first occurrence of needle in haystack.
+   returns -1 if not found. */
+int str_find(const char* haystack, const char* needle) {
+    if (haystack == NULL || needle == NULL) {
+        return -1;
+    }
+    const char* hit = strstr(haystack, needle);
+    if (hit == NULL) {
+        return -1;
+    }
+    return (int)(hit - haystack);
+}
+
+/* usage */
+int pos = str_find(text, "hello");
+if (pos < 0) {
+    fprintf(stderr, "not found\n");
+}
+```
+
+C++ version:
+
+```cpp
+#include <string>
+#include <optional>
+
+namespace strutil {
+
+std::optional<std::size_t> find(const std::string& haystack,
+                                 const std::string& needle) {
+    auto pos = haystack.find(needle);
+    if (pos == std::string::npos) {
+        return std::nullopt;
+    }
+    return pos;
+}
+
+}   // namespace strutil
+
+// usage
+auto pos = strutil::find(text, "hello");
+if (!pos) {
+    std::cerr << "not found\n";
+} else {
+    std::cout << "found at " << *pos << "\n";
+}
+```
+
+Six differences in five lines:
+
+1. **No null checks needed.** `const std::string&` cannot be null.
+2. **Return type is honest.** `std::optional<std::size_t>` says "may or may not have a value"; the caller cannot ignore the failure case.
+3. **No `-1` sentinel.** The optional carries its own absence flag.
+4. **Namespaced.** `strutil::find` instead of `str_find_`.
+5. **Type-safe size.** `std::size_t` (unsigned, sized to match the architecture) instead of `int`.
+6. **The function body is shorter.** `haystack.find` and `std::optional` do the heavy lifting.
+
+This is the C++ value proposition in a nutshell: each individual feature is small, but together they remove whole categories of bugs.
+
+## Exercises
+
+**Exercise 2.1.** Write a function `swap` that exchanges the values of two `int` variables. Provide both a pointer version (`void swap(int* a, int* b);`) and a reference version (`void swap(int& a, int& b);`). Which is easier to call? Easier to misuse?
+
+<Callout type="spec" title="Answer">
+
+```cpp
+void swap_ptr(int* a, int* b) {
+    int tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+void swap_ref(int& a, int& b) {
+    int tmp = a;
+    a = b;
+    b = tmp;
+}
+
+int x = 1, y = 2;
+swap_ptr(&x, &y);   // explicit address-of at the call site
+swap_ref(x, y);     // looks like by-value, but isn't
+```
+
+The reference version is easier to call (no `&`). The pointer version is more obvious at the call site that the function may mutate — you can see the `&x`. C++ codebases lean toward references for clarity in the function body; some codebases require either non-const pointers OR `const` references for mutation arguments, on the theory that surprising mutation through an apparently-by-value call site is worse than the extra character at the call.
+
+(The standard library has `std::swap` which uses references. That is the conventional choice.)
+</Callout>
+
+**Exercise 2.2.** Define an `enum class Direction` with values `North`, `East`, `South`, `West`, backed by `uint8_t`. Write a function that takes a `Direction` and returns the opposite direction. Try removing the `class` keyword and see what changes.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <cstdint>
+
+enum class Direction : std::uint8_t {
+    North, East, South, West
+};
+
+Direction opposite(Direction d) {
+    switch (d) {
+        case Direction::North: return Direction::South;
+        case Direction::South: return Direction::North;
+        case Direction::East:  return Direction::West;
+        case Direction::West:  return Direction::East;
+    }
+    // unreachable; some compilers want a return here anyway.
+    return Direction::North;
+}
+```
+
+Without `class`, you would write `North`, `East`, etc. unqualified, polluting the global namespace. You could also write `Direction d = 2;` and pass `d` to functions expecting `int`. With `enum class`, every conversion is explicit, and every usage site is qualified.
+
+`-Wswitch-enum` will warn if you add a new value (say `Direction::Up`) and forget to handle it in `opposite`. That is the safety dividend.
+</Callout>
+
+**Exercise 2.3.** Write three overloads of a function `format_value`: one for `int`, one for `double`, one for `const std::string&`. Each returns a `std::string` formatted in a way that makes the original type obvious (e.g. integers as decimal, doubles with two decimal places, strings with surrounding quotes). Call all three from `main`.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <iostream>
+#include <string>
+#include <format>     // C++20; on older compilers use std::to_string
+
+std::string format_value(int x) {
+    return std::format("{}", x);
+}
+std::string format_value(double x) {
+    return std::format("{:.2f}", x);
+}
+std::string format_value(const std::string& s) {
+    return std::format("\"{}\"", s);
+}
+
+int main() {
+    std::cout << format_value(42) << "\n";
+    std::cout << format_value(3.14159) << "\n";
+    std::cout << format_value(std::string{"hello"}) << "\n";
+}
+```
+
+Output:
+
+```
+42
+3.14
+"hello"
+```
+
+`std::format` is the modern formatting library; we cover it properly later. On a compiler without C++20 `std::format`, replace with `std::to_string` and manual concatenation.
+</Callout>
+
+## What you learned
+
+- References (`T&`, `const T&`) are aliases — must be initialised, cannot be rebound, cannot be null. Prefer them for non-optional function parameters.
+- Namespaces group names. Use them for your own code; never `using namespace std;` in headers.
+- Function overloading lets multiple functions share a name; the compiler picks the right one based on parameter types.
+- Default arguments are convenient for trailing parameters; for configuration-heavy APIs, prefer an `Options` struct.
+- `enum class` is strongly typed and scoped. Use it for every new enum. Specify the underlying type when size matters.
+
+In lesson 3 we meet classes proper — constructors, destructors, member initialisation, the rule of three, and the killer feature: RAII.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 1 — Hello, C++](/docs/programming/cpp-lesson-01-hello/) | [Lesson 3 — Classes and RAII](/docs/programming/cpp-lesson-03-classes/) |

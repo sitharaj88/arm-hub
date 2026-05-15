@@ -1,0 +1,514 @@
+---
+title: Lesson 11 — The preprocessor
+description: include, define, conditional compilation, function-like macros with parenthesisation, stringification, token pasting, predefined macros, X-macros, _Generic, and when not to use macros.
+order: 12
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, preprocessor, macros]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 11 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: '#include, #define, #if/#ifdef/#endif, function-like macros, stringification (#x) and token pasting (##), predefined macros, X-macros, _Generic, when to use macros and when not' },
+    { label: 'Code provided', value: 'About 90 lines across several preprocessor patterns including an X-macro registry' },
+    { label: 'Time', value: '90-120 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 10 — Dynamic memory' },
+  ]}
+/>
+
+The preprocessor is a separate program that runs before the C compiler proper. It does textual substitution: replacing `#include` lines with the contents of files, expanding `#define` macros, and conditionally including or excluding lines based on `#if` checks. The output is pure C — and the preprocessor itself does not know any C syntax. That last fact is the source of every preprocessor surprise.
+
+## What the preprocessor does
+
+You can see the preprocessor's output:
+
+```bash
+$ gcc -E hello.c
+# 0 "hello.c"
+# 0 "<built-in>"
+# 0 "<command-line>"
+# ... hundreds of lines from stdio.h ...
+# 1 "hello.c"
+int main(void) {
+    printf("hello, C\n");
+    return 0;
+}
+```
+
+`-E` runs only the preprocessor; the output is what the compiler proper would see. The `# 1 "..."` lines are line-number directives — the preprocessor tracks original file/line so that error messages can point at the right place.
+
+For most C work you ignore the preprocessor as an implementation detail. For understanding subtle bugs and for writing cross-platform code, it pays to know exactly what the preprocessor does and does not do.
+
+## `#include`
+
+```c
+#include <stdio.h>      /* system include path */
+#include "myheader.h"   /* current directory first, then system path */
+```
+
+`#include` literally copies the named file's contents into the source at that point. After preprocessing, your translation unit is a single huge stream of C with all the included content inlined.
+
+The search paths are configurable: `gcc -I/some/path` adds `/some/path` to the search list for `#include "..."` (and, with `-isystem`, for `#include <...>`). Build systems set this for project-wide includes.
+
+Headers traditionally end in `.h`. Nothing in the language requires this — `#include "anything"` works — but the convention is universal.
+
+## `#define`
+
+```c
+#define PI 3.14159
+#define MAX_USERS 1024
+```
+
+`#define NAME REPLACEMENT` makes the preprocessor replace every occurrence of `NAME` (as a separate token) with `REPLACEMENT`. The replacement is **textual**: the preprocessor does not parse it.
+
+```c
+#define BIG 1000 * 1000
+int total = BIG + BIG;
+/* expands to: int total = 1000 * 1000 + 1000 * 1000;
+   which is 2,000,000 — fine in this case */
+
+#define HALF 1 / 2
+int twice = HALF + HALF;
+/* expands to: int twice = 1 / 2 + 1 / 2;
+   which is 0 + 0 = 0 — surprising! */
+```
+
+`HALF` is integer division, so `1 / 2` is 0. Each occurrence stays as `1 / 2`, not the value 0. If you wanted 0.5, write `#define HALF 0.5` or `#define HALF (1.0 / 2.0)`.
+
+For numerical constants, **always parenthesise**:
+
+```c
+#define HALF (1.0 / 2.0)
+```
+
+The parentheses prevent any operator precedence surprise when the macro is used inside a larger expression. We will see why in the function-like macro section.
+
+`#undef NAME` removes a previous definition. Rarely needed.
+
+## Constants vs `static const` vs `enum`
+
+For "give me a name for a constant", you have three choices:
+
+```c
+#define MAX_USERS 1024                    /* preprocessor */
+static const int MAX_USERS = 1024;        /* C const */
+enum { MAX_USERS = 1024 };                /* enum */
+```
+
+**`#define`** is the historical default. Works anywhere, including for array sizes (pre-C99 you needed a constant expression for array bounds, and only `#define` or `enum` constants qualified). No type. No type checking.
+
+**`static const`** is type-safe. But pre-C23, it does not count as a constant expression — you cannot use `static const int N = 10;` as an array size in `int arr[N];` (well, except as a VLA, which has its own problems — lesson 6).
+
+**`enum { N = 10 }`** is the modern compromise. It is a constant expression. It has integer type (the implementation picks int or unsigned). It works as an array size, in case labels, in `#if`. The trick is to declare it without listing identifiers in a real enum:
+
+```c
+enum { MAX_USERS = 1024, MAX_TOKENS = 256 };
+```
+
+For integer constants that need to be true compile-time constants, `enum` is usually the cleanest. For floats, doubles, strings, or anything not int-typed, `static const` or `#define` are your options.
+
+## Function-like macros
+
+```c
+#define SQUARE(x) ((x) * (x))
+
+int n = SQUARE(5);     /* expands to: int n = ((5) * (5)); → 25 */
+int m = SQUARE(a + b); /* expands to: int m = ((a + b) * (a + b)); */
+```
+
+The parameter `x` gets textually replaced with whatever was passed in. The outer `()` around the whole replacement and around each parameter use are **mandatory**.
+
+Without them:
+
+```c
+#define SQUARE(x) x * x
+int m = SQUARE(a + b);     /* expands to: a + b * a + b — precedence trap */
+```
+
+`a + b * a + b` is not `(a+b) * (a+b)`. With `a = 1, b = 2`, it computes `1 + 2*1 + 2 = 5`, not the expected 9.
+
+**The two parenthesisation rules for every function-like macro:**
+
+1. Parenthesise every parameter use: `((x))`.
+2. Parenthesise the whole replacement: `((...))`.
+
+Even one-line wrappers benefit from this. Write SQUARE as `((x) * (x))`, not `(x * x)`, even though for `SQUARE` the inner parens are sufficient.
+
+### The double-evaluation trap
+
+```c
+#define SQUARE(x) ((x) * (x))
+int i = 5;
+int j = SQUARE(i++);   /* expands to: ((i++) * (i++)); */
+```
+
+`i++` is evaluated **twice**. After this line, `i` is 7, and the value of the expression is... undefined (the two `i++` have no sequence point between them, lesson 3).
+
+Even without UB, double-evaluation is a performance trap:
+
+```c
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+int best = MAX(expensive(), other_expensive());
+/* expensive() is called twice — once in the comparison, once if it wins */
+```
+
+**Both traps go away if you use `static inline` instead:**
+
+```c
+static inline int max_int(int a, int b) { return a > b ? a : b; }
+```
+
+The arguments evaluate exactly once because they are real function parameters. At `-O2` the compiler inlines the call, so the machine code is identical to the macro. **Prefer `static inline` for any operation that operates on a known type.** Macros remain useful only when:
+
+- The "operation" is type-generic (works on int, float, struct).
+- The operation builds compile-time constants (no runtime present).
+- The operation must inspect tokens, not values (stringification, type-naming).
+
+## Stringification: `#x`
+
+Inside a function-like macro, `#x` produces a string literal containing the text of the argument:
+
+```c
+#define STR(x) #x
+const char *s1 = STR(hello);     /* "hello" */
+const char *s2 = STR(1 + 2);     /* "1 + 2" */
+```
+
+Useful for debug print helpers:
+
+```c
+#define TRACE(x) do { printf("%s = %d\n", #x, (x)); } while (0)
+int n = 42;
+TRACE(n);          /* prints: n = 42 */
+TRACE(n * 2 + 1);  /* prints: n * 2 + 1 = 85 */
+```
+
+The stringified token shows the *source-level expression*, which makes the output self-describing.
+
+The `do { ... } while (0)` wrapper is the canonical idiom for multi-statement macros — see the box below.
+
+## Token pasting: `##`
+
+`a ## b` concatenates two tokens at preprocess time:
+
+```c
+#define CONCAT(a, b) a ## b
+int CONCAT(my, var) = 5;     /* declares int myvar = 5; */
+```
+
+The pasted result must be a valid token. `CONCAT(my, var)` produces the identifier `myvar`. `CONCAT(1, 2)` produces the numeric token `12`.
+
+Token pasting is rare but indispensable when you need it. The canonical use is **generating boilerplate code**:
+
+```c
+#define DECLARE_HANDLER(name) \
+    void on_ ## name(int arg)
+
+DECLARE_HANDLER(button);    /* void on_button(int arg); */
+DECLARE_HANDLER(timer);     /* void on_timer(int arg);  */
+```
+
+We will see more uses in the X-macro section below.
+
+## Predefined macros
+
+The C standard mandates several predefined macros:
+
+```c
+__FILE__   /* string literal: source file name */
+__LINE__   /* integer: current line number */
+__func__   /* string: current function name (C99) — actually a const char[] in scope, not a macro */
+__DATE__   /* string: compilation date — "May 13 2026" format */
+__TIME__   /* string: compilation time */
+__STDC_VERSION__  /* long: language standard version, e.g. 201710L for C17, 202311L for C23 */
+```
+
+Useful for diagnostics:
+
+```c
+#define LOG_ERROR(msg) \
+    fprintf(stderr, "[%s:%d in %s] %s\n", __FILE__, __LINE__, __func__, (msg))
+```
+
+GCC and clang add many of their own: `__GNUC__` (the major version of GCC), `__clang__` (defined when clang is the compiler), `__arm__` (defined on ARM architectures), `__SIZEOF_LONG__` (size of long in bytes), and so on. These are how cross-platform code adapts.
+
+## Conditional compilation
+
+```c
+#ifdef DEBUG
+    fprintf(stderr, "debug: %d\n", x);
+#endif
+
+#if defined(__linux__) || defined(__APPLE__)
+    /* Unix code */
+#elif defined(_WIN32)
+    /* Windows code */
+#else
+    #error "Unsupported platform"
+#endif
+
+#if __STDC_VERSION__ >= 201112L
+    /* C11 or later — _Static_assert, _Generic, etc. available */
+#endif
+```
+
+`#ifdef X` is true when `X` is `#define`d. `#ifndef X` is true when it is not. `#if expr` evaluates the expression at preprocess time — only constant arithmetic, `defined()`, and integer literals.
+
+Conditional compilation is how cross-platform C code adapts to different OSes, compilers, and architectures. It is also how you compile in debug helpers in dev builds and strip them in release builds:
+
+```c
+#ifndef NDEBUG
+    #define DBG(fmt, ...) printf("DBG: " fmt "\n", __VA_ARGS__)
+#else
+    #define DBG(fmt, ...) ((void)0)
+#endif
+```
+
+(`__VA_ARGS__` and the variadic-macro syntax `#define f(fmt, ...)` are a C99 feature.)
+
+## Include guards and `#pragma once`
+
+Headers can be included multiple times (directly, or transitively through other headers). Without protection, definitions get duplicated and the compiler errors out.
+
+The classic guard:
+
+```c
+/* myheader.h */
+#ifndef MYHEADER_H
+#define MYHEADER_H
+
+/* ... declarations ... */
+
+#endif
+```
+
+First time the file is included, `MYHEADER_H` is not defined; the body runs and defines it. Second time, the body is skipped.
+
+The modern alternative:
+
+```c
+/* myheader.h */
+#pragma once
+
+/* ... declarations ... */
+```
+
+`#pragma once` is not in the C standard but is supported by every modern compiler. It is shorter and avoids the unique-macro-name burden. Most projects use it; some style guides still require the classic guards for portability.
+
+## X-macros
+
+A surprisingly powerful pattern. Define a "list" as a macro that takes another macro as argument:
+
+```c
+/* the list */
+#define EVENTS(X) \
+    X(EVENT_BUTTON, "button press") \
+    X(EVENT_TIMER,  "timer tick") \
+    X(EVENT_UART,   "uart byte received")
+
+/* generate the enum */
+typedef enum {
+    #define X(name, desc) name,
+    EVENTS(X)
+    #undef X
+} event_kind_t;
+
+/* generate the description table */
+static const char *event_descriptions[] = {
+    #define X(name, desc) [name] = desc,
+    EVENTS(X)
+    #undef X
+};
+
+/* generate the name table */
+static const char *event_names[] = {
+    #define X(name, desc) [name] = #name,
+    EVENTS(X)
+    #undef X
+};
+```
+
+The X macro is invoked once per entry. Each invocation can produce different output by re-defining X. Add a new event in **one place** (the EVENTS list) and the enum, description table, and name table all update.
+
+```c
+int main(void) {
+    event_kind_t e = EVENT_TIMER;
+    printf("%s: %s\n", event_names[e], event_descriptions[e]);
+    return 0;
+}
+```
+
+Output:
+
+```text
+EVENT_TIMER: timer tick
+```
+
+X-macros are an acquired taste — verbose and visually weird — but they reduce the surface area for "I added an enum value but forgot to update the table" bugs to zero. Heavily used in embedded code for command tables, error tables, and register lists.
+
+## `_Generic` — type-dispatched expressions (C11)
+
+C11 added a way to choose at compile time between expressions based on the type of an argument:
+
+```c
+#include <math.h>
+
+#define ABS(x) _Generic((x), \
+    int:    abs,             \
+    long:   labs,            \
+    float:  fabsf,           \
+    double: fabs             \
+)(x)
+
+int main(void) {
+    int    a = -5;
+    double b = -3.14;
+    printf("%d %f\n", ABS(a), ABS(b));   /* 5 3.14 */
+    return 0;
+}
+```
+
+`_Generic((x), int: f, double: g)(x)` selects `f` or `g` based on `x`'s type, then calls the chosen one with `x`.
+
+This gives C a limited form of compile-time polymorphism. Combined with macros, you get type-safe generic operations. The C standard library uses `_Generic` for the `tgmath.h` (type-generic math) header.
+
+Verbose for everyday use; valuable for library code that needs to dispatch on type without runtime cost.
+
+## The `do { ... } while (0)` macro idiom
+
+A multi-statement macro should look syntactically like a single statement, so it works inside `if`/`else` without surprises. The wrap:
+
+```c
+#define INIT_TWO(a, b) do { (a) = 0; (b) = 0; } while (0)
+
+if (cond)
+    INIT_TWO(x, y);
+else
+    fallback();
+```
+
+Without the `do {} while (0)`, the macro expansion plus the trailing `;` would either cause a syntax error or, worse, attach the trailing else to the wrong statement. The `do {} while (0)` makes the whole thing a single statement that requires a `;` at use site.
+
+This is the standard idiom for any function-like macro that contains more than one statement. Use it.
+
+<Callout type="warn" title="Macros do not understand C">
+The preprocessor is text-substitution. It does not know about types, scopes, or expressions. Every "macro hygiene" surprise comes from this: macro arguments evaluate multiple times, names inside macros collide with names at the call site, statements expand into contexts that change their meaning. The defences are: parenthesise everything, do { } while (0) for multi-statement, and `static inline` instead of macro whenever the operation is on a known type.
+</Callout>
+
+## When to use macros (and when not)
+
+**Good uses:**
+
+- **Compile-time constants** (when `enum` is not appropriate, e.g. floats or strings).
+- **Conditional compilation** — `#ifdef DEBUG`, platform detection.
+- **Boilerplate generation** — X-macros for tables, code-generation patterns.
+- **Stringification / token-pasting** — irreplaceable when needed.
+- **Debug helpers** — `TRACE(x)` that prints the source-level expression.
+- **Compile-time computation that the compiler may not constant-fold** (rare in modern compilers).
+
+**Bad uses (prefer `static inline`):**
+
+- **Type-specific operations** — `static inline int square(int x) { return x * x; }`.
+- **Anything where double-evaluation is a hazard** — `MAX(a, b)` etc.
+- **Anything that creates local variables** — macros pollute the caller's scope; functions do not.
+
+Modern C code uses macros sparingly. The kernel and old libraries are full of them; new code prefers inline functions and `_Generic` where appropriate.
+
+## Exercises
+
+**Exercise 11.1.** Fix this macro so it does not have a precedence bug:
+
+```c
+#define SUM_OF_SQUARES(a, b) a * a + b * b
+```
+
+<Callout type="spec" title="Answer">
+```c
+#define SUM_OF_SQUARES(a, b) ((a) * (a) + (b) * (b))
+```
+
+Parenthesise each parameter use AND wrap the whole replacement. With the original, `SUM_OF_SQUARES(2+1, 3) * 2` expands to `2+1 * 2+1 + 3 * 3 * 2`, which is not what anyone intended. With the fix, every operand and the whole result are protected.
+
+Even better: prefer `static inline int sum_of_squares(int a, int b) { return a*a + b*b; }`.
+</Callout>
+
+**Exercise 11.2.** Use an X-macro to declare an enum of three error codes and a function that returns a string description for each. Adding a fourth code should require changes in only one place.
+
+<Callout type="spec" title="Answer">
+```c
+#define ERRORS(X) \
+    X(ERR_OK,      "success") \
+    X(ERR_BADARG,  "bad argument") \
+    X(ERR_NOMEM,   "out of memory") \
+    X(ERR_TIMEOUT, "timeout")
+
+typedef enum {
+    #define X(name, desc) name,
+    ERRORS(X)
+    #undef X
+} err_t;
+
+const char *err_str(err_t e) {
+    static const char *strs[] = {
+        #define X(name, desc) [name] = desc,
+        ERRORS(X)
+        #undef X
+    };
+    if ((size_t)e < sizeof(strs) / sizeof(strs[0])) return strs[e];
+    return "unknown";
+}
+```
+
+To add a new error, add one line to the ERRORS list and rebuild. The enum and the descriptions update automatically.
+</Callout>
+
+**Exercise 11.3.** Write a `TRACE(x)` macro that prints `file:line: expr = value` for an int x. Test it.
+
+<Callout type="spec" title="Answer">
+```c
+#include <stdio.h>
+
+#define TRACE(x) do { \
+    printf("%s:%d: %s = %d\n", __FILE__, __LINE__, #x, (x)); \
+} while (0)
+
+int main(void) {
+    int n = 7;
+    TRACE(n);
+    TRACE(n * 3 + 1);
+    return 0;
+}
+```
+
+Output (something like):
+```text
+trace.c:8: n = 7
+trace.c:9: n * 3 + 1 = 22
+```
+
+The `#x` stringifies the source expression. `__FILE__` and `__LINE__` come from the preprocessor. `do { ... } while (0)` wraps the multi-statement... wait, it is one statement, but the wrap still makes it a true statement that requires `;` at use site.
+</Callout>
+
+## What you learned
+
+- The preprocessor does text-level substitution before the compiler sees your code.
+- `#include` inlines a header. `<...>` for system, `"..."` for project.
+- `#define X Y` substitutes; **always parenthesise** numerical constants.
+- Function-like macros: parenthesise every parameter use AND the whole replacement.
+- Beware **double evaluation** in function-like macros. Prefer `static inline` when the operation is type-specific.
+- `#x` stringifies an argument; `a ## b` pastes tokens. Use for boilerplate and debug helpers.
+- Predefined macros: `__FILE__`, `__LINE__`, `__func__`, `__STDC_VERSION__`, plus compiler-specific.
+- Conditional compilation (`#ifdef`, `#if`, `#elif`, `#else`, `#endif`) for cross-platform and debug builds.
+- Include guards (`#ifndef X / #define X / #endif`) or `#pragma once` prevent multiple-include errors.
+- X-macros generate parallel tables from a single declaration — heavily used in embedded.
+- `_Generic` (C11) gives compile-time type dispatch.
+- The `do { ... } while (0)` idiom wraps multi-statement macros into a single statement.
+
+In lesson 12 we go from single files to multi-file projects — translation units, headers vs sources, `extern`, the one-definition rule, and a working Makefile.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 10 — Dynamic memory](/docs/programming/c-lesson-10-dynamic-memory/) | [Lesson 12 — Multi-file projects](/docs/programming/c-lesson-12-multi-file/) |

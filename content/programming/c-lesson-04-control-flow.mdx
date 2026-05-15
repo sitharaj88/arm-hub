@@ -1,0 +1,492 @@
+---
+title: Lesson 4 — Control flow
+description: if, switch, while, do/while, for, break/continue/goto, the case fall-through rule, and the unsigned-loop overflow that catches every engineer at least once.
+order: 5
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, control-flow, loops]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 4 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'if/else, switch with fall-through, while, do/while, for, break/continue, goto (for error cleanup only), and unsigned loop counter overflow' },
+    { label: 'Code provided', value: 'About 70 lines including a running-sum array processor' },
+    { label: 'Time', value: '60-90 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 3 — Expressions and operators' },
+  ]}
+/>
+
+Control flow in C looks identical to control flow in Java or JavaScript. Almost. The differences are subtle but matter: `switch` falls through by default, `for` will quietly overflow if you pick the wrong index type, and `goto` exists and is occasionally the right answer despite what Dijkstra said. This lesson covers everything in one place.
+
+## `if` / `else` / `else if`
+
+```c
+if (condition) {
+    /* taken when condition is non-zero */
+} else if (other_condition) {
+    /* taken when condition is zero and other_condition is non-zero */
+} else {
+    /* taken when neither matched */
+}
+```
+
+A "true" condition in C is **any non-zero value**. `if (5)` is taken. `if (-1)` is taken. `if (0)` is not. `if (NULL)` is not. `if (0.0)` is not.
+
+The braces are optional for a single statement:
+
+```c
+if (x > 0) printf("positive\n");
+else       printf("non-positive\n");
+```
+
+**Always use braces anyway.** This is one of the most consistent style rules across professional codebases. The brace-less form caused Apple's famous "goto fail" SSL vulnerability in 2014 — a duplicated `goto` line under an unbraced `if`, indented to look conditional but actually unconditional. Two characters of cost, hours of debugging avoided. Just write the braces.
+
+```c
+if (x > 0)
+    do_something();
+    log_it();        /* always runs! not part of the if */
+```
+
+The second statement is **not** inside the `if`. With braces, you cannot make this mistake.
+
+## `switch` / `case` / `default`
+
+```c
+switch (op) {
+    case 1:
+        printf("one\n");
+        break;
+    case 2:
+        printf("two\n");
+        break;
+    case 3:
+    case 4:
+        printf("three or four\n");
+        break;
+    default:
+        printf("something else\n");
+        break;
+}
+```
+
+Two important rules.
+
+**`case` falls through by default.** If you omit the `break` at the end of a case, execution continues into the next case. This is unlike most modern languages (Rust, Swift, Kotlin) that require explicit fall-through. In C, **every case should end with `break` unless you specifically want fall-through**, in which case mark it:
+
+```c
+switch (op) {
+    case 1:
+        do_one_thing();
+        /* fall through */
+    case 2:
+        do_another_thing();
+        break;
+}
+```
+
+The `/* fall through */` comment is recognised by GCC and clang as suppressing the `-Wimplicit-fallthrough` warning. In C23 you can use the attribute `[[fallthrough]];` instead.
+
+**`switch` values must be integer constants.** You cannot switch on strings, on ranges (`case 1..5:`), or on variables (`case x:`). The case labels must be compile-time integer constants — int literals, enum values, or `#define` macros that expand to them.
+
+`default` matches anything not matched by the other cases. Its position in the `switch` body does not matter (it does not have to be last), but conventionally it is last.
+
+**The empty case trick.** Multiple labels without code between them stack onto the same body:
+
+```c
+case 3:
+case 4:
+case 5:
+    handle_345();
+    break;
+```
+
+This is **not** fall-through in the dangerous sense — the cases share a body, with no executable statements between them. Every linter is fine with this.
+
+<Callout type="tip" title="When to switch vs when to if-else">
+A `switch` on a small set of compile-time integers compiles to a jump table — O(1) dispatch, regardless of how many cases. A long `if/else if` chain on the same values compiles to a sequence of compares — O(n). For dispatch on enum values or message types, prefer `switch` for both readability and codegen.
+</Callout>
+
+## `while` and `do/while`
+
+```c
+while (condition) {
+    /* body */
+}
+```
+
+Standard pre-test loop. Condition is evaluated first; if non-zero, body runs; repeat. If the condition starts false, the body never runs.
+
+```c
+do {
+    /* body */
+} while (condition);
+```
+
+Post-test loop. Body runs first, then condition is checked. The body always runs **at least once**. Note the semicolon after the closing `)` — that surprises people.
+
+`do/while` is useful when the loop body has to run before you can know whether to continue. The classic example is reading input until a sentinel:
+
+```c
+int n;
+do {
+    printf("Enter a non-negative number: ");
+    scanf("%d", &n);
+} while (n < 0);
+```
+
+If you wrote this as `while (n < 0) { ... }`, `n` is uninitialised on the first check.
+
+## `for`
+
+The C `for` loop is structurally three semicolon-separated expressions:
+
+```c
+for (init; condition; step) {
+    /* body */
+}
+```
+
+Equivalent to:
+
+```c
+init;
+while (condition) {
+    /* body */
+    step;
+}
+```
+
+The canonical idiom:
+
+```c
+for (int i = 0; i < n; i++) {
+    process(arr[i]);
+}
+```
+
+`int i = 0` initialises a loop variable (since C99, the declaration can be inside the `for` header). `i < n` is the per-iteration check. `i++` runs at the end of each iteration.
+
+You can leave any of the three parts empty:
+
+```c
+for (;;) { /* infinite loop */ }
+for (int i = 0; ; i++) { /* runs until break */ }
+```
+
+You can put complex expressions in init and step using the comma operator (lesson 3):
+
+```c
+for (int i = 0, j = n - 1; i < j; i++, j--) {
+    swap(&arr[i], &arr[j]);
+}
+```
+
+This is one of the rare legitimate uses of the comma operator. Outside `for`, it almost always reads worse than separate statements.
+
+## The unsigned loop overflow trap
+
+Look at this code carefully:
+
+```c
+unsigned char i;
+for (i = 0; i < 300; i++) {
+    process(i);
+}
+```
+
+What does this do? **Infinite loop.** `unsigned char` is 8 bits on every system in modern use, so it can hold 0..255. When `i` reaches 255 and the loop increments it, it wraps to 0 (unsigned overflow is defined as wrap-around). `i < 300` is always true because `i` can never reach 300. The loop runs forever.
+
+The bug class is: the **loop bound exceeds the range of the loop counter**. It catches everyone at least once. The fix is to use a wide enough counter:
+
+```c
+for (int i = 0; i < 300; i++) { ... }      /* int is at least 16 bits — fine for 300 */
+for (uint16_t i = 0; i < 300; i++) { ... } /* explicit 16-bit unsigned */
+```
+
+The same trap exists for signed types if you push them past their range:
+
+```c
+int8_t i;
+for (i = 0; i < 200; i++) { ... }     /* int8_t maxes out at 127 — bug */
+```
+
+And signed overflow is **undefined behavior** (not wrap-around), so the compiler might optimise the loop away entirely.
+
+**The rule:** pick a counter type wide enough for `loop_bound + 1`. When in doubt, use `int` or `size_t`. The cost of an int counter is one or two extra bytes on the stack; the benefit is no overflow surprises.
+
+<Callout type="warn" title="Subtler version of the same bug">
+The loop `for (size_t i = n - 1; i >= 0; i--)` is an infinite loop. `size_t` is unsigned, so it is always `>= 0` — when `i` is 0 and you decrement, it wraps to `SIZE_MAX`, which is enormous, still `>= 0`. Reverse loops with unsigned counters need a different pattern:
+
+```c
+for (size_t i = n; i > 0; i--) {
+    use(arr[i - 1]);   /* note the i - 1 */
+}
+```
+
+Or use a signed counter and accept the slight type mismatch.
+</Callout>
+
+## `break` and `continue`
+
+`break` exits the innermost loop or `switch`:
+
+```c
+for (int i = 0; i < n; i++) {
+    if (arr[i] == target) {
+        found = i;
+        break;       /* exit the for */
+    }
+}
+```
+
+`continue` skips to the next iteration of the innermost loop:
+
+```c
+for (int i = 0; i < n; i++) {
+    if (arr[i] < 0) {
+        continue;    /* skip negatives */
+    }
+    process(arr[i]);
+}
+```
+
+Neither breaks out of more than one level. To exit nested loops, either use a flag, refactor into a function, or — yes — `goto`.
+
+## `goto` — rarely, but it has its uses
+
+`goto` jumps to a label in the same function. You will not see it for general control flow in good C code; you **will** see it in two specific patterns.
+
+**Error cleanup.** A function that allocates several resources can use goto to skip to a cleanup block on error:
+
+```c
+int load_thing(void) {
+    int err = 0;
+    FILE *f = NULL;
+    char *buf = NULL;
+
+    f = fopen("thing.bin", "rb");
+    if (!f) { err = -1; goto cleanup; }
+
+    buf = malloc(BUFSZ);
+    if (!buf) { err = -2; goto cleanup; }
+
+    if (fread(buf, 1, BUFSZ, f) != BUFSZ) { err = -3; goto cleanup; }
+
+    /* use buf */
+
+cleanup:
+    free(buf);
+    if (f) fclose(f);
+    return err;
+}
+```
+
+The alternative — a deeply-nested pyramid of `if (success) { if (success) { ... } }` — is uglier and harder to maintain. The Linux kernel uses this pattern heavily. It is sometimes called "goto cleanup" or "single exit point".
+
+**Breaking out of nested loops.** Same principle: jump past the loops on early termination.
+
+```c
+for (int i = 0; i < n; i++) {
+    for (int j = 0; j < m; j++) {
+        if (matrix[i][j] == target) {
+            goto found;
+        }
+    }
+}
+goto not_found;
+found:
+    printf("found at %d %d\n", i, j);
+    return;
+not_found:
+    printf("not found\n");
+```
+
+Rare in practice — usually a function refactor reads better. But it is legal.
+
+**Do not use `goto` for general control flow.** Goto-to-anywhere makes code unreadable. Goto-to-cleanup is a structured pattern that just happens to use the goto keyword.
+
+## A real example: running sum over an array
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+#define N 8
+
+int main(void) {
+    int32_t data[N] = { 3, 1, 4, 1, 5, 9, 2, 6 };
+    int32_t running_sum[N];
+    int32_t total = 0;
+
+    for (size_t i = 0; i < N; i++) {
+        total += data[i];
+        running_sum[i] = total;
+    }
+
+    for (size_t i = 0; i < N; i++) {
+        printf("data[%zu]=%d  running_sum[%zu]=%d\n",
+               i, data[i], i, running_sum[i]);
+    }
+    return 0;
+}
+```
+
+Output:
+
+```text
+data[0]=3  running_sum[0]=3
+data[1]=1  running_sum[1]=4
+data[2]=4  running_sum[2]=8
+data[3]=1  running_sum[3]=9
+data[4]=5  running_sum[4]=14
+data[5]=9  running_sum[5]=23
+data[6]=2  running_sum[6]=25
+data[7]=6  running_sum[7]=31
+```
+
+Note `size_t i` as the loop counter — that is the right type for array indexing. Note also `%zu` to print `size_t`. We will come back to the array semantics in lesson 6 (arrays).
+
+## A `switch` with fall-through
+
+Sometimes fall-through is genuinely what you want. A toy duration-classifier:
+
+```c
+#include <stdio.h>
+int main(void) {
+    int hours = 3;
+    int category;
+    switch (hours) {
+        case 0:
+            printf("instant\n");
+            category = 0;
+            break;
+        case 1:
+        case 2:
+            printf("short\n");
+            category = 1;
+            break;
+        case 3:
+        case 4:
+        case 5:
+            printf("medium\n");
+            category = 2;
+            break;
+        default:
+            printf("long\n");
+            category = 3;
+            break;
+    }
+    return category;
+}
+```
+
+The cases share a body — no fall-through warning, no comments needed. If you wanted *real* fall-through (running case 3's body and then case 4's), the explicit `/* fall through */` comment marks intent.
+
+## Best-practice loop patterns
+
+A few patterns that come up constantly:
+
+```c
+/* Iterate over every element of a fixed-size array */
+for (size_t i = 0; i < sizeof(arr) / sizeof(arr[0]); i++) { ... }
+
+/* Iterate over a NUL-terminated string */
+for (const char *p = s; *p != '\0'; p++) { ... }
+
+/* Iterate until end-of-file */
+int c;
+while ((c = fgetc(f)) != EOF) { ... }
+
+/* Iterate over a linked list */
+for (Node *n = head; n != NULL; n = n->next) { ... }
+```
+
+Memorise these — you will write them constantly.
+
+<Callout type="tip" title="The sizeof(arr)/sizeof(arr[0]) idiom">
+Often abbreviated as `ARRAY_SIZE(arr)` via a macro:
+
+```c
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+```
+
+Use this only on real arrays — once an array decays to a pointer (when passed to a function), `sizeof(p)` is the pointer size, not the array size, and the macro silently gives wrong answers. Lesson 6 covers array decay in detail.
+</Callout>
+
+## Exercises
+
+**Exercise 4.1.** What does this print, and why?
+
+```c
+#include <stdio.h>
+int main(void) {
+    for (int i = 0; i < 3; i++) {
+        switch (i) {
+            case 0: printf("zero ");
+            case 1: printf("one ");  break;
+            case 2: printf("two\n"); break;
+        }
+    }
+    return 0;
+}
+```
+
+<Callout type="spec" title="Answer">
+Output: `zero one one two`. The `case 0` body lacks a `break`, so when `i == 0` execution falls through into `case 1` and prints both `zero ` and `one `. When `i == 1` only `one ` prints. When `i == 2`, `two\n` prints. The missing break is the bug; either add `break` after `case 0` or comment `/* fall through */` if intended.
+</Callout>
+
+**Exercise 4.2.** Find the bug:
+
+```c
+size_t n = 10;
+for (size_t i = n - 1; i >= 0; i--) {
+    printf("%zu\n", i);
+}
+```
+
+<Callout type="spec" title="Answer">
+Infinite loop. `size_t` is unsigned, so `i >= 0` is always true. When `i` is 0 and the loop decrements, it wraps to `SIZE_MAX`. Fix by iterating from `n` down with the index adjusted inside:
+
+```c
+for (size_t i = n; i > 0; i--) {
+    printf("%zu\n", i - 1);
+}
+```
+</Callout>
+
+**Exercise 4.3.** Write a function `int count_set_bits(uint32_t x)` that returns the number of 1-bits in `x`, using a `while` loop. Hint: `x & (x - 1)` clears the lowest set bit.
+
+<Callout type="spec" title="Answer">
+```c
+int count_set_bits(uint32_t x) {
+    int count = 0;
+    while (x != 0) {
+        x &= x - 1;   /* clear lowest set bit */
+        count++;
+    }
+    return count;
+}
+```
+
+This is "Kernighan's bit-count" and runs in O(number of set bits) — at most 32 iterations for a 32-bit input, but typically far fewer. GCC has a builtin `__builtin_popcount(x)` that compiles to a single hardware instruction on most CPUs. On Cortex-M4 it is a small instruction sequence; on x86-64 with SSE4.2 it is one cycle.
+</Callout>
+
+## What you learned
+
+- `if (x)` treats any non-zero value as true. Always use braces.
+- `switch` falls through by default — explicit `break` after each case or mark fall-through with `/* fall through */` (C17) or `[[fallthrough]];` (C23).
+- `while` is pre-test, `do/while` is post-test (runs at least once). Note the trailing semicolon on `do/while`.
+- `for (init; cond; step)` is the canonical loop. Declare the loop counter in the header (C99+).
+- Pick a counter type wide enough for the loop bound. `unsigned char i; i < 300` is an infinite loop.
+- Reverse-loop with unsigned counters needs `for (i = n; i > 0; i--)` plus `i - 1` inside, not `i >= 0`.
+- `break` and `continue` affect only the innermost loop or `switch`.
+- `goto` is fine for error-cleanup blocks at the end of a function; avoid it elsewhere.
+
+In lesson 5 we look at functions: declarations vs definitions, pass-by-value, the empty-parens trap, static linkage, inline, and recursion.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 3 — Expressions and operators](/docs/programming/c-lesson-03-expressions/) | [Lesson 5 — Functions](/docs/programming/c-lesson-05-functions/) |

@@ -1,0 +1,463 @@
+---
+title: Lesson 7 — Pointers, the C superpower
+description: Addresses, dereference, NULL, pointer arithmetic, const correctness in all three positions, function pointers as first-class values, and a generic sort using a comparator.
+order: 8
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, pointers]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 7 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'What a pointer is, dereference and address-of, NULL, pointer arithmetic, pointer-to-pointer, the three positions of const, function pointers, a generic sort' },
+    { label: 'Code provided', value: 'About 130 lines including a generic sort using qsort-style comparator pointers' },
+    { label: 'Time', value: '120-150 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 6 — Arrays' },
+  ]}
+/>
+
+Pointers are the feature that separates C from every managed language you have used before. If you understand pointers, the rest of C falls into place. If you do not, every other topic — strings, dynamic memory, structs, function pointers, the standard library — feels like guesswork. This lesson takes pointers slowly and carefully.
+
+## What a pointer is
+
+A pointer is a variable whose value is the memory address of another object. That is it. There is nothing magical: a pointer holds a number, and the number happens to be interpretable as the location of something else in memory.
+
+```c
+int x = 42;
+int *p = &x;     /* p holds the address of x */
+```
+
+After this code:
+
+- `x` is a 4-byte int (on most systems) at some address — say, `0x7ffe9c4a5b3c`.
+- `p` is an 8-byte pointer (on 64-bit) at some other address, holding the value `0x7ffe9c4a5b3c`.
+
+You can print them:
+
+```c
+#include <stdio.h>
+int main(void) {
+    int x = 42;
+    int *p = &x;
+    printf("x = %d\n", x);
+    printf("&x = %p\n", (void *)&x);
+    printf("p = %p\n", (void *)p);
+    printf("*p = %d\n", *p);
+    return 0;
+}
+```
+
+Output (your addresses will differ):
+
+```text
+x = 42
+&x = 0x7ffe9c4a5b3c
+p = 0x7ffe9c4a5b3c
+*p = 42
+```
+
+`&x` is the **address-of** operator — gives the address of the variable.
+`*p` is the **dereference** operator — gives the value at the address.
+`int *p` declares `p` as "pointer to int".
+
+The dereference operator `*` lets you both read and write through the pointer:
+
+```c
+*p = 99;          /* now x is 99 */
+printf("%d\n", x);  /* 99 */
+```
+
+Modifying through a pointer is the way to write functions that modify caller state — exactly the swap example from lesson 5.
+
+## NULL — the "no pointer" pointer
+
+`NULL` is a macro defined in `<stddef.h>` (and many other headers). It represents the "does not point to anything" value of a pointer.
+
+```c
+int *p = NULL;
+if (p == NULL) {
+    /* p is not pointing at anything */
+}
+```
+
+In C, NULL is usually defined as `((void *)0)` or just `0`. The exact definition is implementation-defined, but every C library defines it. **C23 adds `nullptr` as a proper keyword** (lesson 15), which is type-safer than the macro, but for C17 code, NULL is what you write.
+
+**Dereferencing a NULL pointer is undefined behavior.** On Linux/macOS/Windows it usually segfaults — the OS catches the access to the first page of memory and kills the process. On a microcontroller it may successfully read whatever is at address 0 (often the initial stack pointer or vector table) and proceed with garbage. Always check pointers before dereferencing if there is any chance they could be NULL.
+
+The classic guard:
+
+```c
+if (p != NULL) {
+    use(*p);
+}
+
+/* Equivalently — pointers are testable directly */
+if (p) {
+    use(*p);
+}
+```
+
+C lets you test a pointer in a boolean context directly. `if (p)` is "if p is non-NULL". Short-circuit `&&` (lesson 3) makes this idiomatic:
+
+```c
+if (p != NULL && p->ready) { ... }
+```
+
+## Pointer arithmetic
+
+Pointers support arithmetic, but **the unit is the size of the pointed-to type**, not bytes.
+
+```c
+int a[5] = { 10, 20, 30, 40, 50 };
+int *p = a;       /* p points to a[0] */
+
+p + 1             /* points to a[1] — the address is a + sizeof(int) bytes */
+p + 3             /* points to a[3] */
+*(p + 2)          /* equivalent to a[2] — value is 30 */
+p[2]              /* equivalent — [] is pointer arithmetic in disguise */
+```
+
+`p + 1` does not add 1 byte. It adds `sizeof(*p)` bytes. The compiler does this multiplication for you because the unit of an array is the element, not the byte.
+
+```c
+double d[3];
+double *q = d;
+q + 1             /* address advances by sizeof(double) = 8 bytes */
+
+char c[10];
+char *r = c;
+r + 1             /* address advances by sizeof(char) = 1 byte */
+```
+
+Pointer subtraction works similarly: `p2 - p1` is the number of **elements** between them, not bytes. Pointer subtraction is only defined if both pointers point into the same array (or one past the end).
+
+Comparison of pointers (`<`, `<=`, `>`, `>=`) is only defined when the pointers point into the same array. Cross-object comparison is undefined. Equality (`==`, `!=`) is always defined.
+
+The `[]` operator is **defined in terms of pointer arithmetic**: `a[i]` is shorthand for `*(a + i)`. This implies the surprising-but-true `5[a]` is the same as `a[5]` — both compile to `*(a + 5)`. Do not write `5[a]` in production code; it is a curiosity, not a feature.
+
+<Callout type="note" title="One-past-the-end is allowed; two-past-the-end is not">
+For an array `int a[10]`, the address `&a[10]` is a valid pointer value (one past the end) and is commonly used as a loop sentinel:
+
+```c
+for (int *p = a; p != a + 10; p++) { ... }
+```
+
+You can compute and compare against `a + 10`, but you **must not dereference** it. The address `a + 11` is undefined to even compute. This subtlety is mainly important for portability — on a hypothetical system, computing `a + 11` could trigger a segmentation fault on a segmented architecture.
+</Callout>
+
+## Pointers, arrays, and `[]`
+
+The relationship between pointers and arrays is the single most confusing topic for C beginners. Two facts:
+
+1. An array **decays** to a pointer to its first element in most expressions (lesson 6).
+2. The `[]` operator works on any pointer.
+
+Combine them and a lot of C code suddenly makes sense:
+
+```c
+int a[10];
+int *p = a;       /* a decays to &a[0] */
+a[3] = 5;         /* same as *(a + 3) */
+p[3] = 5;         /* same as *(p + 3) — equivalent to a[3] */
+```
+
+But arrays and pointers are **not the same type**:
+
+- `sizeof(a)` is 40 (array size), `sizeof(p)` is 8 (pointer size).
+- `&a` is `int (*)[10]` (pointer to array of 10), `&p` is `int **` (pointer to pointer).
+- You cannot assign to an array name: `a = b;` is a compile error.
+
+The confusion is mostly limited to function parameters, where the rewriting (`int a[10]` becomes `int *a`) is invisible. Once you internalise the "arrays decay; pointers do not have a size" rule, the rest of the syntax stops surprising you.
+
+## Pointer to pointer
+
+A pointer is a variable, so you can have a pointer to one:
+
+```c
+int x = 42;
+int *p = &x;
+int **pp = &p;
+
+printf("%d\n", **pp);   /* dereference twice — 42 */
+*pp = NULL;             /* same as p = NULL */
+```
+
+Pointers-to-pointers come up in two common patterns.
+
+**Modifying a pointer in a caller's frame.** If you want a function to change which object a caller's pointer points at, the function needs the **address of the pointer**:
+
+```c
+void allocate_thing(Thing **out) {
+    *out = malloc(sizeof(Thing));   /* writes into the caller's pointer */
+}
+
+int main(void) {
+    Thing *t = NULL;
+    allocate_thing(&t);
+    /* t now points to a new Thing */
+}
+```
+
+**Arrays of pointers (e.g., `argv`).** `int main(int argc, char *argv[])` — `argv` is an array of `char *`, so its parameter form decays to `char **`. Each `argv[i]` is a `char *` pointing at a string.
+
+## Const correctness
+
+`const` is a type qualifier that says "this value cannot be modified through this name". Where you put it matters.
+
+```c
+const int *p;          /* pointer to const int — cannot modify *p */
+int *const p;          /* const pointer to int — cannot modify p itself */
+const int *const p;    /* const pointer to const int — neither */
+```
+
+Read right-to-left. `const int *p`: "p is a pointer to an int that is const". `int *const p`: "p is a const pointer to an int".
+
+The most common form is **pointer-to-const**: the function reads from the pointed-to data but does not write:
+
+```c
+size_t my_strlen(const char *s) {
+    size_t n = 0;
+    while (s[n] != '\0') n++;
+    return n;
+}
+```
+
+`const char *s` tells the caller "this function will not modify your string", and it tells the compiler to reject any attempt inside the function to write through `s`. If you accidentally type `s[0] = 'X';`, the compiler errors out.
+
+**Top-level const** (the second form, `int *const p`) is rarer. It says "I will not reassign this pointer to a different object" — useful for documenting that a local pointer should not be rebound.
+
+`const` is **shallow**, not deep. `const char *p` lets you assign `p = different_string;` (the *pointer* is not const), but does not let you modify the characters. Conversely, `char *const p` lets you write through the pointer but not rebind it.
+
+```c
+void f(const char *s) {
+    s = "different";   /* OK — the pointer is not const */
+    s[0] = 'X';        /* ERROR — the chars are const */
+}
+
+void g(char *const s) {
+    s[0] = 'X';        /* OK — the chars are not const */
+    s = "different";   /* ERROR — the pointer is const */
+}
+```
+
+**The discipline:** const-qualify every pointer parameter that the function does not write through. This is one of the cheapest, most reliable type-safety improvements you can make to a codebase. The compiler enforces it; readers benefit; APIs become self-documenting.
+
+<Callout type="tip" title="const and string literals">
+A string literal `"hello"` has type `char[6]` but lives in read-only memory on most platforms. Writing through `char *p = "hello"; p[0] = 'H';` is undefined behavior. The fix is to either declare `char p[] = "hello";` (your own modifiable array, initialised from the literal) or `const char *p = "hello";` (a pointer to read-only data, properly qualified).
+
+C23 made string literals have type `const char[N]` to enforce this at compile time. For C17, gcc with `-Wwrite-strings` warns. The habit: every pointer to a string literal is `const char *`.
+</Callout>
+
+## Function pointers
+
+In C, a function has an address, just like a variable. A function pointer holds that address. This sounds exotic; it is the foundation of `qsort`, `bsearch`, every callback API, every event handler in embedded code, and every plugin system.
+
+```c
+int add(int a, int b) { return a + b; }
+int sub(int a, int b) { return a - b; }
+
+int (*op)(int, int);    /* op is a pointer to a function taking (int, int) returning int */
+
+op = add;
+printf("%d\n", op(2, 3));   /* 5 */
+op = sub;
+printf("%d\n", op(7, 4));   /* 3 */
+```
+
+The declaration syntax is famously awkward: `int (*op)(int, int)`. Read from inside out: `op` is — what is it pointing at? — a function — what are its parameters? — `(int, int)` — and what is its return type? — `int`. The parentheses around `*op` are necessary because `*` has lower precedence than function-call `()`; without them, `int *op(int, int)` would mean "op is a function returning int pointer".
+
+You usually `typedef` function-pointer types to make them readable:
+
+```c
+typedef int (*binop_t)(int, int);
+
+binop_t op = add;
+op(2, 3);
+```
+
+Calling through a function pointer looks like a normal call: `op(2, 3)`. You can also write `(*op)(2, 3)` for clarity; both forms work and compile identically.
+
+Function pointers can be stored in arrays, passed to other functions, returned from functions. They are first-class values.
+
+```c
+binop_t ops[4] = { add, sub, mul, div };
+int result = ops[2](6, 7);   /* call mul(6, 7) */
+```
+
+This is **dispatch by index** — the workhorse of state machines, command parsers, and any code that needs to "call one of N things based on a runtime value".
+
+## A real example: a generic sort with comparator
+
+The C standard library's `qsort` takes a comparator function pointer so it can sort any type. Here we write our own simplified version using insertion sort (clear, not fast).
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+typedef int (*cmp_t)(const void *, const void *);
+
+/* Generic insertion sort over an array of `n` elements,
+ * each of size `size` bytes, ordered by `cmp`. */
+static void sort(void *base, size_t n, size_t size, cmp_t cmp) {
+    uint8_t *a = base;            /* byte-pointer view */
+    uint8_t *tmp = malloc(size);
+    if (!tmp) return;
+
+    for (size_t i = 1; i < n; i++) {
+        memcpy(tmp, a + i * size, size);
+        size_t j = i;
+        while (j > 0 && cmp(a + (j - 1) * size, tmp) > 0) {
+            memcpy(a + j * size, a + (j - 1) * size, size);
+            j--;
+        }
+        memcpy(a + j * size, tmp, size);
+    }
+    free(tmp);
+}
+
+/* Comparator: ascending int */
+static int cmp_int_asc(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    return (ia > ib) - (ia < ib);   /* -1, 0, or +1 */
+}
+
+/* Comparator: descending int */
+static int cmp_int_desc(const void *a, const void *b) {
+    return cmp_int_asc(b, a);
+}
+
+/* Comparator: ascending string (case-sensitive) */
+static int cmp_strp_asc(const void *a, const void *b) {
+    const char *sa = *(const char *const *)a;
+    const char *sb = *(const char *const *)b;
+    return strcmp(sa, sb);
+}
+
+int main(void) {
+    int nums[] = { 5, 3, 8, 1, 9, 2, 4 };
+    size_t n_nums = sizeof(nums) / sizeof(nums[0]);
+    sort(nums, n_nums, sizeof(int), cmp_int_asc);
+    for (size_t i = 0; i < n_nums; i++) printf("%d ", nums[i]);
+    putchar('\n');
+    /* prints: 1 2 3 4 5 8 9 */
+
+    const char *names[] = { "Charlie", "Alice", "Bob" };
+    size_t n_names = sizeof(names) / sizeof(names[0]);
+    sort(names, n_names, sizeof(const char *), cmp_strp_asc);
+    for (size_t i = 0; i < n_names; i++) printf("%s ", names[i]);
+    putchar('\n');
+    /* prints: Alice Bob Charlie */
+
+    return 0;
+}
+```
+
+Several patterns to absorb.
+
+**`void *` is the "any pointer".** It does not commit to a pointed-to type. The sort function takes `void *base` because it does not need to know the element type — it manipulates bytes. The comparator gets `const void *` arguments and casts them to the right concrete type.
+
+**`memcpy` for type-agnostic copying.** Inside sort, we cannot do `a[i] = a[i-1]` because we do not know the element type. `memcpy(a + j * size, a + (j-1) * size, size)` copies `size` bytes — works for any type.
+
+**Casting `const void *` to the real type inside the comparator.** `*(const int *)a` reinterprets the void pointer as a pointer to const int and dereferences. This is safe as long as the caller passes the right type — which is contractual, not enforced.
+
+**Comparator returns sign.** Standard convention: negative means a < b, zero means equal, positive means a > b. The expression `(ia > ib) - (ia < ib)` produces -1, 0, or +1 without overflow risk. `ia - ib` would seem simpler but overflows for far-apart values.
+
+**Sorting an array of strings is sorting an array of pointers.** Each `names[i]` is a `const char *`. The comparator receives `const void *` pointing to a `const char *` element, so `*(const char *const *)a` is "dereference to get the `const char *` value".
+
+The real `qsort` from `<stdlib.h>` has the same signature. We will see it in lesson 13.
+
+## Exercises
+
+**Exercise 7.1.** Without running, predict what this prints:
+
+```c
+#include <stdio.h>
+int main(void) {
+    int a[5] = { 10, 20, 30, 40, 50 };
+    int *p = a;
+    printf("%d %d %d\n", *p, *(p + 2), p[4]);
+    printf("%d\n", *(p + 5));
+    return 0;
+}
+```
+
+<Callout type="spec" title="Answer">
+First line: `10 30 50`. `*p` dereferences the pointer (a[0]=10), `*(p+2)` is a[2]=30, `p[4]` is a[4]=50.
+
+Second line: **undefined behavior**. `p + 5` is one past the end of the array — a valid pointer value, but dereferencing it reads memory you do not own. On a typical desktop you might see garbage, on a microcontroller you might see whatever happened to be in the next bytes (often the return address of `main`, which is concerning).
+</Callout>
+
+**Exercise 7.2.** Write a `const`-correct version of this function. Which arguments should be const?
+
+```c
+int sum_array(int *a, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) s += a[i];
+    return s;
+}
+```
+
+<Callout type="spec" title="Answer">
+```c
+int sum_array(const int *a, size_t n) {
+    int s = 0;
+    for (size_t i = 0; i < n; i++) s += a[i];
+    return s;
+}
+```
+
+`a` becomes `const int *` because we only read from it. `n` becomes `size_t` because it is a count (sizes are non-negative and we want the right type for indexing). The body does not modify `a` or anything it points to — making `a` const makes that promise to callers and enforces it at compile time.
+</Callout>
+
+**Exercise 7.3.** Define a function-pointer type `event_handler_t` taking `(uint32_t event_id, void *user_data)` and returning void. Write a table of three handlers and a dispatcher that calls the right one based on `event_id`.
+
+<Callout type="spec" title="Answer">
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+typedef void (*event_handler_t)(uint32_t event_id, void *user_data);
+
+static void on_button(uint32_t e, void *u)  { printf("button %u\n", e); (void)u; }
+static void on_timer (uint32_t e, void *u)  { printf("timer  %u\n", e); (void)u; }
+static void on_uart  (uint32_t e, void *u)  { printf("uart   %u\n", e); (void)u; }
+
+static event_handler_t handlers[] = { on_button, on_timer, on_uart };
+
+void dispatch(uint32_t kind, uint32_t event_id, void *user_data) {
+    if (kind < sizeof(handlers) / sizeof(handlers[0])) {
+        handlers[kind](event_id, user_data);
+    }
+}
+
+int main(void) {
+    dispatch(0, 42, NULL);
+    dispatch(2, 7,  NULL);
+    return 0;
+}
+```
+
+`(void)u` silences the unused-parameter warning. The dispatcher is O(1) regardless of how many handlers — this is the standard dispatch-table pattern used in OS kernels, real-time scheduler ISRs, and embedded protocol stacks.
+</Callout>
+
+## What you learned
+
+- A pointer is a variable that holds an address. `&x` takes an address; `*p` dereferences.
+- `NULL` is the "no pointer" value. Dereferencing it is undefined.
+- Pointer arithmetic moves in units of `sizeof(*p)`, not bytes. `[]` is pointer arithmetic.
+- `const` placement matters: `const int *p` (data const), `int *const p` (pointer const), `const int *const p` (both).
+- The convention: const-qualify every pointer parameter the function does not write through.
+- Function pointers store the address of a function. Syntax is awkward; `typedef` to make readable.
+- `void *` is the generic pointer — used by `qsort`, `memcpy`, dispatchers, allocators.
+
+In lesson 8 we look at strings — a topic that is much trickier in C than in any modern language because there is no string type, just `char` arrays with a NUL terminator.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 6 — Arrays](/docs/programming/c-lesson-06-arrays/) | [Lesson 8 — Strings](/docs/programming/c-lesson-08-strings/) |

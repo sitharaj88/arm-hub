@@ -1,0 +1,527 @@
+---
+title: Lesson 14 — Undefined behavior, the dragon
+description: What UB is and why the compiler is free to do anything. The classic list. Address Sanitizer. The optimisations that exploit UB. The 10 rules to follow in practice.
+order: 15
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, ub, undefined-behavior, sanitizers]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 14 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'What undefined behavior is, the canonical list, how compilers exploit it, sanitizers, assert, and the 10 rules that keep you out of trouble' },
+    { label: 'Code provided', value: 'About 100 lines of UB examples with their sanitizer output' },
+    { label: 'Time', value: '120-150 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 13 — The C standard library' },
+  ]}
+/>
+
+If you only remember one lesson from this tutorial, make it this one. Undefined behavior is the single largest source of difficult-to-debug C bugs, the reason your "obviously correct" code crashes mysteriously after a compiler upgrade, and the conceptual foundation you need to write code that works the same on every target. This lesson is long and dense; it is also the one that will save you the most hours of debugging later.
+
+## What "undefined behavior" actually means
+
+The C standard divides program behavior into four categories:
+
+- **Defined behavior** — the standard specifies exactly what happens.
+- **Implementation-defined behavior** — the standard requires the implementation to pick a specific behavior and document it. Example: whether `char` is signed or unsigned.
+- **Unspecified behavior** — multiple behaviors are allowed; the standard does not require the implementation to pick one. Example: the order of evaluation of function arguments.
+- **Undefined behavior (UB)** — the standard says nothing. The program can do anything. Crash, work, work mostly, return wrong values, format your hard drive — anything.
+
+UB is not "the program will probably crash". It is "the standard places no requirements". A compiler is free to assume your program never invokes UB and optimise on that assumption. If your program does invoke UB, the optimisation can lead to behavior that has no relation to what the source code "looks like it should do".
+
+This is the part that surprises programmers coming from managed languages. In Python, an out-of-bounds list access raises `IndexError`. In Java, it throws `ArrayIndexOutOfBoundsException`. In C, the language definition says "you must not do this; if you do, the compiler can do anything". And the compiler exploits that license aggressively to produce fast code.
+
+## The classic list
+
+Here are the most common forms of UB in C. Memorise the list.
+
+### 1. Signed integer overflow
+
+```c
+int x = INT_MAX;
+int y = x + 1;        /* UB — signed integer overflow */
+```
+
+The standard says signed integer overflow is undefined. Unsigned integer overflow, in contrast, wraps cleanly modulo 2^N — that is defined behavior. For signed types, the language gives the compiler permission to assume overflow does not happen, which enables optimisations like "convert `i < i + 1` to `true` unconditionally".
+
+```c
+for (int i = 0; i <= INT_MAX; i++) { ... }    /* UB — i++ overflows when i == INT_MAX */
+```
+
+Compilers can and do optimise this loop away (or into something else) because the standard says it cannot complete normally.
+
+### 2. Division by zero
+
+```c
+int x = 5 / 0;        /* UB */
+int y = 5 % 0;        /* UB */
+```
+
+Floating-point division by zero is defined (gives `infinity` or `NaN`). Integer division by zero is not.
+
+### 3. Dereferencing a NULL pointer
+
+```c
+int *p = NULL;
+int x = *p;           /* UB */
+```
+
+On Linux/macOS/Windows you get a segfault. On a microcontroller you may successfully read whatever is at address 0. Either way, the standard does not promise.
+
+### 4. Dereferencing a freed pointer (use-after-free)
+
+```c
+int *p = malloc(sizeof *p);
+free(p);
+*p = 5;               /* UB */
+```
+
+The memory may already belong to another allocation. Writing through `p` corrupts that allocation, often surfacing as a crash much later.
+
+### 5. Array out-of-bounds access
+
+```c
+int a[10];
+a[10] = 5;            /* UB — one past the end is a valid pointer value, but not for dereferencing */
+a[-1] = 5;            /* UB */
+a[1000] = 5;          /* UB */
+```
+
+### 6. Reading uninitialised memory
+
+```c
+int x;
+printf("%d\n", x);    /* UB — x has indeterminate value */
+```
+
+Same for `malloc`ed memory before it has been written (`calloc` is fine because it zero-initialises).
+
+### 7. Strict aliasing violations
+
+```c
+float f = 3.14f;
+int i = *(int *)&f;   /* UB — accessing a float through an int pointer violates strict aliasing */
+```
+
+The standard says you may access an object through pointers of compatible type, plus `char *` for byte access, plus a few other exceptions. Type-punning floats and ints through casts is not allowed. The correct way:
+
+```c
+int i;
+memcpy(&i, &f, sizeof i);   /* OK — memcpy is allowed to alias */
+```
+
+Or use a union (allowed since C99 with implementation-defined aspects):
+
+```c
+union { float f; int i; } u;
+u.f = 3.14f;
+int i = u.i;
+```
+
+### 8. Modifying a variable twice without a sequence point
+
+```c
+int i = 0;
+i = i++ + ++i;        /* UB — covered in lesson 3 */
+a[i] = i++;           /* UB */
+```
+
+The classic sequence-point violation.
+
+### 9. Returning a pointer to a local
+
+```c
+int *bad(void) {
+    int x = 5;
+    return &x;        /* UB when caller dereferences — x is gone */
+}
+```
+
+### 10. Shift by negative or too-large amounts
+
+```c
+uint32_t x = 1;
+x << 32;              /* UB — shift count >= width of type */
+x << -1;              /* UB — negative shift count */
+```
+
+### 11. Conversion that does not fit
+
+```c
+double d = 1e20;
+int x = (int)d;       /* UB if the value does not fit in int */
+```
+
+Casting a float to an integer type when the value is out of the destination range is undefined.
+
+### 12. `printf` format/argument mismatch
+
+```c
+int x = 5;
+printf("%s\n", x);    /* UB — printf reads an int as a char* */
+```
+
+We saw this in lesson 1.
+
+There are dozens more. Annex J.2 of the C standard lists them all (199 in the C11 version). The list above is enough to cover 95% of real-world UB.
+
+## The compiler "does anything" — for real
+
+The phrase "UB lets the compiler do anything" is not hyperbole. Here is a famous example from the Linux kernel:
+
+```c
+static void check_null(struct sock *sk) {
+    int family = sk->sk_family;     /* dereference */
+    if (sk == NULL) return;          /* NULL check */
+    /* ... use sk ... */
+}
+```
+
+The bug: the dereference comes before the NULL check. If `sk` is NULL, the dereference is UB. The compiler reasons:
+
+1. The first line dereferences `sk`.
+2. Dereferencing NULL is UB.
+3. The compiler is allowed to assume UB does not happen.
+4. Therefore, `sk` cannot be NULL at line 1.
+5. If `sk` is not NULL at line 1, it is also not NULL at line 2 (nothing in between modified it).
+6. Therefore, the NULL check at line 2 is always false.
+7. The compiler eliminates the NULL check entirely.
+
+A kernel exploit leveraged exactly this — the compiler optimised away a safety check, leaving a path that allowed user-space to escalate privileges. The fix: check before dereferencing.
+
+The lesson: **the compiler's optimiser uses UB as a license to delete code that "could not possibly happen"**. If your code accidentally invokes UB, parts of it may silently disappear from the binary.
+
+## Address Sanitizer and Undefined Behavior Sanitizer
+
+The single best tool for catching UB at runtime: the **sanitizers** built into GCC and clang. Compile with `-fsanitize=address,undefined`:
+
+```bash
+gcc -std=c17 -Wall -Wextra -Wpedantic -fsanitize=address,undefined -g prog.c -o prog
+./prog
+```
+
+Now the runtime instruments every memory access and arithmetic operation. UB and memory bugs become loud failure reports instead of mysterious crashes.
+
+Example. This program has a heap buffer overflow:
+
+```c
+#include <stdlib.h>
+#include <stdio.h>
+
+int main(void) {
+    int *a = malloc(10 * sizeof *a);
+    a[10] = 42;          /* one past the end */
+    printf("%d\n", a[10]);
+    free(a);
+    return 0;
+}
+```
+
+Compile and run normally — it might "work":
+
+```bash
+$ gcc prog.c -o prog && ./prog
+42
+```
+
+Compile with AddressSanitizer:
+
+```bash
+$ gcc -fsanitize=address -g prog.c -o prog && ./prog
+=================================================================
+==12345==ERROR: AddressSanitizer: heap-buffer-overflow
+WRITE of size 4 at 0x602000000038 thread T0
+    #0 0x401234 in main prog.c:5
+    ...
+0x602000000038 is located 0 bytes to the right of 40-byte region
+allocated by thread T0 here:
+    #0 0x7f8a01234 in malloc
+    #1 0x401200 in main prog.c:4
+```
+
+The sanitizer pinpoints the exact line, the kind of bug, and the relevant allocation. This is the difference between a 5-minute fix and a 5-hour debugging session.
+
+AddressSanitizer catches:
+
+- Heap buffer overflows.
+- Stack buffer overflows.
+- Use-after-free.
+- Double-free.
+- Memory leaks (on exit).
+
+UndefinedBehaviorSanitizer (`-fsanitize=undefined`) catches:
+
+- Signed integer overflow.
+- Division by zero.
+- Shift errors.
+- Float-to-int out of range.
+- NULL pointer dereference.
+- Type punning that violates aliasing.
+
+Cost: ASan is about 2-3× slowdown, UBSan about 1.5× slowdown. Affordable for development; disable for production builds where every cycle matters.
+
+**The discipline:** always run your tests under `-fsanitize=address,undefined` in CI. Catching UB in tests is much cheaper than debugging it in production.
+
+## `assert` as a UB-prevention tool
+
+`assert` (lesson 13) becomes much more powerful in the context of UB:
+
+```c
+#include <assert.h>
+
+int safe_divide(int a, int b) {
+    assert(b != 0);          /* prevents division-by-zero UB */
+    return a / b;
+}
+```
+
+When asserts are enabled (debug builds), the precondition fires and you see exactly where the contract was violated. When asserts are disabled (release builds with `-DNDEBUG`), the check is gone, but you have used the development cycle to find the bugs.
+
+Some compilers extend this with `__builtin_unreachable()` — telling the compiler "this point is never reached". After a precondition assert in release mode, you can tell the optimiser the contract is enforced, giving it more freedom:
+
+```c
+#ifdef NDEBUG
+    #define ASSUME(x) do { if (!(x)) __builtin_unreachable(); } while (0)
+#else
+    #define ASSUME(x) assert(x)
+#endif
+```
+
+Use with extreme care — a violated assumption becomes UB.
+
+## Strict aliasing in detail
+
+Strict aliasing is the most subtle UB. The rule: **an object's stored value can only be accessed through pointers of compatible type**, plus exceptions for `char *` and `unsigned char *` (which can alias anything), and for signed/unsigned variants of the same type.
+
+What that means concretely:
+
+```c
+float f = 1.0f;
+int *p = (int *)&f;         /* the cast itself is OK */
+int i = *p;                 /* UB — reading a float through an int pointer */
+```
+
+The compiler is allowed to assume `*p` does not alias `f`, so it might reorder operations:
+
+```c
+float f = 1.0f;
+*(int *)&f = 0x40000000;    /* attempt to set f to 2.0f via int aliasing */
+printf("%f\n", f);          /* may print 1.0 or 2.0 — UB */
+```
+
+The compiler may keep `f` in a float register and the int store goes to a separate memory location. Or it might work. Depends entirely on optimisation.
+
+The legal way to type-pun:
+
+```c
+float f = 1.0f;
+int i;
+memcpy(&i, &f, sizeof i);   /* allowed — memcpy gets a special carve-out */
+```
+
+Or via a union (lesson 9):
+
+```c
+union { float f; int i; } u;
+u.f = 1.0f;
+int i = u.i;                /* implementation-defined, but works on all major compilers */
+```
+
+`char *` and `unsigned char *` can alias any type — that is why you can read a struct as a byte buffer:
+
+```c
+struct frame frame;
+unsigned char *bytes = (unsigned char *)&frame;
+for (size_t i = 0; i < sizeof frame; i++) printf("%02X ", bytes[i]);
+```
+
+This is legal because `unsigned char *` is the universal byte-pointer.
+
+GCC's `-fno-strict-aliasing` disables strict-aliasing optimisations — the Linux kernel uses this so its many type-punning tricks remain safe. Most application code should leave it on and use `memcpy` for legitimate type-punning.
+
+## A worked example: the kernel-bug optimisation
+
+```c
+#include <stdio.h>
+
+static int compute(int *p) {
+    int sum = *p + *p;        /* dereference, so p must not be NULL */
+    if (p == NULL) {          /* compiler: dead code */
+        printf("got NULL\n");
+        return 0;
+    }
+    return sum;
+}
+
+int main(void) {
+    int x = 5;
+    printf("%d\n", compute(&x));
+    return 0;
+}
+```
+
+Compile at `-O0` (no optimisation) and the NULL check runs. Compile at `-O2` and watch:
+
+```bash
+$ gcc -O2 -S prog.c
+```
+
+The generated assembly omits the NULL check entirely. The compiler reasoned that since `*p` was dereferenced on line 1, `p` could not be NULL on line 3, so the check was dead. This is exactly the kernel-bug pattern. The fix is to **check before dereferencing**:
+
+```c
+static int compute(int *p) {
+    if (p == NULL) {
+        printf("got NULL\n");
+        return 0;
+    }
+    int sum = *p + *p;
+    return sum;
+}
+```
+
+Now the NULL check is meaningful and the compiler does not elide it.
+
+<Callout type="warn" title="Compilers are getting more aggressive, not less">
+Each new compiler version finds new optimisations enabled by UB. Code that worked under GCC 7 may break under GCC 13. The defence is not "rely on the old behaviour" — it is "write code that does not invoke UB". The sanitizers help you find the holes in code that has been working "by accident" for years.
+</Callout>
+
+## The 10 rules
+
+After 50 years of C, the rules to avoid UB in practice condense to roughly:
+
+1. **Initialise every variable** before reading it. `int x = 0;` is cheap.
+2. **Check pointers for NULL** before dereferencing, especially function parameters that might be optional.
+3. **Bounds-check every array index** that comes from outside the function. Inside the function, prove (via control flow) that indices are in range.
+4. **Use unsigned types for bit manipulation** — shift behaviour is defined for unsigned, implementation-defined for signed.
+5. **Use `size_t` for sizes and array indices.** Avoid mixing signed and unsigned in comparisons.
+6. **Pair every `malloc` with one `free`.** Set the pointer to NULL after freeing. Run under ASan during development.
+7. **Never return a pointer to a local variable.** The local is gone when the function returns.
+8. **Use `memcpy` or unions for type-punning, never pointer casts.** Strict aliasing UB is hard to debug.
+9. **Avoid expressions that modify the same variable twice without a sequence point.** Split into separate statements.
+10. **Use the strict build flags** (`-Wall -Wextra -Wpedantic`) and **the sanitizers** (`-fsanitize=address,undefined`) on every dev build and in CI. They catch many of the above automatically.
+
+These are not academic. Every senior C programmer follows roughly this list, whether consciously or by habit.
+
+## When you genuinely cannot avoid UB
+
+Some platforms or use cases legitimately rely on technically-UB constructs. Examples:
+
+- **Embedded firmware** sometimes reads memory-mapped registers through type-punned pointers. `volatile` plus a known platform makes this work in practice.
+- **Network protocol parsers** type-pun byte buffers as integer fields. Using `memcpy` or unions is the portable answer; some codebases just use casts and rely on the compiler not doing strict-aliasing optimisation (`-fno-strict-aliasing`).
+- **Compiler-builtin functions** like `__builtin_add_overflow` give defined behavior for what would otherwise be signed-overflow UB.
+
+The discipline: when you intentionally rely on platform-specific or technically-UB behavior, **comment it explicitly** so the next maintainer knows. Test under sanitizers and confirm the result. Add compiler-specific pragmas if needed.
+
+## Exercises
+
+**Exercise 14.1.** Identify all instances of UB in this program. There are at least four.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char *argv[]) {
+    int *p = malloc(10 * sizeof *p);
+    int x;
+    p[10] = x;
+    free(p);
+    p[0] = 99;
+    int y = argc + INT_MAX;
+    printf("%d %s\n", y, argv[argc]);
+    return 0;
+}
+```
+
+<Callout type="spec" title="Answer">
+1. `int x` is uninitialised; reading it (`p[10] = x`) is UB.
+2. `p[10]` is one past the end of the 10-element allocation — out-of-bounds write, UB.
+3. `p[0] = 99` after `free(p)` is use-after-free, UB.
+4. `argc + INT_MAX` may overflow signed int, UB (since argc is typically 1 or more).
+5. `argv[argc]` — the standard requires `argv[argc]` to be NULL, so printing it with `%s` (which expects a non-NULL string) is UB (NULL dereference inside printf).
+
+Address Sanitizer plus UBSan would catch bugs 1, 2, 3, 4 cleanly. The argv issue is caught by UBSan in some configurations.
+</Callout>
+
+**Exercise 14.2.** Rewrite this function to avoid the strict-aliasing UB:
+
+```c
+uint32_t float_bits(float f) {
+    return *(uint32_t *)&f;
+}
+```
+
+<Callout type="spec" title="Answer">
+```c
+#include <string.h>
+
+uint32_t float_bits(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof bits);
+    return bits;
+}
+```
+
+`memcpy` has a special carve-out from strict aliasing — it is allowed to copy any object representation into any other type's storage. The compiler recognises this idiom and emits a single load or move at `-O2`, so there is no performance cost. This is the standard way to bit-cast types.
+
+Alternative: a union, which most compilers also accept:
+
+```c
+uint32_t float_bits(float f) {
+    union { float f; uint32_t i; } u = { .f = f };
+    return u.i;
+}
+```
+
+C99 explicitly allowed reading the "inactive" member of a union if the type representations are compatible.
+</Callout>
+
+**Exercise 14.3.** Run this program under `gcc -O0` and under `gcc -O2 -fsanitize=address,undefined`. What changes?
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int a[5] = { 1, 2, 3, 4, 5 };
+    int i;
+    for (i = 0; i <= 5; i++) {
+        printf("%d\n", a[i]);
+    }
+    return 0;
+}
+```
+
+<Callout type="spec" title="Answer">
+The loop condition is `i <= 5` instead of `i < 5`, so it reads `a[5]` — one past the end, UB.
+
+At `-O0` without sanitizers, the program usually prints `1 2 3 4 5` followed by whatever happens to be in memory at `a[5]` (often 0, the loop counter `i`, or other stack contents). It may or may not crash.
+
+At `-O2 -fsanitize=address,undefined`, the program prints the first five values, then ASan reports:
+
+```text
+==12345==ERROR: AddressSanitizer: stack-buffer-overflow on address 0x...
+READ of size 4 at 0x... thread T0
+    #0 0x... in main prog.c:7
+```
+
+Pinpoints the line. The fix is `i < 5`. The lesson: always run tests under sanitizers — this kind of off-by-one is invisible without them.
+</Callout>
+
+## What you learned
+
+- **Undefined behavior** means the language places no requirements on the result. The program may do anything, including pass tests on your machine and crash in production.
+- The compiler is **allowed to assume UB does not happen**, which enables optimisations that delete code, eliminate checks, and produce results unrelated to the source.
+- The classic UB list: signed overflow, division by zero, NULL/freed/out-of-bounds dereference, uninitialised reads, strict-aliasing, double-modification without sequence point, returning pointer to local, bad shifts, bad conversions, format/argument mismatch.
+- **Address Sanitizer** (`-fsanitize=address`) catches memory UB at runtime. **UndefinedBehaviorSanitizer** (`-fsanitize=undefined`) catches arithmetic and pointer UB. Use both during development.
+- `assert` documents invariants and crashes loudly when they are violated in dev builds.
+- **Strict aliasing**: use `memcpy` or unions for type-punning. Never pointer-cast.
+- The 10 rules: initialise, NULL-check, bounds-check, unsigned for bits, size_t for indices, paired malloc/free, no returning local pointers, memcpy for punning, one mutation per expression, sanitizers always.
+
+In lesson 15 — the final lesson — we look at how C has evolved through C11, C17, and C23, and which compilers support what.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 13 — The C standard library](/docs/programming/c-lesson-13-stdlib/) | [Lesson 15 — Modern C](/docs/programming/c-lesson-15-modern-c/) |

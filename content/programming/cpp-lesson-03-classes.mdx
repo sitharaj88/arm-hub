@@ -1,0 +1,551 @@
+---
+title: Lesson 3 — Classes and RAII
+description: Constructors, destructors, member init lists, the rule of three and five, access control, RAII as the killer feature, explicit, = default, = delete, static members.
+order: 6
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, classes, raii, constructor, destructor]
+badge: tutorial
+---
+
+
+<SpecSheet
+  title="Lesson 3 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'How a C++ class works, constructor/destructor, member initialisation list, the rule of three/five, access control, RAII as a design discipline, explicit, = default and = delete, static members.' },
+    { label: 'Code provided', value: 'About 180 lines across a File RAII class, a Buffer class, and a small Logger example' },
+    { label: 'Time', value: '120-180 minutes' },
+    { label: 'Pre-reqs', value: 'Lessons 1 and 2' },
+  ]}
+/>
+
+A class is a user-defined type that bundles data with the functions that operate on it. C structs do the data half; classes do both, plus they let you control which fields and methods are visible from outside. That alone would be a minor improvement over C. What makes classes the centre of C++ is the **constructor/destructor pair** — code that runs automatically when an object comes into and goes out of existence. Tied together with reliable scoping rules, this gives you **RAII**, the design pattern that makes C++ memory-safe in a way C never is.
+
+## A class declaration
+
+```cpp
+class Point {
+public:
+    Point(double x, double y) : x_(x), y_(y) {}
+
+    double x() const { return x_; }
+    double y() const { return y_; }
+
+    double distance_to(const Point& other) const {
+        double dx = x_ - other.x_;
+        double dy = y_ - other.y_;
+        return std::sqrt(dx*dx + dy*dy);
+    }
+
+private:
+    double x_;
+    double y_;
+};
+```
+
+Pieces:
+
+- **`class Point { ... };`** declares the type. The trailing semicolon is required (the same nuisance you have in C struct declarations).
+- **`public:`** and **`private:`** are access labels. Members declared after `public:` are visible to all code; members after `private:` are visible only inside the class itself. The default for `class` is `private`.
+- **`Point(double x, double y) : x_(x), y_(y) {}`** is the **constructor**. The `: x_(x), y_(y)` part is the **member initialiser list** (covered shortly).
+- **`double x() const { return x_; }`** is a member function. The trailing `const` means "this function does not modify the object's state" — the compiler enforces it, and `const` references to a `Point` can call only `const` member functions.
+- The trailing underscore on `x_` and `y_` is a convention to distinguish member variables from parameters. Some codebases use `m_x`. The important thing is consistency.
+
+Using it:
+
+```cpp
+int main() {
+    Point a{3.0, 4.0};
+    Point b{0.0, 0.0};
+    std::cout << a.distance_to(b) << "\n";   // 5
+}
+```
+
+The brace syntax `Point a{3, 4}` is **uniform initialisation** (C++11). You can also write `Point a(3, 4);` — the parenthesis form is older but identical in this case. Braces have one advantage: they refuse implicit narrowing conversions (`Point a{3.5, 4};` is fine; `int x{3.5};` is a compile error because 3.5 narrows to int). Prefer braces.
+
+## Constructors and member initialisation
+
+A class can have multiple constructors, distinguished by their parameters (overloading applies to constructors too):
+
+```cpp
+class Point {
+public:
+    Point() : x_(0), y_(0) {}                       // default constructor
+    Point(double x, double y) : x_(x), y_(y) {}     // two-argument constructor
+    Point(double both) : x_(both), y_(both) {}      // single-argument constructor
+
+private:
+    double x_, y_;
+};
+
+Point origin;       // calls Point()
+Point a{1, 2};      // calls Point(double, double)
+Point diag{5};      // calls Point(double)
+```
+
+The **member initialiser list** (everything after `:` and before the constructor body's `{`) sets each member directly. The alternative — assignment in the constructor body — is worse:
+
+```cpp
+// Wrong style
+Point(double x, double y) {
+    x_ = x;       // default-construct x_, then assign
+    y_ = y;       // default-construct y_, then assign
+}
+
+// Right style
+Point(double x, double y) : x_(x), y_(y) {}
+```
+
+For `double` members, the difference is just stylistic. For members that are themselves classes (e.g. `std::string`), the wrong style default-constructs an empty string and then assigns over it; the right style constructs it correctly the first time. For `const` and reference members, the right style is **mandatory** — they have no default state to assign over.
+
+```cpp
+class Holder {
+public:
+    Holder(int& ref) : ref_(ref) {}   // only the init list works for reference members
+private:
+    int& ref_;
+};
+```
+
+Member initialisation runs in the order the members are declared, not the order they appear in the initialiser list. The compiler will warn (`-Wreorder`) if these two orders disagree — heed it.
+
+## Destructors and RAII
+
+A **destructor** runs automatically when the object is destroyed. For stack-allocated objects, that is when the enclosing scope ends. For heap-allocated objects, that is when `delete` runs. For class members, that is when the enclosing object is destroyed.
+
+```cpp
+#include <iostream>
+
+class Sentry {
+public:
+    Sentry(const char* name) : name_(name) {
+        std::cout << "construct " << name_ << "\n";
+    }
+    ~Sentry() {
+        std::cout << "destroy " << name_ << "\n";
+    }
+private:
+    const char* name_;
+};
+
+int main() {
+    Sentry outer{"outer"};
+    {
+        Sentry inner{"inner"};
+        std::cout << "...inside the block...\n";
+    }
+    std::cout << "...after the block...\n";
+}
+```
+
+Output:
+
+```
+construct outer
+construct inner
+...inside the block...
+destroy inner
+...after the block...
+destroy outer
+```
+
+Notice how `inner`'s destructor runs at the closing brace of the inner block, even though we wrote no destructor call. The compiler inserts it for every local variable, every function parameter, every temporary. This is the foundation of RAII.
+
+**RAII (Resource Acquisition Is Initialisation)** is a design discipline: any resource that needs to be released (memory, file handle, mutex, GPU buffer, network connection) gets wrapped in a class whose constructor acquires it and whose destructor releases it. From then on, releasing the resource is the language's problem, not the programmer's.
+
+The canonical example:
+
+```cpp
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+
+class File {
+public:
+    File(const std::string& path, const char* mode)
+        : fp_(std::fopen(path.c_str(), mode)) {
+        if (!fp_) throw std::runtime_error("open failed: " + path);
+    }
+
+    ~File() {
+        if (fp_) std::fclose(fp_);
+    }
+
+    // Disable copy — we own one FILE*; copying would close it twice
+    File(const File&) = delete;
+    File& operator=(const File&) = delete;
+
+    int getc()                    { return std::fgetc(fp_); }
+    int putc(int c)               { return std::fputc(c, fp_); }
+    void write(const char* s)     { std::fputs(s, fp_); }
+
+private:
+    FILE* fp_;
+};
+
+void log_message(const std::string& path, const std::string& message) {
+    File f{path, "a"};
+    f.write(message.c_str());
+    f.write("\n");
+    // f's destructor runs here — file closes — even if write threw an exception
+}
+```
+
+Compare to the equivalent C:
+
+```c
+void log_message(const char* path, const char* message) {
+    FILE* f = fopen(path, "a");
+    if (!f) return;
+    fputs(message, f);
+    fputs("\n", f);
+    fclose(f);   /* easy to forget. easy to skip on an early return. */
+}
+```
+
+The C version puts `fclose` on the programmer. Forget it, return early without it, or hit an error path that bypasses it, and you leak. The C++ version puts `fclose` on the language: it cannot be skipped because the destructor runs no matter how control leaves the scope. Even if `f.write` threw an exception mid-call, `~File()` would still run as the stack unwound. This is the **memory-safety story of C++**, and it has no equivalent in C without manual goto-cleanup discipline.
+
+<Callout type="tip" title="The single most important pattern in C++">
+If you understand only one C++ pattern, make it RAII. Every "owning" type — a buffer, a connection, a lock, an OpenGL handle, a database cursor — should be a class whose destructor releases the resource. After you internalise this, half of the bugs that plague C codebases disappear from your C++ codebases.
+</Callout>
+
+## Access control: public, private, protected
+
+- **`public`**: visible everywhere. Use for the interface — methods that callers will invoke, types they will name.
+- **`private`**: visible only inside the class itself. Use for implementation details — fields, helper functions, anything that might change.
+- **`protected`**: visible inside the class and its derived classes. We will use it in lesson 4 (inheritance). For now, you can ignore it.
+
+The discipline is: data members should almost always be `private`. Provide `public` accessor methods (`x()`, `set_x(double)`) if outside code needs to read or modify them. This buys you the freedom to change the underlying representation without breaking callers. C++ does not enforce "must be private", but every code review will complain if you leave a non-trivial data member public.
+
+```cpp
+class BankAccount {
+public:
+    BankAccount(double initial_balance) : balance_(initial_balance) {}
+
+    double balance() const { return balance_; }
+    void deposit(double amount) { balance_ += amount; }
+    bool withdraw(double amount) {
+        if (amount > balance_) return false;
+        balance_ -= amount;
+        return true;
+    }
+
+private:
+    double balance_;
+};
+```
+
+The class can never have a negative balance through `withdraw` because the check is enforced. If `balance_` were public, callers could write `acct.balance_ = -1000;` and the invariant would be broken. That's the value of encapsulation.
+
+## class vs struct
+
+In C++, **`class` and `struct` differ only in the default access**:
+
+- `struct Foo { int x; };` — `x` is public.
+- `class Foo { int x; };` — `x` is private.
+
+That is the entire difference. Convention is:
+
+- **`struct`** for plain-data aggregate types — no invariants, all fields public, no fancy methods.
+- **`class`** for everything else — invariants to protect, mix of public and private members.
+
+Stylistically: if you find yourself writing `public:` as the first line of a class, consider whether it should have been a struct. If you find yourself writing many private fields with public accessors in a struct, it should have been a class.
+
+## The rule of three (then five)
+
+The compiler provides four special functions for any class, by default:
+
+1. **Default constructor** `Foo()` — used when you declare `Foo f;` with no arguments.
+2. **Copy constructor** `Foo(const Foo& other)` — used when you write `Foo a = b;` or pass a `Foo` by value.
+3. **Copy assignment operator** `Foo& operator=(const Foo& other)` — used when you write `a = b;` on existing objects.
+4. **Destructor** `~Foo()` — runs when the object dies.
+
+For trivially copyable types (plain data structs), the compiler-generated versions do member-wise copying and are correct. For classes that own a resource (memory, file handle, mutex), the compiler-generated copy is **wrong** — it copies the resource handle, leaving two objects that both think they own it.
+
+The **rule of three**: if you write a destructor (because you have a resource to release), you almost certainly need to write the copy constructor and copy assignment too — or explicitly disable them. The three are linked because they all concern resource ownership.
+
+```cpp
+class Buffer {
+public:
+    Buffer(std::size_t size) : data_(new int[size]), size_(size) {}
+    ~Buffer() { delete[] data_; }
+
+    // Custom copy: allocate new storage and copy contents
+    Buffer(const Buffer& other) : data_(new int[other.size_]), size_(other.size_) {
+        std::copy(other.data_, other.data_ + size_, data_);
+    }
+    Buffer& operator=(const Buffer& other) {
+        if (this == &other) return *this;
+        int* new_data = new int[other.size_];          // allocate first
+        std::copy(other.data_, other.data_ + other.size_, new_data);
+        delete[] data_;                                 // then free old
+        data_ = new_data;
+        size_ = other.size_;
+        return *this;
+    }
+
+private:
+    int* data_;
+    std::size_t size_;
+};
+```
+
+The copy assignment operator's `if (this == &other)` check handles `a = a;` (self-assignment). Then it allocates new storage *before* freeing the old, so if `new` throws the object is still in a valid state. This is the "strong exception guarantee" pattern.
+
+C++11 adds **move construction** and **move assignment** as two more special functions, giving us the **rule of five**. We cover move semantics in lesson 9; for now know that you sometimes write five special functions, not three.
+
+The escape hatch from all this complexity is the **rule of zero**: use members that already handle their own resources (`std::vector`, `std::string`, `std::unique_ptr`), and let the compiler-generated copy and move operations work correctly because each member knows how to copy and move itself. Most classes you write should follow rule-of-zero. The Buffer example above could have been:
+
+```cpp
+class Buffer {
+public:
+    Buffer(std::size_t size) : data_(size) {}
+    // No destructor, no copy, no move — all generated correctly by the compiler.
+private:
+    std::vector<int> data_;
+};
+```
+
+We will encounter `std::vector` properly in lesson 6.
+
+## explicit constructors
+
+A single-argument constructor enables an implicit conversion from the argument type to the class type:
+
+```cpp
+class Length {
+public:
+    Length(double meters) : meters_(meters) {}
+private:
+    double meters_;
+};
+
+void use_length(Length L);
+
+use_length(3.0);     // implicit Length{3.0} — sometimes you want this
+```
+
+If `use_length(3.0)` reading like "use length 3.0" is intended, great. If it reading like a sneaky `double-to-Length` conversion is a bug magnet, mark the constructor `explicit`:
+
+```cpp
+class Length {
+public:
+    explicit Length(double meters) : meters_(meters) {}
+    // ...
+};
+
+// use_length(3.0);          // compile error
+use_length(Length{3.0});     // explicit construction at the call site
+```
+
+**The convention: mark every single-argument constructor `explicit` unless the implicit conversion is genuinely desirable.** `std::string`'s constructor from `const char*` is intentionally non-explicit because the implicit conversion ("strings and string literals are interchangeable") is the whole point. Almost every other single-argument constructor should be `explicit`.
+
+## = default and = delete
+
+You can ask the compiler to generate the default version of a special function explicitly:
+
+```cpp
+class Foo {
+public:
+    Foo() = default;                            // default constructor, default impl
+    Foo(const Foo&) = default;                  // copy constructor, default impl
+    Foo& operator=(const Foo&) = default;
+    ~Foo() = default;
+};
+```
+
+Or you can forbid it:
+
+```cpp
+class NonCopyable {
+public:
+    NonCopyable() = default;
+    NonCopyable(const NonCopyable&) = delete;
+    NonCopyable& operator=(const NonCopyable&) = delete;
+};
+
+NonCopyable a;
+NonCopyable b = a;     // compile error: copy constructor is deleted
+```
+
+Use `= delete` to mark a class as non-copyable (mutexes, unique resources), or to forbid specific overloads:
+
+```cpp
+void f(int);
+void f(double) = delete;    // refuse double explicitly
+
+f(3);       // OK
+// f(3.0);  // compile error
+```
+
+## static members
+
+A **static member** belongs to the class, not to any instance. There is one copy shared across all objects.
+
+```cpp
+class Widget {
+public:
+    Widget() { ++count_; }
+    ~Widget() { --count_; }
+
+    static int alive() { return count_; }
+
+private:
+    static int count_;     // declaration
+};
+
+int Widget::count_ = 0;     // definition — exactly one .cpp file
+
+Widget a, b, c;
+std::cout << Widget::alive() << "\n";   // 3
+```
+
+Static data members need both a declaration (inside the class) and a definition (in exactly one translation unit). C++17 added **inline static members** that combine both:
+
+```cpp
+class Widget {
+public:
+    static inline int count_ = 0;     // declaration + definition in one place
+};
+```
+
+Static **member functions** do not have a `this` pointer and cannot access non-static members. They are essentially namespaced free functions; use them when a function logically belongs to the class but does not depend on a specific instance (e.g., a factory function: `static Widget make_default();`).
+
+## Exercises
+
+**Exercise 3.1.** Write a `Timer` class that, in its constructor, records the current time (`std::chrono::steady_clock::now()`), and in its destructor prints how many milliseconds elapsed. Use it to time a block of code by creating a `Timer` at the start of the block.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <chrono>
+#include <iostream>
+#include <string>
+
+class Timer {
+public:
+    explicit Timer(std::string label) :
+        label_(std::move(label)),
+        start_(std::chrono::steady_clock::now()) {}
+
+    ~Timer() {
+        auto end = std::chrono::steady_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            end - start_).count();
+        std::cout << label_ << ": " << ms << " ms\n";
+    }
+
+    Timer(const Timer&) = delete;
+    Timer& operator=(const Timer&) = delete;
+
+private:
+    std::string label_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+int main() {
+    Timer t{"work"};
+    for (int i = 0; i < 1000000; ++i) { /* busy */ }
+    // ~Timer runs at the end of main
+}
+```
+
+This is RAII used for timing instead of resource cleanup. The destructor doing the work means you cannot forget to stop the timer.
+</Callout>
+
+**Exercise 3.2.** What's wrong with this class? Fix it.
+
+```cpp
+class IntArray {
+public:
+    IntArray(std::size_t n) {
+        size_ = n;
+        data_ = new int[n];
+    }
+    ~IntArray() { delete[] data_; }
+private:
+    int* data_;
+    std::size_t size_;
+};
+
+IntArray a{10};
+IntArray b = a;     // ???
+```
+
+<Callout type="spec" title="Answer">
+Two problems.
+
+First, the constructor uses assignment instead of an init list, so `data_` and `size_` are default-initialised (to garbage values for raw types) then overwritten. Cosmetic for `int*` and `std::size_t`, important for class-typed members.
+
+Second, and seriously: the compiler-generated copy constructor copies `data_` by pointer value. Now `a` and `b` both hold the same `int*`, both destructors call `delete[]` on it, and the second one is undefined behaviour.
+
+Two fixes:
+
+```cpp
+// Option 1: forbid copying (rule of three by deletion)
+class IntArray {
+public:
+    explicit IntArray(std::size_t n) : data_(new int[n]), size_(n) {}
+    ~IntArray() { delete[] data_; }
+    IntArray(const IntArray&) = delete;
+    IntArray& operator=(const IntArray&) = delete;
+private:
+    int* data_;
+    std::size_t size_;
+};
+
+// Option 2: rule of zero with std::vector
+class IntArray {
+public:
+    explicit IntArray(std::size_t n) : data_(n) {}
+private:
+    std::vector<int> data_;
+};
+```
+
+Option 2 is what you should reach for first.
+</Callout>
+
+**Exercise 3.3.** Add a `size()` method (returning `std::size_t`, marked `const`) and an `operator[]` for both read and write access to your `IntArray` from exercise 3.2. The `operator[]` should return a reference so callers can assign through it.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+class IntArray {
+public:
+    explicit IntArray(std::size_t n) : data_(n) {}
+
+    std::size_t size() const { return data_.size(); }
+
+    int&       operator[](std::size_t i)       { return data_[i]; }
+    const int& operator[](std::size_t i) const { return data_[i]; }
+
+private:
+    std::vector<int> data_;
+};
+
+IntArray a{5};
+a[0] = 42;
+std::cout << a[0] << " " << a.size() << "\n";
+```
+
+Two overloads of `operator[]`: a non-const version that returns a writable reference, and a const version (for `const IntArray& a` callers) that returns a read-only reference. This pair pattern is everywhere in the standard library — `std::vector` does it, `std::string` does it.
+</Callout>
+
+## What you learned
+
+- A class bundles data with the functions that operate on it, plus access control.
+- Constructors set up an object; destructors tear it down. Both run automatically.
+- The member initialiser list initialises members directly; the constructor body assigns over them, which is worse.
+- The rule of three (and five) says: if you write a custom destructor, copy constructor, or copy assignment, you almost certainly need all three (or five with move). The rule of zero says: most classes should let the compiler handle these by using composition of self-managing members.
+- RAII ties a resource's lifetime to an object's scope. The single most important pattern in C++.
+- `explicit` on single-argument constructors prevents accidental implicit conversions.
+- `= default` and `= delete` explicitly request or forbid the special functions.
+- `static` members belong to the class, not to instances. `static inline` in C++17 lets you define them in the header.
+
+In lesson 4 we add inheritance and polymorphism — virtual functions, the vtable, abstract base classes — and look at when to use inheritance versus composition (mostly composition).
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 2 — References, namespaces, and the basics](/docs/programming/cpp-lesson-02-references/) | [Lesson 4 — Inheritance and polymorphism](/docs/programming/cpp-lesson-04-inheritance/) |

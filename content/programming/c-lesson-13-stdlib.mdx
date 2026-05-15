@@ -1,0 +1,517 @@
+---
+title: Lesson 13 — The C standard library
+description: A tour of the headers that matter — stdio, stdlib, string, math, time, assert, errno, limits, stddef, stdint, stdbool, inttypes. File I/O, qsort, bsearch, memcpy vs memmove.
+order: 14
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, libc, stdlib]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 13 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Tour of the useful standard library headers, file I/O, qsort and bsearch, the memcpy vs memmove distinction, errno and assert' },
+    { label: 'Code provided', value: 'About 110 lines including a sorted-array search and a complete file copy' },
+    { label: 'Time', value: '90-120 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 12 — Multi-file projects' },
+  ]}
+/>
+
+C's standard library is small by modern standards. It does I/O, string manipulation, math, time, sorting, dynamic memory — and that is most of it. No networking, no threads (until C11 added `<threads.h>`, which most platforms still do not implement), no regular expressions, no JSON, no encryption. For everything beyond the standard, you reach for platform-specific or third-party libraries. This lesson is a tour of what is actually in the box.
+
+## The headers, by purpose
+
+| Header | Purpose |
+| --- | --- |
+| `<stdio.h>` | printf, scanf, fopen, fread, FILE I/O |
+| `<stdlib.h>` | malloc, free, qsort, bsearch, exit, atoi/strtol, rand |
+| `<string.h>` | strlen, strcpy, strcmp, memcpy, memmove, memset, memchr |
+| `<math.h>` | sin, cos, sqrt, log, pow, floor, ceil, etc. |
+| `<time.h>` | time, clock, struct timespec, time arithmetic |
+| `<assert.h>` | the assert macro |
+| `<errno.h>` | errno variable, error code constants |
+| `<limits.h>` | INT_MAX, LONG_MIN, CHAR_BIT, etc. |
+| `<float.h>` | FLT_MAX, DBL_EPSILON, etc. |
+| `<stddef.h>` | size_t, ptrdiff_t, NULL, offsetof |
+| `<stdint.h>` | int32_t, uint8_t, intptr_t, INT32_MAX, etc. |
+| `<stdbool.h>` | bool, true, false |
+| `<inttypes.h>` | PRId32 etc. format-string macros for printf with stdint types |
+| `<ctype.h>` | isdigit, isalpha, tolower, toupper |
+| `<stdarg.h>` | va_list, va_start, va_arg, va_end (variadic functions) |
+| `<setjmp.h>` | setjmp, longjmp (non-local jumps — rarely used) |
+| `<signal.h>` | signal, raise (Unix signal handling) |
+| `<locale.h>` | locale-aware functions |
+| `<stdalign.h>` | alignas, alignof (C11) |
+| `<stdatomic.h>` | atomic types and operations (C11) |
+| `<threads.h>` | thread, mutex, condvar (C11 — often unimplemented) |
+| `<uchar.h>` | char16_t, char32_t (C11) |
+| `<complex.h>` | complex numbers (rare in embedded) |
+
+We will walk through the most useful ones.
+
+## File I/O: `<stdio.h>`
+
+The model: a **FILE pointer** represents an open file. `fopen` opens; `fclose` closes; `fread`/`fwrite`/`fprintf`/`fscanf` operate on it.
+
+```c
+#include <stdio.h>
+
+FILE *fopen(const char *path, const char *mode);
+int   fclose(FILE *f);
+
+size_t fread (void *ptr, size_t size, size_t nmemb, FILE *f);
+size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *f);
+
+int    fprintf(FILE *f, const char *fmt, ...);
+int    fscanf (FILE *f, const char *fmt, ...);
+
+char  *fgets(char *s, int size, FILE *f);
+int    fputs(const char *s, FILE *f);
+
+int    fseek(FILE *f, long offset, int whence);
+long   ftell(FILE *f);
+```
+
+Modes: `"r"` read, `"w"` write (truncates), `"a"` append, `"r+"` read-write, `"rb"` / `"wb"` binary (relevant on Windows; no-op on Unix).
+
+A complete file copy:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int copy_file(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) { perror(src); return -1; }
+
+    FILE *out = fopen(dst, "wb");
+    if (!out) { perror(dst); fclose(in); return -1; }
+
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            perror("fwrite");
+            fclose(in); fclose(out);
+            return -1;
+        }
+    }
+
+    fclose(in);
+    fclose(out);
+    return 0;
+}
+
+int main(int argc, char *argv[]) {
+    if (argc != 3) {
+        fprintf(stderr, "usage: %s <src> <dst>\n", argv[0]);
+        return 1;
+    }
+    return copy_file(argv[1], argv[2]) == 0 ? 0 : 1;
+}
+```
+
+Things to absorb.
+
+**`fopen` returns NULL on failure.** Always check. `perror(path)` prints a useful message including the OS error reason.
+
+**`fread`/`fwrite` return the number of items read/written.** For partial reads (e.g., end-of-file before the requested size), this is less than the requested count. Use the return to decide when to stop.
+
+**Buffer size matters.** 4096 is a common choice — matches typical OS page size. Smaller buffers make syscall overhead dominate; larger buffers waste cache. For 99% of work, 4096 is fine.
+
+**Always `fclose` what you `fopen`.** Otherwise you leak file descriptors. On Linux, you eventually run out (typically at 1024 open files per process) and `fopen` starts failing.
+
+**stdin, stdout, stderr** are three predefined FILE pointers. `fprintf(stdout, ...)` is the same as `printf(...)`; `fprintf(stderr, ...)` is for diagnostics (so they go to a separate stream that is not redirected with `>`).
+
+## printf and scanf format specifiers (deeper than lesson 1)
+
+```c
+printf("%d %u %x %o\n",  100, 100u, 0xFF, 0777);   /* int, unsigned, hex, octal */
+printf("%f %e %g\n",     3.14, 3.14, 3.14);        /* float (fixed, scientific, shortest) */
+printf("%c %s %p\n",     'A', "hello", (void*)0);  /* char, string, pointer */
+
+printf("%5d\n",   42);           /* min width 5: "   42" */
+printf("%-5d|\n", 42);           /* left-aligned: "42   |" */
+printf("%05d\n",  42);           /* zero-padded: "00042" */
+printf("%.2f\n",  3.14159);      /* 2 decimals: "3.14" */
+printf("%5.2f\n", 3.14159);      /* width 5, 2 decimals: " 3.14" */
+printf("%*d\n",   8, 42);        /* width from arg: "      42" */
+```
+
+Length modifiers for integer types:
+
+```c
+printf("%hd\n", (short)5);       /* short */
+printf("%ld\n", 5L);             /* long */
+printf("%lld\n", 5LL);           /* long long */
+printf("%zd\n", (ssize_t)5);     /* size_t (signed variant) — actually use %zu for size_t */
+printf("%zu\n", sizeof(int));    /* size_t — unsigned */
+```
+
+For stdint types, `<inttypes.h>` provides the right specifiers via macros:
+
+```c
+#include <inttypes.h>
+#include <stdint.h>
+int32_t x = -42;
+uint64_t y = 1234567890;
+printf("%" PRId32 " %" PRIu64 "\n", x, y);
+/* Expands to: printf("%d %lu\n", x, y) on 64-bit Linux */
+```
+
+The `PRId32`, `PRIu64`, etc. are string-literal macros that expand to the correct length modifier for the platform. Verbose, but the only portable way to print stdint types.
+
+## Numeric conversion: strtol et al
+
+```c
+#include <stdlib.h>
+long   strtol(const char *str, char **endptr, int base);
+unsigned long strtoul(const char *str, char **endptr, int base);
+double strtod(const char *str, char **endptr);
+```
+
+`strtol("42abc", &end, 10)` parses leading digits as a base-10 long and sets `*end` to point at the first character that did not match. Returns the parsed value:
+
+```c
+char *end;
+long v = strtol("42abc", &end, 10);
+printf("%ld, remaining = '%s'\n", v, end);   /* 42, remaining = 'abc' */
+```
+
+`base` can be 0 (auto-detect: `0x` prefix → hex, `0` prefix → octal, otherwise decimal) or 2-36.
+
+`atoi` is the older simpler version: `atoi("42")` returns 42, no error reporting, undefined behavior on overflow. Use `strtol` in new code.
+
+For float: `strtod("3.14")`. Same `endptr` pattern.
+
+## Sorting and searching: `qsort` and `bsearch`
+
+```c
+#include <stdlib.h>
+void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *));
+void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
+              int (*compar)(const void *, const void *));
+```
+
+`qsort` sorts an array in place. `bsearch` finds an element in a sorted array (O(log n)). Both take a comparator (lesson 7's generic-sort pattern).
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int cmp_int(const void *a, const void *b) {
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    return (ia > ib) - (ia < ib);
+}
+
+int main(void) {
+    int arr[] = { 4, 1, 9, 3, 7, 2, 8, 5, 6 };
+    size_t n = sizeof arr / sizeof arr[0];
+
+    qsort(arr, n, sizeof arr[0], cmp_int);
+    for (size_t i = 0; i < n; i++) printf("%d ", arr[i]);
+    putchar('\n');
+
+    int key = 7;
+    int *found = bsearch(&key, arr, n, sizeof arr[0], cmp_int);
+    if (found) printf("found 7 at index %zd\n", found - arr);
+    return 0;
+}
+```
+
+Output:
+
+```text
+1 2 3 4 5 6 7 8 9
+found 7 at index 6
+```
+
+`found - arr` is pointer subtraction (lesson 7) — gives the element index.
+
+Notes:
+
+- `qsort` is not specified to be stable (equal elements can reorder).
+- The standard does not specify the algorithm. glibc historically used quicksort with introspective fallback; recent versions use a hybrid algorithm.
+- `bsearch` requires the array be sorted by the same comparator used for searching.
+
+## memcpy, memmove, memset, memcmp
+
+```c
+#include <string.h>
+
+void *memcpy (void *dst, const void *src, size_t n);   /* copy n bytes — pointers must not overlap */
+void *memmove(void *dst, const void *src, size_t n);   /* copy n bytes — overlap OK */
+void *memset (void *s, int c, size_t n);               /* fill n bytes with byte c */
+int   memcmp (const void *a, const void *b, size_t n); /* byte-compare, returns <0/0/>0 */
+void *memchr (const void *s, int c, size_t n);         /* find byte c, returns NULL if not found */
+```
+
+The big distinction: **`memcpy` requires non-overlapping pointers**; **`memmove` handles overlap correctly**.
+
+```c
+char buf[] = "abcdefghij";
+
+memcpy(buf + 2, buf, 5);     /* UB — source and dest overlap by 3 bytes */
+memmove(buf + 2, buf, 5);    /* OK — produces "ababcdehij" reliably */
+```
+
+`memcpy` may read source bytes in any order and write to destination in any order — it can be implemented with SIMD that loads 16 bytes at a time. If source and destination overlap, the result depends on whether the implementation copies forwards or backwards. `memmove` is defined to handle the overlap, conceptually by copying to a temporary first.
+
+**Rule:** if you do not know whether the regions overlap, use `memmove`. If you know they do not, use `memcpy` for the slightly better performance.
+
+`memset(p, 0, n)` is the standard way to zero a region. `memset(p, 0xFF, n)` fills with `0xFF` bytes — useful for initializing arrays to "all 1s" sentinel values. **`memset(p, 1, n)` fills with byte 0x01, not int 1** — a common mistake when the caller wants `(int){1, 1, 1, ...}` and gets `0x01010101...` per int instead.
+
+## A real example: sorted-array search
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    int  key;
+    char name[16];
+} record_t;
+
+static int cmp_by_key(const void *a, const void *b) {
+    int ka = ((const record_t *)a)->key;
+    int kb = ((const record_t *)b)->key;
+    return (ka > kb) - (ka < kb);
+}
+
+int main(void) {
+    record_t records[] = {
+        { 3, "Charlie" },
+        { 1, "Alice"   },
+        { 4, "Diana"   },
+        { 2, "Bob"     },
+        { 5, "Eve"     },
+    };
+    size_t n = sizeof records / sizeof records[0];
+
+    qsort(records, n, sizeof records[0], cmp_by_key);
+
+    record_t key = { 3, "" };
+    record_t *found = bsearch(&key, records, n, sizeof records[0], cmp_by_key);
+    if (found) {
+        printf("key %d -> %s\n", found->key, found->name);
+    } else {
+        printf("not found\n");
+    }
+    return 0;
+}
+```
+
+Output: `key 3 -> Charlie`.
+
+This is the standard pattern: sort once, then binary-search many times. For 100 keys, the binary search is 6-7 comparisons per lookup; for 100k keys, 16-17. Compared to linear search (100k comparisons per lookup), this is orders of magnitude faster.
+
+## Math: `<math.h>`
+
+```c
+#include <math.h>
+double sqrt(double);
+double pow(double base, double exp);
+double sin(double), cos(double), tan(double);
+double log(double), log2(double), log10(double), exp(double);
+double floor(double), ceil(double), round(double), trunc(double);
+double fabs(double);
+double fmod(double x, double y);
+```
+
+Each has a `float` version (`sqrtf`, `sinf`, ...) and a `long double` version (`sqrtl`, ...).
+
+On Linux you may need to link with `-lm`: `gcc prog.c -o prog -lm`. The math library is technically separate from libc.
+
+**Always check ranges and domains.** `sqrt(-1)` returns NaN. `log(0)` returns -infinity. `sin(very_large)` loses precision. Use `isnan(x)`, `isinf(x)` to detect.
+
+## Time: `<time.h>`
+
+```c
+#include <time.h>
+
+time_t time(time_t *out);     /* current Unix time (seconds since 1970-01-01 UTC) */
+clock_t clock(void);          /* CPU time used by the process, in clock ticks */
+struct timespec { time_t tv_sec; long tv_nsec; };
+int clock_gettime(clockid_t clk_id, struct timespec *tp);   /* POSIX */
+```
+
+`time(NULL)` gives wall-clock time in seconds. For sub-second resolution, use `clock_gettime(CLOCK_MONOTONIC, &ts)` (POSIX, available on Linux/macOS).
+
+A quick benchmark:
+
+```c
+#include <stdio.h>
+#include <time.h>
+
+int main(void) {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    /* ... work to measure ... */
+    long sum = 0;
+    for (long i = 0; i < 100000000; i++) sum += i;
+
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    printf("sum = %ld, time = %.3f s\n", sum, elapsed);
+    return 0;
+}
+```
+
+## `assert` — runtime sanity checks
+
+```c
+#include <assert.h>
+
+void process(int *p, int n) {
+    assert(p != NULL);
+    assert(n > 0);
+    /* ... */
+}
+```
+
+`assert(expr)` is a macro. If `expr` evaluates to zero (false), the program prints a message and calls `abort()`. If `expr` is non-zero, nothing happens (the check is checked at runtime).
+
+When compiled with `-DNDEBUG`, `assert` becomes a no-op. The recommended workflow: leave asserts enabled in dev/test builds, define `NDEBUG` for release builds where you want maximum performance.
+
+**Use asserts for invariants you believe are always true.** Things that, if violated, indicate a bug — not user error. Never `assert` on user input (a malicious user can make the assert fire and crash your program); validate input with regular code paths.
+
+## `errno` — out-of-band error reporting
+
+Many C library functions report errors through a global variable `errno`:
+
+```c
+#include <errno.h>
+#include <string.h>
+#include <stdio.h>
+
+FILE *f = fopen("does_not_exist", "r");
+if (!f) {
+    printf("error %d: %s\n", errno, strerror(errno));
+    /* might print: error 2: No such file or directory */
+}
+```
+
+`strerror(errno)` converts the integer error code into a human-readable message. `perror("context")` prints `"context: <error message>"` to stderr.
+
+`errno` is **thread-local** on modern systems — each thread has its own copy. So `errno` checks are safe in multi-threaded code.
+
+`errno` is only meaningful **after** a function call that documents it as set on failure. Reading `errno` "out of context" gives stale data. The discipline: check the return value first, then read `errno` if it indicates failure.
+
+## `limits.h`, `float.h`, `stdint.h`
+
+```c
+#include <limits.h>
+INT_MAX, INT_MIN, LONG_MAX, UCHAR_MAX, CHAR_BIT (usually 8)
+
+#include <float.h>
+FLT_MAX, FLT_MIN, FLT_EPSILON, DBL_MAX, DBL_DIG
+
+#include <stdint.h>
+INT32_MAX, INT64_MIN, UINT8_MAX, INTPTR_MAX (pointer width)
+```
+
+Use these instead of hard-coding `2147483647` for the max int. `INT_MAX` is portable, self-documenting, and adapts to platforms with non-32-bit int.
+
+<Callout type="tip" title="When code goes beyond the C standard">
+The C standard library is small. Real programs need more — networking, threads, GUI, JSON, crypto. The conventional next step is **POSIX** (Linux, macOS, BSDs) for system calls and threads, **WinAPI** for Windows, and a third-party library for anything cross-platform. Libraries to know: `pthread` (POSIX threads), `cJSON`, `libuv` (cross-platform async I/O), `OpenSSL` / `mbedTLS` (crypto), `SQLite` (database).
+
+The standard library is your foundation; everything else is layered on top.
+</Callout>
+
+## Exercises
+
+**Exercise 13.1.** Write a program that reads stdin line by line (using `fgets`) and writes each line to stdout, prefixed by its line number. Stop at EOF.
+
+<Callout type="spec" title="Answer">
+```c
+#include <stdio.h>
+
+int main(void) {
+    char buf[1024];
+    int line = 1;
+    while (fgets(buf, sizeof buf, stdin) != NULL) {
+        printf("%4d: %s", line++, buf);
+    }
+    return 0;
+}
+```
+
+`fgets` returns NULL at EOF or on error. The string read includes the trailing newline if there was one and it fit in the buffer; no explicit newline is needed in printf. The `%4d:` formats the line number right-aligned in a 4-character field. Test with `echo -e "a\nb\nc" | ./prog`.
+</Callout>
+
+**Exercise 13.2.** Use `qsort` to sort an array of strings (`const char **`) alphabetically. Then use `bsearch` to find one.
+
+<Callout type="spec" title="Answer">
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int cmp_strp(const void *a, const void *b) {
+    const char *const *pa = a;
+    const char *const *pb = b;
+    return strcmp(*pa, *pb);
+}
+
+int main(void) {
+    const char *names[] = { "Charlie", "Alice", "Bob", "Eve", "Diana" };
+    size_t n = sizeof names / sizeof names[0];
+
+    qsort(names, n, sizeof names[0], cmp_strp);
+    for (size_t i = 0; i < n; i++) printf("%s\n", names[i]);
+
+    const char *key = "Charlie";
+    const char **found = bsearch(&key, names, n, sizeof names[0], cmp_strp);
+    if (found) printf("found at index %zd\n", found - names);
+    return 0;
+}
+```
+
+The comparator gets a `const void *` pointing at one element of the array. Each element is a `const char *`, so the pointer to it is `const char *const *`. Dereferencing gives the string, which `strcmp` compares.
+</Callout>
+
+**Exercise 13.3.** Why does this code potentially produce wrong results, and how do you fix it?
+
+```c
+char buf[100] = "abcdefghij";
+memcpy(buf, buf + 2, 6);
+```
+
+<Callout type="spec" title="Answer">
+`memcpy` requires non-overlapping regions. `buf` and `buf + 2` overlap in 4 bytes. The result depends on the implementation — `glibc` may copy forwards (giving `cdefgh fghij`) or use SIMD that interleaves. Either way, the standard says it is **undefined behavior**.
+
+Fix: use `memmove`, which is defined for overlapping regions.
+
+```c
+memmove(buf, buf + 2, 6);
+```
+
+This always produces `cdefgh fghij` regardless of implementation.
+</Callout>
+
+## What you learned
+
+- C's standard library is small but covers I/O, strings, math, memory, sorting, time.
+- File I/O uses `FILE *` handles: `fopen`, `fread`/`fwrite`, `fprintf`/`fscanf`, `fclose`.
+- printf format specifiers extend beyond the basics: width, precision, length modifiers. Use `<inttypes.h>` PRI macros for stdint types.
+- Numeric parsing: `strtol`/`strtoul`/`strtod` with `endptr` for error detection.
+- `qsort` and `bsearch` use comparator function pointers — the same pattern as lesson 7's generic sort.
+- `memcpy` does not handle overlap; `memmove` does. **Use memmove if unsure.**
+- `memset(p, 0, n)` zeros memory; pay attention that the fill byte is `int` but only the low 8 bits are used.
+- `<math.h>` requires `-lm` on Linux. Float versions are suffixed `f`, long double versions `l`.
+- `<time.h>` for time; `clock_gettime(CLOCK_MONOTONIC, ...)` for sub-second timing.
+- `assert(expr)` for runtime invariant checks; compiled out with `-DNDEBUG`.
+- `errno` reports library-function errors; check the return value first.
+- `<limits.h>`, `<float.h>`, `<stdint.h>` give the platform's exact ranges and constants.
+
+In lesson 14 we tackle undefined behavior — the dragon. The classic list, the optimisations that exploit it, and the sanitizers that catch it.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 12 — Multi-file projects](/docs/programming/c-lesson-12-multi-file/) | [Lesson 14 — Undefined behavior](/docs/programming/c-lesson-14-ub/) |

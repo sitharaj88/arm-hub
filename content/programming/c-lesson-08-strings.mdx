@@ -1,0 +1,411 @@
+---
+title: Lesson 8 — Strings
+description: There is no string type in C. NUL termination, the strncpy trap, snprintf as your friend, sscanf pitfalls, why gets is gone, UTF-8, char32_t, and a safe string_copy.
+order: 9
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, strings]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 8 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'How C represents strings, NUL termination, every standard string function and its trap, the strncpy gotcha, snprintf, UTF-8, char32_t, and a safe string_copy' },
+    { label: 'Code provided', value: 'About 90 lines including a robust string_copy function with bounds-checking' },
+    { label: 'Time', value: '90-120 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 7 — Pointers' },
+  ]}
+/>
+
+C does not have a string type. What it has is a convention: a string is a contiguous sequence of `char` values, ending with a `'\0'` (the NUL character, value 0). Every standard library function that takes a "string" assumes this convention. Get the NUL wrong and you read garbage, write past your buffer, or crash. This lesson is about how to handle strings without making any of those mistakes.
+
+## The representation
+
+```c
+char s[6] = "hello";
+```
+
+This declares a 6-byte array of `char`, initialised to `'h', 'e', 'l', 'l', 'o', '\0'`. The NUL terminator at index 5 is implicit when you initialise with a string literal — the compiler adds it for you. If you wrote `char s[5] = "hello";`, the NUL would not fit, and most compilers warn loudly (clang errors with `-Werror=string-conversion`).
+
+You can also write:
+
+```c
+char s[] = "hello";       /* size inferred to 6 (5 chars + NUL) */
+char *p = "hello";        /* p points to a string literal in read-only memory */
+const char *q = "hello";  /* preferred — explicit about read-only */
+```
+
+The difference between `char s[]` and `char *p`:
+
+- `char s[]` declares a writable array, copied from the literal at initialisation. You can do `s[0] = 'H';`.
+- `char *p = "hello"` makes `p` point to the literal itself, which lives in read-only memory. Writing `p[0] = 'H';` is **undefined behavior** — typically a segfault on hosted platforms.
+
+**Always declare pointers to string literals as `const char *`.** This is enforced in C23 (string literals officially have type `const char[N]`). For C17, GCC's `-Wwrite-strings` flag catches the mistake. It is the same one-line discipline as const-correctness from lesson 7.
+
+## NUL termination
+
+Every standard library string function relies on the NUL terminator to know where the string ends. There is no length prefix, no separate length variable — just a sentinel byte.
+
+```c
+size_t my_strlen(const char *s) {
+    size_t n = 0;
+    while (s[n] != '\0') n++;
+    return n;
+}
+```
+
+`my_strlen("hello")` returns 5 — the count of characters before the NUL. The NUL itself is not counted. `sizeof` of the same array is 6 (includes the NUL).
+
+This is why functions like `strcpy` "know" how many bytes to copy: they keep copying until they hit a NUL. It is also why feeding `strcpy` a non-NUL-terminated `char` array is undefined behavior — it reads off the end looking for a NUL that is not there.
+
+## `strlen`
+
+```c
+#include <string.h>
+size_t strlen(const char *s);
+```
+
+Returns the number of characters before the NUL. O(n) — it has to scan the string. **If you find yourself calling `strlen` in a loop, hoist it outside**:
+
+```c
+/* SLOW — strlen called n+1 times, each O(n), making the loop O(n^2) */
+for (size_t i = 0; i < strlen(s); i++) { ... }
+
+/* FAST */
+size_t n = strlen(s);
+for (size_t i = 0; i < n; i++) { ... }
+```
+
+This is one of the classic C performance traps.
+
+## `strcpy` — and why you usually want something else
+
+```c
+#include <string.h>
+char *strcpy(char *dst, const char *src);
+```
+
+`strcpy` copies the NUL-terminated string at `src` into `dst`, including the NUL. **It does not know how big `dst` is.** If `dst` is too small, you have a buffer overflow — corrupting memory after `dst`. This is the single most exploited bug class in the history of C programming.
+
+```c
+char buf[8];
+strcpy(buf, "this string is far too long");   /* overflow — UB */
+```
+
+`strcpy` is one of those functions you should know exists, recognise in old code, and almost never call in new code.
+
+## `strncpy` — and its sharper trap
+
+```c
+char *strncpy(char *dst, const char *src, size_t n);
+```
+
+`strncpy` was supposed to fix `strcpy` by adding a size limit. Unfortunately it has two specific gotchas that make it surprisingly unsafe:
+
+**Gotcha 1: `strncpy` may not NUL-terminate.** If `strlen(src) >= n`, `strncpy` copies exactly `n` bytes from `src` to `dst` and **does not write a NUL terminator**. The result is a fixed-width field that is not a valid C string.
+
+**Gotcha 2: `strncpy` pads with NULs.** If `strlen(src) < n`, `strncpy` writes the source's NUL, then fills the rest of the destination up to `n` bytes with **more NULs**. For short strings into large buffers, this is needless work.
+
+```c
+char buf[8] = { 'X', 'X', 'X', 'X', 'X', 'X', 'X', 'X' };
+strncpy(buf, "hello", 8);
+/* buf = 'h', 'e', 'l', 'l', 'o', '\0', '\0', '\0' — NUL-padded, correct */
+
+char buf2[8];
+strncpy(buf2, "this is too long", 8);
+/* buf2 = 't', 'h', 'i', 's', ' ', 'i', 's', ' ' — NO NUL TERMINATOR */
+```
+
+The lesson: `strncpy` is a fixed-width-field copy from the early Unix days when filenames were 14 bytes with no NUL. It is not a safe string copy. Most modern code that wants size-bounded string copying uses `snprintf` or a custom function (see the example below).
+
+<Callout type="warn" title="The strncpy advice you have seen on Stack Overflow is wrong">
+A common pattern is:
+
+```c
+strncpy(dst, src, size - 1);
+dst[size - 1] = '\0';
+```
+
+This is correct, but it requires you to never forget the manual termination, and it still NUL-pads short strings. Use `snprintf(dst, size, "%s", src)` instead — same correctness, harder to get wrong.
+</Callout>
+
+## `strcat` and `strncat`
+
+```c
+char *strcat(char *dst, const char *src);
+char *strncat(char *dst, const char *src, size_t n);
+```
+
+`strcat` appends `src` (NUL-terminated) to the end of `dst` (also NUL-terminated). Same buffer-overflow risk as `strcpy`. `strncat` is **not** the bounded version you would hope for — `n` is the maximum number of characters to copy from `src`, not the size of `dst`. To use `strncat` safely you have to compute the remaining space yourself:
+
+```c
+strncat(dst, src, dst_size - strlen(dst) - 1);
+```
+
+Just use `snprintf`.
+
+## `snprintf` — the modern safe-format function
+
+```c
+#include <stdio.h>
+int snprintf(char *dst, size_t size, const char *fmt, ...);
+```
+
+`snprintf` formats according to a printf-style format string and writes the result to `dst`. **It always NUL-terminates** (as long as `size > 0`). It writes at most `size - 1` characters plus the NUL.
+
+The return value is the number of characters that **would have been written** if there had been enough space, not counting the NUL. So if the return is `>= size`, the output was truncated.
+
+```c
+char buf[16];
+int n = snprintf(buf, sizeof(buf), "x = %d, y = %d", 100, 200);
+if (n < 0) {
+    /* encoding error — rare */
+} else if ((size_t)n >= sizeof(buf)) {
+    /* truncated — buf has the first 15 chars plus NUL */
+}
+```
+
+For most string-building needs, `snprintf` is the right tool: bounded, NUL-terminating, supports rich formatting. It replaces both `strcpy`/`strcat` (with `"%s"`) and `sprintf` (which is unbounded and dangerous).
+
+## `sscanf` — and why people use other tools
+
+```c
+#include <stdio.h>
+int sscanf(const char *src, const char *fmt, ...);
+```
+
+`sscanf` parses a string according to format specifiers. It returns the number of fields successfully read. Useful for quick parsing, but:
+
+- `%s` with no width specifier is unbounded — same buffer overflow risk as `gets`.
+- Always specify a width: `%15s` reads at most 15 characters into a buffer of size 16.
+- Number parsing is permissive — `%d` on `"123abc"` reads `123` and leaves `"abc"` unconsumed. You usually want to know if the whole input was consumed.
+
+```c
+int year, month, day;
+char trailing;
+if (sscanf("2026-05-15", "%d-%d-%d%c", &year, &month, &day, &trailing) != 3) {
+    /* either parsing failed or trailing garbage was present */
+}
+```
+
+The trick is to use `%c` at the end to detect trailing garbage — if sscanf can read 4 fields, something extra was present.
+
+For complex parsing, prefer `strtol` / `strtoul` / `strtod` (each tells you exactly where parsing stopped via the `endptr` argument), or a real parser. `sscanf` is fine for one-off scripts and known-good input.
+
+## `gets` is gone
+
+```c
+char *gets(char *s);    /* REMOVED FROM C11 ONWARDS */
+```
+
+`gets` read a line from stdin into a buffer with **no size argument**. It was the canonical buffer-overflow vector for decades. C11 finally removed it from the standard library. If you see `gets` in code, treat it as a security bug and replace with `fgets`:
+
+```c
+char line[256];
+if (fgets(line, sizeof(line), stdin) != NULL) {
+    /* line includes the trailing '\n' if present */
+}
+```
+
+`fgets` reads up to `size - 1` characters or until newline, whichever comes first, and always NUL-terminates.
+
+## A safe string copy
+
+Building on all of the above, here is the `string_copy` you actually want — bounded, always NUL-terminating, returning a useful status:
+
+```c
+#include <stddef.h>
+#include <string.h>
+#include <stdbool.h>
+
+/* Copy src to dst, ensuring NUL termination.
+ * Returns true if the full src fit; false if it was truncated.
+ * `dst_size` includes the NUL terminator (i.e., it is the buffer size, not the max string length). */
+static bool string_copy(char *dst, size_t dst_size, const char *src) {
+    if (dst_size == 0) return false;     /* no room for even a NUL */
+
+    size_t i;
+    for (i = 0; i < dst_size - 1 && src[i] != '\0'; i++) {
+        dst[i] = src[i];
+    }
+    dst[i] = '\0';
+    return src[i] == '\0';               /* did we reach src's NUL? */
+}
+```
+
+Test it:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    char buf[8];
+
+    if (string_copy(buf, sizeof(buf), "hello")) {
+        printf("ok: '%s'\n", buf);       /* ok: 'hello' */
+    }
+
+    if (!string_copy(buf, sizeof(buf), "much longer string")) {
+        printf("truncated: '%s'\n", buf);/* truncated: 'much lo' */
+    }
+
+    return 0;
+}
+```
+
+Notes worth absorbing.
+
+`dst_size` is the **buffer size**, not "max string length". The implementation knows it needs to leave one byte for the NUL.
+
+The return value lets the caller distinguish success from truncation. Many implementations just return `void` and assume the caller checks the result some other way, but a boolean is cheap and useful.
+
+We do not pad with NULs — `strncpy`'s NUL-padding behaviour is wasted work for most uses. Our loop stops as soon as src's NUL is reached.
+
+OpenBSD's `strlcpy` (which BSD added in 1998 and is now widely available as a non-standard extension) has almost the same semantics, returning the source length instead of a boolean. If you have `strlcpy`, use it. Otherwise the function above is a fine substitute.
+
+## UTF-8 in C
+
+Modern strings are usually UTF-8. C strings can hold UTF-8 — they are just byte sequences, and UTF-8 is a NUL-clean byte encoding. The catch: **all C string functions count bytes, not Unicode code points**.
+
+```c
+const char *s = "café";        /* 5 bytes: c, a, f, 0xC3, 0xA9 */
+printf("%zu\n", strlen(s));    /* 5, not 4 */
+```
+
+The `é` is two bytes in UTF-8 (0xC3 0xA9). `strlen` counts bytes; it does not know about characters. Other operations behave similarly:
+
+- `strcpy` is safe — it copies bytes, NUL-terminates correctly.
+- `strchr` searches for a single byte — fine for ASCII characters, broken for multi-byte characters.
+- `strcmp` compares bytewise — produces a stable but not necessarily linguistically meaningful order.
+
+For most code that just stores and forwards strings, treating UTF-8 as opaque bytes is fine. For code that does character-level processing (line wrapping by character count, case conversion, slicing by character index), you need a UTF-8 library — ICU, utf8.h, or roll your own decoder.
+
+C11 added `char16_t` (16-bit, for UTF-16 code units) and `char32_t` (32-bit, for UTF-32 / code points). String literals with these widths use `u""` and `U""` prefixes:
+
+```c
+#include <uchar.h>
+char32_t c = U'é';       /* code point U+00E9 */
+char32_t s[] = U"café";  /* 4 elements + NUL — one code point per element */
+```
+
+`char32_t` arrays are convenient for code-point manipulation: each element is one Unicode character (well, code point — strict character handling is even more complex due to combining sequences).
+
+Most embedded code does not need any of this. Most application code uses UTF-8 transparently and reaches for a library only when character semantics matter.
+
+## A few more useful functions
+
+```c
+#include <string.h>
+char *strchr(const char *s, int c);       /* find first c in s, or NULL */
+char *strrchr(const char *s, int c);      /* find last c in s, or NULL */
+char *strstr(const char *s, const char *needle);  /* find needle in s, or NULL */
+int   strcmp(const char *a, const char *b);       /* < 0, 0, or > 0 */
+int   strncmp(const char *a, const char *b, size_t n);
+```
+
+`strcmp` returns negative, zero, or positive (not -1, 0, 1 — though many implementations happen to produce those exact values).
+
+`strstr` is naive O(n*m) in most libc implementations. For pattern matching against long strings, a real algorithm (Boyer-Moore, Knuth-Morris-Pratt) is faster, but for typical use it is fine.
+
+`strdup` and `strndup` duplicate a string into a fresh `malloc`-allocated buffer. Convenient but means **you must free the result**. They are POSIX, not C standard — `_GNU_SOURCE` or equivalent feature-test macro on GCC.
+
+<Callout type="tip" title="Use snprintf to build strings safely">
+Instead of `strcat` chains, build strings with `snprintf`:
+
+```c
+char path[256];
+int n = snprintf(path, sizeof(path), "%s/%s.txt", dir, name);
+if (n < 0 || (size_t)n >= sizeof(path)) {
+    /* error or truncation */
+}
+```
+
+One call, one check, no chance of overflow or missing NUL.
+</Callout>
+
+## Exercises
+
+**Exercise 8.1.** Predict the output:
+
+```c
+#include <stdio.h>
+#include <string.h>
+int main(void) {
+    char buf[8];
+    strncpy(buf, "hello", 8);
+    printf("[%s] len=%zu\n", buf, strlen(buf));
+    strncpy(buf, "this is too long", 8);
+    printf("[%s] len=%zu\n", buf, strlen(buf));
+    return 0;
+}
+```
+
+<Callout type="spec" title="Answer">
+First line: `[hello] len=5`. `strncpy` copied "hello\0" and then NUL-padded the remaining 2 bytes.
+
+Second line: **undefined behavior**. `strncpy` copied 8 bytes (`"this is "`) with **no NUL terminator**. Then `printf("%s")` and `strlen` keep reading past the buffer looking for a NUL. You might get `[this is ?garbage?]` or `[this is ]` if the next byte happens to be NUL, or a segfault. This is the strncpy trap.
+</Callout>
+
+**Exercise 8.2.** Write a function `bool ends_with(const char *s, const char *suffix)` that returns true if `s` ends with `suffix`. Handle the case where suffix is longer than s.
+
+<Callout type="spec" title="Answer">
+```c
+#include <stdbool.h>
+#include <string.h>
+
+bool ends_with(const char *s, const char *suffix) {
+    size_t sl = strlen(s);
+    size_t fl = strlen(suffix);
+    if (fl > sl) return false;
+    return memcmp(s + sl - fl, suffix, fl) == 0;
+}
+```
+
+`memcmp` rather than `strcmp` because we know the exact length to compare. `s + sl - fl` points to the position in `s` where the suffix would start if it matched. The length check before the subtraction prevents underflow when `fl > sl`.
+</Callout>
+
+**Exercise 8.3.** Build a path using `snprintf` and detect truncation. Construct `/tmp/log/<name>.log` where `<name>` is a parameter.
+
+<Callout type="spec" title="Answer">
+```c
+#include <stdio.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+static bool build_log_path(char *dst, size_t dst_size, const char *name) {
+    int n = snprintf(dst, dst_size, "/tmp/log/%s.log", name);
+    return n >= 0 && (size_t)n < dst_size;
+}
+
+int main(void) {
+    char path[64];
+    if (build_log_path(path, sizeof(path), "session")) {
+        printf("ok: %s\n", path);    /* /tmp/log/session.log */
+    }
+    return 0;
+}
+```
+
+`snprintf` always NUL-terminates (when dst_size > 0). The return value tells you how many bytes were needed; if it equals or exceeds the buffer size, truncation happened.
+</Callout>
+
+## What you learned
+
+- C strings are NUL-terminated `char` arrays. No length is stored anywhere.
+- String literals (`"hello"`) live in read-only memory; access them via `const char *`.
+- `strlen` is O(n) — hoist it outside loops.
+- `strcpy` and `strcat` are unbounded — avoid in new code.
+- `strncpy` does not always NUL-terminate. Use it for fixed-width fields only, or not at all.
+- `snprintf` is the modern safe-format function — bounded, NUL-terminating, useful return value.
+- `gets` is removed from C11 onwards. Use `fgets`.
+- UTF-8 in C: byte-counting works; character-counting does not. Use a library when character semantics matter.
+- `char32_t` (C11) for code-point-per-element arrays.
+- A safe `string_copy` is a 10-line function. Write it once, reuse forever.
+
+In lesson 9 we cover structs and unions — the way to compose data, plus alignment, padding, and the packed-struct pattern for parsing wire formats.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 7 — Pointers](/docs/programming/c-lesson-07-pointers/) | [Lesson 9 — Structs and unions](/docs/programming/c-lesson-09-structs/) |

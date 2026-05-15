@@ -1,0 +1,437 @@
+---
+title: Lesson 6 — Arrays
+description: Array declaration, indexing, the famous array-to-pointer decay, multi-dimensional arrays, designated initializers, VLAs, and a fixed-size circular buffer implementation.
+order: 7
+updated: 2026-05-13
+tags: [programming, tutorial, c, language, arrays]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 6 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Array declaration and indexing, no bounds checking, the sizeof trick for length, array-to-pointer decay, multi-dim arrays, designated initializers, VLAs, a circular buffer' },
+    { label: 'Code provided', value: 'About 120 lines including a full circular buffer with bounded API' },
+    { label: 'Time', value: '90-120 minutes' },
+    { label: 'Pre-reqs', value: 'Lesson 5 — Functions' },
+  ]}
+/>
+
+Arrays in C are deceptively simple. The declaration looks identical to other languages. The indexing looks identical. But the moment an array crosses a function boundary, it stops being an array and becomes a pointer — and a pointer does not know how long it is. This single fact, called **array-to-pointer decay**, is responsible for a startling fraction of all C bugs. This lesson explains it carefully.
+
+## Declaration and indexing
+
+```c
+int a[10];        /* an array of 10 ints, uninitialised */
+int b[5] = { 1, 2, 3, 4, 5 };   /* declared and initialised */
+int c[] = { 7, 8, 9 };          /* size inferred — 3 */
+int d[10] = { 0 };              /* all zero (rest are zero-filled) */
+```
+
+The size in `[N]` must be a constant expression in C90; C99 added "variable-length arrays" where the size can be a runtime value (covered later in this lesson — they are controversial).
+
+Indexing uses `[]`. Arrays in C are **zero-based**: `a[0]` is the first element, `a[9]` is the tenth, `a[10]` is one past the end and **must not be accessed**.
+
+```c
+int a[10] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+printf("%d\n", a[0]);   /* 1 */
+printf("%d\n", a[9]);   /* 10 */
+a[5] = 99;              /* element 6 (zero-indexed) becomes 99 */
+```
+
+## No bounds checking
+
+This is the single most important thing to know about arrays in C:
+
+```c
+int a[10];
+a[10] = 5;     /* one past the end — UNDEFINED BEHAVIOR */
+a[-1] = 5;     /* before the beginning — UNDEFINED BEHAVIOR */
+a[1000] = 5;   /* way past the end — UNDEFINED BEHAVIOR */
+```
+
+There is **no runtime check**. The compiler emits code that computes `&a[i]` as `&a[0] + i * sizeof(int)` and accesses that address. If the address is yours to access, the access "works". If it is not, the program may crash, may corrupt unrelated data, may silently keep running with subtle errors that surface much later.
+
+The compiler with `-Wall` will catch obviously-constant out-of-bounds accesses (`a[10]` on `int a[10]`) but cannot catch dynamic ones. Address Sanitizer (`-fsanitize=address`, lesson 14) does catch them at runtime by adding bookkeeping around every access — invaluable during development, slower than untrusted production code.
+
+**The discipline:** every array access must be bounds-checked at the boundary where untrusted data enters. Once the index is known to be in range, the access is safe.
+
+## Length: the `sizeof` trick
+
+C does not store array length anywhere. The array variable is just a contiguous block of memory; how long it is, you have to know separately. For a local or global array, `sizeof` knows:
+
+```c
+int a[10];
+size_t len = sizeof(a) / sizeof(a[0]);   /* 10 */
+```
+
+`sizeof(a)` is the total size in bytes (40 on a typical system). `sizeof(a[0])` is the per-element size (4 for `int`). Divide and you get the number of elements.
+
+This is so common it gets a macro:
+
+```c
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+```
+
+**But the trick stops working the moment the array is passed to a function**, because — as we are about to see — arrays decay to pointers, and `sizeof(pointer)` is just the pointer size.
+
+## Array-to-pointer decay (the headline)
+
+When the name of an array appears in **most** expressions, it is automatically converted to a pointer to the first element. That conversion is called **decay**.
+
+```c
+int a[10];
+int *p = a;         /* a decays to &a[0] — p now points to the first element */
+int *q = &a[0];     /* equivalent — the explicit form */
+*p = 42;            /* same as a[0] = 42 */
+p[3] = 99;          /* same as a[3] = 99 — [] works on pointers too */
+```
+
+`p[i]` and `a[i]` compile to the same code: dereference the address `start + i * sizeof(element)`. The `[]` operator works on any pointer.
+
+Decay happens in nearly every context. The exceptions:
+
+- Inside `sizeof`: `sizeof(a)` gives the array size, not the pointer size.
+- Inside `_Alignof` and the address-of operator `&`: `&a` gives `int (*)[10]` (pointer to array of 10 ints), not `int **`.
+- When initialising a `char[]` from a string literal: `char s[] = "hello"` initialises the array, no decay.
+
+Everywhere else, an array name in an expression decays to a pointer.
+
+## The function-parameter trap
+
+Here is the punchline. Look at this function:
+
+```c
+void print_array(int a[10]) {
+    size_t len = sizeof(a) / sizeof(a[0]);   /* WRONG — len is 2 on 64-bit, not 10 */
+    for (size_t i = 0; i < len; i++) {
+        printf("%d ", a[i]);
+    }
+}
+```
+
+Inside the function, `a` is **not** an array. It is a pointer. The `int a[10]` in the parameter list is **a lie that C allows you to write** — the compiler silently rewrites it to `int *a`. Therefore `sizeof(a)` is `sizeof(int *)`, which is 8 on 64-bit systems, and `sizeof(a[0])` is `sizeof(int)`, which is 4. The result is 2.
+
+Watch:
+
+```c
+#include <stdio.h>
+
+void inside(int a[10]) {
+    printf("inside:  sizeof(a) = %zu\n", sizeof(a));
+}
+
+int main(void) {
+    int arr[10];
+    printf("outside: sizeof(arr) = %zu\n", sizeof(arr));
+    inside(arr);
+    return 0;
+}
+```
+
+Output on a 64-bit Linux:
+
+```text
+outside: sizeof(arr) = 40
+inside:  sizeof(a) = 8
+```
+
+The array size at the call site is 40 bytes; inside the function the same "array" reports 8 bytes (the pointer size). This is the most painful lesson new C programmers learn.
+
+**The correct pattern is to pass the array and its length separately**:
+
+```c
+void print_array(const int *a, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        printf("%d ", a[i]);
+    }
+}
+
+int main(void) {
+    int arr[10] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    print_array(arr, sizeof(arr) / sizeof(arr[0]));
+    return 0;
+}
+```
+
+This is the standard library's pattern — `qsort(base, nmemb, size, cmp)`, `memcpy(dst, src, n)`, etc. The function never assumes the array's size; the caller tells it.
+
+For maximum safety, modern code often uses a small struct that bundles pointer and length together:
+
+```c
+typedef struct {
+    int *data;
+    size_t len;
+} int_slice;
+```
+
+This is essentially what Go's slice and Rust's `&[T]` are; in C you build it by hand.
+
+<Callout type="warn" title="int a[10] in a parameter list is documentation, not enforcement">
+Writing `void f(int a[10])` does not constrain the caller — they can pass `int b[5]` or `int c[100]` and the compiler will not complain. The `[10]` is purely informational; the parameter type is `int *`. C99 added `int a[static 10]` to mean "the caller guarantees this points to at least 10 elements" — useful as documentation but still not enforced at compile time.
+</Callout>
+
+## Multi-dimensional arrays
+
+C supports arrays of arrays:
+
+```c
+int grid[3][4];    /* 3 rows of 4 ints each — 12 ints total */
+
+grid[0][0] = 1;
+grid[2][3] = 9;
+```
+
+Multi-dim arrays are laid out in **row-major** order: `grid[0][0]`, `grid[0][1]`, ..., `grid[0][3]`, `grid[1][0]`, ..., `grid[2][3]`. The address of `grid[r][c]` is `&grid[0][0] + (r * 4 + c) * sizeof(int)`.
+
+Initialisation:
+
+```c
+int grid[3][4] = {
+    { 1, 2, 3, 4 },
+    { 5, 6, 7, 8 },
+    { 9, 10, 11, 12 },
+};
+```
+
+Inner braces are stylistic — `{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }` works too — but the bracketed form is much easier to read.
+
+Passing a multi-dim array to a function is awkward. Only the **outermost** dimension decays to a pointer; the inner dimensions must be known to the compiler:
+
+```c
+void process(int g[][4], size_t rows) {     /* outer size unspecified, inner size [4] required */
+    for (size_t r = 0; r < rows; r++) {
+        for (size_t c = 0; c < 4; c++) {
+            g[r][c] *= 2;
+        }
+    }
+}
+```
+
+You cannot write `void process(int g[][])` — the compiler needs to know the row size to compute the address arithmetic.
+
+For genuinely dynamic 2D data (rows variable), use either a 1D array indexed as 2D (`a[r * cols + c]`) or an array of pointers (`int **a` where each `a[r]` is a separately-allocated row). The first is faster and locality-friendly; the second is more flexible. Most real codebases use the first.
+
+## Designated initializers
+
+C99 added a feature borrowed from PL/I: initialise specific elements by index.
+
+```c
+int a[10] = { [3] = 7, [7] = 42 };
+/* a[3] = 7, a[7] = 42, everything else = 0 */
+```
+
+The `[index] = value` syntax names the index. Anything not mentioned is zero-initialised. This is great for sparse arrays:
+
+```c
+const char *month_names[13] = {
+    [1]  = "January",
+    [2]  = "February",
+    [3]  = "March",
+    /* ... */
+    [12] = "December",
+};
+```
+
+Using `month_names[0]` is `NULL` (zero-initialised), which is fine because we never access index 0.
+
+Designated initializers work for struct fields too (lesson 9): `struct point p = { .x = 1, .y = 2 };`.
+
+## Variable-length arrays (VLAs)
+
+C99 added VLAs: arrays whose size is a runtime expression.
+
+```c
+void process(int n) {
+    int buf[n];        /* size known only at runtime */
+    for (int i = 0; i < n; i++) buf[i] = i;
+    /* ... */
+}
+```
+
+VLAs allocate on the stack. They feel convenient but are controversial:
+
+- **Stack overflow risk.** `int buf[n]` with a large or attacker-controlled `n` overflows the stack and crashes (or worse, silently corrupts).
+- **Unpredictable performance.** Stack allocation adjusts the stack pointer dynamically, which means harder-to-optimise code.
+- **Compiler support.** Microsoft's MSVC has never supported VLAs. They were made **optional** in C11 and remain optional in C17 — `__STDC_NO_VLA__` macro tells you if your compiler skipped them.
+
+In embedded code and safety-critical software, VLAs are usually banned outright. Prefer fixed-size arrays, or `malloc` if the size is truly dynamic (covered in lesson 10).
+
+If you need a small dynamically-sized buffer with stack performance, look into `alloca()` — but the same caveats apply.
+
+<Callout type="warn" title="If you see `int buf[n]` in safety-critical code, change it">
+MISRA-C 2012 and CERT-C both forbid VLAs. The risk of stack overflow with no compile-time bound is unacceptable in flight software, automotive firmware, or medical devices. Use a fixed maximum and a runtime check if you need bounded dynamic sizing.
+</Callout>
+
+## A real example: fixed-size circular buffer
+
+A circular buffer (ring buffer) is the canonical embedded data structure for buffering data between producers and consumers — a UART RX buffer, an event queue, an ADC sample stream. Implementation in straightforward C:
+
+```c
+/* ring.h */
+#pragma once
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#define RING_CAPACITY 64
+
+typedef struct {
+    uint8_t  data[RING_CAPACITY];
+    size_t   head;       /* write index */
+    size_t   tail;       /* read  index */
+    size_t   count;      /* current number of stored bytes */
+} ring_t;
+
+static inline void ring_init(ring_t *r) {
+    r->head = r->tail = r->count = 0;
+}
+
+static inline bool ring_empty(const ring_t *r) { return r->count == 0; }
+static inline bool ring_full(const ring_t *r)  { return r->count == RING_CAPACITY; }
+static inline size_t ring_count(const ring_t *r) { return r->count; }
+
+/* Returns true if the byte was stored, false if buffer was full. */
+static inline bool ring_push(ring_t *r, uint8_t byte) {
+    if (ring_full(r)) return false;
+    r->data[r->head] = byte;
+    r->head = (r->head + 1) % RING_CAPACITY;
+    r->count++;
+    return true;
+}
+
+/* Returns true if a byte was read into *out, false if buffer was empty. */
+static inline bool ring_pop(ring_t *r, uint8_t *out) {
+    if (ring_empty(r)) return false;
+    *out = r->data[r->tail];
+    r->tail = (r->tail + 1) % RING_CAPACITY;
+    r->count--;
+    return true;
+}
+```
+
+Usage:
+
+```c
+#include <stdio.h>
+#include "ring.h"
+
+int main(void) {
+    ring_t r;
+    ring_init(&r);
+
+    for (uint8_t i = 0; i < 5; i++) {
+        ring_push(&r, i * 10);
+    }
+    printf("count = %zu\n", ring_count(&r));   /* 5 */
+
+    uint8_t b;
+    while (ring_pop(&r, &b)) {
+        printf("popped %u\n", b);
+    }
+    return 0;
+}
+```
+
+Notes worth absorbing.
+
+The data array is a **fixed-size member of the struct**, not a pointer to dynamic memory. This is deliberate: in embedded code we avoid `malloc`, and the buffer's storage lives with the buffer.
+
+`head` and `tail` are indices, not pointers. Pointers would work too but storing indices makes the struct trivially copyable and serialisable.
+
+`%  RING_CAPACITY` wraps the indices. If `RING_CAPACITY` is a power of two, you can replace `% N` with `& (N - 1)` for a single-cycle bitmask instead of a divide. Most embedded ring buffers exploit this.
+
+All accessor functions are `static inline` — no call overhead, the whole API compiles down to a few instructions per operation. The struct is opaque to callers only by convention; they could reach in and modify fields directly. C does not have private fields.
+
+For a multi-context ring buffer (one producer ISR, one consumer main loop), you need atomic accesses and memory ordering — that is the lock-free SPSC ring buffer in lesson 10 of the [bare-metal tutorial](/docs/programming/tutorial-10-uart-dma/).
+
+## Exercises
+
+**Exercise 6.1.** What does this print? Why does the second number not match the first?
+
+```c
+#include <stdio.h>
+
+void inspect(int arr[10]) {
+    printf("inside  sizeof = %zu\n", sizeof(arr));
+}
+
+int main(void) {
+    int data[10];
+    printf("outside sizeof = %zu\n", sizeof(data));
+    inspect(data);
+    return 0;
+}
+```
+
+<Callout type="spec" title="Answer">
+Output (64-bit):
+```text
+outside sizeof = 40
+inside  sizeof = 8
+```
+
+Inside `inspect`, the parameter `int arr[10]` is silently rewritten by the compiler to `int *arr`. The `[10]` is documentation only. So `sizeof(arr)` is `sizeof(int *)` = 8 bytes, not the 40 bytes of the original array. This is array-to-pointer decay — the single biggest gotcha in the C type system.
+</Callout>
+
+**Exercise 6.2.** Add a `ring_peek` function that reads the next byte without removing it. Signature: `bool ring_peek(const ring_t *r, uint8_t *out)`.
+
+<Callout type="spec" title="Answer">
+```c
+static inline bool ring_peek(const ring_t *r, uint8_t *out) {
+    if (ring_empty(r)) return false;
+    *out = r->data[r->tail];
+    return true;
+}
+```
+
+Note `const ring_t *r` — peek does not modify the buffer. The `const` is enforced by the compiler.
+</Callout>
+
+**Exercise 6.3.** Initialise a 256-entry lookup table where entry `i` holds the bit-reverse of `i` (e.g., entry 0xA0 holds 0x05). Use designated initializers for the special cases `[0] = 0` and `[255] = 255`, and fill the rest with `0xFF` as a sentinel value to verify your function works. Now write the function to fill in the rest.
+
+<Callout type="spec" title="Answer">
+```c
+#include <stdint.h>
+#include <stdio.h>
+
+static uint8_t bitrev(uint8_t x) {
+    x = (x >> 4) | (x << 4);
+    x = ((x & 0xCC) >> 2) | ((x & 0x33) << 2);
+    x = ((x & 0xAA) >> 1) | ((x & 0x55) << 1);
+    return x;
+}
+
+int main(void) {
+    uint8_t table[256] = { [0] = 0, [255] = 255 };
+    /* others were value-initialised to 0, not 0xFF — adjust */
+    for (int i = 0; i < 256; i++) {
+        table[i] = bitrev((uint8_t)i);
+    }
+    /* spot-check */
+    printf("rev(0xA0) = 0x%02X\n", table[0xA0]);   /* 0x05 */
+    return 0;
+}
+```
+
+The designated-initializer part was a red herring — we overwrite everything in the loop anyway. The bit-reverse routine itself is a classic SWAR (SIMD-within-a-register) trick using mask-and-shift to swap nibbles, then pairs, then individual bits.
+</Callout>
+
+## What you learned
+
+- Arrays in C have **no bounds checking** at runtime. Every access is your responsibility.
+- The length of a local array can be recovered with `sizeof(a) / sizeof(a[0])` — only on the array itself, not on a pointer to it.
+- Arrays **decay to pointers** in most expression contexts. The decay is invisible — `f(arr)` and `f(&arr[0])` are the same call.
+- A function parameter `int a[N]` is silently rewritten to `int *a`. The `[N]` is documentation only.
+- Pass arrays as `(pointer, length)` pairs — the standard library pattern.
+- Multi-dim arrays are row-major. Passing them requires the inner dimensions to be known.
+- Designated initializers (C99+) let you initialise specific indices: `{ [3] = 7 }`.
+- VLAs exist (C99) but are widely avoided in embedded and safety-critical code.
+
+In lesson 7 we look at pointers in depth — the C superpower. Dereferencing, arithmetic, const correctness, function pointers, and a generic sort.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 5 — Functions](/docs/programming/c-lesson-05-functions/) | [Lesson 7 — Pointers](/docs/programming/c-lesson-07-pointers/) |

@@ -1,0 +1,525 @@
+---
+title: Lesson 4 — Inheritance and polymorphism
+description: Single inheritance, virtual functions and the vtable, override and final, virtual destructors, abstract classes, the diamond problem, and when composition beats inheritance.
+order: 7
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, inheritance, polymorphism, virtual, vtable]
+badge: tutorial
+---
+
+
+<SpecSheet
+  title="Lesson 4 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Single inheritance, virtual functions, override and final, virtual destructors, abstract classes, the diamond problem (briefly), composition vs inheritance, and the runtime cost of virtual dispatch.' },
+    { label: 'Code provided', value: 'A Shape hierarchy with Circle and Rectangle, plus composition examples; about 150 lines total' },
+    { label: 'Time', value: '120-180 minutes' },
+    { label: 'Pre-reqs', value: 'Lessons 1-3' },
+  ]}
+/>
+
+Inheritance lets one class extend another, adding fields or replacing behaviour. Together with **virtual functions** it gives you runtime polymorphism: a single pointer or reference can refer to objects of many derived types, and calls dispatch to the right implementation at runtime. This is the textbook "object-oriented programming" feature, and it is genuinely useful — for runtime-dynamic types like driver implementations or plugin interfaces. It is also frequently overused: most "is-a" relationships in real code are better modelled as "has-a" composition. This lesson covers both sides.
+
+## Single inheritance
+
+```cpp
+#include <iostream>
+#include <string>
+
+class Animal {
+public:
+    Animal(std::string name) : name_(std::move(name)) {}
+    const std::string& name() const { return name_; }
+protected:
+    std::string name_;
+};
+
+class Dog : public Animal {
+public:
+    Dog(std::string name, int age) : Animal(std::move(name)), age_(age) {}
+    int age() const { return age_; }
+private:
+    int age_;
+};
+
+int main() {
+    Dog rex{"Rex", 5};
+    std::cout << rex.name() << " is " << rex.age() << "\n";
+}
+```
+
+Pieces:
+
+- **`class Dog : public Animal`** declares `Dog` as a public subclass of `Animal`. `Dog` inherits all of `Animal`'s members.
+- **`Animal(std::move(name))`** in `Dog`'s init list calls `Animal`'s constructor. You must call a base-class constructor (explicitly if it takes arguments; implicitly if it has a default constructor).
+- **`protected:`** in `Animal` makes `name_` visible inside `Dog` (and any further subclasses) but not outside the hierarchy. Some style guides forbid protected members entirely; the alternative is private members with public accessors.
+- The three inheritance modifiers (`public`, `protected`, `private`) on the base class control how the base's public members appear in the derived class. **In practice, always use `public` inheritance.** `private` and `protected` inheritance are obscure features used for implementation reuse, almost always better expressed as composition.
+
+## Virtual functions and the vtable
+
+So far inheritance is just code reuse. The interesting feature is **virtual dispatch**:
+
+```cpp
+class Animal {
+public:
+    Animal(std::string name) : name_(std::move(name)) {}
+    virtual std::string sound() const { return "generic animal noise"; }
+    virtual ~Animal() = default;
+protected:
+    std::string name_;
+};
+
+class Dog : public Animal {
+public:
+    Dog(std::string name) : Animal(std::move(name)) {}
+    std::string sound() const override { return "woof"; }
+};
+
+class Cat : public Animal {
+public:
+    Cat(std::string name) : Animal(std::move(name)) {}
+    std::string sound() const override { return "meow"; }
+};
+
+void describe(const Animal& a) {
+    std::cout << a.name() << " says " << a.sound() << "\n";
+}
+
+int main() {
+    Dog rex{"Rex"};
+    Cat whiskers{"Whiskers"};
+    describe(rex);          // Rex says woof
+    describe(whiskers);     // Whiskers says meow
+}
+```
+
+`describe` takes `const Animal&` but the actual call to `a.sound()` runs the right override based on the dynamic type of the object. That is the polymorphism.
+
+How does it work? Each class with at least one virtual function has a **vtable**: a table of function pointers, one per virtual method, stored statically (in flash, in embedded terms). Every instance of the class has a hidden **vpointer** as its first field, pointing to its class's vtable.
+
+```
+Dog rex:
+    vptr -----> Dog vtable
+    name_           [0] -> Dog::sound
+                    [1] -> Animal::~Animal (virtual destructor)
+```
+
+A virtual call `a.sound()` becomes:
+
+```
+1. load vptr from a (one load)
+2. load function pointer from vtable[sound_index] (one load)
+3. call through the function pointer (one indirect call)
+```
+
+Three memory operations per virtual call instead of one direct call. On a modern CPU with branch prediction and instruction cache, the cost is usually tiny — a few cycles. On a Cortex-M without branch prediction, it is more noticeable but still small.
+
+**`override`** is a keyword (C++11) that says "this function is intentionally overriding a base-class virtual". If you misspell the name, change the signature, or the base class function isn't virtual, the compiler will catch the mistake.
+
+```cpp
+class Dog : public Animal {
+public:
+    std::string sound() const override { return "woof"; }    // OK
+    // std::string Sound() const override { ... }   // compile error: nothing to override
+};
+```
+
+**Always write `override` on every override.** It is the cheapest bug-prevention measure in the language.
+
+## Virtual destructors
+
+The most subtle pitfall in C++ inheritance:
+
+```cpp
+class Animal {
+public:
+    ~Animal() { std::cout << "Animal destroyed\n"; }
+};
+
+class Dog : public Animal {
+public:
+    Dog() : extra_(new int[1000]) {}
+    ~Dog() {
+        std::cout << "Dog destroyed\n";
+        delete[] extra_;
+    }
+private:
+    int* extra_;
+};
+
+int main() {
+    Animal* a = new Dog{};
+    delete a;        // calls ~Animal only — Dog's destructor never runs — leak
+}
+```
+
+Output:
+
+```
+Animal destroyed
+```
+
+`Dog`'s destructor never ran. The `delete` only saw an `Animal*` and dispatched to `Animal::~Animal()`. The 1000-int allocation leaked.
+
+The fix:
+
+```cpp
+class Animal {
+public:
+    virtual ~Animal() = default;
+};
+```
+
+A **virtual destructor** dispatches through the vtable to the dynamic type's destructor, which then chains to the base destructor. With `virtual ~Animal()`, `delete a` correctly runs `~Dog()` then `~Animal()`.
+
+**The rule**: if a class has any virtual function (or is intended to be used as a base class), its destructor must be virtual. The cost is one vtable entry. The bug it prevents is silent memory leaks.
+
+The exception: a class that is never deleted polymorphically (e.g., always held by `std::unique_ptr<Dog>` directly, never as `std::unique_ptr<Animal>`) does not strictly need a virtual destructor. But if you are unsure, make it virtual. The cost is negligible.
+
+## Pure virtual functions and abstract classes
+
+A **pure virtual** function has no body in the base class; subclasses must override it. The base class is then **abstract** — you cannot create instances of it directly.
+
+```cpp
+class Shape {
+public:
+    virtual ~Shape() = default;
+    virtual double area() const = 0;          // pure virtual
+    virtual double perimeter() const = 0;
+};
+
+class Circle : public Shape {
+public:
+    explicit Circle(double r) : radius_(r) {}
+    double area() const override      { return std::numbers::pi * radius_ * radius_; }
+    double perimeter() const override { return 2.0 * std::numbers::pi * radius_; }
+private:
+    double radius_;
+};
+
+class Rectangle : public Shape {
+public:
+    Rectangle(double w, double h) : width_(w), height_(h) {}
+    double area() const override      { return width_ * height_; }
+    double perimeter() const override { return 2.0 * (width_ + height_); }
+private:
+    double width_, height_;
+};
+
+// Shape s;          // compile error: Shape is abstract
+Shape* s = new Circle{1.0};   // fine
+```
+
+An abstract class with only pure virtual functions and a virtual destructor is what other languages call an **interface**. The convention `class IThing` (with a capital I prefix) is common in some codebases for these "interface" classes; others just name them by purpose (`Drawable`, `Comparable`, `Sensor`).
+
+## Working example: total area through polymorphism
+
+```cpp
+#include <iostream>
+#include <memory>
+#include <numbers>
+#include <vector>
+
+class Shape {
+public:
+    virtual ~Shape() = default;
+    virtual double area() const = 0;
+};
+
+class Circle : public Shape {
+public:
+    explicit Circle(double r) : radius_(r) {}
+    double area() const override { return std::numbers::pi * radius_ * radius_; }
+private:
+    double radius_;
+};
+
+class Rectangle : public Shape {
+public:
+    Rectangle(double w, double h) : width_(w), height_(h) {}
+    double area() const override { return width_ * height_; }
+private:
+    double width_, height_;
+};
+
+double total_area(const std::vector<std::unique_ptr<Shape>>& shapes) {
+    double sum = 0;
+    for (const auto& s : shapes) {
+        sum += s->area();        // virtual call — dispatches to Circle::area or Rectangle::area
+    }
+    return sum;
+}
+
+int main() {
+    std::vector<std::unique_ptr<Shape>> shapes;
+    shapes.push_back(std::make_unique<Circle>(1.0));
+    shapes.push_back(std::make_unique<Rectangle>(2.0, 3.0));
+    shapes.push_back(std::make_unique<Circle>(0.5));
+
+    std::cout << "total area = " << total_area(shapes) << "\n";
+}
+```
+
+This is the canonical polymorphism example. A heterogeneous collection of `Shape` subclasses, processed uniformly through the base interface. `std::unique_ptr<Shape>` (covered properly in lesson 8) owns each shape; the vector owns the unique_ptrs; everything cleans up when the vector goes out of scope.
+
+## final
+
+The **`final`** keyword has two uses:
+
+1. On a class: forbid further inheritance from it.
+2. On a virtual function: forbid further overrides in derived classes.
+
+```cpp
+class Circle final : public Shape {       // nobody can subclass Circle
+    // ...
+};
+
+class Animal {
+public:
+    virtual void breathe() {}
+};
+
+class Mammal : public Animal {
+public:
+    void breathe() override final {}      // mammals breathe; subclasses cannot override
+};
+
+class Cat : public Mammal {
+public:
+    // void breathe() override {}         // compile error
+};
+```
+
+`final` is mostly an optimisation hint. With `final`, the compiler often knows the exact target of a virtual call and can devirtualise it — emit a direct call instead of going through the vtable. On Cortex-M targets that lack speculative execution, devirtualisation can be a meaningful win.
+
+## Composition over inheritance
+
+Many "is-a" relationships work better as "has-a". Suppose you want a "logging widget":
+
+**Bad (inheritance)**:
+
+```cpp
+class Logger {
+public:
+    void log(const std::string& msg) { /* ... */ }
+};
+
+class Widget : public Logger {
+public:
+    void do_work() {
+        log("starting work");
+        // ...
+        log("done");
+    }
+};
+```
+
+Widget is now a Logger. That makes no semantic sense; Widget cannot be substituted everywhere a Logger is expected. The inheritance is purely for code reuse.
+
+**Good (composition)**:
+
+```cpp
+class Logger {
+public:
+    void log(const std::string& msg) { /* ... */ }
+};
+
+class Widget {
+public:
+    Widget(Logger& log) : log_(log) {}
+    void do_work() {
+        log_.log("starting work");
+        // ...
+        log_.log("done");
+    }
+private:
+    Logger& log_;
+};
+```
+
+Widget *has* a Logger. You can give different Widget instances different Loggers, swap one out for testing, or have a Widget with no Logger at all (use `Logger*` for optional). The relationship is honest.
+
+The general guidance: **inheritance is for when you genuinely have a substitutability relationship** ("anywhere a Shape is expected, a Circle works"). **Composition is for everything else.** When in doubt, compose.
+
+## The diamond problem (lightly)
+
+Multiple inheritance lets a class derive from more than one base:
+
+```cpp
+class A { public: int x = 1; };
+class B : public A {};
+class C : public A {};
+class D : public B, public C {};   // diamond — D inherits A twice
+
+D d;
+// d.x;             // ambiguous: B::x or C::x?
+d.B::x = 10;
+d.C::x = 20;
+```
+
+`D` ends up with **two `A` subobjects**, one through `B` and one through `C`. Most uses of multiple inheritance lead to this problem.
+
+The C++ "solution" is `virtual` inheritance, which shares the A subobject:
+
+```cpp
+class B : public virtual A {};
+class C : public virtual A {};
+class D : public B, public C {};   // D inherits A exactly once
+```
+
+This works but adds complexity (D must know how to construct the shared A) and runtime cost (an extra indirection). In practice, **avoid multiple inheritance except for inheriting one concrete class plus multiple abstract interfaces.** That last case — concrete-plus-interfaces — is fine and matches what other languages call "implements multiple interfaces". Anything more, prefer composition.
+
+## When inheritance is right
+
+After all those caveats, when *should* you use inheritance? Three situations:
+
+1. **Runtime polymorphism with genuine type substitutability.** Drivers behind a generic interface (an `I2cDevice` base with concrete subclasses for different chips). Plugin systems. The Shape/Circle/Rectangle pattern. When the calling code does not know or care which subclass it has.
+
+2. **Implementing a published interface.** If you're writing a class that must conform to an existing virtual API (an event listener, a callback handler), inheritance is the language mechanism for that.
+
+3. **The CRTP pattern** (Curiously Recurring Template Pattern) for compile-time polymorphism. We will see this in lesson 5 when we cover templates.
+
+Outside these cases, default to composition.
+
+<Callout type="spec" title="Embedded callout — virtual dispatch on Cortex-M">
+Every class with virtual functions pays for a vptr per instance (4 bytes on 32-bit Cortex-M) and a vtable per class (one entry per virtual function, stored in flash). A virtual call is two loads (vptr, then function pointer) plus an indirect branch. On Cortex-M without branch prediction, the indirect branch costs roughly the same as a direct call when the branch target predictor (BTAC) hits, and a few cycles more on a miss.
+
+For genuine runtime-dynamic dispatch (a driver registry, a command parser), this cost is fine. For one-instance-per-class designs (you have exactly one `Usart` object), you are paying for polymorphism you do not use — prefer templates (lesson 5) or the CRTP. The reference page at /docs/programming/cpp/ covers this in more detail.
+</Callout>
+
+## Slicing
+
+A subtle inheritance pitfall: copying a derived object into a base-typed slot drops everything that the derived class added.
+
+```cpp
+Dog rex{"Rex"};
+Animal a = rex;        // copies the Animal subobject only — the Dog-specific parts are sliced off
+a.sound();             // calls Animal::sound, not Dog::sound — there is no Dog here anymore
+```
+
+This is called **slicing**. The fix is to use references or pointers when you mean polymorphism:
+
+```cpp
+Dog rex{"Rex"};
+Animal& a = rex;       // a refers to rex; virtual dispatch works
+a.sound();             // calls Dog::sound via the vtable
+```
+
+The rule: **polymorphic types are used through pointers and references, never by value.** Most polymorphic base classes should mark their copy constructor and copy assignment `protected` or `delete`d to prevent accidental slicing.
+
+## Exercises
+
+**Exercise 4.1.** Add a `Triangle` class to the `Shape` hierarchy (with `area` returning `0.5 * base * height`). Verify it works with `total_area`.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+class Triangle : public Shape {
+public:
+    Triangle(double base, double height) : base_(base), height_(height) {}
+    double area() const override { return 0.5 * base_ * height_; }
+private:
+    double base_, height_;
+};
+
+// in main:
+shapes.push_back(std::make_unique<Triangle>(3.0, 4.0));
+```
+
+If you forget the `override` keyword, the code still works — but if you also misspell the function (e.g. `double Area() const`), the compiler will silently not override `Shape::area` and `Triangle` will be abstract because its inherited pure `area` is unimplemented. The compiler error you get ("cannot allocate object of abstract type Triangle") will not point at the typo. With `override`, the compiler catches it directly. Always write `override`.
+</Callout>
+
+**Exercise 4.2.** What is wrong with this code, and how do you fix it?
+
+```cpp
+class Sensor {
+public:
+    virtual int read() = 0;
+};
+
+class TempSensor : public Sensor {
+public:
+    TempSensor() : buffer_(new int[256]) {}
+    ~TempSensor() { delete[] buffer_; }
+    int read() override { return buffer_[0]; }
+private:
+    int* buffer_;
+};
+
+Sensor* s = new TempSensor{};
+delete s;
+```
+
+<Callout type="spec" title="Answer">
+`Sensor`'s destructor is not virtual. When `delete s` runs through a `Sensor*`, only `~Sensor()` is called; `~TempSensor()` is skipped and the 256-int buffer leaks.
+
+Fix: add a virtual destructor to `Sensor`.
+
+```cpp
+class Sensor {
+public:
+    virtual ~Sensor() = default;
+    virtual int read() = 0;
+};
+```
+
+Better still in modern C++: use `std::unique_ptr<int[]>` instead of raw `new`/`delete` for the buffer (rule of zero), and use `std::unique_ptr<Sensor>` to hold the polymorphic object. We cover smart pointers in lesson 8.
+</Callout>
+
+**Exercise 4.3.** Rewrite the Widget/Logger example using composition where the Widget *optionally* logs (pass `nullptr` to disable). Use `Logger*` instead of `Logger&`.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <string>
+#include <iostream>
+
+class Logger {
+public:
+    void log(const std::string& msg) { std::cout << "[log] " << msg << "\n"; }
+};
+
+class Widget {
+public:
+    explicit Widget(Logger* log = nullptr) : log_(log) {}
+
+    void do_work() {
+        if (log_) log_->log("starting work");
+        // do the work
+        if (log_) log_->log("done");
+    }
+
+private:
+    Logger* log_;
+};
+
+int main() {
+    Logger lg;
+    Widget verbose{&lg};
+    Widget silent{};
+    verbose.do_work();
+    silent.do_work();
+}
+```
+
+Note: this is one of the cases where a raw pointer (non-owning) is legitimate — Widget does not own the Logger, it just refers to it. `std::unique_ptr<Logger>` would imply ownership, which is wrong here. We cover the owning/non-owning distinction in lesson 8.
+</Callout>
+
+## What you learned
+
+- Single inheritance with `class Derived : public Base` adds members and lets the derived class customise behaviour.
+- `virtual` functions enable runtime polymorphism via the vtable. Mark every override with `override`.
+- The virtual destructor rule: if a class has any virtual function, give it a virtual destructor. Otherwise polymorphic deletion leaks.
+- Pure virtual functions (`= 0`) make a class abstract — uninstantiable, only useful as a base.
+- `final` forbids further inheritance or override and can help the compiler devirtualise.
+- Composition is usually better than inheritance. Reach for inheritance only when you genuinely want type substitutability.
+- Slicing happens when you copy a derived object into a base-typed slot. Use references and pointers for polymorphic types.
+- The diamond problem is real but avoidable: prefer single inheritance plus interface inheritance.
+
+In lesson 5 we meet templates — the other big polymorphism mechanism, this time at compile time, with zero runtime overhead.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 3 — Classes and RAII](/docs/programming/cpp-lesson-03-classes/) | [Lesson 5 — Templates](/docs/programming/cpp-lesson-05-templates/) |

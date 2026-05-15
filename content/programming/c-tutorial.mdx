@@ -1,0 +1,124 @@
+---
+title: C language tutorial — for embedded engineers
+description: A 15-lesson hands-on tutorial taking you from hello world through pointers, memory, the preprocessor, the standard library, and modern C11/17/23. Built for people who already program and want to learn C properly.
+order: 1
+updated: 2026-05-13
+tags: [programming, tutorial, c, language]
+badge: tutorial
+---
+
+Most people who pick up C in 2026 are not learning their first language. They already know Python or JavaScript or Java or Go, they can read a `for` loop without thinking, and they understand what a function is. What they do not have — and what C demands — is a model of the machine. C is the language where every variable has a known address, every pointer is a literal number, every byte of memory is yours to manage, and the compiler will happily generate code that compiles, links, runs once, and then corrupts itself on the second iteration because you wrote past the end of an array.
+
+This tutorial teaches C as it actually is. Not as a friendlier Python with semicolons, not as a stripped-down Java, but as a thin layer over the silicon — which is exactly what makes it the right language for firmware, kernels, embedded systems, and anywhere else you need to know what the machine is doing.
+
+## Who this is for
+
+You already program. You have shipped code in at least one other language. You understand what a variable, a function, a loop, and a struct or class are at a conceptual level. You may have read C code before (it is hard to avoid in 2026) but never written it confidently. You are probably here because:
+
+- You are moving into embedded or firmware work and the job uses C every day.
+- You want to read the Linux kernel, Redis, SQLite, CPython, or your favourite open-source project without bouncing off the syntax.
+- You are tired of "C is dangerous" advice from people who have never written a memcpy and you want to form your own opinion.
+- You are about to take on a course or project where C is the medium, and you want to be productive on day one instead of week three.
+
+The tutorial does not start at zero. We will not define what a variable is. We will, however, carefully explain everything that makes C different from a managed language: manual memory, undefined behavior, pointers as first-class objects, integer width quirks that bite at runtime, the absence of bounds checking, and a type system that lets you cast a pointer to almost anything if you are willing to ask.
+
+## Philosophy
+
+> Learn the language properly before you touch hardware.
+
+That is the whole pitch. There are two common failure modes for people learning C for embedded work.
+
+The first is to dive straight into a vendor SDK — Arduino, STM32Cube, ESP-IDF — and copy example code. You get an LED blinking in 20 minutes, you feel productive, and then six weeks later you cannot debug a stuck DMA stream because you do not understand pointers well enough to read the source.
+
+The second is to learn C through an academic textbook that spends three weeks on "what is a variable" before getting to anything useful. The pace is wrong for someone who already programs, and the examples (linked lists of student records!) bear no resemblance to what you will actually write.
+
+This tutorial sits in the middle. We move fast where the reader's existing knowledge applies (control flow, expressions, basic functions) and slow where C is genuinely different from what you already know (pointers, memory, undefined behavior, the preprocessor, the standard library quirks, integer promotion rules). Every lesson has real, compileable code you can run on your laptop today, plus exercises with answers so you can verify your understanding.
+
+After you finish this tutorial, you should be ready for the [bare-metal embedded C tutorial](/docs/programming/tutorial/), which takes the C language you have learned and applies it to an ARM Cortex-M microcontroller — volatile, memory-mapped I/O, linker scripts, interrupt handlers, DMA. That tutorial assumes you already know C. This one is how you get there.
+
+## At a glance
+
+<SpecSheet
+  title="Tutorial — at a glance"
+  specs={[
+    { label: 'Target', value: 'Portable C17 — your host PC, any operating system' },
+    { label: 'Hardware required', value: 'None. A laptop with any C compiler is enough.' },
+    { label: 'Software', value: 'gcc (recommended), clang, or MSVC. We use gcc syntax in flags.' },
+    { label: 'Time investment', value: 'Approximately 20-30 hours total — 90-120 minutes per lesson' },
+    { label: 'Prerequisites', value: 'Comfortable in at least one other language (Python, JavaScript, Java, Go, Rust, C#, or similar)' },
+    { label: 'Output', value: 'Solid working knowledge of the C language up to C17, with a preview of C23 features' },
+    { label: 'Standard', value: 'C17 throughout, with C11 features marked, C23 covered in the final lesson' },
+  ]}
+/>
+
+## Required tools
+
+Any modern C compiler will do. The tutorial uses gcc invocations for examples, but every program compiles unchanged with clang and (with minor flag syntax differences) MSVC.
+
+- **Linux:** `sudo apt install build-essential` or your distribution's equivalent. You get gcc, make, and gdb.
+- **macOS:** install the Xcode Command Line Tools (`xcode-select --install`). That gives you clang aliased as `gcc`, plus make and lldb. The lessons work identically.
+- **Windows:** the recommended path is WSL2 with Ubuntu, then follow the Linux instructions. Native MinGW or MSVC also works, but every Stack Overflow answer assumes Linux paths and tooling, so WSL saves you grief.
+
+You also want a text editor that knows C syntax: VS Code with the C/C++ extension, Neovim with treesitter, CLion, or whatever you already use. Avoid IDE-only build systems for this tutorial — we want to see the compiler command line.
+
+To confirm everything works:
+
+```bash
+$ gcc --version
+gcc (Ubuntu 13.2.0-23ubuntu4) 13.2.0
+$ echo 'int main(void){return 0;}' > t.c && gcc t.c -o t && ./t && echo ok
+ok
+```
+
+If that prints `ok`, you are ready for lesson 1.
+
+## The 15 lessons
+
+<CoreCompare
+  rows={[
+    { core: 'Lesson 1 — Hello, C', notes: 'Anatomy of main(), printf, compiling with gcc, exit codes, why void main is wrong.' },
+    { core: 'Lesson 2 — Types and literals', notes: 'char/short/int/long, signed vs unsigned, stdint.h fixed-width types, floating point, integer literals, sizeof, casting.' },
+    { core: 'Lesson 3 — Expressions and operators', notes: 'Arithmetic, bitwise, logical, shift. Precedence. Short-circuit. Sequence points. Why parentheses everywhere.' },
+    { core: 'Lesson 4 — Control flow', notes: 'if/else, switch, while, do/while, for, break/continue/goto, fall-through, loop overflow gotchas.' },
+    { core: 'Lesson 5 — Functions', notes: 'Declarations, prototypes, pass-by-value, static linkage, inline, recursion, the f() vs f(void) trap.' },
+    { core: 'Lesson 6 — Arrays', notes: 'Indexing, no bounds checking, array-to-pointer decay, multi-dimensional arrays, designated initializers, VLAs.' },
+    { core: 'Lesson 7 — Pointers', notes: 'Addresses, dereference, NULL, pointer arithmetic, const correctness, function pointers, a generic sort.' },
+    { core: 'Lesson 8 — Strings', notes: 'char arrays, NUL termination, the strncpy trap, snprintf, UTF-8, char32_t, a safe string copy.' },
+    { core: 'Lesson 9 — Structs and unions', notes: 'Padding, alignment, packed, anonymous structs, unions as sum types, bit fields, designated initializers.' },
+    { core: 'Lesson 10 — Dynamic memory', notes: 'malloc/calloc/realloc/free, double-free, use-after-free, leaks, valgrind, ownership, a growable vector.' },
+    { core: 'Lesson 11 — The preprocessor', notes: 'include, define, conditional compilation, function-like macros, stringification, token paste, X-macros, _Generic.' },
+    { core: 'Lesson 12 — Multi-file projects', notes: 'Translation units, headers vs sources, extern, the one-definition rule, include guards, a working Makefile.' },
+    { core: 'Lesson 13 — The C standard library', notes: 'Tour of stdio, stdlib, string, math, time, assert, errno, limits, stdint, stdbool, inttypes. File I/O. qsort, memcpy vs memmove.' },
+    { core: 'Lesson 14 — Undefined behavior', notes: 'What UB is, the classic list, sanitizers, the optimisations that exploit it, the 10 rules to follow.' },
+    { core: 'Lesson 15 — Modern C: C11, C17, C23', notes: 'What each revision added. _Static_assert, _Generic, atomics, nullptr, constexpr, attributes, embed, BitInt.' },
+  ]}
+/>
+
+## How to use this tutorial
+
+Three rules. They sound boring; they are the difference between absorbing the material and forgetting it.
+
+1. **Read in order.** Lessons assume previous ones. Lesson 7 (pointers) uses array decay from lesson 6. Lesson 10 (dynamic memory) builds on lesson 9 (structs). Lesson 14 (undefined behavior) references almost every prior lesson.
+
+2. **Type the code. Compile it. Run it.** Every code block in this tutorial is a complete, compileable C program (or a snippet that obviously belongs in one). When you read `printf("%d\n", x);`, do not just nod — paste it into a file, compile, run, then change a value and see what changes. Friction is where the learning lives.
+
+3. **Do the exercises before reading the answers.** Each lesson ends with 2-3 exercises and answers in collapsible callouts. Try the exercise. Spend 15 minutes stuck on it. Then read the answer. The hour of struggle teaches more than the five minutes of reading.
+
+<Callout type="tip" title="A note on speed">
+If you can already read C and just want a refresher on the modern features, skim lessons 1-6, slow down on 7 (pointers) and 10 (dynamic memory), and read 14 (undefined behavior) and 15 (modern C) carefully. Those are where most experienced-but-rusty C programmers find new material.
+</Callout>
+
+<Callout type="note" title="What this tutorial is not">
+This is a C *language* tutorial. It does not teach data structures, algorithms, operating systems, or networking — those are separate subjects that happen to be taught in C in many universities. We touch the standard library only enough to write useful programs. After this tutorial, a book like *Algorithms* (Sedgewick) or *Operating Systems: Three Easy Pieces* will be readable to you. Before this tutorial, they probably are not.
+</Callout>
+
+## Cross-references
+
+- [Bare-metal C tutorial](/docs/programming/tutorial/) — the natural next step. Apply your C to a Cortex-M microcontroller.
+- [Embedded C patterns](/docs/programming/embedded-c/) — patterns used in firmware: volatile, packed, alignment, weak symbols.
+- [volatile and memory-mapped I/O](/docs/programming/volatile-mmio/) — what volatile means at the silicon level.
+- [The C standard library on embedded](/docs/programming/libc/) — newlib, picolibc, what to use when malloc is off the table.
+- [C++ tutorial](/docs/programming/cpp-tutorial/) — when you are ready to add classes, RAII, and templates on top.
+- [GCC flags reference](/tools/gcc-flags/) — every flag in our build commands explained.
+
+Start with [Lesson 1 — Hello, C](/docs/programming/c-lesson-01-hello/).

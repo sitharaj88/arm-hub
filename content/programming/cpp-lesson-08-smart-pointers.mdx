@@ -1,0 +1,437 @@
+---
+title: Lesson 8 — Smart pointers
+description: std::unique_ptr, std::shared_ptr, std::weak_ptr, std::make_unique, std::make_shared, custom deleters, the owning-vs-non-owning distinction, and why raw new and delete are mostly wrong in modern C++.
+order: 11
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, smart-pointers, unique_ptr, shared_ptr, raii]
+badge: tutorial
+---
+
+
+<SpecSheet
+  title="Lesson 8 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'std::unique_ptr (exclusive ownership, zero overhead), std::shared_ptr (reference-counted), std::weak_ptr (for cycles), std::make_unique and std::make_shared, custom deleters, the owning vs non-owning pointer distinction, and a tree built from unique_ptr children.' },
+    { label: 'Code provided', value: 'About 180 lines covering each smart pointer, custom deleters for FILE*, and a tree-of-unique-ptr example' },
+    { label: 'Time', value: '120-150 minutes' },
+    { label: 'Pre-reqs', value: 'Lessons 1-7' },
+  ]}
+/>
+
+`new` and `delete` are the C++ versions of `malloc` and `free`. They suffer from the same problem: pairing the allocation with the deallocation requires programmer discipline, and forgetting either leaks or double-frees. C++ has had a solution since 2011: **smart pointers**, which wrap raw pointers in RAII classes that handle the deallocation automatically. In modern C++ you essentially never write raw `new`; you use `std::make_unique` or `std::make_shared` and let the smart pointer's destructor handle cleanup. This lesson covers the three smart pointers and the design pattern they support.
+
+## Why raw new is mostly wrong
+
+```cpp
+void process() {
+    Widget* w = new Widget{};
+    w->configure(42);
+    if (failed_check()) {
+        return;            // LEAK: w never deleted
+    }
+    w->run();              // if run() throws, also leaks
+    delete w;
+}
+```
+
+Three failure modes baked into this pattern:
+
+1. **Early return.** If `failed_check()` returns true, the function exits without freeing `w`.
+2. **Exceptions.** If `w->configure` or `w->run` throws, the function unwinds without reaching `delete w`.
+3. **Refactoring.** A future maintainer adds an early `return` somewhere and silently introduces a leak.
+
+The "fix" with raw new is to wrap everything in try/catch, manually free on every error path, and hope nobody adds a return statement. The fix with `std::unique_ptr` is one line:
+
+```cpp
+void process() {
+    auto w = std::make_unique<Widget>();
+    w->configure(42);
+    if (failed_check()) return;
+    w->run();
+    // unique_ptr destructor deletes Widget automatically, on every path
+}
+```
+
+Every exit path — return, exception, fall-through — runs `~unique_ptr`, which calls `delete`. No code on your end. **This is the only safe way to manage dynamic allocation in C++**, and it has been since 2011. If you see new and delete in a modern C++ codebase, it's a smell.
+
+## std::unique_ptr
+
+`std::unique_ptr<T>` owns a single dynamically allocated `T`. When the unique_ptr goes out of scope, the object is deleted. It is move-only — you cannot copy a unique_ptr (which would imply two owners). You can transfer ownership with `std::move`.
+
+```cpp
+#include <memory>
+
+auto p = std::make_unique<int>(42);
+std::cout << *p << "\n";              // 42
+
+// std::unique_ptr<int> q = p;        // compile error: cannot copy
+std::unique_ptr<int> q = std::move(p);   // OK: ownership transferred
+// p is now empty (nullptr); q owns the int
+
+if (!p) std::cout << "p is empty\n";
+if (q)  std::cout << "q owns " << *q << "\n";
+```
+
+`std::make_unique<T>(args...)` is the right way to construct a unique_ptr. It calls `new T(args...)` internally and gives you a `unique_ptr<T>` wrapping the result. Three reasons to prefer it over `std::unique_ptr<T>(new T{...})`:
+
+1. **Less repetition.** Write the type once.
+2. **Exception safety.** `f(std::unique_ptr<T>(new T), std::unique_ptr<U>(new U))` is unsafe — the compiler is allowed to evaluate as `new T; new U; unique_ptr<T>; unique_ptr<U>` and if `new U` throws, `T` leaks. With `f(std::make_unique<T>(), std::make_unique<U>())`, each construction is atomic.
+3. **No `new` in your code.** Searches for `new` are then leak-hunters; absence means safety.
+
+For arrays, use `std::make_unique<T[]>(n)`:
+
+```cpp
+auto buffer = std::make_unique<int[]>(1024);
+buffer[0] = 42;
+// destructor calls delete[] automatically
+```
+
+But honestly, `std::vector<int>` is almost always a better choice than `std::unique_ptr<int[]>`. The vector gives you `size()`, bounds checking via `at()`, range-based for, and growth — at the same memory cost. Use `unique_ptr<T[]>` only when you specifically need exactly-n-elements with no header.
+
+### Member methods worth knowing
+
+- `p.get()` — returns the raw pointer (still owned by `p`).
+- `p.reset()` — deletes the current object and sets `p` to empty.
+- `p.reset(new T{...})` — deletes the current and takes ownership of a new T (rarely used; prefer `p = std::make_unique<T>(...);`).
+- `p.release()` — returns the raw pointer **and gives up ownership**. The caller is now responsible for `delete`. Dangerous; needed only when interfacing with C APIs that take ownership.
+- `*p`, `p->member` — pointer-like dereference.
+- `static_cast<bool>(p)` or `if (p)` — true if owns something, false if empty.
+
+`unique_ptr` has **zero runtime overhead** compared to a raw pointer. It is the same size (one pointer), the same speed at every operation. The destructor compiles to one comparison + one delete. If you're worried about overhead, you're worried about nothing.
+
+## std::shared_ptr — reference counting
+
+Sometimes ownership is genuinely shared. Multiple parts of the program hold pointers to the same object; nobody knows who will be the last to release it. `std::shared_ptr<T>` handles this with reference counting.
+
+```cpp
+auto a = std::make_shared<int>(42);
+std::cout << a.use_count() << "\n";    // 1
+
+auto b = a;                             // copy: refcount becomes 2
+std::cout << a.use_count() << "\n";    // 2
+
+{
+    auto c = a;                         // 3
+    std::cout << a.use_count() << "\n"; // 3
+}                                       // c destroyed, refcount 2
+
+// when a and b both go out of scope, refcount reaches 0, int is deleted
+```
+
+Each `shared_ptr` increments the refcount on construction and decrements on destruction. When the count reaches zero, the managed object is deleted.
+
+This has costs:
+
+- **Two heap allocations** in the default construction: one for the T, one for the **control block** (which holds the refcount and the weak refcount). `std::make_shared<T>(args...)` consolidates these into one allocation, which is one reason to prefer it.
+- **Atomic increment/decrement** on every copy and destruction. This is safe across threads but not free — atomic operations are 5-10x slower than non-atomic on modern CPUs.
+- **Two pointers of size** (the shared_ptr holds the object pointer and the control block pointer). Twice the size of a raw or unique pointer.
+
+The cost is bearable when ownership is genuinely shared. When it isn't — when one clear owner exists — `unique_ptr` is the right tool. **Reach for `shared_ptr` only when the design genuinely demands shared ownership.**
+
+`std::make_shared<T>(args...)`, like `make_unique`, is preferred over raw construction. Bonus: it puts the T and the control block in one allocation, halving the allocation cost.
+
+### When you actually need shared_ptr
+
+The honest answer: not often. Real cases include:
+
+- Caches that hand out objects to many consumers, where the cache cannot know when the last consumer is done.
+- Graphs where multiple nodes refer to a shared resource (and you cannot turn the graph into a tree).
+- Plugin systems where the lifetime is genuinely cooperative.
+
+Most "the object has multiple users" cases turn out to have a single owner with non-owning observers. Use `unique_ptr` for the owner and raw pointers or references for the observers.
+
+## std::weak_ptr — breaking cycles
+
+Reference counting cannot handle cycles. If A holds a `shared_ptr<B>` and B holds a `shared_ptr<A>`, neither refcount ever reaches zero, even after every external reference is gone. Memory leaks silently.
+
+`std::weak_ptr<T>` solves this. A weak_ptr observes a shared_ptr-owned object without contributing to the refcount. To access the object, you ask the weak_ptr for a temporary shared_ptr via `lock()`:
+
+```cpp
+auto sp = std::make_shared<int>(42);
+std::weak_ptr<int> wp = sp;            // weak observer; refcount still 1
+
+if (auto locked = wp.lock()) {         // try to get a strong ref
+    std::cout << *locked << "\n";      // 42
+}
+
+sp.reset();                            // refcount → 0; object deleted
+
+if (auto locked = wp.lock()) {
+    std::cout << *locked << "\n";      // not reached
+} else {
+    std::cout << "object gone\n";
+}
+```
+
+`wp.lock()` returns either a valid `shared_ptr` (if the object still exists) or an empty one (if it has been deleted). The weak_ptr itself does not extend the lifetime.
+
+Use weak_ptr for the "back-pointer" in a parent-child graph where the children should not keep the parent alive, or for observer lists where observers should not extend the subject's lifetime.
+
+## Custom deleters
+
+Smart pointers can manage non-`delete`-able resources via custom deleters.
+
+```cpp
+#include <cstdio>
+#include <memory>
+
+void close_file(FILE* f) {
+    if (f) std::fclose(f);
+}
+
+auto open_file(const char* path) {
+    return std::unique_ptr<FILE, decltype(&close_file)>{
+        std::fopen(path, "r"),
+        &close_file
+    };
+}
+
+int main() {
+    auto f = open_file("/etc/hosts");
+    if (f) {
+        int c = std::fgetc(f.get());
+        std::cout << static_cast<char>(c);
+    }
+    // fclose runs automatically
+}
+```
+
+The unique_ptr template takes a second template argument: the deleter type. We use `decltype(&close_file)` (the type of the function pointer) and pass the function pointer as a constructor argument.
+
+A cleaner pattern uses a stateless function object so the unique_ptr stays one pointer in size:
+
+```cpp
+struct FileCloser {
+    void operator()(FILE* f) const { if (f) std::fclose(f); }
+};
+
+using UniqueFile = std::unique_ptr<FILE, FileCloser>;
+
+UniqueFile f{std::fopen("/etc/hosts", "r")};
+```
+
+`FileCloser` is empty (no members), so the unique_ptr can apply empty-base-optimisation and stay the size of a single pointer. With a function-pointer deleter the unique_ptr is two pointers in size.
+
+Use cases for custom deleters:
+
+- C library handles: `FILE*`, `sqlite3*`, `OpenSSL_BIO*`, OpenGL textures, audio handles. Anything with `xxx_close` or `xxx_free` instead of `delete`.
+- Memory from a custom allocator (pool, arena, OS region).
+- Objects allocated by a specific factory that has its own destruction protocol.
+
+On embedded targets, custom deleters let you use `unique_ptr` to manage a fixed-storage resource without involving the heap:
+
+```cpp
+static MyDevice device_storage;
+auto dev = std::unique_ptr<MyDevice, void(*)(MyDevice*)>{
+    &device_storage,
+    [](MyDevice*) { /* no-op: storage is static */ }
+};
+```
+
+Now `dev` has the same usage syntax as a heap-allocated device but lives in static memory.
+
+## Owning vs non-owning pointers
+
+The most important conceptual distinction in modern C++ pointer usage:
+
+| Concept | Type | Manages lifetime? |
+| --- | --- | --- |
+| Single owner | `std::unique_ptr<T>` | yes |
+| Shared owner | `std::shared_ptr<T>` | yes (jointly) |
+| Weak observer of shared | `std::weak_ptr<T>` | no |
+| Non-owning view | `T*` or `T&` | no |
+| Non-owning view (semantic) | `std::observer_ptr<T>` (proposed) | no |
+
+When you see `T*` in modern C++ code, it should mean **non-owning** — a temporary view of an object owned elsewhere. Never `new T` into a raw pointer and expect the caller to delete; pass `unique_ptr<T>` if you mean "ownership transfer" or `T*` / `T&` if you mean "lookat-but-don't-touch".
+
+```cpp
+// Owns: returns ownership to caller
+std::unique_ptr<Widget> create_widget();
+
+// Borrows: caller retains ownership; widget must outlive the call
+void process(Widget* w);
+void process(const Widget& w);     // even better — non-null guaranteed
+
+// Owns: takes ownership from caller
+void destroy(std::unique_ptr<Widget> w);
+```
+
+Reading the signature should tell you the ownership story.
+
+`std::observer_ptr<T>` was proposed for the standard as a "this raw pointer is semantically non-owning" marker. It never made it in. The convention "raw pointers are non-owning" is the working compromise.
+
+<Callout type="spec" title="Embedded callout — unique_ptr is fine, shared_ptr probably isn't">
+std::unique_ptr is essentially free on Cortex-M. No exceptions needed for its core operations. No atomics. The destructor is one comparison plus one delete. Use it everywhere you would otherwise have manual new/delete (which on embedded is "almost never anyway").
+
+std::shared_ptr is a different story. The refcount manipulations use atomic operations (CMSIS LDREX/STREX on Cortex-M), which work but cost cycles. The control block is a separate allocation. And on -fno-exceptions builds, some shared_ptr operations cannot signal failure cleanly. Use shared_ptr on embedded only when shared ownership is genuinely necessary, and consider whether a non-owning observer plus a single owner would solve the same problem.
+</Callout>
+
+## Working example: a tree with unique_ptr children
+
+```cpp
+#include <iostream>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+struct Node {
+    std::string name;
+    std::vector<std::unique_ptr<Node>> children;
+
+    explicit Node(std::string n) : name(std::move(n)) {}
+
+    Node* add_child(std::string n) {
+        children.push_back(std::make_unique<Node>(std::move(n)));
+        return children.back().get();        // non-owning observer
+    }
+
+    void print(int depth = 0) const {
+        for (int i = 0; i < depth; ++i) std::cout << "  ";
+        std::cout << name << "\n";
+        for (const auto& child : children) {
+            child->print(depth + 1);
+        }
+    }
+};
+
+int main() {
+    Node root{"root"};
+    auto a = root.add_child("a");
+    auto b = root.add_child("b");
+    a->add_child("a1");
+    a->add_child("a2");
+    b->add_child("b1");
+
+    root.print();
+    // root destructor runs; vector destructor runs; each unique_ptr's destructor
+    // runs; children are deleted; recursively. No leaks possible.
+}
+```
+
+Output:
+
+```
+root
+  a
+    a1
+    a2
+  b
+    b1
+```
+
+Things to note:
+
+- `std::unique_ptr<Node>` children: each node owns its children. When the parent is destroyed, the vector destroys each unique_ptr, which destroys the Node, which destroys its own children. Recursive cleanup falls out of the destructor.
+- `add_child` returns a `Node*` — a non-owning observer. The tree still owns the node; the caller can manipulate it but cannot delete it. This is the "owning vs non-owning" distinction in action.
+- No `new`, no `delete`, no leak possibility.
+- The `Node` class doesn't define a destructor, copy constructor, copy assignment, or any special function. Rule of zero. The compiler-generated destructor runs the vector's destructor which runs the unique_ptrs' destructors. Everything works.
+
+Compare this to the C equivalent, which would need a manual `free_node(Node*)` function calling `free_node` on every child and then `free` on the node itself, paired with manual `malloc` at every `add_child`. Twenty more lines of code, ten more places for bugs.
+
+## Exercises
+
+**Exercise 8.1.** Write a function `read_lines(const std::string& path)` that returns a `std::unique_ptr<std::vector<std::string>>` containing every line in the file. Use a custom-deleter `unique_ptr<FILE>` for the file handle.
+
+<Callout type="spec" title="Answer">
+
+```cpp
+#include <cstdio>
+#include <memory>
+#include <string>
+#include <vector>
+
+struct FileCloser {
+    void operator()(FILE* f) const { if (f) std::fclose(f); }
+};
+using UniqueFile = std::unique_ptr<FILE, FileCloser>;
+
+std::unique_ptr<std::vector<std::string>> read_lines(const std::string& path) {
+    UniqueFile f{std::fopen(path.c_str(), "r")};
+    if (!f) return nullptr;
+
+    auto out = std::make_unique<std::vector<std::string>>();
+    char buf[1024];
+    while (std::fgets(buf, sizeof buf, f.get())) {
+        std::string line{buf};
+        if (!line.empty() && line.back() == '\n') line.pop_back();
+        out->push_back(std::move(line));
+    }
+    return out;
+}
+```
+
+The file handle is closed automatically when `f` goes out of scope, even if anything inside the loop throws. Returning the vector by `unique_ptr` is slightly unusual; in real code you would just return a `std::vector<std::string>` by value (move semantics make this free) or `std::optional<std::vector<std::string>>` to encode the "file could not be opened" case. We use unique_ptr here to exercise the lesson's material.
+</Callout>
+
+**Exercise 8.2.** Why does this code leak? Fix it.
+
+```cpp
+void take_two(std::shared_ptr<int> a, std::shared_ptr<int> b);
+
+void caller() {
+    take_two(std::shared_ptr<int>(new int{1}),
+             std::shared_ptr<int>(new int{2}));
+}
+```
+
+<Callout type="spec" title="Answer">
+The compiler is allowed to evaluate the arguments in any order, and may interleave construction: `new int{1}` → `new int{2}` → `shared_ptr` wraps the first → `shared_ptr` wraps the second. If the second `new` throws, the first `int` leaks because no smart pointer owns it yet.
+
+Fix: use `std::make_shared`:
+
+```cpp
+void caller() {
+    take_two(std::make_shared<int>(1), std::make_shared<int>(2));
+}
+```
+
+Each `make_shared` is atomic — the allocation and the shared_ptr construction happen together. If the second one throws, the first is fully constructed and its destructor runs, freeing the int. No leak possible.
+
+This is the same exception-safety argument as `make_unique`. The rule: never write `new` directly in a function call; always use `make_unique`/`make_shared`.
+</Callout>
+
+**Exercise 8.3.** Modify the tree example to add a `parent` pointer to each Node. Should it be `Node*`, `std::shared_ptr<Node>`, or `std::weak_ptr<Node>`? Why?
+
+<Callout type="spec" title="Answer">
+It depends on the ownership story.
+
+If children are owned by their parent's vector (the existing design), the parent **outlives** the child by definition. A raw `Node*` parent pointer is fine and non-owning — the child cannot be alive without its parent being alive. This is the natural choice:
+
+```cpp
+struct Node {
+    std::string name;
+    Node* parent = nullptr;
+    std::vector<std::unique_ptr<Node>> children;
+
+    Node* add_child(std::string n) {
+        auto child = std::make_unique<Node>(std::move(n));
+        child->parent = this;
+        children.push_back(std::move(child));
+        return children.back().get();
+    }
+};
+```
+
+If you instead used `shared_ptr<Node>` children, then a `shared_ptr<Node>` parent would create a cycle (parent keeps children alive, children keep parent alive, neither ever frees). In that case use `std::weak_ptr<Node>` for the parent pointer to break the cycle.
+
+The general rule: **back-pointers in a tree are non-owning.** Raw pointers when you have a single-owner design; weak_ptr when you have shared ownership.
+</Callout>
+
+## What you learned
+
+- Raw `new` and `delete` are mostly wrong in modern C++ because of leak risks on every error path.
+- `std::unique_ptr<T>` is the default owning pointer: zero-overhead, move-only, single owner. Use `std::make_unique<T>(args)` to construct.
+- `std::shared_ptr<T>` has reference counting overhead (atomic ops, control block). Use only when ownership is genuinely shared.
+- `std::weak_ptr<T>` observes a shared_ptr without extending its lifetime. Used to break reference cycles.
+- Custom deleters extend unique_ptr to manage `FILE*`, OpenGL handles, custom-allocated memory, or static storage with a no-op deleter.
+- The owning-vs-non-owning distinction: smart pointers for ownership, raw `T*` or `T&` for non-owning views.
+- A tree built from `std::unique_ptr` children gets fully recursive cleanup for free via the destructor chain.
+
+That concludes part 1 of the C++ tutorial. In part 2 (lessons 9-12) we cover move semantics and rvalue references, lambdas, error handling without exceptions (`std::optional`, `std::expected`), and the concurrency primitives. Part 3 (lessons 13-15) covers modules, C++23 highlights, and finally putting it all together on a Cortex-M target.
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [Lesson 7 — Iterators and algorithms](/docs/programming/cpp-lesson-07-iterators-algorithms/) | Lesson 9 — Move semantics and rvalue references (part 2 — coming soon) |

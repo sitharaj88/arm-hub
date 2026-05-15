@@ -1,0 +1,389 @@
+---
+title: C++ Lesson 13 — Modules (C++20)
+description: Module interface and implementation units, export and import, partitions, header units, compile-time wins, and the current state of compiler and build-system support.
+order: 14
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++, modules, cxx20]
+badge: tutorial
+---
+
+<SpecSheet
+  title="Lesson 13 — at a glance"
+  specs={[
+    { label: "What you'll learn", value: 'Module interface vs implementation units, export/import, partitions, header units, compile-time benefits, compiler and CMake support' },
+    { label: 'Code provided', value: 'About 80 lines — a geometry module split across files plus CMakeLists' },
+    { label: 'Time', value: '60-90 minutes' },
+    { label: 'Pre-reqs', value: 'Lessons 1-12 (templates, smart pointers, namespaces, build systems)' },
+  ]}
+/>
+
+For forty years, C++ shipped its code through textual `#include`. The preprocessor pasted header files into translation units, the compiler parsed the result, the linker merged the outputs. The model worked, in the same sense that hand-cranking an engine works. It is also responsible for most of what is bad about C++ build times: every translation unit re-parses every transitive header it includes, macros leak everywhere, and the same template definitions are parsed thousands of times across a project.
+
+C++20 modules replace that. A module is a parsed, compiled compilation unit that you import — not include. The compiler parses it once, stores the result, and consumers read the binary interface in milliseconds. Macros do not leak. ABI is well-defined. Compile times drop by 10-100x on large codebases.
+
+This lesson covers the syntax, the file layout, and where the tooling stands in 2026. Modules are now usable in production with GCC 14+, Clang 16+, MSVC 17.5+, and CMake 3.28+.
+
+## The problem modules solve
+
+A typical C++ header:
+
+```cpp
+// widget.hpp
+#pragma once
+#include <string>
+#include <vector>
+#include <memory>
+
+class Widget {
+public:
+    Widget(std::string name);
+    void run();
+private:
+    std::string             name_;
+    std::vector<int>        history_;
+    std::unique_ptr<Widget> parent_;
+};
+```
+
+If 500 source files `#include "widget.hpp"`, then 500 source files also transitively `#include <string>`, `#include <vector>`, `#include <memory>`. Each of those drags in tens of thousands of lines of standard-library code. The compiler parses all of it 500 times. Templates are re-instantiated. The build is slow.
+
+Worse, every `#define` that any header (transitively) includes is now in every translation unit. The classic Windows-header `#define min(a,b)` macro famously breaks any code that uses `std::min`. The preprocessor has no respect for scope.
+
+Modules fix both. An import statement reads a pre-compiled binary description of the module's interface. The compiler does not re-parse the module's body, does not re-parse its transitive dependencies, and does not see any of its macros.
+
+## Module interface units
+
+A module is declared with `export module name;`:
+
+```cpp
+// geometry.cppm  (module interface unit, .cppm convention)
+export module geometry;
+
+import <cmath>;        // header unit — see below
+
+namespace geom {
+
+export struct Point { double x, y; };
+
+export struct Vector { double dx, dy; };
+
+export double distance(Point a, Point b) {
+    return std::hypot(b.x - a.x, b.y - a.y);
+}
+
+export Vector operator-(Point a, Point b) {
+    return {a.x - b.x, a.y - b.y};
+}
+
+// Not exported — visible only inside the module.
+double internal_helper(double x) {
+    return x * x + 1.0;
+}
+
+} // namespace geom
+```
+
+The `export` keyword controls visibility. Names declared `export` are visible to importers; names without are private to the module. There is no header file. `internal_helper` is not visible outside `geometry.cppm` — not even via cast, address-of, or extern declaration. This is real encapsulation, not the suggestion-of-encapsulation you get from `static` in C or `detail::` namespaces in headers.
+
+A consumer imports the module:
+
+```cpp
+// main.cpp
+import geometry;
+import <print>;
+
+int main() {
+    geom::Point a{0, 0}, b{3, 4};
+    std::println("distance = {}", geom::distance(a, b));
+}
+```
+
+`import geometry;` reads a pre-compiled `geometry.gcm` (GCC) or `geometry.ifc` (MSVC). The compiler does not re-parse the module's source. Build time for `main.cpp` is dominated by main's own code, not by walking the module's dependencies.
+
+## Module implementation units
+
+You can split a module across files. The interface unit declares what is exported; one or more implementation units provide the definitions.
+
+```cpp
+// geometry.cppm — interface
+export module geometry;
+
+export namespace geom {
+    struct Point { double x, y; };
+    double distance(Point a, Point b);     // declaration only
+}
+```
+
+```cpp
+// geometry-impl.cpp — implementation
+module geometry;   // not "export module" — this is the impl unit
+
+import <cmath>;
+
+namespace geom {
+    double distance(Point a, Point b) {
+        return std::hypot(b.x - a.x, b.y - a.y);
+    }
+}
+```
+
+The implementation unit can use everything the module declares without re-importing. It compiles separately and links into the same module. This mirrors the header-and-source split, but the consumer never has to see the implementation file or its includes.
+
+## Module partitions
+
+A module can be split into named partitions. Partitions are visible inside the module but their names are local; consumers only see the primary module name.
+
+```cpp
+// geometry-points.cppm
+export module geometry:points;
+export struct Point { double x, y; };
+```
+
+```cpp
+// geometry-vectors.cppm
+export module geometry:vectors;
+import :points;        // partition import
+export struct Vector { double dx, dy; };
+export Vector operator-(Point a, Point b) { return {a.x - b.x, a.y - b.y}; }
+```
+
+```cpp
+// geometry.cppm — primary
+export module geometry;
+export import :points;
+export import :vectors;
+```
+
+`export import :points;` re-exports the partition's exports so consumers see `geom::Point` directly. The `export import` form is the bridge between internal organisation (partitions) and public interface (the primary module).
+
+For most libraries, partitions are how you decompose a large module into manageable files without exposing internal structure.
+
+## Header units
+
+The old world is not going away overnight. The C++20 standard provides an interop mechanism: header units. A header unit is a header file imported as if it were a module:
+
+```cpp
+import <vector>;
+import <print>;
+import "my_legacy_header.hpp";
+```
+
+The compiler treats the header as a translation unit, builds an interface, and lets you import it. Macros defined inside the header are *not* exported (that is the whole point), so legacy macros do not leak. But the header still has to be parsed once per build — header units do not give you the cross-project caching of true modules. They are a transition tool.
+
+Most standard-library implementations now ship pre-built header units for the common headers (`<vector>`, `<string>`, `<print>`, etc). When CMake's modules feature is enabled, importing them just works.
+
+## Build-system state
+
+The story in 2026 is finally good, after rough years.
+
+- **GCC 14+** has stable C++20 module support, including header units. `-std=c++23 -fmodules-ts` is the flag (the `-ts` suffix is historical; the support is the C++20 standard).
+- **Clang 16+** supports modules. `-std=c++23 -fmodules`.
+- **MSVC** has had stable module support since 17.5 (2023). `/std:c++latest /experimental:module` is no longer needed; `/std:c++20` is enough.
+- **CMake 3.28+** treats modules as a first-class build artifact. You list `.cppm` files in `target_sources` with the `FILE_SET` mechanism:
+
+```cmake
+cmake_minimum_required(VERSION 3.28)
+project(geo)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_executable(geo main.cpp)
+target_sources(geo
+    PUBLIC
+    FILE_SET CXX_MODULES FILES
+        geometry.cppm
+        geometry-impl.cpp
+)
+```
+
+CMake handles the dependency scanning, compiles modules in topological order, and caches the binary module interfaces. It mostly just works on GCC 14+ and Clang 17+; MSVC has been stable longer.
+
+Most large existing projects still ship as headers because of the long migration tail — every dependency in the chain has to support modules for the benefit to compound. But greenfield projects in 2026 increasingly start with modules from day one, and many large open-source libraries (Boost, fmt, microsoft/STL) ship dual-mode (headers + module interfaces).
+
+<Callout type="tip" title="The 10-100x compile-time win is real">
+A project with 200 source files that each `#include` the same heavy header (e.g., a code generator for protobuf or flatbuffers) commonly sees a 10x reduction in clean-build time when switched to modules. The standard library `import <vector>;` alone shaves 1-2 seconds per translation unit on a cold cache versus `#include <vector>`. The savings scale with header weight and project size.
+</Callout>
+
+## A complete worked example
+
+Three files plus a CMakeLists. Build with CMake 3.28+ and GCC 14+ (or Clang 17+, or MSVC 17.8+).
+
+```cpp
+// geometry.cppm — module interface
+export module geometry;
+
+import <cmath>;
+
+export namespace geom {
+
+struct Point { double x, y; };
+
+struct Vector { double dx, dy; };
+
+double distance(Point a, Point b);
+
+Vector operator-(Point a, Point b);
+
+Point operator+(Point a, Vector v);
+
+} // namespace geom
+
+// Implementation declared in the same interface unit for brevity.
+namespace geom {
+
+double distance(Point a, Point b) {
+    return std::hypot(b.x - a.x, b.y - a.y);
+}
+
+Vector operator-(Point a, Point b) {
+    return {a.x - b.x, a.y - b.y};
+}
+
+Point operator+(Point a, Vector v) {
+    return {a.x + v.dx, a.y + v.dy};
+}
+
+}
+```
+
+```cpp
+// main.cpp — consumer
+import geometry;
+import <print>;
+
+int main() {
+    geom::Point a{1.0, 2.0};
+    geom::Point b{4.0, 6.0};
+    auto v = b - a;
+    std::println("a = ({}, {})", a.x, a.y);
+    std::println("b = ({}, {})", b.x, b.y);
+    std::println("|ab| = {}", geom::distance(a, b));
+    std::println("v.dx, v.dy = {}, {}", v.dx, v.dy);
+
+    auto c = a + v;
+    std::println("c = ({}, {})", c.x, c.y);   // should equal b
+}
+```
+
+```cmake
+# CMakeLists.txt
+cmake_minimum_required(VERSION 3.28)
+project(geo CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+add_executable(geo main.cpp)
+target_sources(geo
+    PUBLIC
+    FILE_SET CXX_MODULES FILES
+        geometry.cppm
+)
+```
+
+Build:
+
+```
+$ cmake -B build -G Ninja
+$ cmake --build build
+$ ./build/geo
+a = (1, 2)
+b = (4, 6)
+|ab| = 5
+v.dx, v.dy = 3, 4
+c = (4, 6)
+```
+
+CMake invokes the compiler in scan mode first to discover module dependencies, then compiles the module interface, caches the binary `.gcm`/`.ifc`/`.pcm`, and finally compiles `main.cpp` against the cached interface. On a subsequent edit to `main.cpp`, only `main.cpp` rebuilds — the module is unchanged, the binary interface is reused.
+
+## Compatibility with `#include`
+
+You can mix in both directions:
+
+```cpp
+// my_module.cppm
+export module my_module;
+
+#include <stdint.h>          // legacy C header — still works
+import <vector>;             // standard-library header unit
+
+export class Widget { /* ... */ };
+```
+
+A module can include legacy headers internally without re-exporting their contents. The `<stdint.h>` types are visible inside `my_module.cppm` but not in importers (unless explicitly re-declared with `export`).
+
+In the other direction, you can `#include` a header that was generated from a module, or just keep header-shipping code that wraps a module internally. For libraries with hostile dependency trees, the dual-mode (headers + module interface) approach is common.
+
+## Why most projects still use headers
+
+If modules are 10-100x faster, why isn't everyone on them by 2026?
+
+1. **Dependency tail.** Every library in your dependency graph has to be module-friendly. One non-modular dep means a `#include` somewhere, and you lose much of the win.
+2. **Build-system inertia.** Many projects still use older CMake, Bazel without module support, or hand-rolled Makefiles. Migrating the build is more work than migrating the code.
+3. **Templates still go in headers (sort of).** Module interfaces can export templates, but the template definition has to be in the interface unit (or imported through a partition). The "split template declaration and definition" idiom from headers does not work without `extern template`.
+4. **Macros.** Some libraries (Qt, Boost.Preprocessor, logging frameworks) lean heavily on macros, and macros do not export from modules. Those libraries need wrapper macros or a re-architecture.
+
+The migration path is gradual. Start by `import <vector>;` instead of `#include <vector>;` (header units), see the compile-time win, then move your own headers to module interfaces one at a time. For greenfield projects in 2026, start modular and never look back.
+
+## What you learned
+
+- `export module name;` declares a module interface unit. `module name;` declares an implementation unit.
+- `export` controls visibility. Non-exported names are local to the module.
+- `import name;` reads a binary module interface; macros do not leak.
+- Module partitions (`module name:partition;`) decompose large modules.
+- Header units (`import <vector>;`) wrap legacy headers as imports for transition.
+- Build-system support: CMake 3.28+, GCC 14+, Clang 16+, MSVC 17.5+. Stable in 2026.
+- Compile times drop 10-100x on header-heavy codebases.
+- Greenfield projects: start with modules. Legacy: migrate header-by-header.
+
+## Exercises
+
+**Exercise 13.1.** Why does the following fail at the consumer?
+
+```cpp
+// math.cppm
+export module math;
+double square(double x) { return x * x; }
+```
+
+```cpp
+// main.cpp
+import math;
+int main() { square(3.0); }
+```
+
+<Callout type="spec" title="Answer">
+`square` is not marked `export` in the module. Non-exported names are private to the module, even if they are at namespace scope. The consumer's `square(3.0)` is an unresolved identifier. Fix: `export double square(double x) { return x * x; }`.
+
+This is the difference modules make from headers: there is no implicit "everything in the header is part of the public API". Only what you explicitly `export` is.
+</Callout>
+
+**Exercise 13.2.** What happens to the `#define BUFFER_SIZE 64` defined inside a module interface unit when you import that module?
+
+<Callout type="spec" title="Answer">
+Nothing — the macro is not visible to importers. Macros are a preprocessor-level concept and modules do not propagate them. This is the whole point: macro leakage is one of the headline problems modules solve.
+
+If you need a constant that does propagate, declare an `export constexpr int BUFFER_SIZE = 64;` instead. That is a real name with a type, exported through the module's public interface, and it is what consumers should depend on anyway.
+</Callout>
+
+**Exercise 13.3.** You have a 500-source-file project that takes 5 minutes to build. Each source includes a "common.hpp" that pulls in 30k lines of headers. How would you migrate to modules to maximise compile-time win with minimum churn?
+
+<Callout type="spec" title="Answer">
+Phase 1 — header units for the standard library. Replace `#include <vector>` with `import <vector>;` etc. across `common.hpp`. This alone often gives 2-3x on a large project, with zero changes to the rest of the codebase.
+
+Phase 2 — convert `common.hpp` itself into a module interface unit `common.cppm`. Every source file changes `#include "common.hpp"` to `import common;`. Now `common`'s body is parsed once per build instead of 500 times. Expected another 3-5x.
+
+Phase 3 — extract internal subsystems into their own modules. The further down the dependency tree you push modules, the more sharing the build system gets.
+
+Keep the old header around (forwarding to the module) during transition so out-of-tree consumers still compile. CMake's `FILE_SET CXX_MODULES` mechanism makes this incremental. Most teams I have seen pull this off see 5-15x total improvement.
+</Callout>
+
+## Next
+
+| Previous | Next |
+| --- | --- |
+| [C++ Lesson 12 — Concurrency](/docs/programming/cpp-lesson-12-concurrency/) | [C++ Lesson 14 — Modern C++23](/docs/programming/cpp-lesson-14-modern/) |
+
+See also: [C++ on Cortex-M](/docs/programming/cpp/), [C++ tutorial index](/docs/programming/cpp-tutorial/), [GCC flag reference](/tools/gcc-flags/).

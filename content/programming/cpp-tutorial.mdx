@@ -1,0 +1,132 @@
+---
+title: C++ programming tutorial — from C-with-classes to modern C++23
+description: A 15-lesson hands-on tutorial taking you through classes, RAII, templates, the STL, smart pointers, move semantics, lambdas, modules, and modern C++23. Built for C programmers and embedded engineers.
+order: 3
+updated: 2026-05-13
+tags: [programming, tutorial, cpp, c++]
+badge: tutorial
+---
+
+
+C++ is the most misunderstood language in the embedded world. People who learned it from a 2003 textbook remember `iostream`, multiple inheritance, RTTI, exceptions, and a fat runtime — and they refuse to touch it. People who learned it from a 2019 talk remember `constexpr`, ranges, concepts, and zero-overhead abstractions — and they cannot imagine why anyone would still write C. The truth lives between the two, and the difference comes down to which subset of the language you actually use.
+
+This tutorial teaches the modern subset. The features that earn their keep: classes and RAII, templates, the STL containers you will actually reach for, smart pointers, move semantics, lambdas, ranges, and the C++23 additions like `std::expected`. It skips the historical baggage you can safely ignore: `iostream` formatting machinery, RTTI, exceptions on small targets, multiple inheritance soup, and the SFINAE tricks that concepts replaced.
+
+By the end you will be able to read modern C++ codebases, write small libraries, use the STL without surprises, and — in the final lesson — apply what you learned to a Cortex-M target with `arm-none-eabi-g++`, knowing exactly which features cost what.
+
+## At a glance
+
+<SpecSheet
+  title="C++ tutorial — at a glance"
+  specs={[
+    { label: 'Target', value: 'Portable C++23 (or C++20 with explicit fallbacks for ranges, concepts, modules)' },
+    { label: 'Hardware required', value: 'None — runs on any host (Linux, macOS, Windows). Lesson 15 connects to Cortex-M.' },
+    { label: 'Software', value: 'Any C++23-aware compiler: gcc 13+, clang 17+. We use g++ -std=c++23 -Wall -Wextra -Wpedantic.' },
+    { label: 'Time investment', value: 'Approximately 25-35 hours total — 90-120 minutes per lesson' },
+    { label: 'Prerequisites', value: 'Basic C (pointers, structs, headers) or fluency in another statically typed language. No prior C++ required.' },
+    { label: 'You will write', value: 'About 3000 lines of C++ across 15 short, self-contained programs' },
+    { label: 'Output', value: 'Working programs covering classes, RAII, templates, STL, smart pointers, move semantics, lambdas, ranges, modules, and an embedded-flavoured capstone' },
+  ]}
+/>
+
+## Philosophy
+
+Three rules govern every lesson.
+
+**Use the features that pay for themselves at compile time.** Templates, `constexpr`, `concepts`, and the type system are free at runtime — they cost compile time and they buy you safety. Use them liberally.
+
+**Be skeptical of features that pay at runtime.** Virtual functions, `std::function`, `std::shared_ptr`, exceptions, and dynamic allocation all have costs that show up in your final binary and your worst-case execution time. Use them when you need polymorphism, ownership counting, or error propagation that the alternatives cannot give you — not because the textbook said you should.
+
+**Embedded relevance is a callout, not a detour.** Every lesson has a "Embedded callout" section that says what changes when you target a Cortex-M with no heap, no exceptions, and a 100 KB flash budget. Most C++ features survive that constraint with minor tweaks. A few do not. You will know which by lesson 8.
+
+## How this differs from the reference page
+
+[`/docs/programming/cpp/`](/docs/programming/cpp/) is the **reference**: a flat list of C++ features with embedded-flavoured advice on each, suitable for someone who already knows C++ and wants to know what to use on Cortex-M. It does not teach the language; it filters it for firmware engineers.
+
+This tutorial is the **course**: an ordered 15-lesson path from "I know C, what does C++ add?" to "I can write a templated, RAII-managed, move-aware library and ship it on bare metal." Read this first. After lesson 15, the reference page becomes a quick lookup for any feature you forgot. The two are paired: tutorial for learning, reference for living.
+
+## The 15 lessons
+
+<CoreCompare
+  rows={[
+    { core: 'Lesson 1 — Hello, C++', notes: 'First program. iostream, namespaces, auto, nullptr, the four super-features as a roadmap.' },
+    { core: 'Lesson 2 — References, namespaces, basics', notes: 'References vs pointers. const T& parameters. Function overloading. Default arguments. enum class.' },
+    { core: 'Lesson 3 — Classes and RAII', notes: 'Constructor, destructor, member init list. The rule of three / five. RAII as the killer feature. explicit. = default / = delete.' },
+    { core: 'Lesson 4 — Inheritance and polymorphism', notes: 'virtual, override, final. Virtual destructors. Abstract classes. Composition vs inheritance. The vtable cost on embedded.' },
+    { core: 'Lesson 5 — Templates', notes: 'Function and class templates. Specialisation. Variadic packs. if constexpr. Concepts (C++20). A RingBuffer<T, N>.' },
+    { core: 'Lesson 6 — STL containers', notes: 'vector, array, string (SSO), map vs unordered_map, set, span. Which to use, which to avoid on embedded.' },
+    { core: 'Lesson 7 — Iterators and algorithms', notes: 'Iterator categories. Range-based for. The <algorithm> header. C++20 ranges and views.' },
+    { core: 'Lesson 8 — Smart pointers', notes: 'unique_ptr, shared_ptr, weak_ptr. Custom deleters. Owning vs non-owning views. Why raw new is mostly wrong.' },
+    { core: 'Lesson 9 — Move semantics and rvalue references (part 2)', notes: 'Lvalues, rvalues, xvalues. std::move, std::forward. Perfect forwarding. The rule of zero.' },
+    { core: 'Lesson 10 — Lambdas and std::function (part 2)', notes: 'Lambda syntax, captures, mutable, generic lambdas, IIFE. std::function vs function templates.' },
+    { core: 'Lesson 11 — Error handling without exceptions (part 2)', notes: 'std::optional, std::variant, std::expected (C++23). When exceptions are the right tool.' },
+    { core: 'Lesson 12 — Concurrency primitives (part 2)', notes: 'std::thread, std::mutex, std::atomic, std::jthread. Memory ordering. std::stop_token.' },
+    { core: 'Lesson 13 — Modules and modern build (part 3)', notes: 'C++20 modules. import std. Build-system reality (CMake, Bazel). Header-only libraries.' },
+    { core: 'Lesson 14 — C++23 highlights (part 3)', notes: 'std::print, std::expected, deducing this, multidimensional subscript, std::flat_map.' },
+    { core: 'Lesson 15 — C++ on Cortex-M (part 3)', notes: 'arm-none-eabi-g++. -fno-exceptions, -fno-rtti, -fno-use-cxa-atexit. ETL. Templates for register access. Connects to /docs/programming/cpp/.' },
+  ]}
+/>
+
+This page covers part 1: the landing page and lessons 1 through 8. Lessons 9 through 15 live in parts 2 and 3 of the tutorial.
+
+## How to use this tutorial
+
+Four rules.
+
+1. **Read in order.** Each lesson assumes the last. Lesson 4 (inheritance) makes no sense without lesson 3 (classes). Lesson 7 (algorithms) assumes the containers from lesson 6. The dependencies are real and they are dense.
+
+2. **Type the code.** Every code block in this tutorial is real, compileable, and short. Type it into a file, compile with `g++ -std=c++23 -Wall -Wextra -Wpedantic`, and run it. Reading C++ from a webpage and never compiling is the most common way to fool yourself into thinking you have learned C++.
+
+3. **Do the exercises before reading the answers.** Two or three exercises end each lesson. Answers are in `<Callout type="spec">` blocks below them. Skipping the exercises and reading the answers feels efficient and is the slowest way to learn.
+
+4. **Use the warnings.** `-Wall -Wextra -Wpedantic` catches real bugs. When the compiler complains, read the message. C++ compiler errors look ugly but they are usually right. The first 20 you decode by hand will earn you a sense for the next 200.
+
+<Callout type="tip" title="Pick one editor with good C++ tooling">
+clangd (via VS Code, Neovim, or Emacs), or CLion, or Visual Studio with its C++ tooling. Modern C++ is enormously easier to learn with go-to-definition and instant error squiggles than without them. Spend 30 minutes setting up clangd before lesson 1 and the rest of the tutorial will be faster.
+</Callout>
+
+## What you will not learn here
+
+This tutorial deliberately omits:
+
+- **Multiple inheritance and virtual inheritance** beyond a one-paragraph mention. They exist; they are rarely the right answer; the patterns that justify them (mixins, interface inheritance with default implementations) are better served by composition plus templates.
+- **The full template metaprogramming toolkit.** SFINAE, `std::enable_if`, tag dispatch — concepts (C++20) replaced 90% of this. We mention the old names so you can read existing code, and move on.
+- **C++ exceptions as the primary error model.** We cover them in lesson 11 alongside the alternatives (`std::optional`, `std::expected`). For embedded targets, exceptions are usually off.
+- **Boost and other large external libraries.** We stick to the standard library so the lessons compile anywhere `g++` runs.
+
+If you need any of these later, the C++ Programming Language reference (Stroustrup) and cppreference.com are exhaustive. This tutorial gets you to the point where those references are useful.
+
+## Compiler setup, in 30 seconds
+
+On macOS:
+
+```
+brew install gcc
+g++-14 --version
+```
+
+On Linux:
+
+```
+sudo apt install g++-13     # Ubuntu 24.04 has g++-13; 24.10 has g++-14
+g++ --version
+```
+
+On Windows: install [MSYS2](https://www.msys2.org/) and `pacman -S mingw-w64-ucrt-x86_64-gcc`, or use WSL.
+
+Every example in this tutorial compiles with:
+
+```
+g++ -std=c++23 -Wall -Wextra -Wpedantic -O2 file.cpp -o file
+```
+
+If your compiler does not support `-std=c++23`, fall back to `-std=c++20`. Lessons 13 and 14 will then need adjustments noted inline. `clang++` works identically — replace `g++` with `clang++` in every command.
+
+## Cross-references
+
+- [C tutorial](/docs/programming/c-tutorial/) — the 10-lesson bare-metal C tutorial. If you do not yet know C confidently, start there.
+- [C++ on Cortex-M](/docs/programming/cpp/) — the reference page. Use it after this tutorial as a lookup for embedded-specific advice.
+- [Bare-metal C tutorial](/docs/programming/tutorial/) — register-level C on STM32. Lesson 15 of this tutorial connects back to it.
+- [GCC flags reference](/tools/gcc-flags/) — every flag in our build commands explained.
+
+Start with [Lesson 1 — Hello, C++](/docs/programming/cpp-lesson-01-hello/).
